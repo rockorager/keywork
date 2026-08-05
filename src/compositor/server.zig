@@ -3700,6 +3700,7 @@ pub fn generatedSeatRequestSink(self: *Self) SeatDelivery.RequestSink {
     return .{
         .context = self,
         .pointer_enter_snapshot = generatedPointerEnterSnapshot,
+        .keyboard_resource_snapshot = generatedKeyboardResourceSnapshot,
         .set_cursor = generatedSetCursor,
         .cursor_committed = generatedCursorCommitted,
         .cursor_removed = generatedCursorRemoved,
@@ -3714,6 +3715,15 @@ fn generatedPointerEnterSnapshot(
 ) ?SeatDelivery.PointerEnterSnapshot {
     const self: *Self = @ptrCast(@alignCast(context));
     return self.seat.generatedPointerEnterSnapshot(client, generation);
+}
+
+fn generatedKeyboardResourceSnapshot(
+    context: *anyopaque,
+    client: ClientRegistry.Id,
+    generation: SeatDelivery.ResourceGeneration,
+) ?SeatDelivery.KeyboardResourceSnapshot {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.seat.generatedKeyboardResourceSnapshot(client, generation);
 }
 
 fn generatedSetCursor(context: *anyopaque, request: SeatDelivery.CursorRequest) SeatDelivery.CursorRequestResult {
@@ -3734,7 +3744,7 @@ fn generatedCursorRemoved(context: *anyopaque, id: SurfaceRegistry.Id) void {
 fn generatedClientRetiring(context: *anyopaque, client: ClientRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.seat.retireGeneratedClient(client);
-    _ = self.focus_arbiter.clientUnavailable(client);
+    if (self.focus_arbiter.clientUnavailable(client)) self.refreshKeyboardFocus();
 }
 
 pub fn generatedSeatName(self: *const Self) [:0]const u8 {
@@ -3858,6 +3868,7 @@ fn reconcileGeneratedPointerTopology(self: *Self) void {
 fn repairGeneratedFocus(self: *Self) void {
     const target = self.focus_arbiter.target() orelse return;
     if (target.frontend != .generated) return;
+    defer self.refreshKeyboardFocus();
     const root = self.headless_surface_forest.compoundRoot(target.root) orelse {
         _ = self.focus_arbiter.surfaceUnavailable(target.root);
         return;
@@ -6384,9 +6395,10 @@ fn routeTouchDown(
         if (focus != null and focus.?.generated == null) {
             const target = focus.?;
             const root = self.subcompositor.rootSurface(target.surface_id);
-            _ = self.focus_arbiter.clearGenerated();
+            const cleared_generated = self.focus_arbiter.clearGenerated();
             self.window_manager.pointerButton(root, .pressed);
             self.layer_shell.pointerPressed(root);
+            if (cleared_generated) self.refreshKeyboardFocus();
             requestRepaint(self);
         } else if (if (route.generated) |generated|
             generated.root
@@ -7003,9 +7015,10 @@ fn pointerButtonForSeat(
             }
         }
     }
-    if (seat == &self.seat and state == .pressed and route.generated == null and root != null)
-        _ = self.focus_arbiter.clearGenerated();
+    const cleared_generated = seat == &self.seat and state == .pressed and
+        route.generated == null and root != null and self.focus_arbiter.clearGenerated();
     self.window_manager.pointerButton(root, state);
+    if (cleared_generated) self.refreshKeyboardFocus();
     if (state == .pressed) {
         const focused = if (seat.pointerFocusedSurface()) |surface_id|
             self.subcompositor.rootSurface(surface_id)
@@ -7225,9 +7238,10 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     if (focus != null and focus.?.generated == null) {
         const target = focus.?;
         const root = self.subcompositor.rootSurface(target.surface_id);
-        _ = self.focus_arbiter.clearGenerated();
+        const cleared_generated = self.focus_arbiter.clearGenerated();
         self.window_manager.pointerButton(root, .pressed);
         self.layer_shell.pointerPressed(root);
+        if (cleared_generated) self.refreshKeyboardFocus();
         requestRepaint(self);
     } else if (route.generated) |generated| {
         self.window_manager.pointerButton(null, .pressed);
@@ -9693,17 +9707,20 @@ fn refreshKeyboardFocus(self: *Self) void {
         return;
     }
     const default_focus = self.maturePolicyKeyboardFocus();
-    if (self.focus_arbiter.retainGenerated(default_focus) != null and
-        generatedFocusPolicyAllows(
+    if (self.focus_arbiter.retainGenerated(default_focus)) |target| {
+        if (generatedFocusPolicyAllows(
             false,
             self.xdg_shell.hasPopupGrab(),
             self.layer_shell.keyboardFocus(self.xdg_shell.popupKeyboardFocus()) != null,
             self.xwayland_override_redirect_focus != null,
-        ))
-    {
-        self.seat.setKeyboardFocus(null);
-        self.syncXwaylandFocus(null);
-        return;
+        )) {
+            self.seat.setGeneratedKeyboardFocus(.{
+                .surface = target.root,
+                .client = target.client,
+            });
+            self.syncXwaylandFocus(null);
+            return;
+        }
     }
     self.applyMatureKeyboardFocus(default_focus);
     self.syncXwaylandFocus(default_focus);
@@ -9744,11 +9761,13 @@ fn focusGeneratedSurface(self: *Self, requested_root: SurfaceRegistry.Id) bool {
     const state = self.headless_surface_forest.state(root) orelse return false;
     if (state.mapped_size == null) return false;
     const client = self.seat.generatedSurfaceOwner(root) orelse return false;
-    return self.focus_arbiter.focusGenerated(
+    const changed = self.focus_arbiter.focusGenerated(
         root,
         client,
         self.maturePolicyKeyboardFocus(),
     );
+    self.refreshKeyboardFocus();
+    return changed;
 }
 
 fn generatedFocusPolicyAllows(
@@ -11330,12 +11349,23 @@ const SyntheticSurfaceProvider = struct {
 };
 
 const TestGeneratedSeatSink = struct {
+    const KeyboardTag = std.meta.Tag(SeatDelivery.KeyboardEvent);
     const PointerTag = std.meta.Tag(SeatDelivery.PointerEvent);
 
     clients: *ClientRegistry,
     client: ClientRegistry.Id,
+    other_client: ?ClientRegistry.Id = null,
+    other_surface: ?SurfaceRegistry.Id = null,
     event_count: usize = 0,
     next_serial: u32 = 1,
+    keyboard_event_count: usize = 0,
+    keyboard_events: [64]KeyboardTag = undefined,
+    keyboard_clients: [64]ClientRegistry.Id = undefined,
+    keyboard_surfaces: [64]SurfaceRegistry.Id = undefined,
+    keyboard_serials: [64]u32 = undefined,
+    keyboard_states: [64]?SeatDelivery.KeyState = undefined,
+    keyboard_pressed_keys: [64][8]u32 = undefined,
+    keyboard_pressed_key_counts: [64]usize = undefined,
     pointer_event_count: usize = 0,
     pointer_events: [64]PointerTag = undefined,
     pointer_surfaces: [64]SurfaceRegistry.Id = undefined,
@@ -11360,9 +11390,15 @@ const TestGeneratedSeatSink = struct {
 
     fn ownerForSurface(
         context: *anyopaque,
-        _: SurfaceRegistry.Id,
+        surface: SurfaceRegistry.Id,
     ) ?ClientRegistry.Id {
         const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
+        if (self.other_client != null and self.other_surface != null and
+            std.meta.eql(self.other_surface.?, surface) and
+            self.clients.domainOf(self.other_client.?) == .wayring_server)
+        {
+            return self.other_client;
+        }
         return if (self.clients.domainOf(self.client) == .wayring_server)
             self.client
         else
@@ -11380,7 +11416,9 @@ const TestGeneratedSeatSink = struct {
 
     fn issueSerial(context: *anyopaque, client: ClientRegistry.Id) ?ClientRegistry.Serial {
         const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
-        if (!std.meta.eql(client, self.client) or !self.clients.contains(client)) return null;
+        if ((!std.meta.eql(client, self.client) and
+            (self.other_client == null or !std.meta.eql(client, self.other_client.?))) or
+            !self.clients.contains(client)) return null;
         const value = self.next_serial;
         self.next_serial += 1;
         return .{ .domain = .wayring_server, .value = value };
@@ -11406,11 +11444,30 @@ const TestGeneratedSeatSink = struct {
 
     fn keyboard(
         context: *anyopaque,
-        _: ClientRegistry.Id,
-        _: SurfaceRegistry.Id,
-        _: SeatDelivery.KeyboardEvent,
+        client: ClientRegistry.Id,
+        surface: SurfaceRegistry.Id,
+        event: SeatDelivery.KeyboardEvent,
     ) void {
         const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
+        std.debug.assert(self.keyboard_event_count < self.keyboard_events.len);
+        const index = self.keyboard_event_count;
+        self.keyboard_events[index] = event;
+        self.keyboard_clients[index] = client;
+        self.keyboard_surfaces[index] = surface;
+        self.keyboard_states[index] = if (event == .key) event.key.state else null;
+        self.keyboard_pressed_key_counts[index] = 0;
+        self.keyboard_serials[index] = switch (event) {
+            .enter => |enter| blk: {
+                const count = @min(enter.pressed_keys.len, self.keyboard_pressed_keys[index].len);
+                @memcpy(self.keyboard_pressed_keys[index][0..count], enter.pressed_keys[0..count]);
+                self.keyboard_pressed_key_counts[index] = count;
+                break :blk enter.serial.value;
+            },
+            .leave => |leave| leave.serial,
+            .key => |key| key.serial.value,
+            .modifiers => |modifiers| modifiers.serial,
+        };
+        self.keyboard_event_count += 1;
         self.event_count += 1;
     }
 
@@ -12197,6 +12254,164 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
     server.removeHeadlessSurface(replacement_id);
     server.surface_registry.remove(replacement_id);
     try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
+}
+
+test "canonical generated keyboard delivery preserves focus aggregation authority grabs and repeats" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 4, .height = 4 } },
+    );
+    defer server.destroy();
+    var provider_a: SyntheticSurfaceProvider = .{
+        .pixel = 0xff11_1111,
+        .logical_size = .{ .width = 2, .height = 2 },
+    };
+    var provider_b: SyntheticSurfaceProvider = .{
+        .pixel = 0xff22_2222,
+        .logical_size = .{ .width = 2, .height = 2 },
+    };
+    const root_a = try server.surface_registry.add(provider_a.provider());
+    const root_b = try server.surface_registry.add(provider_b.provider());
+    var surfaces_live = true;
+    try server.addHeadlessSurface(root_a, null);
+    try server.addHeadlessSurface(root_b, null);
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{
+            .{ .id = root_a, .mapped_size = provider_a.logical_size, .callbacks_committed = false },
+            .{ .id = root_b, .mapped_size = provider_b.logical_size, .callbacks_committed = false },
+        },
+        .parents = &.{},
+    });
+    defer if (surfaces_live) {
+        server.removeHeadlessSurface(root_b);
+        server.surface_registry.remove(root_b);
+        server.removeHeadlessSurface(root_a);
+        server.surface_registry.remove(root_a);
+    };
+
+    const client_a = try server.client_registry.register(.wayring_server);
+    var client_a_live = true;
+    defer if (client_a_live) server.client_registry.unregister(client_a);
+    const client_b = try server.client_registry.register(.wayring_server);
+    var client_b_live = true;
+    defer if (client_b_live) server.client_registry.unregister(client_b);
+    var sink: TestGeneratedSeatSink = .{
+        .clients = &server.client_registry,
+        .client = client_a,
+        .other_client = client_b,
+        .other_surface = root_b,
+    };
+    server.setGeneratedSeatDeliverySink(sink.sink());
+    defer server.clearGeneratedSeatDeliverySink(&sink);
+
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.Unexpected;
+    defer _ = std.c.close(pipe_fds[1]);
+    server.seat.setKeymap(.xkb_v1, pipe_fds[0], 8);
+    server.seat.setKeyboardAvailable(true);
+    try server.seat.parentKeyboardEnter(&.{30});
+    defer server.seat.setKeyboardAvailable(false);
+
+    try std.testing.expect(server.focusGeneratedSurface(root_a));
+    try std.testing.expectEqualSlices(TestGeneratedSeatSink.KeyboardTag, &.{.enter}, sink.keyboard_events[0..sink.keyboard_event_count]);
+    try std.testing.expectEqual(client_a, sink.keyboard_clients[0]);
+    try std.testing.expectEqual(root_a, sink.keyboard_surfaces[0]);
+    try std.testing.expectEqual(@as(u32, 1), sink.keyboard_serials[0]);
+    try std.testing.expectEqualSlices(u32, &.{30}, sink.keyboard_pressed_keys[0][0..sink.keyboard_pressed_key_counts[0]]);
+    const keyboard_snapshot = server.seat.generatedKeyboardResourceSnapshot(
+        client_a,
+        server.seat.deliverySnapshot().capabilities.keyboard.generation,
+    ).?;
+    try std.testing.expectEqual(@as(u32, 1), keyboard_snapshot.focus.?.serial.value);
+    try std.testing.expectEqualSlices(u32, &.{30}, keyboard_snapshot.focus.?.pressed_keys);
+    try std.testing.expectEqual(@as(u32, 2), sink.next_serial);
+
+    server.seat.setModifiers(1, 2, 4, 3);
+    try server.seat.key(1, 31, .pressed);
+    const press_serial: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 3 };
+    try std.testing.expect(server.seat.authority.acceptsAction(client_a, press_serial));
+    try std.testing.expect(server.seat.authority.selectionOrder(client_a, press_serial) != null);
+    try server.seat.virtualKey(2, 31, .pressed);
+    try server.seat.key(3, 31, .released);
+    try std.testing.expectEqual(@as(usize, 3), sink.keyboard_event_count);
+    try server.seat.virtualKey(4, 31, .released);
+    const release_serial: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 4 };
+    try std.testing.expect(!server.seat.authority.acceptsAction(client_a, release_serial));
+    try std.testing.expect(server.seat.authority.selectionOrder(client_a, release_serial) != null);
+
+    try server.seat.key(5, 32, .pressed);
+    try server.seat.key(6, 32, .repeated);
+    const events_after_repeat = sink.keyboard_event_count;
+    server.seat.setRepeatInfo(25, 500);
+    try server.seat.key(7, 32, .repeated);
+    try std.testing.expectEqual(events_after_repeat, sink.keyboard_event_count);
+    server.seat.setRepeatInfo(0, 500);
+    try server.seat.key(8, 32, .repeated);
+    try std.testing.expectEqual(SeatDelivery.KeyState.repeated, sink.keyboard_states[sink.keyboard_event_count - 1].?);
+
+    const GrabProbe = struct {
+        key_count: usize = 0,
+
+        fn cancel(_: *anyopaque) void {}
+        fn keymap(_: *anyopaque, _: wl.Keyboard.KeymapFormat, _: std.posix.fd_t, _: u32) void {}
+        fn key(context: *anyopaque, _: u32, _: u32, _: u32, _: wl.Keyboard.KeyState) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.key_count += 1;
+        }
+        fn modifiers(_: *anyopaque, _: u32, _: u32, _: u32, _: u32) void {}
+        fn repeatInfo(_: *anyopaque, _: i32, _: i32) void {}
+    };
+    var grab_probe: GrabProbe = .{};
+    server.seat.setKeyboardGrab(.{
+        .context = &grab_probe,
+        .token = 42,
+        .cancel = GrabProbe.cancel,
+        .keymap = GrabProbe.keymap,
+        .key = GrabProbe.key,
+        .modifiers = GrabProbe.modifiers,
+        .repeat_info = GrabProbe.repeatInfo,
+    });
+    const before_grab_key = sink.keyboard_event_count;
+    try server.seat.key(9, 33, .pressed);
+    try std.testing.expectEqual(@as(usize, 1), grab_probe.key_count);
+    try std.testing.expectEqual(before_grab_key, sink.keyboard_event_count);
+    server.seat.clearKeyboardGrab(&grab_probe, true);
+    try server.seat.key(10, 33, .released);
+    try std.testing.expectEqual(before_grab_key + 1, sink.keyboard_event_count);
+    try std.testing.expectEqual(TestGeneratedSeatSink.KeyboardTag.modifiers, sink.keyboard_events[sink.keyboard_event_count - 1]);
+
+    const transition_start = sink.keyboard_event_count;
+    try std.testing.expect(server.focusGeneratedSurface(root_b));
+    try std.testing.expectEqualSlices(
+        TestGeneratedSeatSink.KeyboardTag,
+        &.{ .leave, .enter },
+        sink.keyboard_events[transition_start..sink.keyboard_event_count],
+    );
+    try std.testing.expectEqual(client_a, sink.keyboard_clients[transition_start]);
+    try std.testing.expectEqual(client_b, sink.keyboard_clients[transition_start + 1]);
+    try std.testing.expectEqual(root_a, sink.keyboard_surfaces[transition_start]);
+    try std.testing.expectEqual(root_b, sink.keyboard_surfaces[transition_start + 1]);
+
+    const mature_transition = sink.keyboard_event_count;
+    server.applyMatureKeyboardFocus(null);
+    try std.testing.expectEqual(mature_transition + 1, sink.keyboard_event_count);
+    try std.testing.expectEqual(TestGeneratedSeatSink.KeyboardTag.leave, sink.keyboard_events[mature_transition]);
+    try std.testing.expectEqual(client_b, sink.keyboard_clients[mature_transition]);
+    try std.testing.expect(server.focus_arbiter.target() == null);
+
+    server.client_registry.unregister(client_b);
+    client_b_live = false;
+    server.client_registry.unregister(client_a);
+    client_a_live = false;
+    server.removeHeadlessSurface(root_b);
+    server.surface_registry.remove(root_b);
+    server.removeHeadlessSurface(root_a);
+    server.surface_registry.remove(root_a);
+    surfaces_live = false;
 }
 
 test "headless click and first touch focus compound root with synchronous repair" {

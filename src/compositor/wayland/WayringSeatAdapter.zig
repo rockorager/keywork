@@ -1,4 +1,4 @@
-//! Unpublished generated wl_seat/wl_pointer adapter.
+//! Unpublished generated wl_seat/wl_keyboard/wl_pointer adapter.
 //!
 //! The seat is deliberately available only through `bind`: production does
 //! not install a global. Canonical seat policy calls the resource-free sink;
@@ -24,8 +24,10 @@ request_sink: SeatDelivery.RequestSink,
 seat_name: [:0]const u8,
 snapshot: SeatDelivery.CapabilitySnapshot = .{},
 seats: std.ArrayList(*SeatResource) = .empty,
+keyboards: std.ArrayList(*KeyboardResource) = .empty,
 pointers: std.ArrayList(*PointerResource) = .empty,
 terminal_clients: std.ArrayList(TerminalClient) = .empty,
+next_keyboard_resource_generation: ?SeatDelivery.ResourceGeneration = 1,
 next_pointer_resource_generation: ?SeatDelivery.ResourceGeneration = 1,
 
 const TerminalClient = struct {
@@ -37,6 +39,15 @@ const SeatResource = struct {
     resource: core.wl_seat.Resource,
     client: *wayring.server.Client,
     adapter: *WayringSeatAdapter,
+};
+
+const KeyboardResource = struct {
+    resource: core.wl_keyboard.Resource,
+    client: *wayring.server.Client,
+    adapter: *WayringSeatAdapter,
+    generation: SeatDelivery.ResourceGeneration,
+    resource_generation: SeatDelivery.ResourceGeneration,
+    focused_surface: ?SurfaceRegistry.Id = null,
 };
 
 const PointerResource = struct {
@@ -68,8 +79,10 @@ pub fn init(
 }
 
 pub fn deinit(self: *WayringSeatAdapter) void {
-    std.debug.assert(self.seats.items.len == 0 and self.pointers.items.len == 0 and self.terminal_clients.items.len == 0);
+    std.debug.assert(self.seats.items.len == 0 and self.keyboards.items.len == 0 and
+        self.pointers.items.len == 0 and self.terminal_clients.items.len == 0);
     self.seats.deinit(self.allocator);
+    self.keyboards.deinit(self.allocator);
     self.pointers.deinit(self.allocator);
     self.terminal_clients.deinit(self.allocator);
     self.* = undefined;
@@ -126,7 +139,12 @@ pub fn bind(self: *WayringSeatAdapter, client: *wayring.server.Client, id: u32, 
 pub fn destroyClientResources(self: *WayringSeatAdapter, client: *wayring.server.Client) void {
     self.retireClient(client);
     self.untrackClient(client);
-    var i = self.pointers.items.len;
+    var i = self.keyboards.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (self.keyboards.items[i].client == client) destroyKeyboard(self.keyboards.items[i]);
+    }
+    i = self.pointers.items.len;
     while (i > 0) {
         i -= 1;
         if (self.pointers.items[i].client == client) destroyPointer(self.pointers.items[i]);
@@ -153,10 +171,22 @@ fn seatRequest(_: *core.wl_seat.Resource, request: core.wl_seat.Request, seat: *
                     seat.client.postImplementationError(&seat.resource.runtime, "creating generated pointer");
             };
         },
+        .get_keyboard => |args| {
+            if (!seat.adapter.snapshot.keyboard.ever_available) {
+                missingCapability(seat, "seat has never had a keyboard capability");
+                return;
+            }
+            createKeyboard(seat, args.id) catch |err| {
+                seat.adapter.retireClient(seat.client);
+                if (err == error.OutOfMemory)
+                    seat.client.postOutOfMemory(&seat.resource.runtime, "creating generated keyboard")
+                else
+                    seat.client.postImplementationError(&seat.resource.runtime, "creating generated keyboard");
+            };
+        },
         .release => destroySeat(seat),
-        // Wave 3 deliberately does not claim either implementation. A typed
-        // new_id must never be left as a successful, unmaterialized request.
-        .get_keyboard => missingCapability(seat, "generated keyboard is unavailable"),
+        // Wave 4 deliberately does not claim touch. A typed new_id must never
+        // be left as a successful, unmaterialized request.
         .get_touch => missingCapability(seat, "generated touch is unavailable"),
     }
 }
@@ -168,6 +198,60 @@ fn missingCapability(seat: *SeatResource, detail: []const u8) void {
         @intCast(core.wl_seat.@"error".missing_capability),
         detail,
     );
+}
+
+fn createKeyboard(seat: *SeatResource, id: u32) !void {
+    const self = seat.adapter;
+    const resource_generation = self.next_keyboard_resource_generation orelse {
+        self.retireClient(seat.client);
+        seat.client.postImplementationError(&seat.resource.runtime, "generated keyboard resource generation exhausted");
+        return;
+    };
+    self.next_keyboard_resource_generation = std.math.add(
+        SeatDelivery.ResourceGeneration,
+        resource_generation,
+        1,
+    ) catch null;
+    try self.keyboards.ensureUnusedCapacity(self.allocator, 1);
+    const keyboard_resource = try self.allocator.create(KeyboardResource);
+    errdefer self.allocator.destroy(keyboard_resource);
+    keyboard_resource.* = .{
+        .resource = .init(self.allocator, id, seat.resource.version(), .client, seat.client.ownerHooks()),
+        .client = seat.client,
+        .adapter = self,
+        .generation = self.snapshot.keyboard.generation,
+        .resource_generation = resource_generation,
+    };
+    errdefer {
+        keyboard_resource.resource.destroy();
+        keyboard_resource.resource.deinit();
+    }
+    try keyboard_resource.resource.setHandler(KeyboardResource, keyboard_resource, keyboardRequest, null);
+    try seat.client.materialize(&keyboard_resource.resource.runtime);
+    self.keyboards.appendAssumeCapacity(keyboard_resource);
+    if (!self.snapshot.keyboard.resourceActive(keyboard_resource.generation)) return;
+    const client_id = self.clients.id(seat.client) orelse {
+        self.retireClient(seat.client);
+        seat.client.postImplementationError(&keyboard_resource.resource.runtime, "generated keyboard client mapping is unavailable");
+        return;
+    };
+    const snapshot = self.request_sink.keyboard_resource_snapshot(
+        self.request_sink.context,
+        client_id,
+        keyboard_resource.generation,
+    ) orelse {
+        self.retireClient(seat.client);
+        seat.client.postImplementationError(&keyboard_resource.resource.runtime, "generated keyboard canonical snapshot is unavailable");
+        return;
+    };
+    sendKeyboardInitial(keyboard_resource, snapshot) catch |err|
+        self.eventFailure(seat.client, &keyboard_resource.resource.runtime, err);
+}
+
+fn keyboardRequest(_: *core.wl_keyboard.Resource, request: core.wl_keyboard.Request, keyboard_resource: *KeyboardResource) !void {
+    switch (request) {
+        .release => destroyKeyboard(keyboard_resource),
+    }
 }
 
 fn createPointer(seat: *SeatResource, id: u32) !void {
@@ -259,6 +343,16 @@ fn destroySeat(seat: *SeatResource) void {
         return;
     };
 }
+fn destroyKeyboard(keyboard_resource: *KeyboardResource) void {
+    const self = keyboard_resource.adapter;
+    for (self.keyboards.items, 0..) |item, i| if (item == keyboard_resource) {
+        _ = self.keyboards.orderedRemove(i);
+        keyboard_resource.resource.destroy();
+        keyboard_resource.resource.deinit();
+        self.allocator.destroy(keyboard_resource);
+        return;
+    };
+}
 fn destroyPointer(pointer_resource: *PointerResource) void {
     const self = pointer_resource.adapter;
     for (self.pointers.items, 0..) |item, i| if (item == pointer_resource) {
@@ -271,9 +365,11 @@ fn destroyPointer(pointer_resource: *PointerResource) void {
 }
 
 fn capabilityBits(snapshot: SeatDelivery.CapabilitySnapshot) u32 {
-    // Keyboard and touch resources are deliberately deferred to later waves;
-    // advertising them here would make their missing-capability errors false.
-    return if (snapshot.pointer.available) 1 else 0;
+    var bits: u32 = 0;
+    if (snapshot.pointer.available) bits |= @intCast(core.wl_seat.capability.pointer);
+    if (snapshot.keyboard.available) bits |= @intCast(core.wl_seat.capability.keyboard);
+    // Touch resources remain deliberately deferred to Wave 5.
+    return bits;
 }
 fn sendCapabilities(seat: *SeatResource) !void {
     try core.wl_seat.@"send:capabilities"(&seat.resource, capabilityBits(seat.adapter.snapshot));
@@ -330,6 +426,12 @@ fn cursorRemoved(context: *anyopaque, id: SurfaceRegistry.Id) void {
 fn terminalize(context: *anyopaque, client_id: ClientRegistry.Id, _: SeatDelivery.TerminalReason) void {
     const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
     const client = self.clients.rawClient(client_id) orelse return;
+    for (self.keyboards.items) |keyboard_resource| {
+        if (keyboard_resource.client != client) continue;
+        self.retireClient(client);
+        client.postOutOfMemory(&keyboard_resource.resource.runtime, "storing generated seat state");
+        return;
+    }
     for (self.pointers.items) |pointer_resource| {
         if (pointer_resource.client != client) continue;
         self.retireClient(client);
@@ -339,7 +441,7 @@ fn terminalize(context: *anyopaque, client_id: ClientRegistry.Id, _: SeatDeliver
     for (self.seats.items) |seat| {
         if (seat.client != client) continue;
         self.retireClient(client);
-        client.postOutOfMemory(&seat.resource.runtime, "storing generated pointer state");
+        client.postOutOfMemory(&seat.resource.runtime, "storing generated seat state");
         return;
     }
 }
@@ -385,6 +487,11 @@ fn issueSerial(
 
 fn terminalizeSerialExhaustion(self: *WayringSeatAdapter, client: *wayring.server.Client) void {
     self.retireClient(client);
+    for (self.keyboards.items) |keyboard_resource| {
+        if (keyboard_resource.client != client) continue;
+        client.postImplementationError(&keyboard_resource.resource.runtime, "generated seat serial exhausted");
+        return;
+    }
     for (self.pointers.items) |pointer_resource| {
         if (pointer_resource.client != client) continue;
         client.postImplementationError(&pointer_resource.resource.runtime, "generated seat serial exhausted");
@@ -407,6 +514,9 @@ fn touchTarget(_: *anyopaque, _: SurfaceRegistry.Id) ?SeatDelivery.TouchTarget {
 fn capabilities(context: *anyopaque, snapshot: SeatDelivery.CapabilitySnapshot) void {
     const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
     self.snapshot = snapshot;
+    if (!snapshot.keyboard.available) {
+        for (self.keyboards.items) |keyboard_resource| keyboard_resource.focused_surface = null;
+    }
     if (!snapshot.pointer.available) {
         for (self.pointers.items) |pointer_resource| {
             pointer_resource.last_enter_serial = null;
@@ -415,13 +525,148 @@ fn capabilities(context: *anyopaque, snapshot: SeatDelivery.CapabilitySnapshot) 
     }
     for (self.seats.items) |seat| sendCapabilities(seat) catch |err| self.eventFailure(seat.client, &seat.resource.runtime, err);
 }
-fn keyboardState(_: *anyopaque, _: SeatDelivery.KeyboardStateEvent) void {}
+fn keyboardState(context: *anyopaque, event: SeatDelivery.KeyboardStateEvent) void {
+    const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
+    if (!self.snapshot.keyboard.available) return;
+    for (self.keyboards.items) |keyboard_resource| {
+        if (keyboard_resource.client.fatal() != null or
+            !self.snapshot.keyboard.resourceActive(keyboard_resource.generation)) continue;
+        const result: anyerror!void = switch (event) {
+            .keymap => |keymap| if (keymap) |value|
+                sendKeymap(keyboard_resource, value)
+            else {},
+            .repeat_info => |repeat_info| sendRepeatInfo(keyboard_resource, repeat_info),
+        };
+        result catch |err| self.eventFailure(
+            keyboard_resource.client,
+            &keyboard_resource.resource.runtime,
+            err,
+        );
+    }
+}
 fn keyboard(
-    _: *anyopaque,
-    _: ClientRegistry.Id,
-    _: SurfaceRegistry.Id,
-    _: SeatDelivery.KeyboardEvent,
-) void {}
+    context: *anyopaque,
+    client_id: ClientRegistry.Id,
+    surface: SurfaceRegistry.Id,
+    event: SeatDelivery.KeyboardEvent,
+) void {
+    const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
+    if (!self.snapshot.keyboard.available) return;
+    const endpoint = self.compositor.surfaceEndpoint(surface) orelse return;
+    if (endpoint.client.fatal() != null) return;
+    if (!std.meta.eql(self.clients.id(endpoint.client) orelse return, client_id)) return;
+    for (self.keyboards.items) |keyboard_resource| {
+        if (keyboard_resource.client != endpoint.client or
+            !self.snapshot.keyboard.resourceActive(keyboard_resource.generation)) continue;
+        const result: anyerror!void = switch (event) {
+            .enter => |enter| sendKeyboardEnter(keyboard_resource, endpoint.resource.id(), surface, enter),
+            .leave => |leave| if (keyboardFocusedOn(keyboard_resource, surface))
+                sendKeyboardLeave(keyboard_resource, endpoint.resource.id(), leave.serial)
+            else {},
+            .key => |key| if (keyboardFocusedOn(keyboard_resource, surface) and
+                (key.state != .repeated or keyboard_resource.resource.version() >= 10))
+                core.wl_keyboard.@"send:key"(
+                    &keyboard_resource.resource,
+                    key.serial.value,
+                    key.time,
+                    key.key,
+                    @intFromEnum(key.state),
+                )
+            else {},
+            .modifiers => |modifiers| if (keyboardFocusedOn(keyboard_resource, surface))
+                sendModifiers(keyboard_resource, modifiers.serial, modifiers.state)
+            else {},
+        };
+        result catch |err| self.eventFailure(
+            keyboard_resource.client,
+            &keyboard_resource.resource.runtime,
+            err,
+        );
+    }
+}
+
+fn sendKeyboardInitial(
+    keyboard_resource: *KeyboardResource,
+    snapshot: SeatDelivery.KeyboardResourceSnapshot,
+) !void {
+    try sendKeymap(keyboard_resource, snapshot.keymap);
+    try sendRepeatInfo(keyboard_resource, snapshot.repeat_info);
+    if (snapshot.focus) |focus| {
+        const self = keyboard_resource.adapter;
+        const endpoint = self.compositor.surfaceEndpoint(focus.surface) orelse return;
+        if (endpoint.client != keyboard_resource.client or endpoint.client.fatal() != null) return;
+        try sendKeyboardEnter(keyboard_resource, endpoint.resource.id(), focus.surface, .{
+            .serial = focus.serial,
+            .pressed_keys = focus.pressed_keys,
+            .modifiers = focus.modifiers,
+        });
+    }
+}
+
+fn sendKeymap(keyboard_resource: *KeyboardResource, keymap: SeatDelivery.KeymapSnapshot) !void {
+    // Output.enqueue transactionally duplicates this borrowed canonical FD for
+    // every resource before exposing its event to the transport.
+    try core.wl_keyboard.@"send:keymap"(
+        &keyboard_resource.resource,
+        keymap.format,
+        keymap.fd,
+        keymap.size,
+    );
+}
+
+fn sendRepeatInfo(keyboard_resource: *KeyboardResource, repeat_info: SeatDelivery.RepeatInfo) !void {
+    if (keyboard_resource.resource.version() >= 4) {
+        try core.wl_keyboard.@"send:repeat_info"(
+            &keyboard_resource.resource,
+            repeat_info.rate,
+            repeat_info.delay,
+        );
+    }
+}
+
+fn sendKeyboardEnter(
+    keyboard_resource: *KeyboardResource,
+    surface_id: u32,
+    surface: SurfaceRegistry.Id,
+    enter: @FieldType(SeatDelivery.KeyboardEvent, "enter"),
+) !void {
+    std.debug.assert(enter.serial.domain == .wayring_server);
+    try core.wl_keyboard.@"send:enter"(
+        &keyboard_resource.resource,
+        enter.serial.value,
+        surface_id,
+        std.mem.sliceAsBytes(enter.pressed_keys),
+    );
+    try sendModifiers(keyboard_resource, enter.serial.value, enter.modifiers);
+    keyboard_resource.focused_surface = surface;
+}
+
+fn sendKeyboardLeave(keyboard_resource: *KeyboardResource, surface_id: u32, serial: u32) !void {
+    try core.wl_keyboard.@"send:leave"(&keyboard_resource.resource, serial, surface_id);
+    keyboard_resource.focused_surface = null;
+}
+
+fn sendModifiers(
+    keyboard_resource: *KeyboardResource,
+    serial: u32,
+    modifiers: SeatDelivery.Modifiers,
+) !void {
+    try core.wl_keyboard.@"send:modifiers"(
+        &keyboard_resource.resource,
+        serial,
+        modifiers.depressed,
+        modifiers.latched,
+        modifiers.locked,
+        modifiers.group,
+    );
+}
+
+fn keyboardFocusedOn(keyboard_resource: *const KeyboardResource, surface: SurfaceRegistry.Id) bool {
+    return if (keyboard_resource.focused_surface) |focused|
+        std.meta.eql(focused, surface)
+    else
+        false;
+}
 fn pointer(context: *anyopaque, client_id: ClientRegistry.Id, surface: SurfaceRegistry.Id, event: SeatDelivery.PointerEvent) void {
     const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
     if (!self.snapshot.pointer.available) return;
@@ -482,28 +727,40 @@ fn retireClient(self: *WayringSeatAdapter, client: *wayring.server.Client) void 
     self.request_sink.client_retiring(self.request_sink.context, client_id);
 }
 
-test "capability bits and generations gate generated pointers" {
+test "capability bits and generations gate generated keyboard and pointer resources" {
     var snapshot: SeatDelivery.CapabilitySnapshot = .{};
     try std.testing.expectEqual(@as(u32, 0), capabilityBits(snapshot));
     try std.testing.expect(snapshot.pointer.setAvailable(true));
-    const first = snapshot.pointer.generation;
+    const first_pointer = snapshot.pointer.generation;
     try std.testing.expectEqual(@as(u32, 1), capabilityBits(snapshot));
-    try std.testing.expect(snapshot.pointer.resourceActive(first));
+    try std.testing.expect(snapshot.pointer.resourceActive(first_pointer));
+    try std.testing.expect(snapshot.keyboard.setAvailable(true));
+    const first_keyboard = snapshot.keyboard.generation;
+    try std.testing.expectEqual(@as(u32, 3), capabilityBits(snapshot));
+    try std.testing.expect(snapshot.keyboard.resourceActive(first_keyboard));
     try std.testing.expect(snapshot.pointer.setAvailable(false));
-    try std.testing.expect(!snapshot.pointer.resourceActive(first));
+    try std.testing.expect(!snapshot.pointer.resourceActive(first_pointer));
     try std.testing.expect(snapshot.pointer.setAvailable(true));
-    try std.testing.expect(snapshot.pointer.generation > first);
-    try std.testing.expect(!snapshot.pointer.resourceActive(first));
+    try std.testing.expect(snapshot.pointer.generation > first_pointer);
+    try std.testing.expect(!snapshot.pointer.resourceActive(first_pointer));
 
-    _ = snapshot.keyboard.setAvailable(true);
+    try std.testing.expect(snapshot.keyboard.setAvailable(false));
+    try std.testing.expect(!snapshot.keyboard.resourceActive(first_keyboard));
+    try std.testing.expect(snapshot.keyboard.setAvailable(true));
+    try std.testing.expect(snapshot.keyboard.generation > first_keyboard);
+    try std.testing.expect(!snapshot.keyboard.resourceActive(first_keyboard));
+
     _ = snapshot.touch.setAvailable(true);
-    try std.testing.expectEqual(@as(u32, 1), capabilityBits(snapshot));
+    try std.testing.expectEqual(@as(u32, 3), capabilityBits(snapshot));
 }
 
 const TestRequestProbe = struct {
     pointer_enter_snapshot: ?SeatDelivery.PointerEnterSnapshot = null,
     pointer_enter_client: ?ClientRegistry.Id = null,
     pointer_enter_generation: SeatDelivery.ResourceGeneration = 0,
+    keyboard_resource_snapshot: ?SeatDelivery.KeyboardResourceSnapshot = null,
+    keyboard_resource_client: ?ClientRegistry.Id = null,
+    keyboard_resource_generation: SeatDelivery.ResourceGeneration = 0,
     set_cursor_result: SeatDelivery.CursorRequestResult = .accepted,
     last_cursor_request: ?SeatDelivery.CursorRequest = null,
     set_cursor_count: usize = 0,
@@ -518,6 +775,7 @@ const TestRequestProbe = struct {
         return .{
             .context = self,
             .pointer_enter_snapshot = pointerEnterSnapshot,
+            .keyboard_resource_snapshot = keyboardResourceSnapshot,
             .set_cursor = setCursor,
             .cursor_committed = recordCursorCommitted,
             .cursor_removed = recordCursorRemoved,
@@ -535,6 +793,18 @@ const TestRequestProbe = struct {
             !std.meta.eql(self.pointer_enter_client.?, client) or
             self.pointer_enter_generation != generation) return null;
         return self.pointer_enter_snapshot;
+    }
+
+    fn keyboardResourceSnapshot(
+        context: *anyopaque,
+        client: ClientRegistry.Id,
+        generation: SeatDelivery.ResourceGeneration,
+    ) ?SeatDelivery.KeyboardResourceSnapshot {
+        const self: *TestRequestProbe = @ptrCast(@alignCast(context));
+        if (self.keyboard_resource_client == null or
+            !std.meta.eql(self.keyboard_resource_client.?, client) or
+            self.keyboard_resource_generation != generation) return null;
+        return self.keyboard_resource_snapshot;
     }
 
     fn setCursor(context: *anyopaque, request: SeatDelivery.CursorRequest) SeatDelivery.CursorRequestResult {
@@ -602,6 +872,87 @@ const TestEventLog = struct {
     }
 };
 
+const TestKeyboardLog = struct {
+    const Entry = struct {
+        client: *wayring.server.Client,
+        object_id: u32,
+        name: []const u8,
+        serial: ?u32 = null,
+        format: ?u32 = null,
+        size: ?u32 = null,
+        state: ?u32 = null,
+        keys: [8]u32 = @splat(0),
+        key_count: usize = 0,
+    };
+
+    entries: std.ArrayList(Entry) = .empty,
+
+    fn observe(self: *TestKeyboardLog, client: *wayring.server.Client, message: wayring.server.Client.ProtocolMessage) void {
+        if (message.direction != .event or
+            !std.mem.eql(u8, message.resource.interface().name, "wl_keyboard")) return;
+        var entry: Entry = .{
+            .client = client,
+            .object_id = message.resource.id(),
+            .name = message.descriptor.name,
+        };
+        if (std.mem.eql(u8, message.descriptor.name, "keymap")) {
+            entry.format = message.values[0].uint;
+            entry.size = message.values[2].uint;
+        } else if (std.mem.eql(u8, message.descriptor.name, "enter")) {
+            entry.serial = message.values[0].uint;
+            const bytes = message.values[2].array;
+            std.debug.assert(bytes.len % @sizeOf(u32) == 0);
+            entry.key_count = @min(bytes.len / @sizeOf(u32), entry.keys.len);
+            for (0..entry.key_count) |index| {
+                entry.keys[index] = std.mem.readInt(
+                    u32,
+                    bytes[index * @sizeOf(u32) ..][0..@sizeOf(u32)],
+                    .native,
+                );
+            }
+        } else if (std.mem.eql(u8, message.descriptor.name, "leave") or
+            std.mem.eql(u8, message.descriptor.name, "key") or
+            std.mem.eql(u8, message.descriptor.name, "modifiers"))
+        {
+            entry.serial = message.values[0].uint;
+            if (std.mem.eql(u8, message.descriptor.name, "key"))
+                entry.state = message.values[3].uint;
+        }
+        self.entries.append(std.testing.allocator, entry) catch unreachable;
+    }
+
+    fn deinit(self: *TestKeyboardLog) void {
+        self.entries.deinit(std.testing.allocator);
+    }
+
+    fn clear(self: *TestKeyboardLog) void {
+        self.entries.clearRetainingCapacity();
+    }
+
+    fn namesFor(
+        self: *const TestKeyboardLog,
+        client: *wayring.server.Client,
+        object_id: u32,
+        buffer: [][]const u8,
+    ) []const []const u8 {
+        var count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.client != client or entry.object_id != object_id) continue;
+            buffer[count] = entry.name;
+            count += 1;
+        }
+        return buffer[0..count];
+    }
+
+    fn find(self: *const TestKeyboardLog, client: *wayring.server.Client, object_id: u32, name: []const u8) ?Entry {
+        for (self.entries.items) |entry| {
+            if (entry.client == client and entry.object_id == object_id and
+                std.mem.eql(u8, entry.name, name)) return entry;
+        }
+        return null;
+    }
+};
+
 const AdapterTestSetup = struct {
     client_registry: ClientRegistry,
     surface_registry: SurfaceRegistry,
@@ -612,6 +963,10 @@ const AdapterTestSetup = struct {
     adapter: WayringSeatAdapter,
 
     fn init(self: *AdapterTestSetup) !void {
+        try self.initWithAdapterAllocator(std.testing.allocator);
+    }
+
+    fn initWithAdapterAllocator(self: *AdapterTestSetup, adapter_allocator: std.mem.Allocator) !void {
         self.client_registry = ClientRegistry.init(std.testing.allocator);
         self.surface_registry = SurfaceRegistry.init(std.testing.allocator);
         self.protocol_server = .init(std.testing.allocator);
@@ -624,7 +979,7 @@ const AdapterTestSetup = struct {
         );
         self.probe = .{};
         self.adapter = .init(
-            std.testing.allocator,
+            adapter_allocator,
             &self.protocol_server,
             &self.clients,
             &self.compositor,
@@ -733,6 +1088,12 @@ fn testGetPointer(client: *wayring.server.Client, seat_id: u32, pointer_id: u32)
     });
 }
 
+fn testGetKeyboard(client: *wayring.server.Client, seat_id: u32, keyboard_id: u32) !void {
+    try testSend(client, seat_id, 1, &core.wl_seat.request_messages[1], &.{
+        .{ .new_id = .{ .typed = keyboard_id } },
+    });
+}
+
 fn expectEventNames(expected: []const []const u8, actual: []const []const u8) !void {
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |expected_name, actual_name|
@@ -756,6 +1117,7 @@ test "scanner seat bind negotiates exactly stays unpublished and releases resour
 
     var snapshot: SeatDelivery.CapabilitySnapshot = .{};
     _ = snapshot.pointer.setAvailable(true);
+    _ = snapshot.keyboard.setAvailable(true);
     capabilities(&setup.adapter, snapshot);
     const seat_global = try setup.protocol_server.addGlobal(
         core.wl_seat,
@@ -768,9 +1130,20 @@ test "scanner seat bind negotiates exactly stays unpublished and releases resour
 
     const managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
     const client = managed.client();
-    _ = try setup.registerClient(client);
+    const client_id = try setup.registerClient(client);
     var client_live = true;
     defer if (client_live) setup.destroyClient(managed);
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.Unexpected;
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    setup.probe.keyboard_resource_client = client_id;
+    setup.probe.keyboard_resource_generation = snapshot.keyboard.generation;
+    setup.probe.keyboard_resource_snapshot = .{
+        .keymap = .{ .format = 1, .fd = pipe_fds[0], .size = 8 },
+        .repeat_info = .{ .rate = 25, .delay = 600 },
+        .focus = null,
+    };
 
     var log: TestEventLog = .{};
     defer log.deinit();
@@ -785,6 +1158,11 @@ test "scanner seat bind negotiates exactly stays unpublished and releases resour
 
     try testGetPointer(client, 3, 4);
     try std.testing.expectEqual(@as(u32, 11), setup.adapter.pointers.items[0].resource.version());
+    try testGetKeyboard(client, 3, 5);
+    try std.testing.expectEqual(@as(u32, 11), setup.adapter.keyboards.items[0].resource.version());
+    try testSend(client, 5, 0, &core.wl_keyboard.request_messages[0], &.{});
+    try std.testing.expectEqual(@as(usize, 0), setup.adapter.keyboards.items.len);
+    try std.testing.expect(client.lookup(5) == null);
     try testSend(client, 4, 1, &core.wl_pointer.request_messages[1], &.{});
     try std.testing.expectEqual(@as(usize, 0), setup.adapter.pointers.items.len);
     try std.testing.expect(client.lookup(4) == null);
@@ -796,6 +1174,241 @@ test "scanner seat bind negotiates exactly stays unpublished and releases resour
     try std.testing.expectEqual(@as(usize, 0), countPublished(&setup.protocol_server, "wl_seat"));
     setup.destroyClient(managed);
     client_live = false;
+}
+
+test "scanner keyboard repeat_info begins at protocol version four" {
+    var setup: AdapterTestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+    var capability_snapshot: SeatDelivery.CapabilitySnapshot = .{};
+    _ = capability_snapshot.keyboard.setAvailable(true);
+    capabilities(&setup.adapter, capability_snapshot);
+    const seat_global = try setup.protocol_server.addGlobal(
+        core.wl_seat,
+        core.wl_seat.interface.version,
+        WayringSeatAdapter,
+        &setup.adapter,
+        testSeatBind,
+    );
+    defer setup.protocol_server.removeGlobal(seat_global) catch {};
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.Unexpected;
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    var log: TestKeyboardLog = .{};
+    defer log.deinit();
+    const logger = try setup.protocol_server.addProtocolLogger(TestKeyboardLog, &log, TestKeyboardLog.observe);
+    defer setup.protocol_server.removeProtocolLogger(logger);
+
+    const Case = struct {
+        version: u32,
+        expected: []const []const u8,
+    };
+    for ([_]Case{
+        .{ .version = 3, .expected = &.{"keymap"} },
+        .{ .version = 4, .expected = &.{ "keymap", "repeat_info" } },
+    }) |case| {
+        const managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+        const client = managed.client();
+        const client_id = try setup.registerClient(client);
+        var client_live = true;
+        defer if (client_live) setup.destroyClient(managed);
+        setup.probe.keyboard_resource_client = client_id;
+        setup.probe.keyboard_resource_generation = capability_snapshot.keyboard.generation;
+        setup.probe.keyboard_resource_snapshot = .{
+            .keymap = .{ .format = 1, .fd = pipe_fds[0], .size = 8 },
+            .repeat_info = .{ .rate = 25, .delay = 600 },
+            .focus = null,
+        };
+        try testPrepareRegistry(client);
+        try testBindGlobal(client, seat_global, case.version, 3);
+        log.clear();
+        try testGetKeyboard(client, 3, 4);
+        var names_buffer: [4][]const u8 = undefined;
+        try expectEventNames(case.expected, log.namesFor(client, 4, &names_buffer));
+        try testSend(client, 4, 0, &core.wl_keyboard.request_messages[0], &.{});
+        setup.destroyClient(managed);
+        client_live = false;
+    }
+    setup.protocol_server.removeGlobal(seat_global) catch unreachable;
+    try std.testing.expectEqual(@as(usize, 0), countPublished(&setup.protocol_server, "wl_seat"));
+}
+
+test "scanner keyboards preserve initial late-bind ordering fanout version gates and FD ownership" {
+    var setup: AdapterTestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+    try std.testing.expectEqual(@as(usize, 0), countPublished(&setup.protocol_server, "wl_seat"));
+
+    var capability_snapshot: SeatDelivery.CapabilitySnapshot = .{};
+    _ = capability_snapshot.keyboard.setAvailable(true);
+    capabilities(&setup.adapter, capability_snapshot);
+    const seat_global = try setup.protocol_server.addGlobal(
+        core.wl_seat,
+        core.wl_seat.interface.version,
+        WayringSeatAdapter,
+        &setup.adapter,
+        testSeatBind,
+    );
+    defer setup.protocol_server.removeGlobal(seat_global) catch {};
+
+    const managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client = managed.client();
+    const client_id = try setup.registerClient(client);
+    var client_live = true;
+    defer if (client_live) setup.destroyClient(managed);
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.Unexpected;
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+
+    setup.probe.keyboard_resource_client = client_id;
+    setup.probe.keyboard_resource_generation = capability_snapshot.keyboard.generation;
+    setup.probe.keyboard_resource_snapshot = .{
+        .keymap = .{ .format = 1, .fd = pipe_fds[0], .size = 4096 },
+        .repeat_info = .{ .rate = 0, .delay = 500 },
+        .focus = null,
+    };
+    var log: TestKeyboardLog = .{};
+    defer log.deinit();
+    const logger = try setup.protocol_server.addProtocolLogger(TestKeyboardLog, &log, TestKeyboardLog.observe);
+    defer setup.protocol_server.removeProtocolLogger(logger);
+
+    try testPrepareRegistry(client);
+    try testBindGlobal(client, testGlobal(&setup.protocol_server, "wl_compositor"), 6, 3);
+    try testCreateSurface(client, 3, 4);
+    const surface = setup.compositor.surfaceId(client, 4).?;
+    try testBindGlobal(client, seat_global, 9, 5);
+    log.clear();
+    try testGetKeyboard(client, 5, 6);
+    var names_buffer: [16][]const u8 = undefined;
+    try expectEventNames(
+        &.{ "keymap", "repeat_info" },
+        log.namesFor(client, 6, &names_buffer),
+    );
+    const keymap_entry = log.find(client, 6, "keymap").?;
+    try std.testing.expectEqual(@as(?u32, 1), keymap_entry.format);
+    try std.testing.expectEqual(@as(?u32, 4096), keymap_entry.size);
+
+    log.clear();
+    keyboard(&setup.adapter, client_id, surface, .{ .enter = .{
+        .serial = .{ .domain = .wayring_server, .value = 77 },
+        .pressed_keys = &.{ 30, 31 },
+        .modifiers = .{ .depressed = 1, .latched = 2, .locked = 4, .group = 3 },
+    } });
+    try expectEventNames(&.{ "enter", "modifiers" }, log.namesFor(client, 6, &names_buffer));
+    const enter = log.find(client, 6, "enter").?;
+    try std.testing.expectEqual(@as(?u32, 77), enter.serial);
+    try std.testing.expectEqualSlices(u32, &.{ 30, 31 }, enter.keys[0..enter.key_count]);
+
+    setup.probe.keyboard_resource_snapshot.?.focus = .{
+        .surface = surface,
+        .serial = .{ .domain = .wayring_server, .value = 77 },
+        .pressed_keys = &.{ 30, 31 },
+        .modifiers = .{ .depressed = 1, .latched = 2, .locked = 4, .group = 3 },
+    };
+    try testBindGlobal(client, seat_global, 10, 7);
+    log.clear();
+    try testGetKeyboard(client, 7, 8);
+    try expectEventNames(
+        &.{ "keymap", "repeat_info", "enter", "modifiers" },
+        log.namesFor(client, 8, &names_buffer),
+    );
+    try std.testing.expectEqual(@as(usize, 0), log.namesFor(client, 6, &names_buffer).len);
+    try std.testing.expectEqual(@as(?u32, 77), log.find(client, 8, "enter").?.serial);
+
+    log.clear();
+    keyboard(&setup.adapter, client_id, surface, .{ .key = .{
+        .serial = .{ .domain = .wayring_server, .value = 78 },
+        .time = 1,
+        .key = 30,
+        .state = .pressed,
+    } });
+    keyboard(&setup.adapter, client_id, surface, .{ .key = .{
+        .serial = .{ .domain = .wayring_server, .value = 79 },
+        .time = 2,
+        .key = 30,
+        .state = .repeated,
+    } });
+    keyboard(&setup.adapter, client_id, surface, .{ .modifiers = .{
+        .serial = 80,
+        .state = .{ .depressed = 8 },
+    } });
+    keyboard(&setup.adapter, client_id, surface, .{ .leave = .{ .serial = 81 } });
+    try expectEventNames(
+        &.{ "key", "modifiers", "leave" },
+        log.namesFor(client, 6, &names_buffer),
+    );
+    try expectEventNames(
+        &.{ "key", "key", "modifiers", "leave" },
+        log.namesFor(client, 8, &names_buffer),
+    );
+    var repeated_count: usize = 0;
+    for (log.entries.items) |entry| {
+        if (entry.client == client and std.mem.eql(u8, entry.name, "key") and
+            entry.state == @intFromEnum(SeatDelivery.KeyState.repeated))
+        {
+            repeated_count += 1;
+            try std.testing.expectEqual(@as(u32, 8), entry.object_id);
+            try std.testing.expectEqual(@as(?u32, 79), entry.serial);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), repeated_count);
+
+    try testDrain(client);
+    keyboardState(&setup.adapter, .{ .keymap = .{
+        .format = 1,
+        .fd = pipe_fds[0],
+        .size = 4096,
+    } });
+    const first_batch = (try client.beginSend()).?;
+    try std.testing.expectEqual(@as(usize, 1), first_batch.fds.len);
+    const first_duplicate = first_batch.fds[0];
+    try std.testing.expect(first_duplicate != pipe_fds[0]);
+    try client.completeSend(first_batch.token, first_batch.bytes.len);
+    try std.testing.expect(std.c.fcntl(first_duplicate, std.c.F.GETFD) < 0);
+    const second_batch = (try client.beginSend()).?;
+    try std.testing.expectEqual(@as(usize, 1), second_batch.fds.len);
+    const second_duplicate = second_batch.fds[0];
+    try std.testing.expect(second_duplicate != pipe_fds[0]);
+    try std.testing.expect(second_duplicate != first_duplicate);
+    try client.completeSend(second_batch.token, second_batch.bytes.len);
+    try std.testing.expect(std.c.fcntl(second_duplicate, std.c.F.GETFD) < 0);
+    try std.testing.expect(std.c.fcntl(pipe_fds[0], std.c.F.GETFD) >= 0);
+
+    capability_snapshot.keyboard.available = false;
+    capabilities(&setup.adapter, capability_snapshot);
+    capability_snapshot.keyboard.available = true;
+    capability_snapshot.keyboard.generation += 1;
+    capabilities(&setup.adapter, capability_snapshot);
+    log.clear();
+    keyboard(&setup.adapter, client_id, surface, .{ .enter = .{
+        .serial = .{ .domain = .wayring_server, .value = 82 },
+        .pressed_keys = &.{},
+        .modifiers = .{},
+    } });
+    try std.testing.expectEqual(@as(usize, 0), log.entries.items.len);
+
+    // A queued duplicate remains transport-owned and is closed by client
+    // teardown even when no send completion occurs; the canonical FD survives.
+    setup.probe.keyboard_resource_generation = capability_snapshot.keyboard.generation;
+    setup.probe.keyboard_resource_snapshot.?.focus = null;
+    try testBindGlobal(client, seat_global, 10, 9);
+    try testGetKeyboard(client, 9, 10);
+    try testDrain(client);
+    keyboardState(&setup.adapter, .{ .keymap = .{
+        .format = 1,
+        .fd = pipe_fds[0],
+        .size = 4096,
+    } });
+    const pending = (try client.beginSend()).?;
+    const pending_duplicate = pending.fds[0];
+    setup.destroyClient(managed);
+    client_live = false;
+    try std.testing.expect(std.c.fcntl(pending_duplicate, std.c.F.GETFD) < 0);
+    try std.testing.expect(std.c.fcntl(pipe_fds[0], std.c.F.GETFD) >= 0);
+    setup.protocol_server.removeGlobal(seat_global) catch unreachable;
+    try std.testing.expectEqual(@as(usize, 0), countPublished(&setup.protocol_server, "wl_seat"));
 }
 
 test "scanner pointer events preserve exact order version gates isolation and stale generations" {
@@ -1049,12 +1662,219 @@ test "set_cursor accepts only the entering resource and terminalizes role confli
     client_live = false;
 }
 
+test "keyboard resource materialization OOM retires only its generated client" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var setup: AdapterTestSetup = undefined;
+    try setup.initWithAdapterAllocator(failing.allocator());
+    defer setup.deinit();
+    var capability_snapshot: SeatDelivery.CapabilitySnapshot = .{};
+    _ = capability_snapshot.keyboard.setAvailable(true);
+    capabilities(&setup.adapter, capability_snapshot);
+    const seat_global = try setup.protocol_server.addGlobal(
+        core.wl_seat,
+        core.wl_seat.interface.version,
+        WayringSeatAdapter,
+        &setup.adapter,
+        testSeatBind,
+    );
+    defer setup.protocol_server.removeGlobal(seat_global) catch {};
+
+    const managed_a = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client_a = managed_a.client();
+    const id_a = try setup.registerClient(client_a);
+    var live_a = true;
+    defer if (live_a) setup.destroyClient(managed_a);
+    const managed_b = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client_b = managed_b.client();
+    const id_b = try setup.registerClient(client_b);
+    var live_b = true;
+    defer if (live_b) setup.destroyClient(managed_b);
+    inline for (.{ client_a, client_b }) |client| {
+        try testPrepareRegistry(client);
+        try testBindGlobal(client, seat_global, 10, 3);
+    }
+
+    setup.probe.watched_terminal_client = client_a;
+    failing.fail_index = failing.alloc_index;
+    try testGetKeyboard(client_a, 3, 4);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.out_of_memory, client_a.fatal().?.kind);
+    try std.testing.expect(setup.probe.retiring_before_fatal);
+    try std.testing.expectEqual(id_a, setup.probe.last_retiring.?);
+    try std.testing.expectEqual(@as(usize, 0), setup.adapter.keyboards.items.len);
+    failing.fail_index = std.math.maxInt(usize);
+
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.Unexpected;
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    setup.probe.keyboard_resource_client = id_b;
+    setup.probe.keyboard_resource_generation = capability_snapshot.keyboard.generation;
+    setup.probe.keyboard_resource_snapshot = .{
+        .keymap = .{ .format = 1, .fd = pipe_fds[0], .size = 8 },
+        .repeat_info = .{},
+        .focus = null,
+    };
+    try testGetKeyboard(client_b, 3, 4);
+    try std.testing.expect(client_b.fatal() == null);
+    try std.testing.expectEqual(@as(usize, 1), setup.adapter.keyboards.items.len);
+    try std.testing.expectEqual(client_b, setup.adapter.keyboards.items[0].client);
+
+    setup.destroyClient(managed_b);
+    live_b = false;
+    setup.destroyClient(managed_a);
+    live_a = false;
+}
+
+test "keyboard resource generation exhaustion never aliases and isolates the next client" {
+    var setup: AdapterTestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+    var capability_snapshot: SeatDelivery.CapabilitySnapshot = .{};
+    _ = capability_snapshot.keyboard.setAvailable(true);
+    capabilities(&setup.adapter, capability_snapshot);
+    const seat_global = try setup.protocol_server.addGlobal(
+        core.wl_seat,
+        core.wl_seat.interface.version,
+        WayringSeatAdapter,
+        &setup.adapter,
+        testSeatBind,
+    );
+    defer setup.protocol_server.removeGlobal(seat_global) catch {};
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.Unexpected;
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+
+    const managed_a = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client_a = managed_a.client();
+    const id_a = try setup.registerClient(client_a);
+    var live_a = true;
+    defer if (live_a) setup.destroyClient(managed_a);
+    const managed_b = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client_b = managed_b.client();
+    const id_b = try setup.registerClient(client_b);
+    var live_b = true;
+    defer if (live_b) setup.destroyClient(managed_b);
+    inline for (.{ client_a, client_b }) |client| {
+        try testPrepareRegistry(client);
+        try testBindGlobal(client, seat_global, 10, 3);
+    }
+
+    setup.adapter.next_keyboard_resource_generation = std.math.maxInt(SeatDelivery.ResourceGeneration);
+    setup.probe.keyboard_resource_client = id_a;
+    setup.probe.keyboard_resource_generation = capability_snapshot.keyboard.generation;
+    setup.probe.keyboard_resource_snapshot = .{
+        .keymap = .{ .format = 1, .fd = pipe_fds[0], .size = 8 },
+        .repeat_info = .{},
+        .focus = null,
+    };
+    try testGetKeyboard(client_a, 3, 4);
+    try std.testing.expect(client_a.fatal() == null);
+    try std.testing.expectEqual(
+        std.math.maxInt(SeatDelivery.ResourceGeneration),
+        setup.adapter.keyboards.items[0].resource_generation,
+    );
+    try std.testing.expect(setup.adapter.next_keyboard_resource_generation == null);
+
+    setup.probe.watched_terminal_client = client_b;
+    setup.probe.keyboard_resource_client = id_b;
+    try testGetKeyboard(client_b, 3, 4);
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.implementation, client_b.fatal().?.kind);
+    try std.testing.expect(setup.probe.retiring_before_fatal);
+    try std.testing.expectEqual(id_b, setup.probe.last_retiring.?);
+    try std.testing.expectEqual(@as(usize, 1), setup.adapter.keyboards.items.len);
+    try std.testing.expectEqual(client_a, setup.adapter.keyboards.items[0].client);
+    try std.testing.expect(client_a.fatal() == null);
+
+    setup.destroyClient(managed_b);
+    live_b = false;
+    setup.destroyClient(managed_a);
+    live_a = false;
+}
+
+test "keyboard keymap enqueue OOM retires one client before fatal and preserves other clients and FD" {
+    var setup: AdapterTestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+    var capability_snapshot: SeatDelivery.CapabilitySnapshot = .{};
+    _ = capability_snapshot.keyboard.setAvailable(true);
+    capabilities(&setup.adapter, capability_snapshot);
+    const seat_global = try setup.protocol_server.addGlobal(
+        core.wl_seat,
+        core.wl_seat.interface.version,
+        WayringSeatAdapter,
+        &setup.adapter,
+        testSeatBind,
+    );
+    defer setup.protocol_server.removeGlobal(seat_global) catch {};
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.Unexpected;
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+
+    var client_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const managed_a = try wayring.server.CoreClient.create(client_allocator.allocator(), &setup.protocol_server, .{});
+    const client_a = managed_a.client();
+    const id_a = try setup.registerClient(client_a);
+    var live_a = true;
+    defer if (live_a) setup.destroyClient(managed_a);
+    const managed_b = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client_b = managed_b.client();
+    const id_b = try setup.registerClient(client_b);
+    var live_b = true;
+    defer if (live_b) setup.destroyClient(managed_b);
+
+    inline for (.{
+        .{ client_a, id_a },
+        .{ client_b, id_b },
+    }) |entry| {
+        setup.probe.keyboard_resource_client = entry[1];
+        setup.probe.keyboard_resource_generation = capability_snapshot.keyboard.generation;
+        setup.probe.keyboard_resource_snapshot = .{
+            .keymap = .{ .format = 1, .fd = pipe_fds[0], .size = 8 },
+            .repeat_info = .{},
+            .focus = null,
+        };
+        try testPrepareRegistry(entry[0]);
+        try testBindGlobal(entry[0], seat_global, 10, 3);
+        try testGetKeyboard(entry[0], 3, 4);
+        try testDrain(entry[0]);
+    }
+    setup.probe.watched_terminal_client = client_a;
+    client_allocator.fail_index = client_allocator.alloc_index;
+    keyboardState(&setup.adapter, .{ .keymap = .{
+        .format = 1,
+        .fd = pipe_fds[0],
+        .size = 8,
+    } });
+
+    try std.testing.expect(client_allocator.has_induced_failure);
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.out_of_memory, client_a.fatal().?.kind);
+    try std.testing.expect(setup.probe.retiring_before_fatal);
+    try std.testing.expectEqual(id_a, setup.probe.last_retiring.?);
+    try std.testing.expect(client_b.fatal() == null);
+    const healthy_batch = (try client_b.beginSend()).?;
+    try std.testing.expectEqual(@as(usize, 1), healthy_batch.fds.len);
+    const healthy_duplicate = healthy_batch.fds[0];
+    try std.testing.expect(healthy_duplicate != pipe_fds[0]);
+    try client_b.completeSend(healthy_batch.token, healthy_batch.bytes.len);
+    try std.testing.expect(std.c.fcntl(healthy_duplicate, std.c.F.GETFD) < 0);
+    try std.testing.expect(std.c.fcntl(pipe_fds[0], std.c.F.GETFD) >= 0);
+
+    setup.destroyClient(managed_b);
+    live_b = false;
+    setup.destroyClient(managed_a);
+    live_a = false;
+}
+
 test "event OOM and serial exhaustion terminalize only the affected generated client" {
     var setup: AdapterTestSetup = undefined;
     try setup.init();
     defer setup.deinit();
     var snapshot: SeatDelivery.CapabilitySnapshot = .{};
     _ = snapshot.pointer.setAvailable(true);
+    _ = snapshot.keyboard.setAvailable(true);
     capabilities(&setup.adapter, snapshot);
     const seat_global = try setup.protocol_server.addGlobal(
         core.wl_seat,
@@ -1087,6 +1907,18 @@ test "event OOM and serial exhaustion terminalize only the affected generated cl
     }
     try testGetPointer(client_a, 3, 4);
     try testGetPointer(client_b, 3, 4);
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.Unexpected;
+    defer _ = std.c.close(pipe_fds[0]);
+    defer _ = std.c.close(pipe_fds[1]);
+    setup.probe.keyboard_resource_client = id_b;
+    setup.probe.keyboard_resource_generation = snapshot.keyboard.generation;
+    setup.probe.keyboard_resource_snapshot = .{
+        .keymap = .{ .format = 1, .fd = pipe_fds[0], .size = 8 },
+        .repeat_info = .{},
+        .focus = null,
+    };
+    try testGetKeyboard(client_b, 3, 5);
     var pointer_a: ?*PointerResource = null;
     for (setup.adapter.pointers.items) |pointer_resource| {
         if (pointer_resource.client == client_a) pointer_a = pointer_resource;
@@ -1108,6 +1940,7 @@ test "event OOM and serial exhaustion terminalize only the affected generated cl
     try std.testing.expectEqual(wayring.server.Fatal.Kind.out_of_memory, client_c.fatal().?.kind);
     try std.testing.expectEqual(id_c, setup.probe.last_retiring.?);
     try std.testing.expectEqual(@as(usize, 2), setup.adapter.pointers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), setup.adapter.keyboards.items.len);
 
     setup.destroyClient(managed_c);
     live_c = false;

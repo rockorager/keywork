@@ -34,10 +34,27 @@ pub const PointerEnterSnapshot = struct {
     y: i32,
 };
 
+/// Existing canonical keyboard state used to initialize one newly
+/// materialized generated resource without creating another focus transition
+/// or authority grant. Every slice and descriptor is borrowed synchronously.
+pub const KeyboardResourceSnapshot = struct {
+    keymap: KeymapSnapshot,
+    repeat_info: RepeatInfo,
+    focus: ?KeyboardFocusSnapshot,
+};
+
+pub const KeyboardFocusSnapshot = struct {
+    surface: SurfaceRegistry.Id,
+    serial: ClientRegistry.Serial,
+    pressed_keys: []const u32,
+    modifiers: Modifiers,
+};
+
 /// Canonical request boundary copied by a generated frontend adapter.
 pub const RequestSink = struct {
     context: *anyopaque,
     pointer_enter_snapshot: *const fn (*anyopaque, ClientRegistry.Id, ResourceGeneration) ?PointerEnterSnapshot = unavailablePointerEnterSnapshot,
+    keyboard_resource_snapshot: *const fn (*anyopaque, ClientRegistry.Id, ResourceGeneration) ?KeyboardResourceSnapshot = unavailableKeyboardResourceSnapshot,
     set_cursor: *const fn (*anyopaque, CursorRequest) CursorRequestResult,
     cursor_committed: *const fn (*anyopaque, SurfaceRegistry.Id, i32, i32) void,
     cursor_removed: *const fn (*anyopaque, SurfaceRegistry.Id) void,
@@ -45,6 +62,10 @@ pub const RequestSink = struct {
 };
 
 fn unavailablePointerEnterSnapshot(_: *anyopaque, _: ClientRegistry.Id, _: ResourceGeneration) ?PointerEnterSnapshot {
+    return null;
+}
+
+fn unavailableKeyboardResourceSnapshot(_: *anyopaque, _: ClientRegistry.Id, _: ResourceGeneration) ?KeyboardResourceSnapshot {
     return null;
 }
 
