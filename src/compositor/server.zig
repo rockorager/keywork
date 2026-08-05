@@ -11361,6 +11361,11 @@ const WayringHeadlessClient = struct {
         const shm = self.shm orelse return error.ShmMissing;
         const surface = try compositor.createSurface();
         defer surface.destroy();
+        const region = try compositor.createRegion();
+        region.add(0, 0, 1, 1);
+        surface.setOpaqueRegion(region);
+        surface.setInputRegion(region);
+        region.destroy();
 
         const shm_fd = try std.posix.memfd_create("keywork-wayring-headless", std.os.linux.MFD.CLOEXEC);
         defer _ = std.os.linux.close(shm_fd);
@@ -11665,6 +11670,10 @@ test "Wayring libwayland SHM reaches persistent headless pixels and repairs life
     try std.testing.expectEqual(@as(u8, 1), client.release_count.load(.acquire));
     try std.testing.expectEqual(registry_baseline + 1, server.surface_registry.len());
     try std.testing.expectEqual(@as(usize, 1), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 0), compositor.regionCount());
+    const initial_state = server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id).?;
+    try std.testing.expect(initial_state.opaque_region.?.contains(0, 0));
+    try std.testing.expect(!initial_state.opaque_region.?.contains(1, 0));
     try expectWayringSnapshot(server, .{ 0x0011_2233, 0x0044_5566 }, 1);
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, .{ 0x0011_2233, 0x0044_5566 });

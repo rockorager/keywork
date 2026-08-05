@@ -7,6 +7,7 @@
 
 const WayringCompositor = @This();
 
+const builtin = @import("builtin");
 const std = @import("std");
 const core = @import("wayring-core-protocol");
 const wayring = @import("wayring");
@@ -41,9 +42,86 @@ const Surface = struct {
     pending_attach_x: i32 = 0,
     pending_attach_y: i32 = 0,
     pending_damage: Region,
+    pending_opaque: Region,
+    pending_opaque_dirty: bool = false,
+    current_opaque: Region,
+    pending_input: InputRegion,
+    pending_input_dirty: bool = false,
+    current_input: InputRegion,
+    pending_scale: i32 = 1,
+    current_scale: i32 = 1,
+    pending_transform: render.BufferTransform = .normal,
+    current_transform: render.BufferTransform = .normal,
     current: ?CopiedBufferSnapshot = null,
+    current_logical_size: ?render.Size = null,
     source_cache_id: u64,
     next_source_version: u64 = 1,
+};
+
+const InputRegion = struct {
+    infinite: bool,
+    value: Region,
+
+    fn init() InputRegion {
+        return .{ .infinite = true, .value = Region.init() };
+    }
+
+    fn deinit(self: *InputRegion) void {
+        self.value.deinit();
+        self.* = undefined;
+    }
+
+    fn set(self: *InputRegion, region: *const Region) Region.Error!void {
+        try self.value.copyFrom(region);
+        self.infinite = false;
+    }
+
+    fn setInfinite(self: *InputRegion) void {
+        self.value.clear();
+        self.infinite = true;
+    }
+
+    fn copyFrom(self: *InputRegion, other: *const InputRegion) Region.Error!void {
+        try self.value.copyFrom(&other.value);
+        self.infinite = other.infinite;
+    }
+};
+
+/// One fully validated, independently owned candidate publication. Wave 2 can
+/// extend this value with a pending callback boundary, and subsurface roles can
+/// retain it later, without changing the root surface publication seam.
+const PreparedCommit = struct {
+    damage: Region,
+    opaque_region: ?Region = null,
+    input: ?InputRegion = null,
+    buffer: ?CopiedBufferSnapshot = null,
+    attachment_changed: bool,
+    publishes_snapshot: bool = false,
+    logical_size: ?render.Size,
+    scale: i32,
+    transform: render.BufferTransform,
+    legacy_attach_x: i32,
+    legacy_attach_y: i32,
+
+    fn init(surface: *const Surface) PreparedCommit {
+        return .{
+            .damage = Region.init(),
+            .attachment_changed = surface.has_pending_attachment,
+            .logical_size = surface.current_logical_size,
+            .scale = surface.pending_scale,
+            .transform = surface.pending_transform,
+            .legacy_attach_x = surface.pending_attach_x,
+            .legacy_attach_y = surface.pending_attach_y,
+        };
+    }
+
+    fn deinit(self: *PreparedCommit) void {
+        self.damage.deinit();
+        if (self.opaque_region) |*opaque_region| opaque_region.deinit();
+        if (self.input) |*input| input.deinit();
+        if (self.buffer) |*buffer| buffer.deinit();
+        self.* = undefined;
+    }
 };
 
 const PendingAttachment = struct {
@@ -67,10 +145,25 @@ const Compositor = struct {
     resource: core.wl_compositor.Resource,
 };
 
+const RegionResource = struct {
+    resource: core.wl_region.Resource,
+    value: Region,
+};
+
 const ClientObjects = struct {
     client: *server.Client,
     compositors: std.ArrayList(*Compositor) = .empty,
     surfaces: std.ArrayList(*Surface) = .empty,
+    regions: std.ArrayList(*RegionResource) = .empty,
+};
+
+const CommitFault = enum {
+    candidate_allocation,
+    region_copy,
+    access,
+    copy,
+    access_end,
+    release_enqueue,
 };
 
 allocator: std.mem.Allocator,
@@ -81,6 +174,7 @@ global: *const server.Server.Global,
 shm: Shm,
 clients: std.ArrayList(*ClientObjects) = .empty,
 owned_provider_count: usize = 0,
+commit_fault: if (builtin.is_test) ?CommitFault else void,
 
 /// Borrows the shared registry and copies the optional presentation listener.
 /// Both the registry and listener context must outlive this adapter.
@@ -98,6 +192,7 @@ pub fn init(
         .presentation_listener = presentation_listener,
         .global = undefined,
         .shm = .init(allocator),
+        .commit_fault = if (builtin.is_test) null else {},
     };
     self.global = try protocol_server.addGlobal(core.wl_compositor, 1, WayringCompositor, self, bind);
     errdefer protocol_server.removeGlobal(self.global) catch {};
@@ -122,10 +217,14 @@ pub fn destroyClientResources(self: *WayringCompositor, client: *server.Client) 
         while (objects.surfaces.items.len > 0) {
             self.destroySurface(objects.surfaces.items[objects.surfaces.items.len - 1]);
         }
+        while (objects.regions.items.len > 0) {
+            self.destroyRegion(objects.regions.items[objects.regions.items.len - 1]);
+        }
         while (objects.compositors.items.len > 0) {
             self.destroyCompositor(objects.compositors.items[objects.compositors.items.len - 1]);
         }
         objects.surfaces.deinit(self.allocator);
+        objects.regions.deinit(self.allocator);
         objects.compositors.deinit(self.allocator);
         self.allocator.destroy(objects);
         _ = self.clients.orderedRemove(index);
@@ -137,6 +236,12 @@ pub fn destroyClientResources(self: *WayringCompositor, client: *server.Client) 
 pub fn surfaceCount(self: *const WayringCompositor) usize {
     var count: usize = 0;
     for (self.clients.items) |objects| count += objects.surfaces.items.len;
+    return count;
+}
+
+pub fn regionCount(self: *const WayringCompositor) usize {
+    var count: usize = 0;
+    for (self.clients.items) |objects| count += objects.regions.items.len;
     return count;
 }
 
@@ -182,10 +287,7 @@ fn handleCompositor(
 ) !void {
     switch (request) {
         .create_surface => |create| try self.createSurface(resource, create.id),
-        .create_region => {
-            const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
-            client.postImplementationError(&resource.runtime, "wl_region is not implemented by the Wayring backend");
-        },
+        .create_region => |create| try self.createRegion(resource, create.id),
         .release => self.destroyCompositor(@fieldParentPtr("resource", resource)),
     }
 }
@@ -199,9 +301,19 @@ fn createSurface(self: *WayringCompositor, compositor: *core.wl_compositor.Resou
         .resource = undefined,
         .id = undefined,
         .pending_damage = .init(),
+        .pending_opaque = .init(),
+        .current_opaque = .init(),
+        .pending_input = .init(),
+        .current_input = .init(),
         .source_cache_id = render.allocateSourceCacheId(),
     };
-    errdefer surface.pending_damage.deinit();
+    errdefer {
+        surface.current_input.deinit();
+        surface.pending_input.deinit();
+        surface.current_opaque.deinit();
+        surface.pending_opaque.deinit();
+        surface.pending_damage.deinit();
+    }
     surface.id = try self.surface_registry.add(.{
         .context = surface,
         .render_state = surfaceRenderState,
@@ -221,7 +333,7 @@ fn createSurface(self: *WayringCompositor, compositor: *core.wl_compositor.Resou
         listener_added = true;
     }
     try objects.surfaces.ensureUnusedCapacity(self.allocator, 1);
-    surface.resource = .init(self.allocator, object_id, 1, .client, client.ownerHooks());
+    surface.resource = .init(self.allocator, object_id, compositor.version(), .client, client.ownerHooks());
     surface.resource.setHandler(WayringCompositor, self, handleSurface, null) catch unreachable;
     // Dispatch reserved and type-checked this new_id before calling us;
     // materialization only replaces that reservation and cannot allocate.
@@ -229,17 +341,37 @@ fn createSurface(self: *WayringCompositor, compositor: *core.wl_compositor.Resou
     objects.surfaces.appendAssumeCapacity(surface);
 }
 
+fn createRegion(self: *WayringCompositor, compositor: *core.wl_compositor.Resource, object_id: u32) !void {
+    const client = self.clientForResource(&compositor.runtime) orelse return error.UntrackedClient;
+    const objects = self.findClient(client) orelse return error.UntrackedClient;
+    try objects.regions.ensureUnusedCapacity(self.allocator, 1);
+    const region = try self.allocator.create(RegionResource);
+    errdefer self.allocator.destroy(region);
+    region.* = .{
+        .resource = .init(self.allocator, object_id, compositor.version(), .client, client.ownerHooks()),
+        .value = .init(),
+    };
+    errdefer {
+        region.value.deinit();
+        region.resource.destroy();
+        region.resource.deinit();
+    }
+    try region.resource.setHandler(WayringCompositor, self, handleRegion, null);
+    try client.materialize(&region.resource.runtime);
+    objects.regions.appendAssumeCapacity(region);
+}
+
 fn surfaceRenderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
     const surface: *Surface = @ptrCast(@alignCast(context));
     const current = if (surface.current) |*snapshot| snapshot else return null;
     return .{
         .buffer = current.pixelBuffer(.{}, .{}),
-        .logical_size = current.size,
+        .logical_size = surface.current_logical_size.?,
         .source = null,
-        .transform = .normal,
+        .transform = surface.current_transform,
         .force_opaque = current.forceOpaque(),
         .alpha_multiplier = std.math.maxInt(u32),
-        .opaque_region = null,
+        .opaque_region = &surface.current_opaque,
         .blur_region = null,
     };
 }
@@ -255,15 +387,99 @@ fn handleSurface(
         .damage => |damage| {
             if (damage.width > 0 and damage.height > 0) {
                 const surface: *Surface = @fieldParentPtr("resource", resource);
-                try surface.pending_damage.add(damage.x, damage.y, damage.width, damage.height);
+                surface.pending_damage.add(damage.x, damage.y, damage.width, damage.height) catch {
+                    const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
+                    client.postOutOfMemory(&resource.runtime, "adding wl_surface damage");
+                };
             }
         },
+        .set_opaque_region => |set| self.setOpaqueRegion(resource, set.region),
+        .set_input_region => |set| self.setInputRegion(resource, set.region),
         .commit => try self.commitSurface(@fieldParentPtr("resource", resource)),
         else => {
             const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
             client.postImplementationError(&resource.runtime, "wl_surface request is not implemented by the Wayring backend");
         },
     }
+}
+
+fn handleRegion(
+    resource: *core.wl_region.Resource,
+    request: core.wl_region.Request,
+    self: *WayringCompositor,
+) !void {
+    const region: *RegionResource = @fieldParentPtr("resource", resource);
+    switch (request) {
+        .destroy => self.destroyRegion(region),
+        .add => |add| region.value.add(add.x, add.y, add.width, add.height) catch {
+            const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
+            client.postOutOfMemory(&resource.runtime, "adding to wl_region");
+        },
+        .subtract => |subtract| region.value.subtract(
+            subtract.x,
+            subtract.y,
+            subtract.width,
+            subtract.height,
+        ) catch {
+            const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
+            client.postOutOfMemory(&resource.runtime, "subtracting from wl_region");
+        },
+    }
+}
+
+fn setOpaqueRegion(self: *WayringCompositor, resource: *core.wl_surface.Resource, region_id: ?u32) void {
+    const surface: *Surface = @fieldParentPtr("resource", resource);
+    const id = region_id orelse {
+        surface.pending_opaque.clear();
+        surface.pending_opaque_dirty = true;
+        return;
+    };
+    const source = self.resolveRegion(resource, id) orelse return;
+    var candidate = Region.init();
+    candidate.copyFrom(&source.value) catch {
+        candidate.deinit();
+        const client = self.clientForResource(&resource.runtime) orelse return;
+        client.postOutOfMemory(&resource.runtime, "copying wl_surface opaque region");
+        return;
+    };
+    std.mem.swap(Region, &surface.pending_opaque, &candidate);
+    candidate.deinit();
+    surface.pending_opaque_dirty = true;
+}
+
+fn setInputRegion(self: *WayringCompositor, resource: *core.wl_surface.Resource, region_id: ?u32) void {
+    const surface: *Surface = @fieldParentPtr("resource", resource);
+    const id = region_id orelse {
+        surface.pending_input.setInfinite();
+        surface.pending_input_dirty = true;
+        return;
+    };
+    const source = self.resolveRegion(resource, id) orelse return;
+    var candidate = InputRegion.init();
+    candidate.set(&source.value) catch {
+        candidate.deinit();
+        const client = self.clientForResource(&resource.runtime) orelse return;
+        client.postOutOfMemory(&resource.runtime, "copying wl_surface input region");
+        return;
+    };
+    std.mem.swap(InputRegion, &surface.pending_input, &candidate);
+    candidate.deinit();
+    surface.pending_input_dirty = true;
+}
+
+fn resolveRegion(
+    self: *WayringCompositor,
+    surface: *core.wl_surface.Resource,
+    object_id: u32,
+) ?*RegionResource {
+    const client = self.clientForResource(&surface.runtime) orelse return null;
+    const object = client.lookup(object_id) orelse return null;
+    const objects = self.findClient(client) orelse return null;
+    for (objects.regions.items) |region| {
+        if (&region.resource.runtime == object and object.state() == .live) return region;
+    }
+    client.postImplementationError(&surface.runtime, "wl_surface region is not a live Wayring wl_region");
+    return null;
 }
 
 fn attachSurface(
@@ -305,35 +521,90 @@ fn attachSurface(
 }
 
 fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
-    defer surface.pending_damage.clear();
-    if (!surface.has_pending_attachment) return;
-    surface.has_pending_attachment = false;
-    const pending = if (surface.pending_attachment) |*attachment| attachment else {
-        clearPendingAttachment(surface);
-        if (surface.current) |*current| current.deinit();
-        surface.current = null;
-        if (self.presentation_listener) |listener|
-            listener.committed(listener.context, surface.id, null);
+    const had_pending_attachment = surface.has_pending_attachment;
+    var published = false;
+    defer if (!published and had_pending_attachment) clearPendingAttachment(surface);
+
+    var prepared = self.prepareCommit(surface) catch |err| {
+        const client = self.clientForResource(&surface.resource.runtime) orelse return error.UntrackedClient;
+        if (err == error.OutOfMemory) {
+            client.postOutOfMemory(&surface.resource.runtime, "preparing wl_surface commit");
+        } else {
+            client.postImplementationError(&surface.resource.runtime, @errorName(err));
+        }
         return;
     };
-    defer clearPendingAttachment(surface);
+    defer prepared.deinit();
+    self.publishPreparedCommit(surface, &prepared);
+    published = true;
+}
+
+fn prepareCommit(self: *WayringCompositor, surface: *Surface) !PreparedCommit {
+    var prepared = PreparedCommit.init(surface);
+    errdefer prepared.deinit();
+
+    if (self.failCommitAt(.candidate_allocation)) return error.OutOfMemory;
+    try prepared.damage.copyFrom(&surface.pending_damage);
+    if (surface.pending_opaque_dirty) {
+        var opaque_region = Region.init();
+        var opaque_region_owned = true;
+        errdefer if (opaque_region_owned) opaque_region.deinit();
+        try opaque_region.copyFrom(&surface.pending_opaque);
+        prepared.opaque_region = opaque_region;
+        opaque_region_owned = false;
+    }
+    if (self.failCommitAt(.region_copy)) return error.OutOfMemory;
+    if (surface.pending_input_dirty) {
+        var input = InputRegion.init();
+        var input_owned = true;
+        errdefer if (input_owned) input.deinit();
+        try input.copyFrom(&surface.pending_input);
+        prepared.input = input;
+        input_owned = false;
+    }
+
+    if (surface.has_pending_attachment) {
+        if (surface.pending_attachment) |*pending| {
+            try self.preparePendingBuffer(surface, pending, &prepared);
+        } else {
+            prepared.logical_size = null;
+        }
+    } else if (surface.current) |*current| {
+        prepared.logical_size = try logicalSize(current.size, prepared.scale, prepared.transform);
+    } else {
+        prepared.logical_size = null;
+    }
+    return prepared;
+}
+
+fn preparePendingBuffer(
+    self: *WayringCompositor,
+    surface: *Surface,
+    pending: *PendingAttachment,
+    prepared: *PreparedCommit,
+) !void {
+    if (self.failCommitAt(.access)) return error.InvalidBacking;
     var access = pending.pin.access() catch |err| {
-        const client = self.clientForResource(&surface.resource.runtime) orelse return error.UntrackedClient;
-        client.postImplementationError(&surface.resource.runtime, @errorName(err));
-        return;
+        return err;
     };
     var access_live = true;
     defer if (access_live) access.end() catch {};
     const geometry = access.geometry;
+    const physical_size: render.Size = .{
+        .width = @intCast(geometry.width),
+        .height = @intCast(geometry.height),
+    };
+    prepared.logical_size = try logicalSize(physical_size, prepared.scale, prepared.transform);
     const source_cache: render.SourceCache = .{
         .id = surface.source_cache_id,
         .version = surface.next_source_version,
     };
-    var candidate = CopiedBufferSnapshot.copy(
+    if (self.failCommitAt(.copy)) return error.OutOfMemory;
+    prepared.buffer = try CopiedBufferSnapshot.copy(
         self.allocator,
         .{
             .bytes = access.bytes,
-            .size = .{ .width = @intCast(geometry.width), .height = @intCast(geometry.height) },
+            .size = physical_size,
             .stride_bytes = geometry.stride,
             .format = switch (geometry.format) {
                 .argb8888 => .argb8888,
@@ -341,32 +612,70 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
             },
         },
         null,
-        &surface.pending_damage,
+        null,
         source_cache,
-    ) catch |err| {
-        const client = self.clientForResource(&surface.resource.runtime) orelse return error.UntrackedClient;
-        if (err == error.OutOfMemory) client.postOutOfMemory(&surface.resource.runtime, "copying wl_shm surface buffer") else client.postImplementationError(&surface.resource.runtime, @errorName(err));
-        return;
-    };
-    var candidate_owned = true;
-    defer if (candidate_owned) candidate.deinit();
+    );
+    prepared.publishes_snapshot = true;
+    if (self.failCommitAt(.access_end)) {
+        access.end() catch {};
+        access_live = false;
+        return error.InvalidBacking;
+    }
     access.end() catch |err| {
         access_live = false;
-        const client = self.clientForResource(&surface.resource.runtime) orelse return error.UntrackedClient;
-        client.postImplementationError(&surface.resource.runtime, @errorName(err));
-        return;
+        return err;
     };
     access_live = false;
-    if (pending.resource) |buffer_resource| self.shm.sendRelease(buffer_resource) catch |err| switch (err) {
-        error.ResourceNotLive, error.NotShmBuffer => {},
-        else => return err,
+    if (pending.resource) |buffer_resource| {
+        if (self.failCommitAt(.release_enqueue)) return error.OutOfMemory;
+        try self.shm.sendRelease(buffer_resource);
+    }
+}
+
+fn logicalSize(
+    physical_size: render.Size,
+    scale: i32,
+    transform: render.BufferTransform,
+) error{InvalidBuffer}!render.Size {
+    if (scale <= 0) return error.InvalidBuffer;
+    const transformed = transform.applyToSize(physical_size);
+    const divisor: u32 = @intCast(scale);
+    if (transformed.width % divisor != 0 or transformed.height % divisor != 0)
+        return error.InvalidBuffer;
+    return .{
+        .width = transformed.width / divisor,
+        .height = transformed.height / divisor,
     };
-    if (surface.current) |*current| current.deinit();
-    surface.current = candidate;
-    candidate_owned = false;
-    surface.next_source_version +%= 1;
+}
+
+fn publishPreparedCommit(self: *WayringCompositor, surface: *Surface, prepared: *PreparedCommit) void {
+    if (prepared.opaque_region) |*opaque_region| std.mem.swap(Region, &surface.current_opaque, opaque_region);
+    if (prepared.input) |*input| std.mem.swap(InputRegion, &surface.current_input, input);
+    if (prepared.attachment_changed) std.mem.swap(?CopiedBufferSnapshot, &surface.current, &prepared.buffer);
+    surface.current_logical_size = prepared.logical_size;
+    surface.current_scale = prepared.scale;
+    surface.current_transform = prepared.transform;
+
+    // Roleless root presentation intentionally ignores legacy movement. The
+    // prepared offsets remain available at this seam for future role policy.
+    _ = prepared.legacy_attach_x;
+    _ = prepared.legacy_attach_y;
+    surface.pending_damage.clear();
+    surface.pending_opaque_dirty = false;
+    surface.pending_input_dirty = false;
+    clearPendingAttachment(surface);
+    if (prepared.publishes_snapshot) surface.next_source_version +%= 1;
+
+    std.debug.assert((surface.current != null) == (surface.current_logical_size != null));
     if (self.presentation_listener) |listener|
-        listener.committed(listener.context, surface.id, surface.current.?.size);
+        listener.committed(listener.context, surface.id, surface.current_logical_size);
+}
+
+fn failCommitAt(self: *WayringCompositor, point: CommitFault) bool {
+    if (comptime !builtin.is_test) return false;
+    if (self.commit_fault != point) return false;
+    self.commit_fault = null;
+    return true;
 }
 
 fn clearPendingAttachment(surface: *Surface) void {
@@ -420,10 +729,24 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     removePointer(Surface, &objects.surfaces, surface);
     clearPendingAttachment(surface);
     if (surface.current) |*current| current.deinit();
+    surface.current_input.deinit();
+    surface.pending_input.deinit();
+    surface.current_opaque.deinit();
+    surface.pending_opaque.deinit();
     surface.pending_damage.deinit();
     surface.resource.destroy();
     surface.resource.deinit();
     self.allocator.destroy(surface);
+}
+
+fn destroyRegion(self: *WayringCompositor, region: *RegionResource) void {
+    const client = self.clientForResource(&region.resource.runtime) orelse unreachable;
+    const objects = self.findClient(client) orelse unreachable;
+    removePointer(RegionResource, &objects.regions, region);
+    region.resource.destroy();
+    region.resource.deinit();
+    region.value.deinit();
+    self.allocator.destroy(region);
 }
 
 fn destroyCompositor(self: *WayringCompositor, compositor: *Compositor) void {
@@ -531,6 +854,39 @@ fn createSurfaceResource(client: *server.Client, compositor_id: u32, surface_id:
     try send(client, compositor_id, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = surface_id } }});
 }
 
+fn createRegionResource(client: *server.Client, compositor_id: u32, region_id: u32) !void {
+    try send(client, compositor_id, 1, &core.wl_compositor.request_messages[1], &.{.{ .new_id = .{ .typed = region_id } }});
+}
+
+fn changeRegion(
+    client: *server.Client,
+    region_id: u32,
+    opcode: u16,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) !void {
+    try send(client, region_id, opcode, &core.wl_region.request_messages[opcode], &.{
+        .{ .int = x },
+        .{ .int = y },
+        .{ .int = width },
+        .{ .int = height },
+    });
+}
+
+fn addRegion(client: *server.Client, region_id: u32, x: i32, y: i32, width: i32, height: i32) !void {
+    try changeRegion(client, region_id, 1, x, y, width, height);
+}
+
+fn subtractRegion(client: *server.Client, region_id: u32, x: i32, y: i32, width: i32, height: i32) !void {
+    try changeRegion(client, region_id, 2, x, y, width, height);
+}
+
+fn setSurfaceRegion(client: *server.Client, surface_id: u32, opcode: u16, region_id: ?u32) !void {
+    try send(client, surface_id, opcode, &core.wl_surface.request_messages[opcode], &.{.{ .object = region_id }});
+}
+
 fn createShmPool(client: *server.Client, shm_id: u32, pool_id: u32, fd: std.posix.fd_t, size: usize) !void {
     try sendWithFds(client, shm_id, 0, &core.wl_shm.request_messages[0], &.{
         .{ .new_id = .{ .typed = pool_id } }, .{ .fd = fd }, .{ .int = @intCast(size) },
@@ -581,6 +937,28 @@ fn commitSurfaceResource(client: *server.Client, surface_id: u32) !void {
 
 // Scanner tests construct exact negotiated versions without changing the
 // production global or its v1 child construction policy.
+fn replaceCompositorResourceForTest(
+    self: *WayringCompositor,
+    client: *server.Client,
+    compositor: *Compositor,
+    version: u32,
+) !void {
+    const objects = self.findClient(client).?;
+    std.debug.assert(objects.surfaces.items.len == 0);
+    std.debug.assert(objects.regions.items.len == 0);
+    const object_id = compositor.resource.id();
+    compositor.resource.destroy();
+    compositor.resource.deinit();
+    const delete_id = try drain(client);
+    defer std.testing.allocator.free(delete_id);
+    try std.testing.expectEqual(@as(usize, 12), delete_id.len);
+    try std.testing.expectEqual(object_id, word(delete_id, 8));
+
+    compositor.resource = .init(self.allocator, object_id, version, .client, client.ownerHooks());
+    try compositor.resource.setHandler(WayringCompositor, self, handleCompositor, null);
+    try client.installClientInitial(object_id, &compositor.resource.runtime);
+}
+
 fn replaceSurfaceResourceForTest(
     self: *WayringCompositor,
     client: *server.Client,
@@ -703,6 +1081,244 @@ const TestPresentationListener = struct {
         self.event_count += 1;
     }
 };
+
+test "scanner wl_region inherits compositor version and owns rectangle state through teardown" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, null);
+    defer compositor.deinit();
+    const first = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    var first_live = true;
+    defer if (first_live) {
+        compositor.destroyClientResources(first.client());
+        first.destroy();
+    };
+    const second = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    var second_live = true;
+    defer if (second_live) {
+        compositor.destroyClientResources(second.client());
+        second.destroy();
+    };
+
+    try bindCompositor(first.client(), 3);
+    try createRegionResource(first.client(), 3, 4);
+    try createSurfaceResource(first.client(), 3, 5);
+    const first_objects = compositor.findClient(first.client()).?;
+    try std.testing.expectEqual(@as(u32, 1), first_objects.compositors.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 1), first_objects.regions.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 1), first_objects.surfaces.items[0].resource.version());
+
+    try addRegion(first.client(), 4, 0, 0, 10, 10);
+    try addRegion(first.client(), 4, 50, 50, 0, 4);
+    try subtractRegion(first.client(), 4, 2, 2, 4, 4);
+    try subtractRegion(first.client(), 4, 0, 0, -1, 9);
+    const region = first_objects.regions.items[0];
+    try std.testing.expect(region.value.contains(1, 1));
+    try std.testing.expect(!region.value.contains(3, 3));
+    try std.testing.expect(!region.value.contains(50, 50));
+    try std.testing.expect(first.client().fatal() == null);
+
+    try send(first.client(), 4, 0, &core.wl_region.request_messages[0], &.{});
+    try std.testing.expectEqual(@as(usize, 0), first_objects.regions.items.len);
+    try std.testing.expect(first.client().lookup(4) == null);
+    try send(first.client(), 5, 0, &core.wl_surface.request_messages[0], &.{});
+
+    try bindCompositor(second.client(), 3);
+    const second_objects = compositor.findClient(second.client()).?;
+    try compositor.replaceCompositorResourceForTest(second.client(), second_objects.compositors.items[0], 4);
+    try createRegionResource(second.client(), 3, 4);
+    try createSurfaceResource(second.client(), 3, 5);
+    try std.testing.expectEqual(@as(u32, 4), second_objects.regions.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 4), second_objects.surfaces.items[0].resource.version());
+    try std.testing.expectEqual(@as(usize, 1), compositor.regionCount());
+
+    compositor.destroyClientResources(second.client());
+    second.destroy();
+    second_live = false;
+    try std.testing.expectEqual(@as(usize, 0), compositor.regionCount());
+    try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
+    compositor.destroyClientResources(first.client());
+    first.destroy();
+    first_live = false;
+}
+
+test "surface regions copy immediately and persist with null and explicit-empty input semantics" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try createSurfaceResource(client, 3, 4);
+    try createRegionResource(client, 3, 5);
+    try createRegionResource(client, 3, 6);
+    try addRegion(client, 5, 1, 2, 5, 6);
+    try setSurfaceRegion(client, 4, 4, 5);
+    try setSurfaceRegion(client, 4, 5, 5);
+
+    const surface = compositor.findClient(client).?.surfaces.items[0];
+    try std.testing.expect(surface.current_opaque.isEmpty());
+    try std.testing.expect(surface.current_input.infinite);
+    try std.testing.expect(surface.pending_opaque.contains(2, 3));
+    try std.testing.expect(!surface.pending_input.infinite);
+    try std.testing.expect(surface.pending_input.value.contains(2, 3));
+
+    try subtractRegion(client, 5, 1, 2, 5, 6);
+    try send(client, 5, 0, &core.wl_region.request_messages[0], &.{});
+    try std.testing.expect(surface.pending_opaque.contains(2, 3));
+    try std.testing.expect(surface.pending_input.value.contains(2, 3));
+    try commitSurfaceResource(client, 4);
+    try std.testing.expect(surface.current_opaque.contains(2, 3));
+    try std.testing.expect(!surface.current_input.infinite);
+    try std.testing.expect(surface.current_input.value.contains(2, 3));
+    try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
+    try std.testing.expect(listener_state.last_size == null);
+
+    try commitSurfaceResource(client, 4);
+    try std.testing.expect(surface.current_opaque.contains(2, 3));
+    try std.testing.expect(surface.current_input.value.contains(2, 3));
+    try std.testing.expectEqual(@as(usize, 2), listener_state.committed_count);
+
+    try setSurfaceRegion(client, 4, 4, null);
+    try setSurfaceRegion(client, 4, 5, null);
+    try std.testing.expect(surface.current_opaque.contains(2, 3));
+    try std.testing.expect(!surface.current_input.infinite);
+    try commitSurfaceResource(client, 4);
+    try std.testing.expect(surface.current_opaque.isEmpty());
+    try std.testing.expect(surface.current_input.infinite);
+
+    try setSurfaceRegion(client, 4, 5, 6);
+    try commitSurfaceResource(client, 4);
+    try std.testing.expect(!surface.current_input.infinite);
+    try std.testing.expect(surface.current_input.value.isEmpty());
+    try std.testing.expectEqual(@as(usize, 4), listener_state.committed_count);
+    try std.testing.expectEqual(@as(usize, 1), compositor.regionCount());
+}
+
+test "surface region object validation rejects wrong foreign and non-Wayring resources" {
+    const WrongInterface = struct {
+        fn run() !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var registry = SurfaceRegistry.init(std.testing.allocator);
+            defer registry.deinit();
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(std.testing.allocator, &host, &registry, null);
+            defer compositor.deinit();
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            defer {
+                compositor.destroyClientResources(managed.client());
+                managed.destroy();
+            }
+            try bindCompositor(managed.client(), 3);
+            try createSurfaceResource(managed.client(), 3, 4);
+            try setSurfaceRegion(managed.client(), 4, 4, 3);
+            try std.testing.expectEqual(server.Fatal.Kind.protocol, managed.client().fatal().?.kind);
+            try std.testing.expect(compositor.findClient(managed.client()).?.surfaces.items[0].current_opaque.isEmpty());
+        }
+    };
+    const Foreign = struct {
+        fn run() !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var registry = SurfaceRegistry.init(std.testing.allocator);
+            defer registry.deinit();
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(std.testing.allocator, &host, &registry, null);
+            defer compositor.deinit();
+            const owner = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const other = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            defer {
+                compositor.destroyClientResources(other.client());
+                other.destroy();
+                compositor.destroyClientResources(owner.client());
+                owner.destroy();
+            }
+            try bindCompositor(owner.client(), 3);
+            try createSurfaceResource(owner.client(), 3, 4);
+            try createRegionResource(owner.client(), 3, 5);
+            try bindCompositor(other.client(), 3);
+            try createSurfaceResource(other.client(), 3, 4);
+            try setSurfaceRegion(other.client(), 4, 5, 5);
+            try std.testing.expectEqual(server.Fatal.Kind.protocol, other.client().fatal().?.kind);
+            try std.testing.expect(compositor.findClient(other.client()).?.surfaces.items[0].current_input.infinite);
+        }
+    };
+    const Impostor = struct {
+        fn run() !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var registry = SurfaceRegistry.init(std.testing.allocator);
+            defer registry.deinit();
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(std.testing.allocator, &host, &registry, null);
+            defer compositor.deinit();
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const client = managed.client();
+            var managed_live = true;
+            defer if (managed_live) {
+                compositor.destroyClientResources(client);
+                managed.destroy();
+            };
+            try bindCompositor(client, 3);
+            try createSurfaceResource(client, 3, 4);
+            var impostor: core.wl_region.Resource = .init(std.testing.allocator, 5, 1, .client, client.ownerHooks());
+            try client.installClientInitial(5, &impostor.runtime);
+            try setSurfaceRegion(client, 4, 4, 5);
+            try std.testing.expectEqual(server.Fatal.Kind.implementation, client.fatal().?.kind);
+            try std.testing.expect(compositor.findClient(client).?.surfaces.items[0].current_opaque.isEmpty());
+            compositor.destroyClientResources(client);
+            impostor.destroy();
+            impostor.deinit();
+            managed.destroy();
+            managed_live = false;
+        }
+    };
+
+    try WrongInterface.run();
+    try Foreign.run();
+    try Impostor.run();
+}
+
+test "wl_region creation OOM rolls back reservation list and storage" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(failing.allocator(), &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    defer {
+        compositor.destroyClientResources(managed.client());
+        managed.destroy();
+    }
+
+    try bindCompositor(managed.client(), 3);
+    const live_before = failing.allocated_bytes - failing.freed_bytes;
+    failing.fail_index = failing.alloc_index;
+    try createRegionResource(managed.client(), 3, 4);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, managed.client().fatal().?.kind);
+    try std.testing.expectEqual(@as(usize, 0), compositor.regionCount());
+    try std.testing.expect(managed.client().lookup(4) == null);
+    try std.testing.expectEqual(live_before, failing.allocated_bytes - failing.freed_bytes);
+}
 
 test "scanner-backed surfaces use canonical registry IDs without Wayring lookup confusion" {
     var host: server.Server = .init(std.testing.allocator);
@@ -1045,6 +1661,15 @@ test "scanner wl_surface versions 1 through 4 retain legacy pending attach offse
             const no_events = try drain(client);
             defer std.testing.allocator.free(no_events);
             try std.testing.expectEqual(@as(usize, 0), no_events.len);
+
+            try commitSurfaceResource(client, 5);
+            try std.testing.expect(!surface.has_pending_attachment);
+            try std.testing.expect(surface.pending_attachment == null);
+            try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_x);
+            try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_y);
+            const release = try drain(client);
+            defer std.testing.allocator.free(release);
+            try std.testing.expectEqual(@as(usize, 8), release.len);
         }
     };
 
@@ -1202,7 +1827,7 @@ test "scanner-backed surface commits copied SHM and releases the buffer" {
     try std.testing.expectEqual(render.BufferTransform.normal, render_state.transform);
     try std.testing.expect(render_state.force_opaque);
     try std.testing.expectEqual(std.math.maxInt(u32), render_state.alpha_multiplier);
-    try std.testing.expect(render_state.opaque_region == null);
+    try std.testing.expect(render_state.opaque_region.?.isEmpty());
     try std.testing.expect(render_state.blur_region == null);
     try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
     try std.testing.expectEqual(render.SourceCache{ .id = surface.source_cache_id, .version = 1 }, listener_state.last_source_cache.?);
@@ -1310,7 +1935,7 @@ test "listener observes published equal-size resize null and damage-only transac
 
     try damageSurface(client, 5, .{ .x = 1, .y = 0, .width = 1, .height = 1 });
     try commitSurfaceResource(client, 5);
-    try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.committed_count);
     try std.testing.expectEqual(first_pointer, compositor.currentBuffer(id).?.pixels.ptr);
     try std.testing.expectEqual(@as(u64, 2), surface.next_source_version);
 
@@ -1320,7 +1945,7 @@ test "listener observes published equal-size resize null and damage-only transac
     const second_release = try drain(client);
     defer std.testing.allocator.free(second_release);
     try std.testing.expectEqual(@as(usize, 8), second_release.len);
-    try std.testing.expectEqual(@as(usize, 2), listener_state.committed_count);
+    try std.testing.expectEqual(@as(usize, 3), listener_state.committed_count);
     try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, listener_state.last_size.?);
     try std.testing.expectEqual(render.SourceCache{ .id = source_id, .version = 2 }, listener_state.last_source_cache.?);
     try std.testing.expectEqual(@as(u32, pixels[2]), listener_state.last_first_pixel.?);
@@ -1332,26 +1957,128 @@ test "listener observes published equal-size resize null and damage-only transac
     const third_release = try drain(client);
     defer std.testing.allocator.free(third_release);
     try std.testing.expectEqual(@as(usize, 8), third_release.len);
-    try std.testing.expectEqual(@as(usize, 3), listener_state.committed_count);
+    try std.testing.expectEqual(@as(usize, 4), listener_state.committed_count);
     try std.testing.expectEqual(render.Size{ .width = 1, .height = 2 }, listener_state.last_size.?);
     try std.testing.expectEqual(render.SourceCache{ .id = source_id, .version = 3 }, listener_state.last_source_cache.?);
     try std.testing.expectEqualSlices(u32, pixels[4..6], surface_registry.renderState(id).?.buffer.pixels);
 
     try attachBuffer(client, 5, null);
     try commitSurfaceResource(client, 5);
-    try std.testing.expectEqual(@as(usize, 4), listener_state.committed_count);
+    try std.testing.expectEqual(@as(usize, 5), listener_state.committed_count);
     try std.testing.expect(listener_state.last_size == null);
     try std.testing.expect(compositor.currentBuffer(id) == null);
     try std.testing.expect(surface_registry.renderState(id) == null);
 
     try damageSurface(client, 5, .{ .x = 0, .y = 0, .width = 1, .height = 1 });
     try commitSurfaceResource(client, 5);
-    try std.testing.expectEqual(@as(usize, 4), listener_state.committed_count);
+    try std.testing.expectEqual(@as(usize, 6), listener_state.committed_count);
     try std.testing.expectEqualSlices(
         TestPresentationListener.Event,
-        &.{ .added, .committed, .committed, .committed, .committed },
+        &.{ .added, .committed, .committed, .committed, .committed, .committed, .committed },
         listener_state.events[0..listener_state.event_count],
     );
+}
+
+test "prepared commit failures preserve all published surface state and reclaim candidates" {
+    const Case = struct {
+        fn run(fault: CommitFault) !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var compositor_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+            defer surface_registry.deinit();
+            var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(compositor_allocator.allocator(), &host, &surface_registry, listener_state.listener());
+            defer compositor.deinit();
+            listener_state.compositor = &compositor;
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const client = managed.client();
+            defer {
+                compositor.destroyClientResources(client);
+                managed.destroy();
+            }
+
+            try bindCompositor(client, 3);
+            try bindShm(&compositor, client, 4);
+            try createSurfaceResource(client, 3, 5);
+            const id = compositor.surfaceId(client, 5).?;
+            const surface = compositor.surfaceForId(id).?;
+            const pixels = [_]u32{ 0xff11_2233, 0xffaa_bbcc };
+            const fd = try memfdWithPixels(&pixels);
+            defer _ = std.c.close(fd);
+            try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
+            try createShmBuffer(client, 6, 7, 0, .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+            try createShmBuffer(client, 6, 8, @sizeOf(u32), .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+            try createRegionResource(client, 3, 9);
+            try createRegionResource(client, 3, 10);
+            try addRegion(client, 9, 0, 0, 1, 1);
+            try addRegion(client, 10, 8, 8, 1, 1);
+
+            try setSurfaceRegion(client, 5, 4, 9);
+            try setSurfaceRegion(client, 5, 5, 9);
+            try attachBuffer(client, 5, 7);
+            try commitSurfaceResource(client, 5);
+            const first_release = try drain(client);
+            defer std.testing.allocator.free(first_release);
+            try std.testing.expectEqual(@as(usize, 8), first_release.len);
+
+            const old_pointer = compositor.currentBuffer(id).?.pixels.ptr;
+            const old_source_cache = surface_registry.renderState(id).?.buffer.source_cache.?;
+            const old_version = surface.next_source_version;
+            const old_listener_count = listener_state.committed_count;
+            try std.testing.expect(surface.current_opaque.contains(0, 0));
+            try std.testing.expect(!surface.current_opaque.contains(8, 8));
+            try std.testing.expect(!surface.current_input.infinite);
+            try std.testing.expect(surface.current_input.value.contains(0, 0));
+
+            try setSurfaceRegion(client, 5, 4, 10);
+            try setSurfaceRegion(client, 5, 5, 10);
+            try damageSurface(client, 5, .{ .x = 0, .y = 0, .width = 1, .height = 1 });
+            const live_before_attachment = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
+            try attachBufferAt(client, 5, 8, -4, 5);
+            try std.testing.expect(surface.pending_attachment.?.observer != null);
+            compositor.commit_fault = fault;
+            try commitSurfaceResource(client, 5);
+
+            const expected_fatal: server.Fatal.Kind = switch (fault) {
+                .access, .access_end => .implementation,
+                .candidate_allocation, .region_copy, .copy, .release_enqueue => .out_of_memory,
+            };
+            try std.testing.expectEqual(expected_fatal, client.fatal().?.kind);
+            try std.testing.expect(surface.pending_attachment == null);
+            try std.testing.expect(!surface.has_pending_attachment);
+            try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_x);
+            try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_y);
+            try std.testing.expectEqual(
+                live_before_attachment,
+                compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes,
+            );
+            try std.testing.expectEqual(old_pointer, compositor.currentBuffer(id).?.pixels.ptr);
+            try std.testing.expectEqualSlices(u32, pixels[0..1], compositor.currentBuffer(id).?.pixels);
+            try std.testing.expectEqual(old_source_cache, surface_registry.renderState(id).?.buffer.source_cache.?);
+            try std.testing.expect(surface_registry.renderState(id).?.buffer.source_damage == null);
+            try std.testing.expectEqual(old_version, surface.next_source_version);
+            try std.testing.expectEqual(old_listener_count, listener_state.committed_count);
+            try std.testing.expect(surface.current_opaque.contains(0, 0));
+            try std.testing.expect(!surface.current_opaque.contains(8, 8));
+            try std.testing.expect(!surface.current_input.infinite);
+            try std.testing.expect(surface.current_input.value.contains(0, 0));
+            try std.testing.expect(!surface.current_input.value.contains(8, 8));
+            try std.testing.expectEqual(render.Size{ .width = 1, .height = 1 }, surface.current_logical_size.?);
+            try std.testing.expectEqual(@as(i32, 1), surface.current_scale);
+            try std.testing.expectEqual(render.BufferTransform.normal, surface.current_transform);
+        }
+    };
+
+    for ([_]CommitFault{
+        .region_copy,
+        .candidate_allocation,
+        .access,
+        .copy,
+        .access_end,
+        .release_enqueue,
+    }) |fault| try Case.run(fault);
 }
 
 test "scanner-backed release failure cleans pending attachment and preserves current pixels" {
