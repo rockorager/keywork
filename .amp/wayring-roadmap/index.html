@@ -97,7 +97,7 @@
   <header>
     <h1>Keywork → Wayring</h1>
     <p class="lede">Working roadmap for replacing the compositor's libwayland server path with scanner-generated Wayring, without weakening component boundaries.</p>
-    <p class="meta">Current migration implementation: <code>ec53b3f8</code> on <code>wayring</code> · Updated 2026-08-05 · P3-B2 Wave 1 is integrated; Wave 2 is establishing headless generated-seat focus and compound-root ownership behind direct tests.</p>
+    <p class="meta">Current migration implementation: <code>455955a2</code> on <code>wayring</code> · Updated 2026-08-05 · P3-B2 Wave 2 is integrated; Wave 3 is implementing generated pointer delivery and the complete cursor-surface subtree behind direct tests.</p>
   </header>
 
   <section class="summary" aria-label="Migration summary">
@@ -142,7 +142,7 @@
   </section>
 
   <section class="phase">
-    <div class="bar"><span style="width:34%"></span></div>
+    <div class="bar"><span style="width:37%"></span></div>
     <div class="phase-head">
       <div><h2>Phase 3 — Broader protocol parity and cutover readiness</h2><p class="detail">Migrate dependency-ordered protocol families while preserving one owner for output, input, windows, selection, and security policy.</p></div>
       <span class="status active">In progress</span>
@@ -155,7 +155,8 @@
     <div class="wave"><span class="wave-label">P3-B1 gate</span><div><h3>Independent authority and allocator review</h3><p class="detail">Combined identity lifetime, authority purpose and age, disconnect teardown, selection ordering, allocator completeness, mature parity, and unchanged Wayring globals passed after focused corrections.</p></div><span class="status done">Passed</span></div>
     <div class="wave"><span class="wave-label">P3-B2 Wave 0</span><div><h3>Generated-client lifecycle foundations</h3><p class="detail">Display-wide non-reusing serials, neutral generated-client identity, pre-receive registration, client-local rejection, and prompt async-fatal retirement landed without publishing input globals.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">P3-B2 Wave 1</span><div><h3>Neutral delivery and canonical cleanup</h3><p class="detail">Structured frontend-neutral input delivery now shares canonical capability generations and narrow authority operations; touch identity, frame sequencing, borrowed key state, and repeat gating are hardened without generated resources.</p></div><span class="status done">Integrated</span></div>
-    <div class="wave"><span class="wave-label">P3-B2 Wave 2</span><div><h3>Headless generated-seat focus</h3><p class="detail">Add neutral compound-root ownership and an explicit cross-frontend focus arbiter so generated click and first-touch focus can share canonical policy before protocol-specific delivery lands.</p></div><span class="status active">In progress</span></div>
+    <div class="wave"><span class="wave-label">P3-B2 Wave 2</span><div><h3>Headless generated-seat focus</h3><p class="detail">Neutral compound-root hit testing, generational generated ownership, and exclusive cross-frontend focus now cover click, first-touch, topology repair, and teardown without protocol event delivery.</p></div><span class="status done">Integrated</span></div>
+    <div class="wave"><span class="wave-label">P3-B2 Wave 3</span><div><h3>Generated pointer and cursor subtree</h3><p class="detail">Implement scanner-backed pointer resources, canonical focus and implicit-grab delivery, enter-serial validation, and complete cursor-surface commit/invalidation behavior without keyboard or touch resources.</p></div><span class="status active">In progress</span></div>
     <div class="wave"><span class="wave-label">P3-C</span><div><h3>Atomic XDG window roles</h3><p class="detail">Integrate wm-base, surface, toplevel, popup, and positioner into real window policy for the first meaningful scale-1 SHM runtime milestone.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">P3-D</span><div><h3>Scale and interaction ergonomics</h3><p class="detail">Viewporter plus fractional scale, decoration, cursor-shape with SHM fallback, and activation on shared output/seat/XDG owners.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">P3-E1–E3</span><div><h3>Selection, drag, and text input</h3><p class="detail">Core data-device/DnD, primary and privileged data-control, then text-input/input-method as coherent shared-state families.</p></div><span class="status proposed">Planned</span></div>
