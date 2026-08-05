@@ -53,7 +53,6 @@ connection: Client,
 display: Resource,
 registries: std.ArrayList(*Registry) = .empty,
 publication_observer: *Server.PublicationObserver,
-serial: u32 = 0,
 
 pub fn create(allocator: std.mem.Allocator, server: *Server, options: Options) !*CoreClient {
     const self = try allocator.create(CoreClient);
@@ -144,9 +143,9 @@ fn sync(self: *CoreClient, id: u32) !void {
         callback.resource.destroy();
         callback.resource.deinit();
     };
-    self.serial +%= 1;
-    if (self.serial == 0) self.serial = 1;
-    try callback.resource.emit(0, &callback_done, &.{.{ .uint = self.serial }});
+    // Wayland defines wl_display.sync callback data as undefined. Keep this
+    // barrier namespace separate from display-wide authority serials.
+    try callback.resource.emit(0, &callback_done, &.{.{ .uint = 0 }});
     callback.resource.destroy();
     live = false;
     callback.resource.deinit();
@@ -227,9 +226,49 @@ test "display sync emits callback done before delete_id and tears down cleanly" 
     try std.testing.expectEqual(bytes.len, offset);
     try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[0..4], .little));
     try std.testing.expectEqual(@as(u16, 0), @as(u16, @truncate(std.mem.readInt(u32, bytes[4..8], .little))));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bytes[8..12], .little));
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[12..16], .little));
     try std.testing.expectEqual(@as(u16, 1), @as(u16, @truncate(std.mem.readInt(u32, bytes[16..20], .little))));
     try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[20..24], .little));
+}
+
+test "repeated multi-client sync returns zero without consuming display serials" {
+    var host: Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const first = try CoreClient.create(std.testing.allocator, &host, .{});
+    var first_live = true;
+    defer if (first_live) first.destroy();
+    const second = try CoreClient.create(std.testing.allocator, &host, .{});
+    defer second.destroy();
+
+    try std.testing.expectEqual(@as(u32, 1), try host.nextSerial());
+    try testSend(first.client(), 1, 0, &display_sync, &.{.{ .new_id = .{ .typed = 2 } }});
+    try testSend(first.client(), 1, 0, &display_sync, &.{.{ .new_id = .{ .typed = 3 } }});
+    try testSend(second.client(), 1, 0, &display_sync, &.{.{ .new_id = .{ .typed = 2 } }});
+
+    for ([_]*CoreClient{ first, second }) |managed| {
+        while (try managed.client().beginSend()) |batch| {
+            var offset: usize = 0;
+            while (offset < batch.bytes.len) : (offset += 12) {
+                const object_id = std.mem.readInt(u32, batch.bytes[offset..][0..4], .little);
+                const opcode: u16 = @truncate(std.mem.readInt(u32, batch.bytes[offset + 4 ..][0..4], .little));
+                if (object_id != 1 and opcode == 0)
+                    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, batch.bytes[offset + 8 ..][0..4], .little));
+            }
+            try managed.client().completeSend(batch.token, batch.bytes.len);
+        }
+    }
+
+    first.destroy();
+    first_live = false;
+    const reconnected = try CoreClient.create(std.testing.allocator, &host, .{});
+    defer reconnected.destroy();
+    try testSend(reconnected.client(), 1, 0, &display_sync, &.{.{ .new_id = .{ .typed = 2 } }});
+    while (try reconnected.client().beginSend()) |batch| {
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, batch.bytes[8..12], .little));
+        try reconnected.client().completeSend(batch.token, batch.bytes.len);
+    }
+    try std.testing.expectEqual(@as(u32, 2), try host.nextSerial());
 }
 
 test "managed client destruction notifies borrowed observers" {
