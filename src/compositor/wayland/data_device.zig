@@ -742,7 +742,7 @@ pub fn cancel(self: *Self) void {
 /// `externalDragSourceDestroyed` before destroying a source still in use.
 pub fn startExternalDrag(self: *Self, source: *const ExternalDragSource) ?u64 {
     if (self.drag != null or !self.seat.hasPressedPointerButton(0x110)) return null;
-    const pointer_focus = self.seat.pointerFocus() orelse return null;
+    const pointer_focus = self.seat.maturePointerFocus() orelse return null;
     const pointer_position = self.seat.pointerPosition() orelse return null;
     self.cancelRetainedExternalDrag();
     self.next_drag_generation = std.math.add(u64, self.next_drag_generation, 1) catch 1;

@@ -25,7 +25,13 @@ seat_name: [:0]const u8,
 snapshot: SeatDelivery.CapabilitySnapshot = .{},
 seats: std.ArrayList(*SeatResource) = .empty,
 pointers: std.ArrayList(*PointerResource) = .empty,
+terminal_clients: std.ArrayList(TerminalClient) = .empty,
 next_pointer_resource_generation: ?SeatDelivery.ResourceGeneration = 1,
+
+const TerminalClient = struct {
+    client: *wayring.server.Client,
+    observer: *wayring.server.Client.TerminalObserver,
+};
 
 const SeatResource = struct {
     resource: core.wl_seat.Resource,
@@ -40,6 +46,7 @@ const PointerResource = struct {
     generation: SeatDelivery.ResourceGeneration,
     resource_generation: SeatDelivery.ResourceGeneration,
     last_enter_serial: ?u32 = null,
+    frame_pending: bool = false,
 };
 
 pub fn init(
@@ -61,10 +68,32 @@ pub fn init(
 }
 
 pub fn deinit(self: *WayringSeatAdapter) void {
-    std.debug.assert(self.seats.items.len == 0 and self.pointers.items.len == 0);
+    std.debug.assert(self.seats.items.len == 0 and self.pointers.items.len == 0 and self.terminal_clients.items.len == 0);
     self.seats.deinit(self.allocator);
     self.pointers.deinit(self.allocator);
+    self.terminal_clients.deinit(self.allocator);
     self.* = undefined;
+}
+
+/// Registers the canonical pre-fatal retirement hook for one accepted raw
+/// generated client. Lifecycle code must call this immediately after mapping.
+pub fn trackClient(self: *WayringSeatAdapter, client: *wayring.server.Client) !void {
+    for (self.terminal_clients.items) |entry| if (entry.client == client) return error.AlreadyTracked;
+    try self.terminal_clients.ensureUnusedCapacity(self.allocator, 1);
+    const observer = try client.addTerminalObserver(WayringSeatAdapter, self, clientTerminal);
+    self.terminal_clients.appendAssumeCapacity(.{ .client = client, .observer = observer });
+}
+
+fn clientTerminal(self: *WayringSeatAdapter, client: *wayring.server.Client, _: *wayring.server.Client.TerminalObserver) void {
+    self.retireClient(client);
+}
+
+fn untrackClient(self: *WayringSeatAdapter, client: *wayring.server.Client) void {
+    for (self.terminal_clients.items, 0..) |entry, index| if (entry.client == client) {
+        wayring.server.Client.removeTerminalObserver(entry.observer);
+        _ = self.terminal_clients.swapRemove(index);
+        return;
+    };
 }
 
 pub fn installCursorListener(self: *WayringSeatAdapter) void {
@@ -96,6 +125,7 @@ pub fn bind(self: *WayringSeatAdapter, client: *wayring.server.Client, id: u32, 
 
 pub fn destroyClientResources(self: *WayringSeatAdapter, client: *wayring.server.Client) void {
     self.retireClient(client);
+    self.untrackClient(client);
     var i = self.pointers.items.len;
     while (i > 0) {
         i -= 1;
@@ -169,6 +199,25 @@ fn createPointer(seat: *SeatResource, id: u32) !void {
     try pointer_resource.resource.setHandler(PointerResource, pointer_resource, pointerRequest, null);
     try seat.client.materialize(&pointer_resource.resource.runtime);
     self.pointers.appendAssumeCapacity(pointer_resource);
+    const client_id = self.clients.id(seat.client) orelse return;
+    const snapshot = self.request_sink.pointer_enter_snapshot(
+        self.request_sink.context,
+        client_id,
+        pointer_resource.generation,
+    ) orelse return;
+    const endpoint = self.compositor.surfaceEndpoint(snapshot.surface) orelse return;
+    if (endpoint.client != seat.client) return;
+    sendEnter(pointer_resource, endpoint.resource.id(), .{
+        .serial = snapshot.serial,
+        .x = snapshot.x,
+        .y = snapshot.y,
+    }) catch |err| {
+        self.eventFailure(seat.client, &pointer_resource.resource.runtime, err);
+        return;
+    };
+    if (pointer_resource.resource.version() >= 5)
+        core.wl_pointer.@"send:frame"(&pointer_resource.resource) catch |err|
+            self.eventFailure(seat.client, &pointer_resource.resource.runtime, err);
 }
 
 fn pointerRequest(_: *core.wl_pointer.Resource, request: core.wl_pointer.Request, pointer_resource: *PointerResource) !void {
@@ -359,7 +408,10 @@ fn capabilities(context: *anyopaque, snapshot: SeatDelivery.CapabilitySnapshot) 
     const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
     self.snapshot = snapshot;
     if (!snapshot.pointer.available) {
-        for (self.pointers.items) |pointer_resource| pointer_resource.last_enter_serial = null;
+        for (self.pointers.items) |pointer_resource| {
+            pointer_resource.last_enter_serial = null;
+            pointer_resource.frame_pending = false;
+        }
     }
     for (self.seats.items) |seat| sendCapabilities(seat) catch |err| self.eventFailure(seat.client, &seat.resource.runtime, err);
 }
@@ -378,16 +430,17 @@ fn pointer(context: *anyopaque, client_id: ClientRegistry.Id, surface: SurfaceRe
     if (!std.meta.eql(self.clients.id(endpoint.client) orelse return, client_id)) return;
     for (self.pointers.items) |p| {
         if (p.client != endpoint.client or p.generation != self.snapshot.pointer.generation) continue;
+        const tag = std.meta.activeTag(event);
+        if (tag == .frame) {
+            if (p.last_enter_serial == null and !p.frame_pending) continue;
+        } else if (tag != .enter and p.last_enter_serial == null) continue;
         const result: anyerror!void = switch (event) {
             .enter => |v| sendEnter(p, endpoint.resource.id(), v),
-            .leave => |v| blk: {
-                p.last_enter_serial = null;
-                break :blk core.wl_pointer.@"send:leave"(&p.resource, v.serial, endpoint.resource.id());
-            },
+            .leave => |v| sendLeave(p, endpoint.resource.id(), v.serial),
             .motion => |v| core.wl_pointer.@"send:motion"(&p.resource, v.time, v.x, v.y),
             .button => |v| core.wl_pointer.@"send:button"(&p.resource, v.serial.value, v.time, v.button, @intFromEnum(v.state)),
             .axis => |v| core.wl_pointer.@"send:axis"(&p.resource, v.time, v.axis, v.value),
-            .frame => if (p.resource.version() >= 5) core.wl_pointer.@"send:frame"(&p.resource) else {},
+            .frame => sendFrame(p),
             .axis_source => |v| if (p.resource.version() >= 5) core.wl_pointer.@"send:axis_source"(&p.resource, v) else {},
             .axis_stop => |v| if (p.resource.version() >= 5) core.wl_pointer.@"send:axis_stop"(&p.resource, v.time, v.axis) else {},
             .axis_discrete => |v| if (p.resource.version() >= 5 and p.resource.version() <= 7) core.wl_pointer.@"send:axis_discrete"(&p.resource, v.axis, v.discrete) else {},
@@ -407,6 +460,19 @@ fn sendEnter(pointer_resource: *PointerResource, surface_id: u32, event: @FieldT
         event.y,
     );
     pointer_resource.last_enter_serial = event.serial.value;
+    pointer_resource.frame_pending = false;
+}
+
+fn sendLeave(pointer_resource: *PointerResource, surface_id: u32, serial: u32) !void {
+    try core.wl_pointer.@"send:leave"(&pointer_resource.resource, serial, surface_id);
+    pointer_resource.last_enter_serial = null;
+    pointer_resource.frame_pending = true;
+}
+
+fn sendFrame(pointer_resource: *PointerResource) !void {
+    if (pointer_resource.resource.version() >= 5)
+        try core.wl_pointer.@"send:frame"(&pointer_resource.resource);
+    pointer_resource.frame_pending = false;
 }
 
 fn touch(_: *anyopaque, _: ClientRegistry.Id, _: SeatDelivery.TouchEvent) void {}
@@ -435,6 +501,9 @@ test "capability bits and generations gate generated pointers" {
 }
 
 const TestRequestProbe = struct {
+    pointer_enter_snapshot: ?SeatDelivery.PointerEnterSnapshot = null,
+    pointer_enter_client: ?ClientRegistry.Id = null,
+    pointer_enter_generation: SeatDelivery.ResourceGeneration = 0,
     set_cursor_result: SeatDelivery.CursorRequestResult = .accepted,
     last_cursor_request: ?SeatDelivery.CursorRequest = null,
     set_cursor_count: usize = 0,
@@ -442,15 +511,30 @@ const TestRequestProbe = struct {
     removed_count: usize = 0,
     retiring_count: usize = 0,
     last_retiring: ?ClientRegistry.Id = null,
+    watched_terminal_client: ?*wayring.server.Client = null,
+    retiring_before_fatal: bool = false,
 
     fn sink(self: *TestRequestProbe) SeatDelivery.RequestSink {
         return .{
             .context = self,
+            .pointer_enter_snapshot = pointerEnterSnapshot,
             .set_cursor = setCursor,
             .cursor_committed = recordCursorCommitted,
             .cursor_removed = recordCursorRemoved,
             .client_retiring = recordClientRetiring,
         };
+    }
+
+    fn pointerEnterSnapshot(
+        context: *anyopaque,
+        client: ClientRegistry.Id,
+        generation: SeatDelivery.ResourceGeneration,
+    ) ?SeatDelivery.PointerEnterSnapshot {
+        const self: *TestRequestProbe = @ptrCast(@alignCast(context));
+        if (self.pointer_enter_client == null or
+            !std.meta.eql(self.pointer_enter_client.?, client) or
+            self.pointer_enter_generation != generation) return null;
+        return self.pointer_enter_snapshot;
     }
 
     fn setCursor(context: *anyopaque, request: SeatDelivery.CursorRequest) SeatDelivery.CursorRequestResult {
@@ -471,6 +555,8 @@ const TestRequestProbe = struct {
         const self: *TestRequestProbe = @ptrCast(@alignCast(context));
         self.retiring_count += 1;
         self.last_retiring = client;
+        if (self.watched_terminal_client) |raw|
+            self.retiring_before_fatal = raw.fatal() == null;
     }
 };
 
@@ -556,6 +642,13 @@ const AdapterTestSetup = struct {
         self.protocol_server.deinit();
         self.surface_registry.deinit();
         self.client_registry.deinit();
+    }
+
+    fn registerClient(self: *AdapterTestSetup, client: *wayring.server.Client) !ClientRegistry.Id {
+        const id = try self.clients.register(client);
+        errdefer self.clients.unregister(client);
+        try self.adapter.trackClient(client);
+        return id;
     }
 
     fn destroyClient(self: *AdapterTestSetup, managed: *wayring.server.CoreClient) void {
@@ -675,7 +768,7 @@ test "scanner seat bind negotiates exactly stays unpublished and releases resour
 
     const managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
     const client = managed.client();
-    _ = try setup.clients.register(client);
+    _ = try setup.registerClient(client);
     var client_live = true;
     defer if (client_live) setup.destroyClient(managed);
 
@@ -739,7 +832,7 @@ test "scanner pointer events preserve exact order version gates isolation and st
     for (cases, 0..) |case, index| {
         const managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
         const client = managed.client();
-        const client_id = try setup.clients.register(client);
+        const client_id = try setup.registerClient(client);
         var client_live = true;
         defer if (client_live) setup.destroyClient(managed);
         try testPrepareRegistry(client);
@@ -796,6 +889,76 @@ test "scanner pointer events preserve exact order version gates isolation and st
     }
 }
 
+test "late pointer bind joins canonical focus with enter before later delivery" {
+    var setup: AdapterTestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+    var snapshot: SeatDelivery.CapabilitySnapshot = .{};
+    _ = snapshot.pointer.setAvailable(true);
+    capabilities(&setup.adapter, snapshot);
+    const seat_global = try setup.protocol_server.addGlobal(
+        core.wl_seat,
+        core.wl_seat.interface.version,
+        WayringSeatAdapter,
+        &setup.adapter,
+        testSeatBind,
+    );
+    defer setup.protocol_server.removeGlobal(seat_global) catch {};
+    var log: TestEventLog = .{};
+    defer log.deinit();
+    const logger = try setup.protocol_server.addProtocolLogger(TestEventLog, &log, TestEventLog.observe);
+    defer setup.protocol_server.removeProtocolLogger(logger);
+
+    for ([_]u32{ 4, 5 }, 0..) |version, index| {
+        const managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+        const client = managed.client();
+        const client_id = try setup.registerClient(client);
+        var client_live = true;
+        defer if (client_live) setup.destroyClient(managed);
+        try testPrepareRegistry(client);
+        try testBindGlobal(client, testGlobal(&setup.protocol_server, "wl_compositor"), 6, 3);
+        try testCreateSurface(client, 3, 4);
+        try testBindGlobal(client, seat_global, version, 5);
+        try testGetPointer(client, 5, 6);
+        const surface = setup.compositor.surfaceId(client, 4).?;
+        pointer(&setup.adapter, client_id, surface, .{ .enter = .{
+            .serial = .{ .domain = .wayring_server, .value = 77 },
+            .x = 256,
+            .y = 512,
+        } });
+        setup.probe.pointer_enter_client = client_id;
+        setup.probe.pointer_enter_generation = snapshot.pointer.generation;
+        setup.probe.pointer_enter_snapshot = .{
+            .surface = surface,
+            .serial = .{ .domain = .wayring_server, .value = 77 },
+            .x = 256,
+            .y = 512,
+        };
+
+        log.clear();
+        try testGetPointer(client, 5, 7);
+        var names_buffer: [8][]const u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), log.namesFor(client, 6, &names_buffer).len);
+        const expected: []const []const u8 = if (version >= 5) &.{ "enter", "frame" } else &.{"enter"};
+        try expectEventNames(expected, log.namesFor(client, 7, &names_buffer));
+        try std.testing.expectEqual(@as(?u32, 77), setup.adapter.pointers.items[1].last_enter_serial);
+
+        try testSend(client, 7, 0, &core.wl_pointer.request_messages[0], &.{
+            .{ .uint = 77 }, .{ .object = null }, .{ .int = 0 }, .{ .int = 0 },
+        });
+        try std.testing.expectEqual(index + 1, setup.probe.set_cursor_count);
+        log.clear();
+        pointer(&setup.adapter, client_id, surface, .{ .motion = .{ .time = 9, .x = 384, .y = 640 } });
+        try expectEventNames(&.{"motion"}, log.namesFor(client, 6, &names_buffer));
+        try expectEventNames(&.{"motion"}, log.namesFor(client, 7, &names_buffer));
+
+        setup.probe.pointer_enter_snapshot = null;
+        setup.probe.pointer_enter_client = null;
+        setup.destroyClient(managed);
+        client_live = false;
+    }
+}
+
 test "set_cursor accepts only the entering resource and terminalizes role conflict locally" {
     var setup: AdapterTestSetup = undefined;
     try setup.init();
@@ -813,7 +976,7 @@ test "set_cursor accepts only the entering resource and terminalizes role confli
     defer setup.protocol_server.removeGlobal(seat_global) catch {};
     const managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
     const client = managed.client();
-    const client_id = try setup.clients.register(client);
+    const client_id = try setup.registerClient(client);
     var client_live = true;
     defer if (client_live) setup.destroyClient(managed);
     try testPrepareRegistry(client);
@@ -845,8 +1008,8 @@ test "set_cursor accepts only the entering resource and terminalizes role confli
     try std.testing.expectEqual(@as(i32, 3), request.hotspot_x);
     try std.testing.expectEqual(@as(i32, 4), request.hotspot_y);
 
-    // A pointer created after the enter did not receive that event and cannot
-    // borrow another resource's serial, even though both belong to one client.
+    // With no canonical snapshot in this focused fixture, a late pointer
+    // cannot borrow another resource's serial even for the same client.
     try testGetPointer(client, 5, 7);
     try testSend(client, 7, 0, &core.wl_pointer.request_messages[0], &.{
         .{ .uint = 71 }, .{ .object = 4 }, .{ .int = 0 }, .{ .int = 0 },
@@ -904,17 +1067,17 @@ test "event OOM and serial exhaustion terminalize only the affected generated cl
 
     const managed_a = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
     const client_a = managed_a.client();
-    const id_a = try setup.clients.register(client_a);
+    const id_a = try setup.registerClient(client_a);
     var live_a = true;
     defer if (live_a) setup.destroyClient(managed_a);
     const managed_b = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
     const client_b = managed_b.client();
-    const id_b = try setup.clients.register(client_b);
+    const id_b = try setup.registerClient(client_b);
     var live_b = true;
     defer if (live_b) setup.destroyClient(managed_b);
     const managed_c = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
     const client_c = managed_c.client();
-    const id_c = try setup.clients.register(client_c);
+    const id_c = try setup.registerClient(client_c);
     var live_c = true;
     defer if (live_c) setup.destroyClient(managed_c);
 
@@ -952,4 +1115,39 @@ test "event OOM and serial exhaustion terminalize only the affected generated cl
     live_b = false;
     setup.destroyClient(managed_a);
     live_a = false;
+}
+
+test "frame callback enqueue fatal retires canonical client before fatal becomes visible" {
+    var setup: AdapterTestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+    var client_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const managed = try wayring.server.CoreClient.create(client_allocator.allocator(), &setup.protocol_server, .{});
+    const client = managed.client();
+    _ = try setup.registerClient(client);
+    var client_live = true;
+    defer if (client_live) setup.destroyClient(managed);
+    setup.probe.watched_terminal_client = client;
+
+    try testPrepareRegistry(client);
+    try testBindGlobal(client, testGlobal(&setup.protocol_server, "wl_compositor"), 6, 3);
+    try testCreateSurface(client, 3, 4);
+    try testSend(client, 4, 3, &core.wl_surface.request_messages[3], &.{
+        .{ .new_id = .{ .typed = 5 } },
+    });
+    try testSend(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
+    try testDrain(client);
+    const surface = setup.compositor.surfaceId(client, 4).?;
+
+    client_allocator.fail_index = client_allocator.alloc_index;
+    setup.compositor.completeFrame(surface, 55);
+
+    try std.testing.expect(client_allocator.has_induced_failure);
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+    try std.testing.expect(setup.probe.retiring_before_fatal);
+    try std.testing.expectEqual(@as(usize, 1), setup.probe.retiring_count);
+    try std.testing.expect(client.lookup(5) == null);
+
+    setup.destroyClient(managed);
+    client_live = false;
 }

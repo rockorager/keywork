@@ -25,14 +25,28 @@ pub const CursorRequest = struct {
     hotspot_y: i32,
 };
 
+/// Existing canonical pointer-enter state that a newly materialized generated
+/// pointer resource may join without synthesizing a second logical enter.
+pub const PointerEnterSnapshot = struct {
+    surface: SurfaceRegistry.Id,
+    serial: ClientRegistry.Serial,
+    x: i32,
+    y: i32,
+};
+
 /// Canonical request boundary copied by a generated frontend adapter.
 pub const RequestSink = struct {
     context: *anyopaque,
+    pointer_enter_snapshot: *const fn (*anyopaque, ClientRegistry.Id, ResourceGeneration) ?PointerEnterSnapshot = unavailablePointerEnterSnapshot,
     set_cursor: *const fn (*anyopaque, CursorRequest) CursorRequestResult,
     cursor_committed: *const fn (*anyopaque, SurfaceRegistry.Id, i32, i32) void,
     cursor_removed: *const fn (*anyopaque, SurfaceRegistry.Id) void,
     client_retiring: *const fn (*anyopaque, ClientRegistry.Id) void,
 };
+
+fn unavailablePointerEnterSnapshot(_: *anyopaque, _: ClientRegistry.Id, _: ResourceGeneration) ?PointerEnterSnapshot {
+    return null;
+}
 
 pub const Capability = struct {
     available: bool = false,

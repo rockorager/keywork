@@ -192,6 +192,8 @@ pub fn main(init: std.process.Init) !void {
         fn accepted(erased: *anyopaque, client: *wayring.server.Client) !void {
             const self: *@This() = @ptrCast(@alignCast(erased));
             _ = try self.clients.register(client);
+            errdefer self.clients.unregister(client);
+            try self.seat.trackClient(client);
         }
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {

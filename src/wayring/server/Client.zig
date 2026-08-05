@@ -43,12 +43,24 @@ pub const Options = struct {
 /// Opaque, runtime-owned destruction registration handle.
 pub const Observer = opaque {};
 
+/// Opaque registration notified synchronously before the first fatal is recorded.
+pub const TerminalObserver = opaque {};
+
 const ObserverNode = struct {
     client: *Client,
     context: *anyopaque,
     notify: *const fn (*anyopaque, *Client, *Observer) void,
     previous: ?*ObserverNode = null,
     next: ?*ObserverNode = null,
+    active: bool = true,
+};
+
+const TerminalObserverNode = struct {
+    client: *Client,
+    context: *anyopaque,
+    notify: *const fn (*anyopaque, *Client, *TerminalObserver) void,
+    previous: ?*TerminalObserverNode = null,
+    next: ?*TerminalObserverNode = null,
     active: bool = true,
 };
 
@@ -87,7 +99,11 @@ dispatching: bool = false,
 active_new_ids: ?[]NewIdExpectation = null,
 observer_head: ?*ObserverNode = null,
 observer_tail: ?*ObserverNode = null,
+terminal_observer_head: ?*TerminalObserverNode = null,
+terminal_observer_tail: ?*TerminalObserverNode = null,
 notifying_destroy: bool = false,
+notifying_terminal: bool = false,
+terminalizing: bool = false,
 destroying: bool = false,
 
 pub fn init(allocator: std.mem.Allocator, options: Options) Client {
@@ -167,6 +183,39 @@ pub fn removeDestroyObserver(observer: *Observer) void {
     node.active = false;
     if (self.notifying_destroy) return;
     self.unlinkAndFreeObserver(node);
+}
+
+pub fn addTerminalObserver(
+    self: *Client,
+    comptime Context: type,
+    context: *Context,
+    comptime callback: *const fn (*Context, *Client, *TerminalObserver) void,
+) !*TerminalObserver {
+    if (self.destroying) return error.ClientDestroying;
+    if (self.fatal_state.recorded or self.terminalizing) return error.ClientTerminal;
+    const observer = try self.allocator.create(TerminalObserverNode);
+    observer.* = .{
+        .client = self,
+        .context = context,
+        .notify = struct {
+            fn call(erased: *anyopaque, client: *Client, handle: *TerminalObserver) void {
+                callback(@ptrCast(@alignCast(erased)), client, handle);
+            }
+        }.call,
+        .previous = self.terminal_observer_tail,
+    };
+    if (self.terminal_observer_tail) |tail| tail.next = observer else self.terminal_observer_head = observer;
+    self.terminal_observer_tail = observer;
+    return @ptrCast(observer);
+}
+
+pub fn removeTerminalObserver(observer: *TerminalObserver) void {
+    const node: *TerminalObserverNode = @ptrCast(@alignCast(observer));
+    if (!node.active) return;
+    const self = node.client;
+    node.active = false;
+    if (self.notifying_terminal) return;
+    self.unlinkAndFreeTerminalObserver(node);
 }
 
 /// Records an application-detected protocol violation without allocating and
@@ -494,6 +543,17 @@ fn record(self: *Client, kind: Fatal.Kind, id: u32, opcode: ?u16, interface: ?*c
 
 fn recordDetails(self: *Client, details: Fatal.Details) void {
     self.input.discardAfterFatal();
+    if (self.fatal_state.recorded or self.terminalizing) return;
+    self.terminalizing = true;
+    defer self.terminalizing = false;
+    self.notifying_terminal = true;
+    var observer = self.terminal_observer_head;
+    while (observer) |current| {
+        const next = current.next;
+        if (current.active) current.notify(current.context, self, @ptrCast(current));
+        observer = next;
+    }
+    self.notifying_terminal = false;
     if (!self.fatal_state.record(details)) return;
     if (details.kind == .peer_disconnect) return;
     const display = self.lookup(1) orelse return;
@@ -541,6 +601,12 @@ fn unlinkAndFreeObserver(self: *Client, observer: *ObserverNode) void {
     self.allocator.destroy(observer);
 }
 
+fn unlinkAndFreeTerminalObserver(self: *Client, observer: *TerminalObserverNode) void {
+    if (observer.previous) |previous| previous.next = observer.next else self.terminal_observer_head = observer.next;
+    if (observer.next) |next| next.previous = observer.previous else self.terminal_observer_tail = observer.previous;
+    self.allocator.destroy(observer);
+}
+
 fn freeAllObservers(self: *Client) void {
     var current = self.observer_head;
     while (current) |observer| {
@@ -550,6 +616,14 @@ fn freeAllObservers(self: *Client) void {
     }
     self.observer_head = null;
     self.observer_tail = null;
+    var terminal = self.terminal_observer_head;
+    while (terminal) |observer| {
+        const next = observer.next;
+        self.allocator.destroy(observer);
+        terminal = next;
+    }
+    self.terminal_observer_head = null;
+    self.terminal_observer_tail = null;
 }
 
 test "Client destruction observers retain order and can remove registrations" {
@@ -584,6 +658,48 @@ test "Client destruction observers retain order and can remove registrations" {
 
     client.deinit();
     try std.testing.expectEqualStrings("ab", order.items);
+}
+
+test "terminal observers run once before the first fatal is visible" {
+    const Context = struct {
+        calls: usize = 0,
+        fatal_was_visible: bool = false,
+        future: ?*TerminalObserver = null,
+
+        fn observe(self: *@This(), client: *Client, handle: *TerminalObserver) void {
+            self.calls += 1;
+            self.fatal_was_visible = self.fatal_was_visible or client.fatal() != null;
+            std.testing.expectError(
+                error.ClientTerminal,
+                client.addTerminalObserver(@This(), self, observe),
+            ) catch unreachable;
+            removeTerminalObserver(handle);
+            if (self.future) |future| removeTerminalObserver(future);
+            client.postImplementationError(client.lookup(1).?, "reentrant fatal");
+        }
+    };
+
+    var client: Client = .init(std.testing.allocator, .{});
+    defer client.deinit();
+    var display: Resource = .init(std.testing.allocator, 1, 1, &test_display_interface, &.{}, .client, client.ownerHooks());
+    defer {
+        display.destroy();
+        display.deinit();
+    }
+    try client.installClientInitial(1, &display);
+    var first: Context = .{};
+    var removed: Context = .{};
+    _ = try client.addTerminalObserver(Context, &first, Context.observe);
+    first.future = try client.addTerminalObserver(Context, &removed, Context.observe);
+
+    client.postOutOfMemory(&display, "first fatal");
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqual(@as(usize, 0), removed.calls);
+    try std.testing.expect(!first.fatal_was_visible);
+    try std.testing.expectEqual(Fatal.Kind.out_of_memory, client.fatal().?.kind);
+    try std.testing.expectEqualStrings("first fatal", client.fatal().?.detail());
+    client.postProtocolError(&display, 9, "later fatal");
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
 }
 
 test "Client fatal terminal frames are allocation independent and follow in-flight output" {

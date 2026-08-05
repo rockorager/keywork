@@ -91,6 +91,14 @@ pub fn clearPointerEnter(self: *SeatAuthority) void {
     self.latest_enter = null;
 }
 
+/// Returns the retained enter serial only to its exact client. This is a
+/// read-only resource-materialization seam, not a new authority grant.
+pub fn latestPointerEnterSerial(self: *const SeatAuthority, client: ClientRegistry.Id) ?ClientRegistry.Serial {
+    const grant = self.latest_enter orelse return null;
+    if (!std.meta.eql(grant.client, client) or !self.valid(client, grant.serial)) return null;
+    return grant.serial;
+}
+
 /// Discards weak grants when their owning seat is permanently retired.
 /// Live presses must already have ended through normal seat capability teardown.
 pub fn discardGrants(self: *SeatAuthority) void {
@@ -136,6 +144,20 @@ pub fn hasPointerButtons(self: *const SeatAuthority) bool {
 
 /// Drops all live pointer presses without releasing retained capacity.
 pub fn clearPointerPresses(self: *SeatAuthority) void {
+    self.presses.clearRetainingCapacity();
+}
+
+/// Cancels currently live presses and every weak grant issued from those
+/// exact serials, preserving unrelated keyboard, touch, and selection grants.
+pub fn cancelPointerPressesAndGrants(self: *SeatAuthority) void {
+    for (self.presses.items) |press| {
+        if (self.latest_action) |grant| {
+            if (same(grant, press.grant.client, press.grant.serial)) self.latest_action = null;
+        }
+        for (&self.selections) |*entry| if (entry.*) |grant| {
+            if (same(grant, press.grant.client, press.grant.serial)) entry.* = null;
+        };
+    }
     self.presses.clearRetainingCapacity();
 }
 
@@ -331,8 +353,16 @@ test "pointer grants require exact live client serial button and canonical surfa
     try std.testing.expect(authority.forgetPointerPress(2));
     try std.testing.expect(!authority.hasPointerButtons());
     try std.testing.expect(try authority.addPointerPress(client, serial, 3, first));
+    const unrelated: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 43 };
+    try std.testing.expect(authority.recordSelection(client, unrelated));
+    try std.testing.expect(authority.recordAction(client, serial));
+    authority.cancelPointerPressesAndGrants();
+    try std.testing.expect(!authority.hasPointerButtons());
+    try std.testing.expect(!authority.acceptsAction(client, serial));
+    try std.testing.expect(authority.selectionOrder(client, serial) == null);
+    try std.testing.expect(authority.selectionOrder(client, unrelated) != null);
     clients.unregister(client);
-    try std.testing.expect(authority.clientDisconnected(client));
+    try std.testing.expect(!authority.clientDisconnected(client));
     clients.unregister(other);
     surfaces.remove(first);
     surfaces.remove(current);

@@ -61,7 +61,7 @@ pub fn constrainMotion(self: *Self, target: Region.Point) Motion {
     if (constraint.kind() == .locked) {
         return .{ .point = .{ .x = position.x, .y = position.y }, .locked = true };
     }
-    const focus = self.seat.pointerFocus() orelse return .{ .point = target };
+    const focus = self.seat.maturePointerFocus() orelse return .{ .point = target };
     const start: Region.Point = .{ .x = focus.x, .y = focus.y };
     const local_target: Region.Point = .{
         .x = focus.x + target.x - position.x,
@@ -77,7 +77,7 @@ pub fn constrainMotion(self: *Self, target: Region.Point) Motion {
 
 /// Reconcile protocol activation with the seat's current pointer focus.
 pub fn syncFocus(self: *Self) void {
-    const focus = self.seat.pointerFocus();
+    const focus = self.seat.maturePointerFocus();
     for (self.constraints.items) |constraint| {
         if (!constraint.active) continue;
         if (!constraint.canRemainActive(focus)) constraint.deactivate();
@@ -302,6 +302,7 @@ const Constraint = struct {
         const pointer = self.pointer orelse return null;
         if (!self.manager.seat.pointerHandleIsActive(pointer)) return null;
         const position = focus orelse return null;
+        if (position.generated != null) return null;
         if (!std.meta.eql(position.surface_id, self.surface_id)) return null;
         return position;
     }

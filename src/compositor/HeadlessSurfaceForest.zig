@@ -327,6 +327,19 @@ pub fn compoundRoot(
     }
 }
 
+/// Reports whether the exact endpoint is currently mapped through a fully
+/// mapped ancestry chain under the expected compound root.
+pub fn presentedInCompound(
+    self: *const HeadlessSurfaceForest,
+    id: SurfaceRegistry.Id,
+    root: SurfaceRegistry.Id,
+) bool {
+    if (self.exactGeometry(id) == null) return false;
+    const current_root = self.compoundRoot(id) orelse return false;
+    if (self.nodeConst(current_root).?.cursor_role) return false;
+    return sameId(current_root, root);
+}
+
 pub fn len(self: *const HeadlessSurfaceForest) usize {
     return self.node_count;
 }

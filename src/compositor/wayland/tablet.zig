@@ -1370,13 +1370,14 @@ fn ensureTool(
 }
 
 fn updateFocus(self: *Self, tool: *Tool, target: ?Seat.PointerFocus, time: u32) void {
-    const next = if (target) |focus| focus.surface_id else null;
+    const mature_target = if (target) |focus| if (focus.generated == null) focus else null else null;
+    const next = if (mature_target) |focus| focus.surface_id else null;
     if (tool.focus) |current| {
         if (next != null and std.meta.eql(current, next.?)) return;
         if (tool.tip_down or tool.pressed_buttons.items.len != 0) return;
         self.leaveFocus(tool, time, false);
     } else if (next == null) return;
-    const focus = target orelse return;
+    const focus = mature_target orelse return;
     const surface = Surface.resourceFor(self.surface_store, focus.surface_id) orelse return;
     tool.focus = focus.surface_id;
     tool.focus_resource = surface;
