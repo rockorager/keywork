@@ -97,7 +97,7 @@
   <header>
     <h1>Keywork → Wayring</h1>
     <p class="lede">Working roadmap for replacing the compositor's libwayland server path with scanner-generated Wayring, without weakening component boundaries.</p>
-    <p class="meta">Current migration implementation: <code>86d59176</code> on <code>wayring</code> · Updated 2026-08-05 · Phase 2 independently passed at exact shared tip <code>eebee1ab</code>; Phase 3 architecture inventory is next.</p>
+    <p class="meta">Current migration implementation: <code>86d59176</code> on <code>wayring</code> · Updated 2026-08-05 · Phase 3 architecture is dependency-ordered; P3-A begins by splitting canonical output membership from frontend delivery.</p>
   </header>
 
   <section class="summary" aria-label="Migration summary">
@@ -142,13 +142,20 @@
   </section>
 
   <section class="phase">
-    <div class="bar"><span style="width:5%"></span></div>
+    <div class="bar"><span style="width:8%"></span></div>
     <div class="phase-head">
-      <div><h2>Phase 3 — Broader protocol parity and cutover readiness</h2><p class="detail">Inventory remaining globals and fix dependency-ordered subwaves before any broader protocol implementation begins.</p></div>
-      <span class="status active">Planning</span>
+      <div><h2>Phase 3 — Broader protocol parity and cutover readiness</h2><p class="detail">Migrate dependency-ordered protocol families while preserving one owner for output, input, windows, selection, and security policy.</p></div>
+      <span class="status active">In progress</span>
     </div>
-    <div class="wave"><span class="wave-label">Architecture inventory</span><div><h3>Remaining server protocol families</h3><p class="detail">Map ownership, dependencies, generated contracts, client compatibility, and acceptance gates while preserving the canonical libwayland socket.</p></div><span class="status active">In progress</span></div>
-    <div class="wave"><span class="wave-label">Cutover gate</span><div><h3>Canonical WAYLAND_DISPLAY decision</h3><p class="detail">Only after lifecycle, behavior, compatibility, and real-client equivalence are independently verified.</p></div><span class="status proposed">Unscoped</span></div>
+    <div class="wave"><span class="wave-label">Architecture inventory</span><div><h3>Remaining server protocol families</h3><p class="detail">Verified current globals, consumers, generated-contract readiness, ownership dependencies, session profiles, and explicit cutover criteria.</p></div><span class="status done">Complete</span></div>
+    <div class="wave"><span class="wave-label">P3-A</span><div><h3>Output delivery split</h3><p class="detail">Keep <code>Output</code>/<code>OutputLayout</code> authoritative, record canonical membership independently of mature resources, and add honest headless Wayring <code>wl_output</code> v4 plus enter/leave.</p></div><span class="status active">In progress</span></div>
+    <div class="wave"><span class="wave-label">P3-B1/B2</span><div><h3>Input authority and core seat</h3><p class="detail">First neutralize client/serial-domain authorization without behavior change, then publish one Wayring seat with pointer, keyboard, touch, and cursor roles.</p></div><span class="status proposed">Planned</span></div>
+    <div class="wave"><span class="wave-label">P3-C</span><div><h3>Atomic XDG window roles</h3><p class="detail">Integrate wm-base, surface, toplevel, popup, and positioner into real window policy for the first meaningful scale-1 SHM runtime milestone.</p></div><span class="status proposed">Planned</span></div>
+    <div class="wave"><span class="wave-label">P3-D</span><div><h3>Scale and interaction ergonomics</h3><p class="detail">Viewporter plus fractional scale, decoration, cursor-shape with SHM fallback, and activation on shared output/seat/XDG owners.</p></div><span class="status proposed">Planned</span></div>
+    <div class="wave"><span class="wave-label">P3-E1–E3</span><div><h3>Selection, drag, and text input</h3><p class="detail">Core data-device/DnD, primary and privileged data-control, then text-input/input-method as coherent shared-state families.</p></div><span class="status proposed">Planned</span></div>
+    <div class="wave"><span class="wave-label">P3-F</span><div><h3>Session shell roles</h3><p class="detail">Layer shell, session lock, idle notification, and workspace behavior needed by the Keywork shell.</p></div><span class="status proposed">Planned</span></div>
+    <div class="wave"><span class="wave-label">P3-G</span><div><h3>Security and profile parity</h3><p class="detail">Peer credentials, security contexts, restricted/private visibility, diagnostics, and exact global/version profile manifests.</p></div><span class="status proposed">Planned</span></div>
+    <div class="wave"><span class="wave-label">P3-H</span><div><h3>Canonical socket gate</h3><p class="detail">Explicit restart-time selector and independent profile gate before any <code>WAYLAND_DISPLAY</code>, systemd, Xwayland, or readiness default changes.</p></div><span class="status proposed">Planned</span></div>
   </section>
 
   <section class="phase">
@@ -163,7 +170,7 @@
     <h2>Standing constraints</h2>
     <ul>
       <li>Wayring stays reusable, policy-free, scanner-generated, and sans-I/O; Keywork owns event-loop, scene, render, and shell policy.</li>
-      <li>No fake libwayland surfaces, Scene frontend unions, or mature subsurface migration during Phase 2.</li>
+      <li>No fake libwayland surfaces, Scene frontend unions, duplicate identity domains, or mature protocol-object migration.</li>
       <li>Core protocol contracts come from the official Wayland 1.26.0 XML pinned by <code>build.zig.zon</code> and scanner-generated by the root build.</li>
       <li>Debug validation only: formatting, aggregate tests, renderer checks, Wayring tests, Oracle review, then an independent gate.</li>
       <li>Wayring client support and removal of <code>libwayland-client</code> are a separate track.</li>
