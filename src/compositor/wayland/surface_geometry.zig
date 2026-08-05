@@ -1,10 +1,7 @@
 //! Pure buffer transform, scale, and viewporter geometry policy for surfaces.
 
 const std = @import("std");
-const wayland = @import("wayland");
 const render = @import("../render/types.zig");
-
-const wl = wayland.server.wl;
 
 pub const ViewportSource = struct {
     x: i32,
@@ -29,44 +26,15 @@ pub const Error = error{
     ViewportOutOfBuffer,
 };
 
-pub fn validTransform(transform: wl.Output.Transform) bool {
-    return switch (transform) {
-        .normal,
-        .@"90",
-        .@"180",
-        .@"270",
-        .flipped,
-        .flipped_90,
-        .flipped_180,
-        .flipped_270,
-        => true,
-        else => false,
-    };
-}
-
-fn swapsAxes(transform: wl.Output.Transform) bool {
-    return switch (transform) {
-        .@"90", .@"270", .flipped_90, .flipped_270 => true,
-        else => false,
-    };
-}
-
-fn transformedSize(buffer_size: render.Size, transform: wl.Output.Transform) render.Size {
-    return if (swapsAxes(transform))
-        .{ .width = buffer_size.height, .height = buffer_size.width }
-    else
-        buffer_size;
-}
-
 fn logicalSize(
     buffer_size: render.Size,
     scale: i32,
-    transform: wl.Output.Transform,
+    transform: render.BufferTransform,
     allow_non_divisible_scale: bool,
 ) error{InvalidSize}!render.Size {
-    if (scale <= 0 or !validTransform(transform)) return error.InvalidSize;
+    if (scale <= 0) return error.InvalidSize;
 
-    const transformed = transformedSize(buffer_size, transform);
+    const transformed = transform.applyToSize(buffer_size);
     const unsigned_scale: u32 = @intCast(scale);
     // Cursor themes and CSS cursors can provide odd-sized buffers at an
     // integer scale. Established compositors accept those once the cursor role
@@ -87,7 +55,7 @@ fn logicalSize(
 pub fn calculate(
     buffer_size: render.Size,
     scale: i32,
-    transform: wl.Output.Transform,
+    transform: render.BufferTransform,
     viewport: ViewportState,
     allow_non_divisible_scale: bool,
 ) Error!Geometry {
@@ -105,7 +73,7 @@ pub fn calculate(
 
     const right = @as(i64, source.x) + source.width;
     const bottom = @as(i64, source.y) + source.height;
-    const transformed = transformedSize(buffer_size, transform);
+    const transformed = transform.applyToSize(buffer_size);
     if (source.x < 0 or source.y < 0 or source.width <= 0 or source.height <= 0 or
         right * scale > @as(i64, transformed.width) * 256 or
         bottom * scale > @as(i64, transformed.height) * 256)
@@ -137,19 +105,36 @@ pub fn calculate(
     };
 }
 
-test "logical surface size accounts for scale and transform" {
-    try std.testing.expectEqual(
-        render.Size{ .width = 100, .height = 50 },
-        try logicalSize(.{ .width = 200, .height = 100 }, 2, .normal, false),
-    );
-    try std.testing.expectEqual(
-        render.Size{ .width = 50, .height = 100 },
-        try logicalSize(.{ .width = 200, .height = 100 }, 2, .@"90", false),
-    );
-    try std.testing.expectError(
-        error.InvalidSize,
-        logicalSize(.{ .width = 201, .height = 100 }, 2, .normal, false),
-    );
+test "all buffer transforms apply renderer axis rules to logical size" {
+    const Case = struct {
+        transform: render.BufferTransform,
+        expected: render.Size,
+    };
+    const cases = [_]Case{
+        .{ .transform = .normal, .expected = .{ .width = 6, .height = 4 } },
+        .{ .transform = .rotate_90, .expected = .{ .width = 4, .height = 6 } },
+        .{ .transform = .rotate_180, .expected = .{ .width = 6, .height = 4 } },
+        .{ .transform = .rotate_270, .expected = .{ .width = 4, .height = 6 } },
+        .{ .transform = .flipped, .expected = .{ .width = 6, .height = 4 } },
+        .{ .transform = .flipped_90, .expected = .{ .width = 4, .height = 6 } },
+        .{ .transform = .flipped_180, .expected = .{ .width = 6, .height = 4 } },
+        .{ .transform = .flipped_270, .expected = .{ .width = 4, .height = 6 } },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            case.expected,
+            try logicalSize(.{ .width = 12, .height = 8 }, 2, case.transform, false),
+        );
+    }
+}
+
+test "logical size requires exact transformed dimensions at integer scale" {
+    inline for (std.meta.tags(render.BufferTransform)) |transform| {
+        try std.testing.expectError(
+            error.InvalidSize,
+            logicalSize(.{ .width = 13, .height = 8 }, 2, transform, false),
+        );
+    }
 }
 
 test "cursor compatibility covers non-divisible buffer scale" {
@@ -230,6 +215,35 @@ test "viewport source is validated and converted to buffer coordinates" {
             2,
             .normal,
             .{ .source = .{ .x = 0, .y = 0, .width = 128, .height = 256 } },
+            false,
+        ),
+    );
+}
+
+test "viewport source bounds use post-transform axes" {
+    const viewport: ViewportState = .{
+        .source = .{ .x = 0, .y = 0, .width = 4 * 256, .height = 8 * 256 },
+    };
+    const geometry = try calculate(
+        .{ .width = 8, .height = 4 },
+        1,
+        .rotate_90,
+        viewport,
+        false,
+    );
+    try std.testing.expectEqual(
+        render.Size{ .width = 4, .height = 8 },
+        geometry.logical_size,
+    );
+    try std.testing.expectEqual(@as(f64, 4), geometry.source.?.width);
+    try std.testing.expectEqual(@as(f64, 8), geometry.source.?.height);
+    try std.testing.expectError(
+        error.ViewportOutOfBuffer,
+        calculate(
+            .{ .width = 8, .height = 4 },
+            1,
+            .normal,
+            viewport,
             false,
         ),
     );

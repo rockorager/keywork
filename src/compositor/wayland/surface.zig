@@ -331,7 +331,7 @@ fn providerRenderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
         .buffer = buffer.pixelBuffer(),
         .logical_size = buffer.logical_size,
         .source = buffer.source,
-        .transform = renderTransform(buffer.transform),
+        .transform = renderTransform(buffer.transform) orelse unreachable,
         .force_opaque = buffer.force_opaque,
         .alpha_multiplier = surface_state.current_alpha_multiplier,
         .opaque_region = &surface_state.current_opaque,
@@ -342,7 +342,7 @@ fn providerRenderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
     };
 }
 
-fn renderTransform(transform: wl.Output.Transform) render_types.BufferTransform {
+fn renderTransform(transform: wl.Output.Transform) ?render_types.BufferTransform {
     return switch (transform) {
         .normal => .normal,
         .@"90" => .rotate_90,
@@ -352,7 +352,7 @@ fn renderTransform(transform: wl.Output.Transform) render_types.BufferTransform 
         .flipped_90 => .flipped_90,
         .flipped_180 => .flipped_180,
         .flipped_270 => .flipped_270,
-        else => unreachable,
+        else => null,
     };
 }
 
@@ -1330,7 +1330,7 @@ fn handleRequest(resource: *wl.Surface, request: wl.Surface.Request, self: *Self
         },
         .commit => commit(self),
         .set_buffer_transform => |set| {
-            if (!surface_geometry.validTransform(set.transform)) {
+            if (renderTransform(set.transform) == null) {
                 resource.postError(.invalid_transform, "invalid buffer transform");
                 return;
             }
@@ -1618,7 +1618,7 @@ fn cachePending(self: *Self, role_ready: bool) bool {
             _ = surface_geometry.calculate(
                 existing.buffer_size,
                 surface_state.pending_scale,
-                surface_state.pending_transform,
+                renderTransform(surface_state.pending_transform) orelse unreachable,
                 surface_state.pending_viewport,
                 surface_state.role == .cursor,
             ) catch |err| {
@@ -2516,7 +2516,7 @@ pub const BufferSnapshot = struct {
         const geometry = surface_geometry.calculate(
             buffer_size,
             scale,
-            transform,
+            renderTransform(transform) orelse unreachable,
             viewport,
             allow_non_divisible_scale,
         ) catch |err| return err;
@@ -2589,7 +2589,7 @@ pub const BufferSnapshot = struct {
         const geometry = try surface_geometry.calculate(
             buffer_size,
             scale,
-            transform,
+            renderTransform(transform) orelse unreachable,
             viewport,
             allow_non_divisible_scale,
         );
@@ -2624,7 +2624,7 @@ pub const BufferSnapshot = struct {
         const geometry = try surface_geometry.calculate(
             buffer_size,
             scale,
-            transform,
+            renderTransform(transform) orelse unreachable,
             viewport,
             allow_non_divisible_scale,
         );
@@ -2662,7 +2662,7 @@ pub const BufferSnapshot = struct {
         const geometry = try surface_geometry.calculate(
             self.buffer_size,
             scale,
-            transform,
+            renderTransform(transform) orelse unreachable,
             viewport,
             allow_non_divisible_scale,
         );
@@ -2826,6 +2826,45 @@ fn removeBufferReleaseCallback(
 
 extern fn wl_shm_buffer_ref(buffer: *wl.shm.Buffer) *wl.shm.Buffer;
 extern fn wl_shm_buffer_unref(buffer: *wl.shm.Buffer) void;
+
+test "mature protocol transforms map to renderer geometry exactly" {
+    const Case = struct {
+        protocol: wl.Output.Transform,
+        render: render_types.BufferTransform,
+        expected: render_types.Size,
+    };
+    const cases = [_]Case{
+        .{ .protocol = .normal, .render = .normal, .expected = .{ .width = 6, .height = 4 } },
+        .{ .protocol = .@"90", .render = .rotate_90, .expected = .{ .width = 4, .height = 6 } },
+        .{ .protocol = .@"180", .render = .rotate_180, .expected = .{ .width = 6, .height = 4 } },
+        .{ .protocol = .@"270", .render = .rotate_270, .expected = .{ .width = 4, .height = 6 } },
+        .{ .protocol = .flipped, .render = .flipped, .expected = .{ .width = 6, .height = 4 } },
+        .{ .protocol = .flipped_90, .render = .flipped_90, .expected = .{ .width = 4, .height = 6 } },
+        .{ .protocol = .flipped_180, .render = .flipped_180, .expected = .{ .width = 6, .height = 4 } },
+        .{ .protocol = .flipped_270, .render = .flipped_270, .expected = .{ .width = 4, .height = 6 } },
+    };
+    var snapshot: BufferSnapshot = .{
+        .buffer_size = .{ .width = 12, .height = 8 },
+        .logical_size = undefined,
+        .scale = undefined,
+        .transform = undefined,
+        .source = undefined,
+        .force_opaque = false,
+        .copied = null,
+        .source_cache = .{ .id = 1, .version = 1 },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(@as(?render_types.BufferTransform, case.render), renderTransform(case.protocol));
+        try snapshot.updateGeometry(2, case.protocol, .{}, false);
+        try std.testing.expectEqual(case.expected, snapshot.logical_size);
+        try std.testing.expectEqual(case.protocol, snapshot.transform);
+        try std.testing.expectEqual(@as(?render_types.SourceRect, null), snapshot.source);
+    }
+    try std.testing.expectEqual(
+        @as(?render_types.BufferTransform, null),
+        renderTransform(@enumFromInt(8)),
+    );
+}
 
 test "single pixel snapshots use viewporter destination without changing color" {
     var snapshot = try BufferSnapshot.copySinglePixel(
