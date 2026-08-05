@@ -8,7 +8,6 @@ const Seat = @import("seat.zig");
 const SelectionSource = @import("SelectionSource.zig");
 const Surface = @import("surface.zig");
 const MatureSerials = @import("mature_serials.zig");
-const ClientRegistry = @import("../ClientRegistry.zig");
 const SeatAuthority = @import("../SeatAuthority.zig");
 const slot_map = @import("../slot_map.zig");
 
@@ -101,7 +100,7 @@ const OfferState = struct {
     external_drag_source: ?*const ExternalDragSource = null,
     kind: Kind,
     drag_generation: u64 = 0,
-    enter_serial: ClientRegistry.Serial = .{ .domain = .mature_display, .value = 0 },
+    enter_serial: u32 = 0,
     active: bool = false,
     accepted: bool = false,
     destination_actions: wl.DataDeviceManager.DndAction = .{},
@@ -127,7 +126,7 @@ const DragState = struct {
     const Target = struct {
         surface_id: Surface.Id,
         client: *wl.Client,
-        enter_serial: ClientRegistry.Serial,
+        enter_serial: u32,
         x: f64,
         y: f64,
     };
@@ -967,7 +966,7 @@ fn updateDragTarget(self: *Self, focus: ?Seat.PointerFocus) void {
     const client = surface.getClient();
     if (drag.source == null and client != drag.source_client.?) return;
 
-    const serial = MatureSerials.issue(self.display);
+    const serial = MatureSerials.issueWire(self.display);
     self.drag.?.target = .{
         .surface_id = next.surface_id,
         .client = client,
@@ -1040,7 +1039,7 @@ fn sendCurrentDragToDevice(
         break :offer resource;
     } else null;
     device.resource.sendEnter(
-        target.enter_serial.value,
+        target.enter_serial,
         surface,
         fixed(target.x),
         fixed(target.y),
@@ -1127,7 +1126,7 @@ const OfferResource = struct {
         external_drag_source: ?*const ExternalDragSource,
         kind: OfferState.Kind,
         drag_generation: u64,
-        enter_serial: ClientRegistry.Serial,
+        enter_serial: u32,
     ) error{ OutOfMemory, ResourceCreateFailed }!*wl.DataOffer {
         const resource = try wl.DataOffer.create(client, version, 0);
         errdefer resource.destroy();
@@ -1220,7 +1219,7 @@ fn acceptOffer(
 ) void {
     const offer = self.offers.get(offer_id) orelse return;
     if (offer.kind != .drag or (!offer.active and !offer.dropped)) return;
-    if (offer.active and !std.meta.eql(MatureSerials.fromWire(serial), offer.enter_serial)) return;
+    if (offer.active and serial != offer.enter_serial) return;
     const source = offerDragSource(offer) orelse return;
     if (!self.dragSourceAvailable(source)) return;
     const accepted = if (mime_type) |value| self.dragSourceHasMime(source, value) else false;
@@ -1422,7 +1421,7 @@ fn keyboardFocusChanged(context: *anyopaque, client: ?*wl.Client) void {
 }
 
 fn setSelection(self: *Self, source_id: ?SourceId, order: SeatAuthority.Order) void {
-    if (order < self.selection_order) return;
+    if (self.selection != null and order < self.selection_order) return;
     const selection: ?Selection = if (source_id) |id| .{ .local = id } else null;
     if (std.meta.eql(self.selection, selection)) {
         self.selection_order = order;
@@ -1563,7 +1562,7 @@ fn sendSelectionToDevice(
         null,
         .selection,
         0,
-        MatureSerials.fromWire(0),
+        0,
     );
     device.resource.sendDataOffer(offer);
     for (self.selectionMimeTypes()) |mime_type| offer.sendOffer(mime_type.ptr);
@@ -1624,11 +1623,8 @@ pub fn sendSelection(self: *Self, mime_type: [*:0]const u8, fd: std.posix.fd_t) 
 /// `externalSourceDestroyed`.
 pub fn setExternalSelection(self: *Self, source: ?*const SelectionSource) void {
     const selection: ?Selection = if (source) |value| .{ .external = value } else null;
+    if (std.meta.eql(self.selection, selection)) return;
     const order = self.seat.nextSelectionOrder();
-    if (std.meta.eql(self.selection, selection)) {
-        self.selection_order = order;
-        return;
-    }
     self.replaceSelection(selection, order, true);
 }
 
@@ -1780,4 +1776,127 @@ test "drag action negotiation honors a common preference then bit order" {
 test "drag icon position applies committed surface offsets" {
     try std.testing.expectEqual(@as(i32, 15), dragIconCoordinate(12.75, 3));
     try std.testing.expectEqual(std.math.maxInt(i32), dragIconCoordinate(1.0e20, 4));
+}
+
+const TestSelectionSource = struct {
+    cancelled: usize = 0,
+
+    fn mimeTypes(_: *anyopaque) []const [:0]const u8 {
+        return &.{};
+    }
+
+    fn send(_: *anyopaque, _: [*:0]const u8, _: std.posix.fd_t) void {}
+
+    fn cancel(context: *anyopaque) void {
+        const self: *TestSelectionSource = @ptrCast(@alignCast(context));
+        self.cancelled += 1;
+    }
+
+    fn source(self: *TestSelectionSource) SelectionSource {
+        return .{
+            .context = self,
+            .mime_types = TestSelectionSource.mimeTypes,
+            .send = TestSelectionSource.send,
+            .cancel = TestSelectionSource.cancel,
+        };
+    }
+};
+
+test "older selection grant installs a used source after a newer clear" {
+    var seat: Seat = undefined;
+    var fixture: TestSelectionSource = .{};
+    const external = fixture.source();
+    var manager = testSelectionManager(&seat, .{ .external = &external }, 1);
+    const source_id = try manager.sources.insert(std.testing.allocator, .{
+        .resource = undefined,
+    });
+    defer {
+        var source = manager.sources.remove(source_id).?;
+        source.deinit(std.testing.allocator);
+        manager.sources.deinit(std.testing.allocator);
+    }
+
+    const older_order: SeatAuthority.Order = 2;
+    const newer_order: SeatAuthority.Order = 3;
+    manager.setSelection(null, newer_order);
+    try std.testing.expect(manager.selection == null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.cancelled);
+
+    // DeviceResource marks a validated source used before selection arbitration.
+    manager.sources.get(source_id).?.used = true;
+    manager.setSelection(source_id, older_order);
+
+    const expected: ?Selection = .{ .local = source_id };
+    try std.testing.expect(std.meta.eql(expected, manager.selection));
+    try std.testing.expect(manager.sources.get(source_id).?.used);
+    try std.testing.expectEqual(older_order, manager.selection_order);
+}
+
+test "unchanged external selection preserves a prior client grant" {
+    var seat: Seat = undefined;
+    seat.authority = SeatAuthority.init(std.testing.allocator, undefined, undefined);
+    defer seat.authority.deinit();
+    const external_order = seat.nextSelectionOrder();
+    const client_order = seat.nextSelectionOrder();
+
+    var fixture: TestSelectionSource = .{};
+    const external = fixture.source();
+    var manager = testSelectionManager(&seat, .{ .external = &external }, external_order);
+    const source_id = try manager.sources.insert(std.testing.allocator, .{
+        .resource = undefined,
+        .used = true,
+    });
+    defer {
+        var source = manager.sources.remove(source_id).?;
+        source.deinit(std.testing.allocator);
+        manager.sources.deinit(std.testing.allocator);
+    }
+
+    manager.setExternalSelection(&external);
+    try std.testing.expectEqual(external_order, manager.selection_order);
+    manager.setSelection(source_id, client_order);
+
+    const expected: ?Selection = .{ .local = source_id };
+    try std.testing.expect(std.meta.eql(expected, manager.selection));
+    try std.testing.expectEqual(client_order, manager.selection_order);
+    try std.testing.expectEqual(@as(usize, 1), fixture.cancelled);
+    try std.testing.expectEqual(client_order + 1, seat.nextSelectionOrder());
+}
+
+test "drag destination serial state remains protocol-local u32" {
+    try std.testing.expect(@FieldType(OfferState, "enter_serial") == u32);
+    try std.testing.expect(@FieldType(DragState.Target, "enter_serial") == u32);
+    const create_info = @typeInfo(@TypeOf(OfferResource.create)).@"fn";
+    try std.testing.expect(create_info.params[9].type.? == u32);
+}
+
+fn testSelectionManager(
+    seat: *Seat,
+    selection: ?Selection,
+    selection_order: SeatAuthority.Order,
+) Self {
+    return .{
+        .allocator = std.testing.allocator,
+        .global = undefined,
+        .display = undefined,
+        .seat = seat,
+        .surface_store = undefined,
+        .listener = undefined,
+        .sources = .{},
+        .source_adapters = .empty,
+        .devices = .{},
+        .device_adapters = .empty,
+        .offers = .{},
+        .offer_adapters = .empty,
+        .selection = selection,
+        .selection_order = selection_order,
+        .selection_generation = 0,
+        .selection_listeners = .empty,
+        .drag_selection_listeners = .empty,
+        .focused_client = null,
+        .drag = null,
+        .retained_external_drag = null,
+        .next_drag_generation = 0,
+        .drag_icon = null,
+    };
 }

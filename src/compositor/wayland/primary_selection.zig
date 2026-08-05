@@ -423,7 +423,7 @@ fn keyboardFocusChanged(context: *anyopaque, client: ?*wl.Client) void {
 }
 
 fn setSelection(self: *Self, source_id: ?SourceId, order: SeatAuthority.Order) void {
-    if (order < self.selection_order) return;
+    if (self.selection != null and order < self.selection_order) return;
     const selection: ?Selection = if (source_id) |id| .{ .local = id } else null;
     if (std.meta.eql(self.selection, selection)) {
         self.selection_order = order;
@@ -585,11 +585,8 @@ pub fn sendSelection(self: *Self, mime_type: [*:0]const u8, fd: std.posix.fd_t) 
 /// `externalSourceDestroyed`.
 pub fn setExternalSelection(self: *Self, source: ?*const SelectionSource) void {
     const selection: ?Selection = if (source) |value| .{ .external = value } else null;
+    if (std.meta.eql(self.selection, selection)) return;
     const order = self.seat.nextSelectionOrder();
-    if (std.meta.eql(self.selection, selection)) {
-        self.selection_order = order;
-        return;
-    }
     self.replaceSelection(selection, order, true);
 }
 
@@ -617,4 +614,105 @@ fn sourceHasMime(source: *const SourceState, mime_type: [*:0]const u8) bool {
         if (std.mem.eql(u8, offered, requested)) return true;
     }
     return false;
+}
+
+const TestSelectionSource = struct {
+    cancelled: usize = 0,
+
+    fn mimeTypes(_: *anyopaque) []const [:0]const u8 {
+        return &.{};
+    }
+
+    fn send(_: *anyopaque, _: [*:0]const u8, _: std.posix.fd_t) void {}
+
+    fn cancel(context: *anyopaque) void {
+        const self: *TestSelectionSource = @ptrCast(@alignCast(context));
+        self.cancelled += 1;
+    }
+
+    fn source(self: *TestSelectionSource) SelectionSource {
+        return .{
+            .context = self,
+            .mime_types = TestSelectionSource.mimeTypes,
+            .send = TestSelectionSource.send,
+            .cancel = TestSelectionSource.cancel,
+        };
+    }
+};
+
+test "older selection grant installs a primary source after a newer clear" {
+    var seat: Seat = undefined;
+    var fixture: TestSelectionSource = .{};
+    const external = fixture.source();
+    var manager = testSelectionManager(&seat, .{ .external = &external }, 1);
+    const source_id = try manager.sources.insert(std.testing.allocator, .{
+        .resource = undefined,
+    });
+    defer {
+        var source = manager.sources.remove(source_id).?;
+        source.deinit(std.testing.allocator);
+        manager.sources.deinit(std.testing.allocator);
+    }
+
+    const older_order: SeatAuthority.Order = 2;
+    const newer_order: SeatAuthority.Order = 3;
+    manager.setSelection(null, newer_order);
+    try std.testing.expect(manager.selection == null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.cancelled);
+    manager.setSelection(source_id, older_order);
+
+    const expected: ?Selection = .{ .local = source_id };
+    try std.testing.expect(std.meta.eql(expected, manager.selection));
+    try std.testing.expectEqual(older_order, manager.selection_order);
+}
+
+test "unchanged external primary selection preserves a prior client grant" {
+    var seat: Seat = undefined;
+    seat.authority = SeatAuthority.init(std.testing.allocator, undefined, undefined);
+    defer seat.authority.deinit();
+    const external_order = seat.nextSelectionOrder();
+    const client_order = seat.nextSelectionOrder();
+
+    var fixture: TestSelectionSource = .{};
+    const external = fixture.source();
+    var manager = testSelectionManager(&seat, .{ .external = &external }, external_order);
+    const source_id = try manager.sources.insert(std.testing.allocator, .{
+        .resource = undefined,
+    });
+    defer {
+        var source = manager.sources.remove(source_id).?;
+        source.deinit(std.testing.allocator);
+        manager.sources.deinit(std.testing.allocator);
+    }
+
+    manager.setExternalSelection(&external);
+    try std.testing.expectEqual(external_order, manager.selection_order);
+    manager.setSelection(source_id, client_order);
+
+    const expected: ?Selection = .{ .local = source_id };
+    try std.testing.expect(std.meta.eql(expected, manager.selection));
+    try std.testing.expectEqual(client_order, manager.selection_order);
+    try std.testing.expectEqual(@as(usize, 1), fixture.cancelled);
+    try std.testing.expectEqual(client_order + 1, seat.nextSelectionOrder());
+}
+
+fn testSelectionManager(
+    seat: *Seat,
+    selection: ?Selection,
+    selection_order: SeatAuthority.Order,
+) Self {
+    return .{
+        .allocator = std.testing.allocator,
+        .global = undefined,
+        .display = undefined,
+        .seat = seat,
+        .sources = .{},
+        .devices = .{},
+        .offers = .{},
+        .selection = selection,
+        .selection_order = selection_order,
+        .selection_generation = 0,
+        .selection_listeners = .empty,
+        .focused_client = null,
+    };
 }
