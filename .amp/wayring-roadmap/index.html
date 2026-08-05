@@ -97,7 +97,7 @@
   <header>
     <h1>Keywork → Wayring</h1>
     <p class="lede">Working roadmap for replacing the compositor's libwayland server path with scanner-generated Wayring, without weakening component boundaries.</p>
-    <p class="meta">Current migration implementation: <code>5c43a04e</code> on <code>wayring</code> · Updated 2026-08-05 · P3-A output delivery is integrated; P3-B1 now designs frontend-neutral client and serial-domain authority.</p>
+    <p class="meta">Current migration implementation: <code>5c43a04e</code> on <code>wayring</code> · Updated 2026-08-05 · P3-B1 authority design is approved; B1a implements generational clients, typed domains, disconnect cleanup, and selection ordering first.</p>
   </header>
 
   <section class="summary" aria-label="Migration summary">
@@ -149,7 +149,9 @@
     </div>
     <div class="wave"><span class="wave-label">Architecture inventory</span><div><h3>Remaining server protocol families</h3><p class="detail">Verified current globals, consumers, generated-contract readiness, ownership dependencies, session profiles, and explicit cutover criteria.</p></div><span class="status done">Complete</span></div>
     <div class="wave"><span class="wave-label">P3-A</span><div><h3>Output delivery split</h3><p class="detail">Canonical completed-frame membership now drives mature delivery and headless generated <code>wl_output</code> v4 enter/leave, with hotplug grace, same-client routing, and real-client acceptance.</p></div><span class="status done">Integrated</span></div>
-    <div class="wave"><span class="wave-label">P3-B1</span><div><h3>Input authority refactor</h3><p class="detail">Design and then implement frontend-neutral client identity and issuing-domain serial authorization while preserving mature seat behavior and all current globals.</p></div><span class="status active">Designing</span></div>
+    <div class="wave"><span class="wave-label">P3-B1 design</span><div><h3>Input authority model</h3><p class="detail">Approved generational compositor-client IDs, explicit mature/Wayring serial domains, weak authority grants, disconnect purging, monotonic selection ordering, and fail-before-u32-reuse policy.</p></div><span class="status done">Complete</span></div>
+    <div class="wave"><span class="wave-label">P3-B1a</span><div><h3>Identity, authority, and ordering</h3><p class="detail">Implement neutral client liveness, mature connection adaptation, seat grants and live presses, disconnect cleanup, and cross-domain-safe clipboard ordering without changing globals.</p></div><span class="status active">In progress</span></div>
+    <div class="wave"><span class="wave-label">P3-B1b</span><div><h3>Complete mature serial issuance</h3><p class="detail">Route every mature display serial through one checked transport adapter, prove no zero/reuse, and run the exhaustive behavior/global parity gate.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">P3-B2</span><div><h3>Wayring core seat</h3><p class="detail">Publish one generated seat with pointer, keyboard, touch, capability generations, keymap/repeat state, focus ordering, and cursor-surface role.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">P3-C</span><div><h3>Atomic XDG window roles</h3><p class="detail">Integrate wm-base, surface, toplevel, popup, and positioner into real window policy for the first meaningful scale-1 SHM runtime milestone.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">P3-D</span><div><h3>Scale and interaction ergonomics</h3><p class="detail">Viewporter plus fractional scale, decoration, cursor-shape with SHM fallback, and activation on shared output/seat/XDG owners.</p></div><span class="status proposed">Planned</span></div>
