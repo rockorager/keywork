@@ -4024,7 +4024,7 @@ fn repairGeneratedFocus(self: *Self) void {
         self.refreshKeyboardFocusReplacingGenerated();
         return;
     };
-    if (state.mapped_size == null) {
+    if (state.presentation_class != .background or state.mapped_size == null) {
         self.refreshKeyboardFocusReplacingGenerated();
         return;
     }
@@ -13685,6 +13685,73 @@ test "Wayring listener applies XDG presentation progression without detaching ma
         HeadlessSurfaceForest.Placement.root,
         server.headless_surface_forest.state(id).?.placement,
     );
+}
+
+test "hidden XDG presentation classes synchronously clear generated keyboard focus" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 2, .height = 1 } },
+    );
+    defer server.destroy();
+    var reserved_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff11_2233,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    var managed_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff44_5566,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const reserved = try server.surface_registry.add(reserved_provider.provider());
+    const managed = try server.surface_registry.add(managed_provider.provider());
+    try server.addHeadlessSurface(reserved, null);
+    try server.addHeadlessSurface(managed, null);
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{
+            .{ .id = reserved, .mapped_size = reserved_provider.logical_size, .callbacks_committed = false },
+            .{ .id = managed, .mapped_size = managed_provider.logical_size, .callbacks_committed = false },
+        },
+        .parents = &.{},
+    });
+    defer {
+        server.removeHeadlessSurface(managed);
+        server.surface_registry.remove(managed);
+        server.removeHeadlessSurface(reserved);
+        server.surface_registry.remove(reserved);
+    }
+
+    const generated_client = try server.client_registry.register(.wayring_server);
+    defer server.client_registry.unregister(generated_client);
+    var sink: TestGeneratedSeatSink = .{
+        .clients = &server.client_registry,
+        .client = generated_client,
+    };
+    server.setGeneratedSeatDeliverySink(sink.sink());
+    defer server.clearGeneratedSeatDeliverySink(&sink);
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.Unexpected;
+    defer _ = std.c.close(pipe_fds[1]);
+    server.seat.setKeymap(.xkb_v1, pipe_fds[0], 8);
+    server.seat.setKeyboardAvailable(true);
+    defer server.seat.setKeyboardAvailable(false);
+    const changed = server.wayringPresentationListener().?.presentation_class.?;
+
+    try std.testing.expect(server.focusGeneratedSurface(reserved));
+    changed(server, reserved, .xdg_reserved);
+    try std.testing.expect(server.seat.generatedKeyboardFocus() == null);
+    const after_reserved = sink.keyboard_event_count;
+    try server.seat.key(1, 30, .pressed);
+    try std.testing.expectEqual(after_reserved, sink.keyboard_event_count);
+
+    try std.testing.expect(server.focusGeneratedSurface(managed));
+    changed(server, managed, .managed);
+    try std.testing.expect(server.seat.generatedKeyboardFocus() == null);
+    const after_managed = sink.keyboard_event_count;
+    try server.seat.key(2, 31, .pressed);
+    try std.testing.expectEqual(after_managed, sink.keyboard_event_count);
 }
 
 test "Wayring presentation policy excludes DRM and nested sidecars" {
