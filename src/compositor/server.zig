@@ -12390,6 +12390,18 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
 }
 
 test "mature keyboard late bind reuses one logical enter serial and authority grant" {
+    const KeyboardFocusProbe = struct {
+        changes: usize = 0,
+        null_changes: usize = 0,
+        client: ?*wl.Client = null,
+
+        fn changed(context: *anyopaque, client: ?*wl.Client) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.changes += 1;
+            if (client == null) self.null_changes += 1;
+            self.client = client;
+        }
+    };
     const server = try Self.createWithVirtualOutput(
         std.testing.allocator,
         std.testing.io,
@@ -12416,6 +12428,12 @@ test "mature keyboard late bind reuses one logical enter serial and authority gr
     );
     const mature_client = wl.Client.create(server.display, sockets[0]) orelse return error.OutOfMemory;
     const client_id = server.mature_clients.id(mature_client) orelse return error.TestUnexpectedResult;
+    var focus_probe: KeyboardFocusProbe = .{};
+    try server.seat.addKeyboardFocusListener(.{
+        .context = &focus_probe,
+        .changed = KeyboardFocusProbe.changed,
+    });
+    defer server.seat.removeKeyboardFocusListener(&focus_probe);
     const raw_command_fd = std.os.linux.eventfd(0, std.os.linux.EFD.CLOEXEC);
     if (std.os.linux.errno(raw_command_fd) != .SUCCESS) return error.EventFdFailed;
     const command_fd: std.posix.fd_t = @intCast(raw_command_fd);
@@ -12506,6 +12524,7 @@ test "mature keyboard late bind reuses one logical enter serial and authority gr
         grab_serial,
         server.seat.authority.latestKeyboardEnterSerial(client_id).?,
     );
+    try std.testing.expectEqual(mature_client, server.seat.keyboardFocusedClient().?);
 
     var generated_provider: SyntheticSurfaceProvider = .{
         .pixel = 0xff12_3456,
@@ -12523,6 +12542,7 @@ test "mature keyboard late bind reuses one logical enter serial and authority gr
         grab_serial,
         server.seat.authority.latestKeyboardEnterSerial(client_id).?,
     );
+    try std.testing.expectEqual(mature_client, server.seat.keyboardFocusedClient().?);
     const retiring_generated = try server.client_registry.register(.wayring_server);
     try std.testing.expect(server.seat.applyGeneratedKeyboardFocus(.{
         .surface = generated_surface,
@@ -12533,6 +12553,7 @@ test "mature keyboard late bind reuses one logical enter serial and authority gr
         grab_serial,
         server.seat.authority.latestKeyboardEnterSerial(client_id).?,
     );
+    try std.testing.expectEqual(mature_client, server.seat.keyboardFocusedClient().?);
     server.client_registry.unregister(retiring_generated);
 
     try signalWayringCommand(command_fd);
@@ -12547,8 +12568,16 @@ test "mature keyboard late bind reuses one logical enter serial and authority gr
         grab_serial,
         server.seat.authority.latestKeyboardEnterSerial(client_id).?,
     );
-    server.seat.clearKeyboardGrab(&grab_probe, false);
-    try std.testing.expect(server.seat.authority.latestKeyboardEnterSerial(client_id) == null);
+    _ = server.seat.applyMatureKeyboardFocus(surface);
+    server.seat.clearKeyboardGrab(&grab_probe, true);
+    try std.testing.expectEqual(surface, server.seat.matureKeyboardFocus().?);
+    try std.testing.expectEqual(mature_client, server.seat.keyboardFocusedClient().?);
+    const disconnect_serial = server.seat.authority.latestKeyboardEnterSerial(client_id) orelse
+        return error.MatureKeyboardDisconnectGrantMissing;
+    try std.testing.expect(disconnect_serial.value != grab_serial.value);
+    try std.testing.expectEqual(mature_client, focus_probe.client.?);
+    const focus_changes_before_disconnect = focus_probe.changes;
+    const null_changes_before_disconnect = focus_probe.null_changes;
 
     try signalWayringCommand(command_fd);
     try waitForMatureKeyboardStage(server, &client, .disconnected);
@@ -12560,6 +12589,9 @@ test "mature keyboard late bind reuses one logical enter serial and authority gr
     } else return error.MatureKeyboardClientTimedOut;
     try std.testing.expect(server.seat.matureKeyboardFocus() == null);
     try std.testing.expect(server.seat.authority.latestKeyboardEnterSerial(client_id) == null);
+    try std.testing.expect(focus_probe.changes > focus_changes_before_disconnect);
+    try std.testing.expect(focus_probe.null_changes > null_changes_before_disconnect);
+    try std.testing.expect(focus_probe.client == null);
     try std.testing.expectEqual(@as(usize, 0), server.compositor.surfaceStore().len());
 }
 

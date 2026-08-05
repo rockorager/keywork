@@ -871,11 +871,13 @@ fn recordPointerEnter(self: *Self, client: *wl.Client, serial: ClientRegistry.Se
 fn clientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
     std.debug.assert(!self.clients.contains(client));
+    var mature_keyboard_focus_invalidated = false;
     if (self.authority.clientDisconnected(client)) self.pointer_grab = null;
     if (self.mature_keyboard_focus_client) |focused_client| {
         if (std.meta.eql(focused_client, client)) {
             self.focus = null;
             self.mature_keyboard_focus_client = null;
+            mature_keyboard_focus_invalidated = true;
         }
     }
     if (self.generated_keyboard_focus) |focus| {
@@ -907,6 +909,7 @@ fn clientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
         if (std.meta.eql(target.client, client)) point.target = null;
     }
     if (clear_active_shape) self.clearCursor();
+    if (mature_keyboard_focus_invalidated) self.notifyKeyboardFocus();
 }
 
 pub fn pointerFocusedSurface(self: *const Self) ?Surface.Id {
