@@ -97,12 +97,12 @@
   <header>
     <h1>Keywork → Wayring</h1>
     <p class="lede">Working roadmap for replacing the compositor's libwayland server path with scanner-generated Wayring, without weakening component boundaries.</p>
-    <p class="meta">Current migration implementation: <code>6d74b805</code> on <code>wayring</code> · Updated 2026-08-05 · Core surface staircase complete through v6; Wave 4 decomposed and not yet advertised.</p>
+    <p class="meta">Current migration implementation: <code>489e6d9a</code> on <code>wayring</code> · Updated 2026-08-05 · Neutral compound topology integrated; subsurface protocol remains unadvertised.</p>
   </header>
 
   <section class="summary" aria-label="Migration summary">
     <div class="metric"><strong>2</strong><span>active phase</span></div>
-    <div class="metric"><strong>12</strong><span>Phase 2 waves integrated</span></div>
+    <div class="metric"><strong>13</strong><span>Phase 2 waves integrated</span></div>
     <div class="metric"><strong>PASS</strong><span>honest v1 gate</span></div>
     <div class="metric"><strong>Debug</strong><span>validation profile</span></div>
   </section>
@@ -119,7 +119,7 @@
   </section>
 
   <section class="phase">
-    <div class="bar"><span style="width:75%"></span></div>
+    <div class="bar"><span style="width:81%"></span></div>
     <div class="phase-head">
       <div><h2>Phase 2 — Honest core surfaces and subsurfaces</h2><p class="detail">Complete core compositor semantics, then add synchronized topology without migrating mature subsurfaces.</p></div>
       <span class="status active">In progress</span>
@@ -134,8 +134,8 @@
     <div class="wave"><span class="wave-label">Wave 3C</span><div><h3>Buffer damage v4</h3><p class="detail">Explicit damage_buffer handling preserves coordinate domains and conservatively relies on full-copy/full-bounds publication.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">Wave 3D</span><div><h3>Surface offset v5</h3><p class="detail">Double-buffered offset metadata, exact legacy/v5 attach semantics, terminal-failure ownership, real-client coverage, and honest v5 advertisement.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">Wave 3E</span><div><h3>Fixed default preferences v6</h3><p class="detail">Ordered initial preferred scale 1 and normal-transform events, negotiated-version isolation, enqueue-failure teardown, and real-client proof. v7 explicit release remains deferred.</p></div><span class="status done">Integrated</span></div>
-    <div class="wave"><span class="wave-label">Wave 4A</span><div><h3>Neutral applied topology</h3><p class="detail">In progress: canonical compound trees, allocation-free applied batches, iterative render traversal, conservative damage, and exact per-node completion. No new protocol global.</p></div><span class="status active">In progress</span></div>
-    <div class="wave"><span class="wave-label">Wave 4B</span><div><h3>Wayland 1.26 Content Update engine</h3><p class="detail">Exact queued SCU/DCU dependencies, child-tail claims, projected state, callback association, rollback, and atomic closure publication while root behavior stays immediate.</p></div><span class="status proposed">Planned</span></div>
+    <div class="wave"><span class="wave-label">Wave 4A</span><div><h3>Neutral applied topology</h3><p class="detail">Canonical compound trees, allocation-free applied batches, iterative render traversal, conservative old/new damage, and exact per-node sampled completion. No new protocol global.</p></div><span class="status done">Integrated</span></div>
+    <div class="wave"><span class="wave-label">Wave 4B</span><div><h3>Wayland 1.26 Content Update engine</h3><p class="detail">In progress: exact queued SCU/DCU dependencies, child-tail claims, projected state, callback association, rollback, and atomic closure publication while root behavior stays immediate.</p></div><span class="status active">In progress</span></div>
     <div class="wave"><span class="wave-label">Wave 4C</span><div><h3>Generated subsurface adapter semantics</h3><p class="detail">Complete roles, resources, synchronization, positioning, stacking, validation, destruction, and direct scanner fault coverage without production advertisement.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">Wave 4D</span><div><h3>Real-client acceptance and v1 advertisement</h3><p class="detail">Nested libwayland E2E and final <code>wl_subcompositor</code> v1 global publication. Canonical <code>WAYLAND_DISPLAY</code> remains mature libwayland.</p></div><span class="status proposed">Planned</span></div>
   </section>
