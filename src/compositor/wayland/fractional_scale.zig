@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const render = @import("../render/types.zig");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const OutputLayout = @import("output_layout.zig");
 const Surface = @import("surface.zig");
 
@@ -229,9 +230,11 @@ test "hidden surface has no replacement preferred scale" {
 
     var surfaces: Surface.Store = .{};
     defer surfaces.deinit(std.testing.allocator);
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
 
     var outputs: OutputLayout = undefined;
-    outputs.init(std.testing.allocator, display, &surfaces);
+    outputs.init(std.testing.allocator, display, &surface_registry, &surfaces);
     defer outputs.deinit();
 
     const output_id = try outputs.add(.{

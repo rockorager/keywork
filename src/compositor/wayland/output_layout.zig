@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const slot_map = @import("../slot_map.zig");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const Output = @import("output.zig");
 const Surface = @import("surface.zig");
 
@@ -12,13 +13,24 @@ const wl = wayland.server.wl;
 
 allocator: std.mem.Allocator,
 display: *wl.Server,
+surface_registry: *SurfaceRegistry,
 surfaces: *Surface.Store,
 outputs: Store,
+listener: ?Listener,
+notifying_listener: bool,
 
 const Store = slot_map.SlotMap(*Output, enum { output });
 pub const Id = Store.Id;
 
 pub const Config = Output.Config;
+
+/// Resource-free hotplug seam. Callbacks may inspect the announced output by
+/// ID but must not mutate this layout while notification is active.
+pub const Listener = struct {
+    context: *anyopaque,
+    added: *const fn (*anyopaque, Id) error{OutOfMemory}!void,
+    removing: *const fn (*anyopaque, Id) void,
+};
 
 pub const Entry = struct {
     id: Id,
@@ -38,23 +50,30 @@ pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
     display: *wl.Server,
+    surface_registry: *SurfaceRegistry,
     surfaces: *Surface.Store,
 ) void {
     self.* = .{
         .allocator = allocator,
         .display = display,
+        .surface_registry = surface_registry,
         .surfaces = surfaces,
         .outputs = .{},
+        .listener = null,
+        .notifying_listener = false,
     };
 }
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.outputs.len() == 0);
+    std.debug.assert(self.listener == null);
+    std.debug.assert(!self.notifying_listener);
     self.outputs.deinit(self.allocator);
     self.* = undefined;
 }
 
 pub fn add(self: *Self, config: Config) !Id {
+    std.debug.assert(!self.notifying_listener);
     var outputs = self.iterator();
     while (outputs.next()) |entry| {
         if (std.mem.eql(u8, entry.output.name(), config.name)) return error.DuplicateName;
@@ -66,14 +85,33 @@ pub fn add(self: *Self, config: Config) !Id {
         self.allocator,
         self.display,
         config,
+        self.surface_registry,
         self.surfaces,
     );
-    errdefer output.deinit();
-    return self.outputs.insert(self.allocator, output);
+    errdefer {
+        output.retire();
+        output.deinit();
+    }
+    const id = try self.outputs.insert(self.allocator, output);
+    errdefer std.debug.assert(self.outputs.remove(id) != null);
+    if (self.listener) |listener| {
+        self.notifying_listener = true;
+        defer self.notifying_listener = false;
+        try listener.added(listener.context, id);
+    }
+    return id;
 }
 
 pub fn remove(self: *Self, id: Id) bool {
-    const output = self.outputs.remove(id) orelse return false;
+    std.debug.assert(!self.notifying_listener);
+    const output = (self.outputs.get(id) orelse return false).*;
+    if (self.listener) |listener| {
+        self.notifying_listener = true;
+        listener.removing(listener.context, id);
+        self.notifying_listener = false;
+    }
+    const removed = self.outputs.remove(id) orelse unreachable;
+    std.debug.assert(removed == output);
     output.retire();
     output.deinit();
     self.allocator.destroy(output);
@@ -115,6 +153,18 @@ pub fn iterator(self: *Self) Iterator {
     return .{ .inner = self.outputs.iterator() };
 }
 
+pub fn setListener(self: *Self, listener: Listener) void {
+    std.debug.assert(self.listener == null);
+    std.debug.assert(!self.notifying_listener);
+    self.listener = listener;
+}
+
+pub fn clearListener(self: *Self) void {
+    std.debug.assert(self.listener != null);
+    std.debug.assert(!self.notifying_listener);
+    self.listener = null;
+}
+
 test "output handles are stable across additions and stale after removal" {
     const display = try wl.Server.create();
     defer display.destroy();
@@ -122,8 +172,11 @@ test "output handles are stable across additions and stale after removal" {
     var surfaces: Surface.Store = .{};
     defer surfaces.deinit(std.testing.allocator);
 
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+
     var layout: Self = undefined;
-    layout.init(std.testing.allocator, display, &surfaces);
+    layout.init(std.testing.allocator, display, &surface_registry, &surfaces);
     defer layout.deinit();
 
     const first = try layout.add(.{
@@ -168,4 +221,88 @@ test "output handles are stable across additions and stale after removal" {
     try std.testing.expect(layout.remove(first));
     try std.testing.expectEqual(@as(?*Output, null), layout.get(first));
     try std.testing.expect(layout.remove(second));
+}
+
+test "listener observes live hotplug IDs rolls back failure and detaches cleanly" {
+    const Probe = struct {
+        layout: *Self,
+        added_ids: [3]Id = undefined,
+        added_count: usize = 0,
+        removing_ids: [2]Id = undefined,
+        removing_count: usize = 0,
+        fail_added: bool = true,
+
+        fn added(context: *anyopaque, id: Id) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(self.layout.get(id) != null);
+            self.added_ids[self.added_count] = id;
+            self.added_count += 1;
+            if (self.fail_added) return error.OutOfMemory;
+        }
+
+        fn removing(context: *anyopaque, id: Id) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(self.layout.get(id) != null);
+            self.removing_ids[self.removing_count] = id;
+            self.removing_count += 1;
+        }
+    };
+
+    const display = try wl.Server.create();
+    defer display.destroy();
+    var surfaces: Surface.Store = .{};
+    defer surfaces.deinit(std.testing.allocator);
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var layout: Self = undefined;
+    layout.init(std.testing.allocator, display, &surface_registry, &surfaces);
+    defer layout.deinit();
+    var probe: Probe = .{ .layout = &layout };
+    layout.setListener(.{
+        .context = &probe,
+        .added = Probe.added,
+        .removing = Probe.removing,
+    });
+    var listener_live = true;
+    defer if (listener_live) layout.clearListener();
+
+    try std.testing.expectError(error.OutOfMemory, layout.add(.{
+        .size = .{ .width = 640, .height = 480 },
+        .physical_size = .{ .width = 320, .height = 240 },
+        .scale = 1,
+        .name = "FAILED",
+        .description = "failed output",
+        .model = "headless",
+    }));
+    try std.testing.expectEqual(@as(usize, 1), probe.added_count);
+    try std.testing.expect(layout.get(probe.added_ids[0]) == null);
+
+    probe.fail_added = false;
+    const live = try layout.add(.{
+        .size = .{ .width = 640, .height = 480 },
+        .physical_size = .{ .width = 320, .height = 240 },
+        .scale = 1,
+        .name = "LIVE",
+        .description = "live output",
+        .model = "headless",
+    });
+    try std.testing.expectEqual(@as(usize, 2), probe.added_count);
+    try std.testing.expectEqual(live, probe.added_ids[1]);
+    try std.testing.expect(layout.remove(live));
+    try std.testing.expectEqual(@as(usize, 1), probe.removing_count);
+    try std.testing.expectEqual(live, probe.removing_ids[0]);
+
+    const detached = try layout.add(.{
+        .size = .{ .width = 800, .height = 600 },
+        .physical_size = .{ .width = 400, .height = 300 },
+        .scale = 1,
+        .name = "DETACHED",
+        .description = "detached listener output",
+        .model = "headless",
+    });
+    try std.testing.expectEqual(@as(usize, 3), probe.added_count);
+    layout.clearListener();
+    listener_live = false;
+    try std.testing.expect(layout.remove(detached));
+    try std.testing.expectEqual(@as(usize, 1), probe.removing_count);
 }

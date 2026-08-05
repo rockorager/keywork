@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const Output = @import("output.zig");
 const OutputLayout = @import("output_layout.zig");
 const Surface = @import("surface.zig");
@@ -181,8 +182,10 @@ test "removing an output leaves xdg-output resources alive and inert" {
 
     var surfaces: Surface.Store = .{};
     defer surfaces.deinit(std.testing.allocator);
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
     var outputs: OutputLayout = undefined;
-    outputs.init(std.testing.allocator, display, &surfaces);
+    outputs.init(std.testing.allocator, display, &surface_registry, &surfaces);
     defer outputs.deinit();
 
     var output: Output = undefined;
@@ -197,6 +200,7 @@ test "removing an output leaves xdg-output resources alive and inert" {
             .description = "Keywork headless output",
             .model = "headless",
         },
+        &surface_registry,
         &surfaces,
     );
     defer output.deinit();

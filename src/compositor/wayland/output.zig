@@ -6,6 +6,7 @@ const std = @import("std");
 const wayland = @import("wayland");
 const presentation = @import("../presentation.zig");
 const render = @import("../render/types.zig");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const Surface = @import("surface.zig");
 
 const wl = wayland.server.wl;
@@ -27,10 +28,13 @@ description_value: [:0]u8,
 make: [:0]u8,
 model: [:0]u8,
 resources: std.ArrayList(*wl.Output),
+surface_registry: *SurfaceRegistry,
 surfaces: *Surface.Store,
 memberships: std.ArrayList(Membership),
 frame_active: bool,
 bind_listener: ?BindListener,
+delivery_listener: ?DeliveryListener,
+notifying_delivery: bool,
 
 pub const Position = struct {
     x: i32 = 0,
@@ -68,9 +72,56 @@ pub const BindListener = struct {
     bound: *const fn (*anyopaque, *Self, *wl.Output) void,
 };
 
+/// Resource-free output state borrowed only for a synchronous delivery
+/// callback. String slices remain owned by Output.
+pub const Snapshot = struct {
+    position: Position,
+    size: render.Size,
+    mode_size: render.Size,
+    physical_size: render.Size,
+    mode_preferred: bool,
+    scale: i32,
+    preferred_scale: render.Scale,
+    color_description: render.ColorDescription,
+    color_identity: u64,
+    refresh_millihertz: i32,
+    name: []const u8,
+    description: []const u8,
+    make: []const u8,
+    model: []const u8,
+};
+
+pub const Changes = packed struct {
+    geometry: bool = false,
+    mode: bool = false,
+    scale: bool = false,
+};
+
+/// Synchronous frontend fanout seam. Callbacks receive canonical surface IDs
+/// and immutable output state, never Wayland resources. They must not reenter
+/// output configuration or membership mutation.
+pub const DeliveryListener = struct {
+    context: *anyopaque,
+    configured: *const fn (*anyopaque, Snapshot, Changes) void,
+    entered: *const fn (*anyopaque, SurfaceRegistry.Id) void,
+    left: *const fn (*anyopaque, SurfaceRegistry.Id) void,
+};
+
 const Membership = struct {
-    surface_id: Surface.Id,
+    surface_id: SurfaceRegistry.Id,
     visible: bool,
+    announced: bool,
+};
+
+pub const MembershipIterator = struct {
+    memberships: []const Membership,
+    index: usize = 0,
+
+    pub fn next(self: *MembershipIterator) ?SurfaceRegistry.Id {
+        if (self.index >= self.memberships.len) return null;
+        defer self.index += 1;
+        return self.memberships[self.index].surface_id;
+    }
 };
 
 pub const Error = error{
@@ -84,6 +135,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     display: *wl.Server,
     config: Config,
+    surface_registry: *SurfaceRegistry,
     surfaces: *Surface.Store,
 ) Error!void {
     const mode_size = config.mode_size orelse config.size;
@@ -126,16 +178,21 @@ pub fn init(
         .make = make,
         .model = model,
         .resources = .empty,
+        .surface_registry = surface_registry,
         .surfaces = surfaces,
         .memberships = .empty,
         .frame_active = false,
         .bind_listener = null,
+        .delivery_listener = null,
+        .notifying_delivery = false,
     };
 }
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(!self.frame_active);
     std.debug.assert(self.bind_listener == null);
+    std.debug.assert(self.delivery_listener == null);
+    std.debug.assert(!self.notifying_delivery);
     while (self.resources.items.len > 0) self.resources.items[0].destroy();
     self.global.destroy();
     self.resources.deinit(self.allocator);
@@ -174,6 +231,25 @@ pub fn logicalPosition(self: *const Self) Position {
     return self.position;
 }
 
+pub fn snapshot(self: *const Self) Snapshot {
+    return .{
+        .position = self.position,
+        .size = self.size,
+        .mode_size = self.mode_size,
+        .physical_size = self.physical_size,
+        .mode_preferred = self.mode_preferred,
+        .scale = self.scale,
+        .preferred_scale = self.preferred_scale,
+        .color_description = self.color_description,
+        .color_identity = self.color_identity,
+        .refresh_millihertz = self.refresh_millihertz,
+        .name = self.name_value,
+        .description = self.description_value,
+        .make = self.make,
+        .model = self.model,
+    };
+}
+
 /// Replaces output geometry and mode state and advertises changed properties.
 /// The caller must finish related extension updates with sendDone().
 pub fn configure(
@@ -186,6 +262,7 @@ pub fn configure(
     scale: u32,
     preferred_scale: render.Scale,
 ) bool {
+    std.debug.assert(!self.notifying_delivery);
     std.debug.assert(logicalGeometryValid(position, size));
     std.debug.assert(mode_size.width > 0 and mode_size.height > 0);
     std.debug.assert(scale > 0 and scale <= std.math.maxInt(i32));
@@ -210,6 +287,11 @@ pub fn configure(
             resource.sendScale(self.scale);
         }
     }
+    self.notifyConfigured(.{
+        .geometry = position_changed,
+        .mode = mode_changed,
+        .scale = client_scale_changed,
+    });
     return mode_changed;
 }
 
@@ -284,7 +366,22 @@ pub fn clearBindListener(self: *Self) void {
     self.bind_listener = null;
 }
 
+/// Installs one resource-free frontend delivery listener. The listener must be
+/// cleared before Output retirement or deinitialization.
+pub fn setDeliveryListener(self: *Self, listener: DeliveryListener) void {
+    std.debug.assert(self.delivery_listener == null);
+    std.debug.assert(!self.notifying_delivery);
+    self.delivery_listener = listener;
+}
+
+pub fn clearDeliveryListener(self: *Self) void {
+    std.debug.assert(self.delivery_listener != null);
+    std.debug.assert(!self.notifying_delivery);
+    self.delivery_listener = null;
+}
+
 pub fn setRefresh(self: *Self, info: presentation.Info) void {
+    std.debug.assert(!self.notifying_delivery);
     const refresh_millihertz: i32 = @intCast(@min(
         info.refreshMillihertz(),
         std.math.maxInt(i32),
@@ -295,60 +392,94 @@ pub fn setRefresh(self: *Self, info: presentation.Info) void {
         self.sendMode(resource);
         if (resource.getVersion() >= wl.Output.done_since_version) resource.sendDone();
     }
+    self.notifyConfigured(.{ .mode = true });
 }
 
 pub fn beginFrame(self: *Self) void {
+    std.debug.assert(!self.notifying_delivery);
     std.debug.assert(!self.frame_active);
     for (self.memberships.items) |*membership| membership.visible = false;
     self.frame_active = true;
 }
 
-pub fn markSurfaceVisible(self: *Self, surface_id: Surface.Id) error{OutOfMemory}!void {
+pub fn markSurfaceVisible(self: *Self, surface_id: SurfaceRegistry.Id) error{OutOfMemory}!void {
+    std.debug.assert(!self.notifying_delivery);
     std.debug.assert(self.frame_active);
+    std.debug.assert(self.surface_registry.contains(surface_id));
     for (self.memberships.items) |*membership| {
         if (!std.meta.eql(membership.surface_id, surface_id)) continue;
         membership.visible = true;
         return;
     }
 
-    const surface = Surface.resourceFor(self.surfaces, surface_id) orelse return;
     try self.memberships.append(self.allocator, .{
         .surface_id = surface_id,
         .visible = true,
+        .announced = false,
     });
-    for (self.resources.items) |resource| {
-        if (resource.getClient() == surface.getClient()) surface.sendEnter(resource);
-    }
 }
 
 pub fn endFrame(self: *Self) void {
+    std.debug.assert(!self.notifying_delivery);
     std.debug.assert(self.frame_active);
     var index = self.memberships.items.len;
     while (index > 0) {
         index -= 1;
-        const membership = self.memberships.items[index];
-        if (membership.visible) continue;
-        if (Surface.resourceFor(self.surfaces, membership.surface_id)) |surface| {
-            for (self.resources.items) |resource| {
-                if (resource.getClient() == surface.getClient()) surface.sendLeave(resource);
+        const membership = &self.memberships.items[index];
+        if (membership.visible and self.surface_registry.contains(membership.surface_id)) {
+            if (!membership.announced) {
+                if (Surface.resourceFor(self.surfaces, membership.surface_id)) |surface| {
+                    for (self.resources.items) |resource| {
+                        if (resource.getClient() == surface.getClient()) surface.sendEnter(resource);
+                    }
+                }
+                self.notifyMembership(membership.surface_id, true);
+                membership.announced = true;
             }
+            continue;
+        }
+        if (membership.announced) {
+            if (Surface.resourceFor(self.surfaces, membership.surface_id)) |surface| {
+                for (self.resources.items) |resource| {
+                    if (resource.getClient() == surface.getClient()) surface.sendLeave(resource);
+                }
+            }
+            self.notifyMembership(membership.surface_id, false);
         }
         _ = self.memberships.orderedRemove(index);
     }
     self.frame_active = false;
+    for (self.memberships.items, 0..) |membership, membership_index| {
+        std.debug.assert(membership.announced);
+        std.debug.assert(self.surface_registry.contains(membership.surface_id));
+        for (self.memberships.items[membership_index + 1 ..]) |candidate|
+            std.debug.assert(!std.meta.eql(membership.surface_id, candidate.surface_id));
+    }
 }
 
 pub fn cancelFrame(self: *Self) void {
+    std.debug.assert(!self.notifying_delivery);
     std.debug.assert(self.frame_active);
-    for (self.memberships.items) |*membership| membership.visible = true;
+    var index = self.memberships.items.len;
+    while (index > 0) {
+        index -= 1;
+        if (!self.memberships.items[index].announced) {
+            _ = self.memberships.orderedRemove(index);
+        } else self.memberships.items[index].visible = true;
+    }
     self.frame_active = false;
 }
 
-pub fn containsSurface(self: *const Self, surface_id: Surface.Id) bool {
+pub fn containsSurface(self: *const Self, surface_id: SurfaceRegistry.Id) bool {
     for (self.memberships.items) |membership| {
         if (std.meta.eql(membership.surface_id, surface_id)) return true;
     }
     return false;
+}
+
+pub fn membershipIterator(self: *const Self) MembershipIterator {
+    std.debug.assert(!self.frame_active);
+    return .{ .memberships = self.memberships.items };
 }
 
 pub fn hasCallbackOnlyFrameCallbacks(self: *const Self) bool {
@@ -421,6 +552,22 @@ fn sendMode(self: *const Self, resource: *wl.Output) void {
     );
 }
 
+fn notifyConfigured(self: *Self, changes: Changes) void {
+    const listener = self.delivery_listener orelse return;
+    std.debug.assert(!self.notifying_delivery);
+    self.notifying_delivery = true;
+    defer self.notifying_delivery = false;
+    listener.configured(listener.context, self.snapshot(), changes);
+}
+
+fn notifyMembership(self: *Self, surface_id: SurfaceRegistry.Id, entered: bool) void {
+    const listener = self.delivery_listener orelse return;
+    std.debug.assert(!self.notifying_delivery);
+    self.notifying_delivery = true;
+    defer self.notifying_delivery = false;
+    if (entered) listener.entered(listener.context, surface_id) else listener.left(listener.context, surface_id);
+}
+
 fn handleRequest(resource: *wl.Output, request: wl.Output.Request, _: *Self) void {
     switch (request) {
         .release => resource.destroy(),
@@ -477,6 +624,8 @@ test "retiring an output leaves client-owned resources alive" {
 
     var surfaces: Surface.Store = .{};
     defer surfaces.deinit(std.testing.allocator);
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
 
     var output: Self = undefined;
     try output.init(
@@ -490,6 +639,7 @@ test "retiring an output leaves client-owned resources alive" {
             .description = "Keywork headless output",
             .model = "headless",
         },
+        &surface_registry,
         &surfaces,
     );
     defer output.deinit();
@@ -512,6 +662,8 @@ test "frame membership removes surfaces which are no longer visible" {
 
     var surfaces: Surface.Store = .{};
     defer surfaces.deinit(std.testing.allocator);
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
 
     var output: Self = undefined;
     try output.init(
@@ -525,6 +677,7 @@ test "frame membership removes surfaces which are no longer visible" {
             .description = "Keywork headless output",
             .model = "headless",
         },
+        &surface_registry,
         &surfaces,
     );
     defer output.deinit();
@@ -532,6 +685,7 @@ test "frame membership removes surfaces which are no longer visible" {
     try output.memberships.append(std.testing.allocator, .{
         .surface_id = .{ .index = 0, .generation = 1 },
         .visible = true,
+        .announced = true,
     });
     output.beginFrame();
     output.endFrame();
@@ -544,6 +698,8 @@ test "cancelled frame preserves existing membership" {
 
     var surfaces: Surface.Store = .{};
     defer surfaces.deinit(std.testing.allocator);
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
 
     var output: Self = undefined;
     try output.init(
@@ -557,6 +713,7 @@ test "cancelled frame preserves existing membership" {
             .description = "Keywork headless output",
             .model = "headless",
         },
+        &surface_registry,
         &surfaces,
     );
     defer output.deinit();
@@ -564,9 +721,143 @@ test "cancelled frame preserves existing membership" {
     try output.memberships.append(std.testing.allocator, .{
         .surface_id = .{ .index = 0, .generation = 1 },
         .visible = true,
+        .announced = true,
     });
     output.beginFrame();
     output.cancelFrame();
     try std.testing.expectEqual(@as(usize, 1), output.memberships.items.len);
     try std.testing.expect(output.memberships.items[0].visible);
+}
+
+test "canonical membership and delivery are independent of mature resources" {
+    const Provider = struct {
+        fn renderState(_: *anyopaque) ?SurfaceRegistry.RenderState {
+            return null;
+        }
+    };
+    const Probe = struct {
+        entered_ids: [4]SurfaceRegistry.Id = undefined,
+        entered_count: usize = 0,
+        left_ids: [4]SurfaceRegistry.Id = undefined,
+        left_count: usize = 0,
+        changes: [4]Changes = undefined,
+        change_count: usize = 0,
+
+        fn configured(context: *anyopaque, _: Snapshot, changes: Changes) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.changes[self.change_count] = changes;
+            self.change_count += 1;
+        }
+
+        fn entered(context: *anyopaque, id: SurfaceRegistry.Id) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.entered_ids[self.entered_count] = id;
+            self.entered_count += 1;
+        }
+
+        fn left(context: *anyopaque, id: SurfaceRegistry.Id) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.left_ids[self.left_count] = id;
+            self.left_count += 1;
+        }
+    };
+
+    const display = try wl.Server.create();
+    defer display.destroy();
+    var surfaces: Surface.Store = .{};
+    defer surfaces.deinit(std.testing.allocator);
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var provider_context: u8 = 0;
+    const first = try surface_registry.add(.{
+        .context = &provider_context,
+        .render_state = Provider.renderState,
+    });
+
+    var output: Self = undefined;
+    try output.init(
+        std.testing.allocator,
+        display,
+        .{
+            .size = .{ .width = 1280, .height = 720 },
+            .physical_size = .{ .width = 600, .height = 340 },
+            .scale = 1,
+            .name = "HEADLESS-1",
+            .description = "Keywork headless output",
+            .model = "headless",
+        },
+        &surface_registry,
+        &surfaces,
+    );
+    defer output.deinit();
+    var probe: Probe = .{};
+    output.setDeliveryListener(.{
+        .context = &probe,
+        .configured = Probe.configured,
+        .entered = Probe.entered,
+        .left = Probe.left,
+    });
+    defer output.clearDeliveryListener();
+
+    output.beginFrame();
+    try output.markSurfaceVisible(first);
+    try output.markSurfaceVisible(first);
+    try std.testing.expectEqual(@as(usize, 1), output.memberships.items.len);
+    try std.testing.expectEqual(@as(usize, 0), probe.entered_count);
+    output.cancelFrame();
+    try std.testing.expectEqual(@as(usize, 0), output.memberships.items.len);
+
+    output.beginFrame();
+    try output.markSurfaceVisible(first);
+    output.endFrame();
+    try std.testing.expect(output.containsSurface(first));
+    try std.testing.expectEqual(@as(usize, 1), probe.entered_count);
+    try std.testing.expectEqual(first, probe.entered_ids[0]);
+
+    output.beginFrame();
+    try output.markSurfaceVisible(first);
+    output.endFrame();
+    try std.testing.expectEqual(@as(usize, 1), probe.entered_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.left_count);
+
+    surface_registry.remove(first);
+    const second = try surface_registry.add(.{
+        .context = &provider_context,
+        .render_state = Provider.renderState,
+    });
+    try std.testing.expectEqual(first.index, second.index);
+    try std.testing.expect(first.generation != second.generation);
+    output.beginFrame();
+    try output.markSurfaceVisible(second);
+    output.endFrame();
+    try std.testing.expect(!output.containsSurface(first));
+    try std.testing.expect(output.containsSurface(second));
+    try std.testing.expectEqual(@as(usize, 2), probe.entered_count);
+    try std.testing.expectEqual(second, probe.entered_ids[1]);
+    try std.testing.expectEqual(@as(usize, 1), probe.left_count);
+    try std.testing.expectEqual(first, probe.left_ids[0]);
+
+    _ = output.configure(
+        .{ .x = 10, .y = 20 },
+        .{ .width = 640, .height = 360 },
+        .{ .width = 1920, .height = 1080 },
+        75_000,
+        false,
+        2,
+        .{ .numerator = 180 },
+    );
+    output.setRefresh(.{
+        .timestamp = .{ .seconds = 0, .nanoseconds = 0 },
+        .refresh_nanoseconds = 20_000_000,
+    });
+    try std.testing.expectEqual(@as(usize, 2), probe.change_count);
+    try std.testing.expectEqual(Changes{ .geometry = true, .mode = true, .scale = true }, probe.changes[0]);
+    try std.testing.expectEqual(Changes{ .mode = true }, probe.changes[1]);
+
+    output.beginFrame();
+    output.endFrame();
+    try std.testing.expectEqual(@as(usize, 0), output.memberships.items.len);
+    try std.testing.expectEqual(@as(usize, 2), probe.left_count);
+    try std.testing.expectEqual(second, probe.left_ids[1]);
+    surface_registry.remove(second);
 }

@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const slot_map = @import("slot_map.zig");
+const SurfaceRegistry = @import("SurfaceRegistry.zig");
 const Scene = @import("scene.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const Surface = @import("wayland/surface.zig");
@@ -2843,9 +2844,11 @@ test "workspace switching targets the pointer output without changing keyboard f
 
     var surfaces: Surface.Store = .{};
     defer surfaces.deinit(std.testing.allocator);
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
 
     var outputs: OutputLayout = undefined;
-    outputs.init(std.testing.allocator, display, &surfaces);
+    outputs.init(std.testing.allocator, display, &surface_registry, &surfaces);
     defer outputs.deinit();
 
     const first = try outputs.add(.{

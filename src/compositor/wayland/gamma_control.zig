@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const OutputLayout = @import("output_layout.zig");
 const SecurityContext = @import("security_context.zig");
 const Surface = @import("surface.zig");
@@ -288,8 +289,10 @@ test "removed output fails its control and resets gamma once" {
 
     var surfaces: Surface.Store = .{};
     defer surfaces.deinit(std.testing.allocator);
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
     var outputs: OutputLayout = undefined;
-    outputs.init(std.testing.allocator, display, &surfaces);
+    outputs.init(std.testing.allocator, display, &surface_registry, &surfaces);
     defer outputs.deinit();
     const output_id = try outputs.add(.{
         .size = .{ .width = 1280, .height = 720 },

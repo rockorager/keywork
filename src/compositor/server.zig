@@ -85,6 +85,7 @@ const HeadlessSurfaceForest = @import("HeadlessSurfaceForest.zig");
 const SurfaceFrameCompletion = @import("SurfaceFrameCompletion.zig");
 const Surface = @import("wayland/surface.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
+const WayringOutput = @import("wayland/WayringOutput.zig");
 const Viewporter = @import("wayland/viewporter.zig");
 const InputManager = @import("input_manager.zig");
 const BuiltinKeybindings = @import("builtin_keybindings.zig");
@@ -1126,7 +1127,12 @@ pub fn createWithVirtualOutput(
     errdefer self.compositor.deinit();
     try self.security_context.init(allocator, display);
     errdefer self.security_context.deinit();
-    self.outputs.init(allocator, display, self.compositor.surfaceStore());
+    self.outputs.init(
+        allocator,
+        display,
+        &self.surface_registry,
+        self.compositor.surfaceStore(),
+    );
     errdefer self.outputs.deinit();
     try self.color_management.init(
         allocator,
@@ -3648,6 +3654,13 @@ pub fn wayringPresentationListener(self: *Self) ?WayringCompositor.PresentationL
         .applied = wayringSurfaceApplied,
         .removing = wayringSurfaceRemoving,
     };
+}
+
+/// Output globals use the same presentation gate as scanner-backed surfaces.
+/// Non-presenting DRM and nested sidecars retain their three-global registry.
+pub fn wayringOutputLayout(self: *Self) ?*OutputLayout {
+    if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return null;
+    return &self.outputs;
 }
 
 fn wayringPresentationEnabled(output_kind: OutputBackend.Kind) bool {
@@ -9530,6 +9543,7 @@ fn renderHeadlessSurfaces(self: *Self, frame: *const OutputFrame) Renderer.Error
             .height = mapped_size.height,
         };
         if (surface_rect.intersection(frame.visible_rect) == null) continue;
+        if (frame.track_visibility) try frame.output.markSurfaceVisible(entry.id);
 
         const capture_id: ?u32 = if (renderStateBlurBounds(
             frame,
@@ -11113,7 +11127,7 @@ test "applied nested topology paints exact order and completes only sampled chil
     try std.testing.expectEqual(@as(?SurfaceRegistry.Id, null), server.scene.topWindowSurface());
     try std.testing.expect(!server.scene.surfaceTracked(grandchild_id));
     try std.testing.expectEqual(@as(?Seat.PointerFocus, null), server.pointerFocus(0, 0));
-    try std.testing.expect(!server.outputs.get(output.protocol_id).?.containsSurface(grandchild_id));
+    try std.testing.expect(server.outputs.get(output.protocol_id).?.containsSurface(grandchild_id));
 
     server.removeHeadlessSurface(root_id);
     server.surface_registry.remove(root_id);
@@ -11993,7 +12007,15 @@ const WayringHeadlessClient = struct {
     failure: ?anyerror = null,
     compositor: ?*wayland.client.wl.Compositor = null,
     shm: ?*wayland.client.wl.Shm = null,
+    output: ?*wayland.client.wl.Output = null,
     compositor_version: std.atomic.Value(u32) = .init(0),
+    output_globals: u8 = 0,
+    output_version: u32 = 0,
+    output_name_valid: bool = false,
+    output_mode_width: i32 = 0,
+    output_mode_height: i32 = 0,
+    output_scale: i32 = 0,
+    output_done_count: u8 = 0,
     release_count: std.atomic.Value(u8) = .init(0),
     frame_done_count: std.atomic.Value(u8) = .init(0),
     last_frame_timestamp_ms: std.atomic.Value(u32) = .init(0),
@@ -12001,6 +12023,8 @@ const WayringHeadlessClient = struct {
     preferred_buffer_scale: std.atomic.Value(i32) = .init(0),
     preferred_buffer_transform_count: std.atomic.Value(u8) = .init(0),
     preferred_buffer_transform: std.atomic.Value(i32) = .init(std.math.maxInt(i32)),
+    output_enter_count: std.atomic.Value(u8) = .init(0),
+    output_leave_count: std.atomic.Value(u8) = .init(0),
 
     fn run(self: *WayringHeadlessClient) void {
         self.runFallible() catch |err| {
@@ -12043,6 +12067,14 @@ const WayringHeadlessClient = struct {
         try expectClientRoundtrip(display);
         const compositor = self.compositor orelse return error.CompositorMissing;
         const shm = self.shm orelse return error.ShmMissing;
+        const output = self.output orelse return error.OutputMissing;
+        defer output.release();
+        try expectClientRoundtrip(display);
+        if (self.output_globals != 1 or self.output_version != 4 or
+            !self.output_name_valid or self.output_mode_width != 4 or
+            self.output_mode_height != 2 or self.output_scale != 1 or
+            self.output_done_count != 1)
+            return error.UnexpectedOutputState;
         const surface = try compositor.createSurface();
         defer surface.destroy();
         surface.setListener(*WayringHeadlessClient, surfaceEvent, self);
@@ -12078,6 +12110,9 @@ const WayringHeadlessClient = struct {
         try waitForWayringCommand(self.command_fd);
         try expectClientRoundtrip(display);
         if (self.frame_done_count.load(.acquire) != 1) return error.MissingFrameDone;
+        if (self.output_enter_count.load(.acquire) != 1 or
+            self.output_leave_count.load(.acquire) != 0)
+            return error.UnexpectedOutputMembership;
         self.stage.store(@intFromEnum(Stage.initial_done), .release);
         try waitForWayringCommand(self.command_fd);
 
@@ -12178,6 +12213,9 @@ const WayringHeadlessClient = struct {
         try waitForWayringCommand(self.command_fd);
         try expectClientRoundtrip(display);
         if (self.frame_done_count.load(.acquire) != 6) return error.UnexpectedFrameDone;
+        if (self.output_enter_count.load(.acquire) != 1 or
+            self.output_leave_count.load(.acquire) != 1)
+            return error.UnexpectedOutputMembership;
         self.stage.store(@intFromEnum(Stage.unmapped_no_done), .release);
         try waitForWayringCommand(self.command_fd);
 
@@ -12186,6 +12224,9 @@ const WayringHeadlessClient = struct {
         try waitForWayringCommand(self.command_fd);
         try expectClientRoundtrip(display);
         if (self.frame_done_count.load(.acquire) != 7) return error.MissingFrameDone;
+        if (self.output_enter_count.load(.acquire) != 2 or
+            self.output_leave_count.load(.acquire) != 1)
+            return error.UnexpectedOutputMembership;
         self.stage.store(@intFromEnum(Stage.remapped_done), .release);
         try waitForWayringCommand(self.command_fd);
 
@@ -12270,6 +12311,19 @@ const WayringHeadlessClient = struct {
                         wayland.client.wl.Shm,
                         global.version,
                     ) catch null;
+                } else if (std.mem.eql(u8, interface, "wl_output")) {
+                    self.output_globals += 1;
+                    self.output_version = global.version;
+                    if (self.output == null and global.version >= 4) {
+                        self.output = registry.bind(
+                            global.name,
+                            wayland.client.wl.Output,
+                            4,
+                        ) catch null;
+                        if (self.output) |output| {
+                            output.setListener(*WayringHeadlessClient, outputEvent, self);
+                        }
+                    }
                 }
             },
             .global_remove => {},
@@ -12300,7 +12354,27 @@ const WayringHeadlessClient = struct {
                 self.preferred_buffer_transform.store(@intFromEnum(preferred.transform), .monotonic);
                 _ = self.preferred_buffer_transform_count.fetchAdd(1, .release);
             },
-            .enter, .leave => {},
+            .enter => _ = self.output_enter_count.fetchAdd(1, .acq_rel),
+            .leave => _ = self.output_leave_count.fetchAdd(1, .acq_rel),
+        }
+    }
+
+    fn outputEvent(
+        _: *wayland.client.wl.Output,
+        event: wayland.client.wl.Output.Event,
+        self: *WayringHeadlessClient,
+    ) void {
+        switch (event) {
+            .geometry, .description => {},
+            .mode => |mode| if (mode.flags.current) {
+                self.output_mode_width = mode.width;
+                self.output_mode_height = mode.height;
+            },
+            .scale => |scale| self.output_scale = scale.factor,
+            .name => |name| {
+                self.output_name_valid = std.mem.eql(u8, std.mem.span(name.name), "HEADLESS-1");
+            },
+            .done => self.output_done_count += 1,
         }
     }
 
@@ -12380,8 +12454,10 @@ const WayringSubsurfaceClient = struct {
     subcompositor: ?*wayland.client.wl.Subcompositor = null,
     compositor_globals: u8 = 0,
     subcompositor_globals: u8 = 0,
+    output_globals: u8 = 0,
     compositor_version: u32 = 0,
     subcompositor_version: u32 = 0,
+    output_version: u32 = 0,
     release_count: std.atomic.Value(u8) = .init(0),
     done_count: std.atomic.Value(u8) = .init(0),
     last_done_timestamp_ms: std.atomic.Value(u32) = .init(0),
@@ -12683,6 +12759,9 @@ const WayringSubsurfaceClient = struct {
                     self.subcompositor_version = global.version;
                     if (self.subcompositor == null and global.version >= 1)
                         self.subcompositor = registry.bind(global.name, wayland.client.wl.Subcompositor, 1) catch null;
+                } else if (std.mem.eql(u8, interface, "wl_output")) {
+                    self.output_globals += 1;
+                    self.output_version = global.version;
                 }
             },
             .global_remove => {},
@@ -13005,18 +13084,32 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     );
     var compositor_live = true;
     defer if (compositor_live) compositor.deinit();
+    var wayring_outputs: WayringOutput = undefined;
+    try wayring_outputs.init(
+        std.testing.allocator,
+        &protocol_server,
+        server.wayringOutputLayout().?,
+        &compositor,
+    );
+    var wayring_outputs_live = true;
+    defer if (wayring_outputs_live) wayring_outputs.deinit();
     const Lifecycle = struct {
+        outputs: *WayringOutput,
+        compositor: *WayringCompositor,
+
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
-            const owner: *WayringCompositor = @ptrCast(@alignCast(erased));
-            owner.destroyClientResources(client);
+            const self: *@This() = @ptrCast(@alignCast(erased));
+            self.outputs.destroyClientResources(client);
+            self.compositor.destroyClientResources(client);
         }
     };
+    var lifecycle: Lifecycle = .{ .outputs = &wayring_outputs, .compositor = &compositor };
     const host = try WayringHost.create(
         std.testing.allocator,
         server.eventLoop(),
         &protocol_server,
         runtime_directory,
-        .{ .context = &compositor, .destroy_resources = Lifecycle.destroy },
+        .{ .context = &lifecycle, .destroy_resources = Lifecycle.destroy },
     );
     var host_live = true;
     defer if (host_live) host.destroy() catch {};
@@ -13260,6 +13353,8 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     } else return error.WayringTransportDrainTimedOut;
     try host.destroy();
     host_live = false;
+    wayring_outputs.deinit();
+    wayring_outputs_live = false;
     compositor.deinit();
     compositor_live = false;
     protocol_server.deinit();
@@ -13321,18 +13416,31 @@ test "Wayring wl_subcompositor v1 nested synchronized state is accepted end to e
         server.wayringPresentationListener(),
     );
     defer compositor.deinit();
+    var wayring_outputs: WayringOutput = undefined;
+    try wayring_outputs.init(
+        std.testing.allocator,
+        &protocol_server,
+        server.wayringOutputLayout().?,
+        &compositor,
+    );
+    defer wayring_outputs.deinit();
     const Lifecycle = struct {
+        outputs: *WayringOutput,
+        compositor: *WayringCompositor,
+
         fn destroy(context: *anyopaque, peer: *wayring.server.Client) void {
-            const owner: *WayringCompositor = @ptrCast(@alignCast(context));
-            owner.destroyClientResources(peer);
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.outputs.destroyClientResources(peer);
+            self.compositor.destroyClientResources(peer);
         }
     };
+    var lifecycle: Lifecycle = .{ .outputs = &wayring_outputs, .compositor = &compositor };
     const host = try WayringHost.create(
         std.testing.allocator,
         server.eventLoop(),
         &protocol_server,
         runtime_directory,
-        .{ .context = &compositor, .destroy_resources = Lifecycle.destroy },
+        .{ .context = &lifecycle, .destroy_resources = Lifecycle.destroy },
     );
     defer host.destroy() catch {};
     const raw_command_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
@@ -13356,6 +13464,8 @@ test "Wayring wl_subcompositor v1 nested synchronized state is accepted end to e
     try std.testing.expectEqual(@as(u32, 6), client.compositor_version);
     try std.testing.expectEqual(@as(u8, 1), client.subcompositor_globals);
     try std.testing.expectEqual(@as(u32, 1), client.subcompositor_version);
+    try std.testing.expectEqual(@as(u8, 2), client.output_globals);
+    try std.testing.expectEqual(@as(u32, 4), client.output_version);
     try std.testing.expectEqual(@as(u8, 4), client.release_count.load(.acquire));
     try std.testing.expectEqual(@as(u8, 0), client.done_count.load(.acquire));
     try std.testing.expectEqual(@as(usize, 4), compositor.surfaceCount());
@@ -13579,8 +13689,11 @@ test "Wayring wl_subcompositor v1 nested synchronized state is accepted end to e
     try std.testing.expectEqual(@as(?SurfaceRegistry.Id, null), server.scene.focusedSurface());
     try std.testing.expect(!server.scene.surfaceTracked(child_id));
     try std.testing.expectEqual(@as(?Seat.PointerFocus, null), server.pointerFocus(0, 0));
+    // Topology changes alone cannot create membership on the primary output.
+    // The second output retains its last completed-frame truth until its next
+    // completed frame, independent of the newly recreated placement.
     try std.testing.expect(!server.outputs.get(output.protocol_id).?.containsSurface(child_id));
-    try std.testing.expect(!server.outputs.get(second_output.protocol_id).?.containsSurface(child_id));
+    try std.testing.expect(server.outputs.get(second_output.protocol_id).?.containsSurface(child_id));
 
     try signalWayringCommand(command_fd);
     try waitForWayringSubsurfaceStage(server, host, &client, .parent_destroyed);
