@@ -215,6 +215,7 @@ pub const TouchEvent = union(enum) {
 pub const Sink = struct {
     context: *anyopaque,
     owner_for_surface: *const fn (*anyopaque, SurfaceRegistry.Id) ?ClientRegistry.Id,
+    surface_accepts_input: *const fn (*anyopaque, SurfaceRegistry.Id, f64, f64) bool,
     issue_serial: *const fn (*anyopaque, ClientRegistry.Id) ?ClientRegistry.Serial,
     touch_target: *const fn (*anyopaque, SurfaceRegistry.Id) ?TouchTarget,
     capabilities: *const fn (*anyopaque, CapabilitySnapshot) void,
@@ -273,6 +274,16 @@ pub fn clearSink(self: *SeatDelivery, context: *anyopaque) void {
 pub fn ownerForSurface(self: *const SeatDelivery, surface: SurfaceRegistry.Id) ?ClientRegistry.Id {
     const sink = self.sink orelse return null;
     return sink.owner_for_surface(sink.context, surface);
+}
+
+pub fn surfaceAcceptsInput(
+    self: *const SeatDelivery,
+    surface: SurfaceRegistry.Id,
+    x: f64,
+    y: f64,
+) bool {
+    const sink = self.sink orelse return false;
+    return sink.surface_accepts_input(sink.context, surface, x, y);
 }
 
 pub fn issueSerial(self: *const SeatDelivery, client: ClientRegistry.Id) ?ClientRegistry.Serial {
@@ -380,6 +391,16 @@ test "sink forwards neutral snapshots identity serial and touch cutoff queries" 
             return if (std.meta.eql(self.surface, surface)) self.client else null;
         }
 
+        fn acceptsInput(
+            context: *anyopaque,
+            surface: SurfaceRegistry.Id,
+            x: f64,
+            y: f64,
+        ) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return std.meta.eql(self.surface, surface) and x == 2 and y == 3;
+        }
+
         fn issue(context: *anyopaque, client: ClientRegistry.Id) ?ClientRegistry.Serial {
             const self: *@This() = @ptrCast(@alignCast(context));
             return if (std.meta.eql(self.client, client)) self.serial else null;
@@ -412,6 +433,7 @@ test "sink forwards neutral snapshots identity serial and touch cutoff queries" 
     delivery.setSink(.{
         .context = &probe,
         .owner_for_surface = Probe.owner,
+        .surface_accepts_input = Probe.acceptsInput,
         .issue_serial = Probe.issue,
         .touch_target = Probe.target,
         .capabilities = Probe.capabilities,
@@ -427,6 +449,8 @@ test "sink forwards neutral snapshots identity serial and touch cutoff queries" 
 
     try std.testing.expectEqual(@as(usize, 1), probe.capability_calls);
     try std.testing.expect(std.meta.eql(client, delivery.ownerForSurface(surface).?));
+    try std.testing.expect(delivery.surfaceAcceptsInput(surface, 2, 3));
+    try std.testing.expect(!delivery.surfaceAcceptsInput(surface, 3, 2));
     try std.testing.expect(std.meta.eql(serial, delivery.issueSerial(client).?));
     const target_value = delivery.touchTarget(surface).?;
     try std.testing.expect(std.meta.eql(client, target_value.client));

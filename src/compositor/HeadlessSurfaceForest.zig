@@ -70,6 +70,17 @@ pub const RenderEntry = struct {
     position: Position,
 };
 
+pub const InputHit = struct {
+    id: SurfaceRegistry.Id,
+    x: f64,
+    y: f64,
+};
+
+pub const InputFilter = struct {
+    context: *anyopaque,
+    accepts: *const fn (*anyopaque, SurfaceRegistry.Id, f64, f64) bool,
+};
+
 pub const CompoundBounds = union(enum) {
     hidden,
     rect: render.Rect,
@@ -283,6 +294,27 @@ pub fn rootIndex(self: *const HeadlessSurfaceForest, id: SurfaceRegistry.Id) ?us
     return null;
 }
 
+/// Resolves one active node to its current attached compound root. Detached,
+/// removed, stale, cyclic, and foreign-forest identities are rejected. The
+/// bounded parent walk is allocation-free.
+pub fn compoundRoot(
+    self: *const HeadlessSurfaceForest,
+    id: SurfaceRegistry.Id,
+) ?SurfaceRegistry.Id {
+    var current = self.nodeConst(id) orelse return null;
+    var steps: usize = 0;
+    while (true) {
+        steps += 1;
+        if (steps > self.node_count) return null;
+        switch (current.placement) {
+            .detached => return null,
+            .root => return current.id,
+            .child => current = self.nodeConst(current.parent orelse return null) orelse
+                return null,
+        }
+    }
+}
+
 pub fn len(self: *const HeadlessSurfaceForest) usize {
     return self.node_count;
 }
@@ -396,6 +428,30 @@ pub fn renderIterator(self: *const HeadlessSurfaceForest) RenderIterator {
         .next_root = self.root_head,
         .steps_remaining = self.node_count *| 2 +| self.root_count,
     };
+}
+
+/// Returns the topmost visible node accepted by the frontend-local input
+/// filter. Iteration follows exact paint order and retains only one candidate;
+/// neither topology traversal nor filtering allocates.
+pub fn inputHit(
+    self: *const HeadlessSurfaceForest,
+    x: f64,
+    y: f64,
+    filter: InputFilter,
+) ?InputHit {
+    if (!std.math.isFinite(x) or !std.math.isFinite(y)) return null;
+    var hit: ?InputHit = null;
+    var iterator = self.renderIterator();
+    while (iterator.next()) |entry| {
+        const surface_x = x - @as(f64, @floatFromInt(entry.position.x));
+        const surface_y = y - @as(f64, @floatFromInt(entry.position.y));
+        if (surface_x < 0 or surface_y < 0 or
+            surface_x >= @as(f64, @floatFromInt(entry.mapped_size.width)) or
+            surface_y >= @as(f64, @floatFromInt(entry.mapped_size.height))) continue;
+        if (!filter.accepts(filter.context, entry.id, surface_x, surface_y)) continue;
+        hit = .{ .id = entry.id, .x = surface_x, .y = surface_y };
+    }
+    return hit;
 }
 
 /// Returns the visible, unclipped bounds of a node and all its descendants.
@@ -850,6 +906,90 @@ test "root parity and stale generations use canonical indexed slots" {
     try std.testing.expect(forest.state(current) != null);
     forest.remove(second);
     forest.remove(current);
+}
+
+test "compound roots reject stale removed detached and changed topology" {
+    var forest = HeadlessSurfaceForest.init(std.testing.allocator);
+    defer forest.deinit();
+    var other = HeadlessSurfaceForest.init(std.testing.allocator);
+    defer other.deinit();
+    const root: SurfaceRegistry.Id = .{ .index = 0, .generation = 1 };
+    const child: SurfaceRegistry.Id = .{ .index = 1, .generation = 1 };
+    const replacement_root: SurfaceRegistry.Id = .{ .index = 2, .generation = 1 };
+    try forest.addRoot(root, null);
+    try forest.addRoot(child, null);
+    try forest.addRoot(replacement_root, null);
+    const initial_stack = [_]AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = child, .position = .{} } },
+    };
+    forest.apply(.{
+        .surfaces = &.{},
+        .parents = &.{.{ .id = root, .stack = &initial_stack }},
+    });
+    try std.testing.expectEqual(root, forest.compoundRoot(child).?);
+    try std.testing.expect(other.compoundRoot(child) == null);
+    try std.testing.expect(forest.compoundRoot(.{
+        .index = child.index,
+        .generation = child.generation + 1,
+    }) == null);
+
+    const changed_stack = [_]AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = root, .position = .{} } },
+    };
+    forest.apply(.{
+        .surfaces = &.{},
+        .parents = &.{.{ .id = replacement_root, .stack = &changed_stack }},
+    });
+    try std.testing.expectEqual(replacement_root, forest.compoundRoot(child).?);
+    forest.detach(root);
+    try std.testing.expect(forest.compoundRoot(child) == null);
+    forest.remove(child);
+    try std.testing.expect(forest.compoundRoot(child) == null);
+    forest.remove(root);
+    forest.remove(replacement_root);
+}
+
+test "input hit follows topmost compound paint order without allocation" {
+    const Filter = struct {
+        rejected: SurfaceRegistry.Id,
+
+        fn accepts(context: *anyopaque, id: SurfaceRegistry.Id, x: f64, y: f64) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(x >= 0 and y >= 0);
+            return !sameId(self.rejected, id);
+        }
+    };
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var forest = HeadlessSurfaceForest.init(failing.allocator());
+    defer forest.deinit();
+    const root: SurfaceRegistry.Id = .{ .index = 0, .generation = 1 };
+    const child: SurfaceRegistry.Id = .{ .index = 1, .generation = 1 };
+    try forest.addRoot(root, null);
+    try forest.addRoot(child, null);
+    inline for (.{ root, child }) |id|
+        applyOne(&forest, id, .{ .width = 4, .height = 4 }, false);
+    const stack = [_]AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = child, .position = .{ .x = 1, .y = 1 } } },
+    };
+    forest.apply(.{
+        .surfaces = &.{},
+        .parents = &.{.{ .id = root, .stack = &stack }},
+    });
+    var filter: Filter = .{ .rejected = root };
+    failing.fail_index = failing.alloc_index;
+    const hit = forest.inputHit(2, 3, .{
+        .context = &filter,
+        .accepts = Filter.accepts,
+    }).?;
+    try std.testing.expectEqual(child, hit.id);
+    try std.testing.expectEqual(@as(f64, 1), hit.x);
+    try std.testing.expectEqual(@as(f64, 2), hit.y);
+    try std.testing.expect(!failing.has_induced_failure);
+    forest.remove(root);
+    forest.remove(child);
 }
 
 test "nested stack paints below parent above with grandchildren and negative positions" {
