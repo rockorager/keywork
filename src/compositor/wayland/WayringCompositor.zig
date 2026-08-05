@@ -20,7 +20,7 @@ const render = @import("../render/types.zig");
 const server = wayring.server;
 const wire = wayring.wire;
 const Shm = server.shm.Protocol(core);
-const compositor_version = 4;
+const compositor_version = 5;
 
 pub const SurfaceId = SurfaceRegistry.Id;
 
@@ -57,8 +57,10 @@ const Surface = struct {
     frame_callbacks: std.ArrayList(*FrameCallback) = .empty,
     pending_attachment: ?PendingAttachment = null,
     has_pending_attachment: bool = false,
-    pending_attach_x: i32 = 0,
-    pending_attach_y: i32 = 0,
+    pending_offset_x: i32 = 0,
+    pending_offset_y: i32 = 0,
+    current_offset_x: i32 = 0,
+    current_offset_y: i32 = 0,
     pending_damage: Region,
     pending_opaque: Region,
     pending_opaque_dirty: bool = false,
@@ -119,8 +121,8 @@ const PreparedCommit = struct {
     logical_size: ?render.Size,
     scale: i32,
     transform: render.BufferTransform,
-    legacy_attach_x: i32,
-    legacy_attach_y: i32,
+    offset_x: i32,
+    offset_y: i32,
 
     fn init(surface: *const Surface) PreparedCommit {
         return .{
@@ -130,8 +132,8 @@ const PreparedCommit = struct {
             .logical_size = surface.current_logical_size,
             .scale = surface.pending_scale,
             .transform = surface.pending_transform,
-            .legacy_attach_x = surface.pending_attach_x,
-            .legacy_attach_y = surface.pending_attach_y,
+            .offset_x = surface.pending_offset_x,
+            .offset_y = surface.pending_offset_y,
         };
     }
 
@@ -494,6 +496,11 @@ fn handleSurface(
             // the full old and new root bounds for every successful commit, so
             // this advisory rectangle has no incremental consumer yet.
         },
+        .offset => |offset| {
+            const surface: *Surface = @fieldParentPtr("resource", resource);
+            surface.pending_offset_x = offset.x;
+            surface.pending_offset_y = offset.y;
+        },
         else => {
             const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
             client.postImplementationError(&resource.runtime, "wl_surface request is not implemented by the Wayring backend");
@@ -636,8 +643,10 @@ fn attachSurface(
     }
     clearPendingAttachment(surface);
     surface.has_pending_attachment = true;
-    surface.pending_attach_x = x;
-    surface.pending_attach_y = y;
+    if (resource.version() < 5) {
+        surface.pending_offset_x = x;
+        surface.pending_offset_y = y;
+    }
     const id = buffer_id orelse return;
     const buffer_resource = client.lookup(id) orelse {
         client.postImplementationError(&resource.runtime, "wl_surface.attach references an unknown buffer");
@@ -662,10 +671,11 @@ fn attachSurface(
 fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     const had_pending_attachment = surface.has_pending_attachment;
     var published = false;
-    // Every preparation failure terminalizes the client. Consume only the
-    // pending attachment so its observer and pin cannot outlive teardown; no
-    // release is sent for a buffer whose transaction was never published.
-    // Other pending state remains intact, matching the existing fatal path.
+    // Every preparation failure terminalizes the client. Consume only pending
+    // attachment ownership so its observer and pin cannot outlive teardown;
+    // no release is sent for a buffer whose transaction was never published.
+    // Offset and other pending protocol state remain intact, while applied
+    // state remains unchanged, matching the existing terminal policy.
     defer if (!published and had_pending_attachment) clearPendingAttachment(surface);
 
     var prepared = self.prepareCommit(surface) catch |err| {
@@ -805,15 +815,18 @@ fn publishPreparedCommit(self: *WayringCompositor, surface: *Surface, prepared: 
     surface.current_logical_size = prepared.logical_size;
     surface.current_scale = prepared.scale;
     surface.current_transform = prepared.transform;
+    surface.current_offset_x = prepared.offset_x;
+    surface.current_offset_y = prepared.offset_y;
 
-    // Roleless root presentation intentionally ignores legacy movement. The
-    // prepared offsets remain available at this seam for future role policy.
-    _ = prepared.legacy_attach_x;
-    _ = prepared.legacy_attach_y;
+    // Offset is applied protocol metadata for this content update. Phase 2's
+    // roleless root policy intentionally keeps rendering at the global origin;
+    // future roles can consume the exact applied value without leaking it into
+    // SurfaceRegistry or Scene prematurely.
     surface.pending_damage.clear();
     surface.pending_opaque_dirty = false;
     surface.pending_input_dirty = false;
     clearPendingAttachment(surface);
+    clearPendingOffset(surface);
     if (prepared.publishes_snapshot) surface.next_source_version +%= 1;
 
     var callbacks_to_commit = prepared.pending_frame_callback_count;
@@ -848,8 +861,11 @@ fn clearPendingAttachment(surface: *Surface) void {
         surface.pending_attachment = null;
     }
     surface.has_pending_attachment = false;
-    surface.pending_attach_x = 0;
-    surface.pending_attach_y = 0;
+}
+
+fn clearPendingOffset(surface: *Surface) void {
+    surface.pending_offset_x = 0;
+    surface.pending_offset_y = 0;
 }
 
 fn pendingFrameCallbackCount(surface: *const Surface) usize {
@@ -1168,6 +1184,13 @@ fn damageBuffer(
     });
 }
 
+fn setSurfaceOffset(client: *server.Client, surface_id: u32, x: i32, y: i32) !void {
+    try send(client, surface_id, 10, &core.wl_surface.request_messages[10], &.{
+        .{ .int = x },
+        .{ .int = y },
+    });
+}
+
 fn commitSurfaceResource(client: *server.Client, surface_id: u32) !void {
     try send(client, surface_id, 6, &core.wl_surface.request_messages[6], &.{});
 }
@@ -1348,7 +1371,7 @@ const TestPresentationListener = struct {
     }
 };
 
-test "production wl_compositor advertises v4 and bound children inherit v4" {
+test "production wl_compositor advertises v5 and bound children inherit v5" {
     var host: server.Server = .init(std.testing.allocator);
     defer host.deinit();
     var surface_registry = SurfaceRegistry.init(std.testing.allocator);
@@ -1356,7 +1379,7 @@ test "production wl_compositor advertises v4 and bound children inherit v4" {
     var compositor: WayringCompositor = undefined;
     try compositor.init(std.testing.allocator, &host, &surface_registry, null);
     defer compositor.deinit();
-    try std.testing.expectEqual(@as(u32, 4), compositor.global.version());
+    try std.testing.expectEqual(@as(u32, 5), compositor.global.version());
     try std.testing.expectEqualStrings("wl_compositor", compositor.global.interface().name);
 
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
@@ -1365,14 +1388,14 @@ test "production wl_compositor advertises v4 and bound children inherit v4" {
         compositor.destroyClientResources(client);
         managed.destroy();
     }
-    try bindCompositorVersion(client, 3, 4);
+    try bindCompositorVersion(client, 3, 5);
     try createSurfaceResource(client, 3, 4);
     try createRegionResource(client, 3, 5);
 
     const objects = compositor.findClient(client).?;
-    try std.testing.expectEqual(@as(u32, 4), objects.compositors.items[0].resource.version());
-    try std.testing.expectEqual(@as(u32, 4), objects.surfaces.items[0].resource.version());
-    try std.testing.expectEqual(@as(u32, 4), objects.regions.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 5), objects.compositors.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 5), objects.surfaces.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 5), objects.regions.items[0].resource.version());
     try std.testing.expect(client.fatal() == null);
 }
 
@@ -1488,6 +1511,55 @@ test "v1 through v3 runtime since gate reject damage_buffer before adapter handl
     try Case.run(1);
     try Case.run(2);
     try Case.run(3);
+}
+
+test "v1 through v4 runtime since gate reject offset before adapter mutation" {
+    const descriptor = &core.wl_surface.request_messages[10];
+    try std.testing.expectEqualStrings("offset", descriptor.name);
+    try std.testing.expectEqual(@as(u32, 5), descriptor.since);
+    try std.testing.expectEqual(@as(usize, 2), descriptor.arguments.len);
+    try std.testing.expectEqualStrings("x", descriptor.arguments[0].name);
+    try std.testing.expectEqualStrings("y", descriptor.arguments[1].name);
+    try std.testing.expectEqual(wire.ArgumentKind.int, descriptor.arguments[0].kind);
+    try std.testing.expectEqual(wire.ArgumentKind.int, descriptor.arguments[1].kind);
+
+    const Case = struct {
+        fn run(version: u32) !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+            defer surface_registry.deinit();
+            var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+            defer compositor.deinit();
+            listener_state.compositor = &compositor;
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const client = managed.client();
+            defer {
+                compositor.destroyClientResources(client);
+                managed.destroy();
+            }
+
+            try bindCompositorVersion(client, 3, version);
+            try createSurfaceResource(client, 3, 4);
+            const surface = compositor.findClient(client).?.surfaces.items[0];
+            try setSurfaceOffset(client, 4, -17, 23);
+
+            const fatal = client.fatal().?;
+            try std.testing.expectEqual(server.Fatal.Kind.protocol, fatal.kind);
+            try std.testing.expectEqual(@as(u32, 4), fatal.object_id);
+            try std.testing.expectEqual(@as(?u16, 10), fatal.opcode);
+            try std.testing.expectEqualStrings("request unsupported by object version", fatal.detail());
+            try std.testing.expectEqual(@as(i32, 0), surface.pending_offset_x);
+            try std.testing.expectEqual(@as(i32, 0), surface.pending_offset_y);
+            try std.testing.expectEqual(@as(i32, 0), surface.current_offset_x);
+            try std.testing.expectEqual(@as(i32, 0), surface.current_offset_y);
+            try std.testing.expectEqual(@as(usize, 0), listener_state.committed_count);
+        }
+    };
+
+    for (1..5) |version| try Case.run(@intCast(version));
 }
 
 test "v4 damage_buffer is allocation-free advisory state consumed at commit boundaries" {
@@ -2791,7 +2863,7 @@ test "scanner pending replacements never release and clean live and destroyed bu
     try std.testing.expectEqual(@as(usize, 2), listener_state.committed_count);
 }
 
-test "scanner wl_surface versions 1 through 4 retain legacy pending attach offsets" {
+test "v1 through v4 attach replaces offset across null replacement destroy and failure" {
     const Case = struct {
         fn run(version: u32) !void {
             var host: server.Server = .init(std.testing.allocator);
@@ -2814,35 +2886,210 @@ test "scanner wl_surface versions 1 through 4 retain legacy pending attach offse
             const id = compositor.surfaceId(client, 5).?;
             const surface = compositor.surfaceForId(id).?;
             try compositor.replaceSurfaceResourceForTest(client, surface, version);
-            const pixels = [_]u32{0xff11_2233};
+            const pixels = [_]u32{ 0xff11_2233, 0xff44_5566 };
             const fd = try memfdWithPixels(&pixels);
             defer _ = std.c.close(fd);
             try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
             try createShmBuffer(client, 6, 7, 0, .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+            try createShmBuffer(client, 6, 8, @sizeOf(u32), .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
 
             try attachBufferAt(client, 5, 7, -7, 9);
             try std.testing.expect(client.fatal() == null);
             try std.testing.expectEqual(version, surface.resource.version());
             try std.testing.expect(surface.has_pending_attachment);
-            try std.testing.expectEqual(@as(i32, -7), surface.pending_attach_x);
-            try std.testing.expectEqual(@as(i32, 9), surface.pending_attach_y);
+            try std.testing.expectEqual(@as(i32, -7), surface.pending_offset_x);
+            try std.testing.expectEqual(@as(i32, 9), surface.pending_offset_y);
             try std.testing.expectEqual(client.lookup(7).?, surface.pending_attachment.?.resource.?);
             const no_events = try drain(client);
             defer std.testing.allocator.free(no_events);
             try std.testing.expectEqual(@as(usize, 0), no_events.len);
 
+            try attachBufferAt(client, 5, null, 3, 4);
+            try std.testing.expect(surface.has_pending_attachment);
+            try std.testing.expect(surface.pending_attachment == null);
+            try std.testing.expectEqual(@as(i32, 3), surface.pending_offset_x);
+            try std.testing.expectEqual(@as(i32, 4), surface.pending_offset_y);
+
+            try attachBufferAt(client, 5, 8, 5, -6);
+            try std.testing.expectEqual(@as(i32, 5), surface.pending_offset_x);
+            try std.testing.expectEqual(@as(i32, -6), surface.pending_offset_y);
+            try std.testing.expectEqual(client.lookup(8).?, surface.pending_attachment.?.resource.?);
+            try send(client, 8, 0, &core.wl_buffer.request_messages[0], &.{});
+            try std.testing.expect(surface.pending_attachment.?.resource == null);
+            try std.testing.expect(surface.pending_attachment.?.observer == null);
+            try std.testing.expectEqual(@as(i32, 5), surface.pending_offset_x);
+            try std.testing.expectEqual(@as(i32, -6), surface.pending_offset_y);
+            const destroyed_buffer = try drain(client);
+            defer std.testing.allocator.free(destroyed_buffer);
+            try expectDeleteIds(destroyed_buffer, &.{8});
+
+            try attachBufferAt(client, 5, 7, -11, 12);
+            try std.testing.expectEqual(@as(i32, -11), surface.pending_offset_x);
+            try std.testing.expectEqual(@as(i32, 12), surface.pending_offset_y);
             try commitSurfaceResource(client, 5);
             try std.testing.expect(!surface.has_pending_attachment);
             try std.testing.expect(surface.pending_attachment == null);
-            try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_x);
-            try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_y);
+            try std.testing.expectEqual(@as(i32, 0), surface.pending_offset_x);
+            try std.testing.expectEqual(@as(i32, 0), surface.pending_offset_y);
+            try std.testing.expectEqual(@as(i32, -11), surface.current_offset_x);
+            try std.testing.expectEqual(@as(i32, 12), surface.current_offset_y);
             const release = try drain(client);
             defer std.testing.allocator.free(release);
             try std.testing.expectEqual(@as(usize, 8), release.len);
+
+            try createShmBuffer(client, 6, 8, @sizeOf(u32), .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+            try attachBufferAt(client, 5, 8, 13, -14);
+            compositor.commit_fault = .copy;
+            try commitSurfaceResource(client, 5);
+            try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+            try std.testing.expect(!surface.has_pending_attachment);
+            try std.testing.expect(surface.pending_attachment == null);
+            try std.testing.expectEqual(@as(i32, 13), surface.pending_offset_x);
+            try std.testing.expectEqual(@as(i32, -14), surface.pending_offset_y);
+            try std.testing.expectEqual(@as(i32, -11), surface.current_offset_x);
+            try std.testing.expectEqual(@as(i32, 12), surface.current_offset_y);
         }
     };
 
     for (1..5) |version| try Case.run(@intCast(version));
+}
+
+test "v5 offset transactions survive attach replacement and publish exact applied metadata" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try bindShm(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    const id = compositor.surfaceId(client, 5).?;
+    const surface = compositor.surfaceForId(id).?;
+    const pixels = [_]u32{ 0xff11_2233, 0xff44_5566 };
+    const fd = try memfdWithPixels(&pixels);
+    defer _ = std.c.close(fd);
+    try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
+    try createShmBuffer(client, 6, 7, 0, .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+    try createShmBuffer(client, 6, 8, @sizeOf(u32), .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+
+    try setSurfaceOffset(client, 5, -7, 9);
+    try attachBuffer(client, 5, 7);
+    try std.testing.expectEqual(@as(i32, -7), surface.pending_offset_x);
+    try std.testing.expectEqual(@as(i32, 9), surface.pending_offset_y);
+    var first_prepared = PreparedCommit.init(surface);
+    defer first_prepared.deinit();
+    try std.testing.expectEqual(@as(i32, -7), first_prepared.offset_x);
+    try std.testing.expectEqual(@as(i32, 9), first_prepared.offset_y);
+    try std.testing.expectEqual(@as(i32, 0), surface.current_offset_x);
+    try std.testing.expectEqual(@as(i32, 0), surface.current_offset_y);
+
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(i32, 0), surface.pending_offset_x);
+    try std.testing.expectEqual(@as(i32, 0), surface.pending_offset_y);
+    try std.testing.expectEqual(@as(i32, -7), surface.current_offset_x);
+    try std.testing.expectEqual(@as(i32, 9), surface.current_offset_y);
+    const first_release = try drain(client);
+    defer std.testing.allocator.free(first_release);
+    try std.testing.expectEqual(@as(usize, 8), first_release.len);
+    try std.testing.expectEqual(@as(u32, 7), word(first_release, 0));
+
+    const current_pointer = compositor.currentBuffer(id).?.pixels.ptr;
+    const current_cache = surface_registry.renderState(id).?.buffer.source_cache.?;
+    const next_source_version = surface.next_source_version;
+    const committed_count = listener_state.committed_count;
+    try requestFrame(client, 5, 9);
+    try setSurfaceOffset(client, 5, 4, -5);
+    var state_prepared = PreparedCommit.init(surface);
+    defer state_prepared.deinit();
+    try std.testing.expectEqual(@as(i32, 4), state_prepared.offset_x);
+    try std.testing.expectEqual(@as(i32, -5), state_prepared.offset_y);
+    try commitSurfaceResource(client, 5);
+
+    try std.testing.expectEqual(committed_count + 1, listener_state.committed_count);
+    try std.testing.expect(listener_state.last_callbacks_committed);
+    try std.testing.expectEqual(FrameCallback.State.committed, surface.frame_callbacks.items[0].state);
+    try std.testing.expectEqual(@as(i32, 0), surface.pending_offset_x);
+    try std.testing.expectEqual(@as(i32, 0), surface.pending_offset_y);
+    try std.testing.expectEqual(@as(i32, 4), surface.current_offset_x);
+    try std.testing.expectEqual(@as(i32, -5), surface.current_offset_y);
+    try std.testing.expectEqual(current_pointer, compositor.currentBuffer(id).?.pixels.ptr);
+    try std.testing.expectEqual(current_cache, surface_registry.renderState(id).?.buffer.source_cache.?);
+    try std.testing.expectEqual(next_source_version, surface.next_source_version);
+    const no_state_release = try drain(client);
+    defer std.testing.allocator.free(no_state_release);
+    try std.testing.expectEqual(@as(usize, 0), no_state_release.len);
+
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(i32, 0), surface.current_offset_x);
+    try std.testing.expectEqual(@as(i32, 0), surface.current_offset_y);
+    try std.testing.expectEqual(current_pointer, compositor.currentBuffer(id).?.pixels.ptr);
+    try std.testing.expectEqual(next_source_version, surface.next_source_version);
+
+    try setSurfaceOffset(client, 5, 11, 12);
+    try attachBuffer(client, 5, null);
+    try std.testing.expectEqual(@as(i32, 11), surface.pending_offset_x);
+    try std.testing.expectEqual(@as(i32, 12), surface.pending_offset_y);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expect(compositor.currentBuffer(id) == null);
+    try std.testing.expect(surface_registry.renderState(id) == null);
+    try std.testing.expectEqual(@as(i32, 11), surface.current_offset_x);
+    try std.testing.expectEqual(@as(i32, 12), surface.current_offset_y);
+    try std.testing.expectEqual(next_source_version, surface.next_source_version);
+
+    try setSurfaceOffset(client, 5, 13, 14);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expect(compositor.currentBuffer(id) == null);
+    try std.testing.expect(surface_registry.renderState(id) == null);
+    try std.testing.expectEqual(@as(i32, 13), surface.current_offset_x);
+    try std.testing.expectEqual(@as(i32, 14), surface.current_offset_y);
+    try std.testing.expectEqual(next_source_version, surface.next_source_version);
+
+    try setSurfaceOffset(client, 5, 20, 21);
+    try attachBuffer(client, 5, 8);
+    try attachBuffer(client, 5, 7);
+    try std.testing.expectEqual(@as(i32, 20), surface.pending_offset_x);
+    try std.testing.expectEqual(@as(i32, 21), surface.pending_offset_y);
+    try send(client, 7, 0, &core.wl_buffer.request_messages[0], &.{});
+    try std.testing.expect(surface.pending_attachment.?.resource == null);
+    try std.testing.expectEqual(@as(i32, 20), surface.pending_offset_x);
+    try std.testing.expectEqual(@as(i32, 21), surface.pending_offset_y);
+    const destroyed_buffer = try drain(client);
+    defer std.testing.allocator.free(destroyed_buffer);
+    try expectDeleteIds(destroyed_buffer, &.{7});
+
+    try attachBuffer(client, 5, 8);
+    try std.testing.expectEqual(@as(i32, 20), surface.pending_offset_x);
+    try std.testing.expectEqual(@as(i32, 21), surface.pending_offset_y);
+    try setSurfaceOffset(client, 5, 30, 31);
+    try setSurfaceOffset(client, 5, 32, 33);
+    var replacement_prepared = PreparedCommit.init(surface);
+    defer replacement_prepared.deinit();
+    try std.testing.expectEqual(@as(i32, 32), replacement_prepared.offset_x);
+    try std.testing.expectEqual(@as(i32, 33), replacement_prepared.offset_y);
+    try commitSurfaceResource(client, 5);
+
+    try std.testing.expectEqual(@as(i32, 0), surface.pending_offset_x);
+    try std.testing.expectEqual(@as(i32, 0), surface.pending_offset_y);
+    try std.testing.expectEqual(@as(i32, 32), surface.current_offset_x);
+    try std.testing.expectEqual(@as(i32, 33), surface.current_offset_y);
+    try std.testing.expectEqualSlices(u32, pixels[1..2], compositor.currentBuffer(id).?.pixels);
+    try std.testing.expectEqual(next_source_version + 1, surface.next_source_version);
+    const replacement_release = try drain(client);
+    defer std.testing.allocator.free(replacement_release);
+    try std.testing.expectEqual(@as(usize, 8), replacement_release.len);
+    try std.testing.expectEqual(@as(u32, 8), word(replacement_release, 0));
+    try std.testing.expect(client.fatal() == null);
 }
 
 test "scanner wl_surface version 5 and newer reject attach offsets before mutation" {
@@ -2885,6 +3132,11 @@ test "scanner wl_surface version 5 and newer reject attach offsets before mutati
             defer std.testing.allocator.free(first_release);
             try std.testing.expectEqual(@as(usize, 8), first_release.len);
             try attachBuffer(client, 5, 8);
+            try setSurfaceOffset(client, 5, -23, 29);
+            try setBufferScale(client, 5, 2);
+            try setBufferTransform(client, 5, @intCast(core.wl_output.transform.@"90"));
+            try damageSurface(client, 5, .{ .x = 0, .y = 0, .width = 1, .height = 1 });
+            try requestFrame(client, 5, 10);
 
             const old_current_pointer = compositor.currentBuffer(id).?.pixels.ptr;
             const old_current_pixels = compositor.currentBuffer(id).?.pixels;
@@ -2895,6 +3147,7 @@ test "scanner wl_surface version 5 and newer reject attach offsets before mutati
             const old_pending_resource = surface.pending_attachment.?.resource;
             const old_pending_observer = surface.pending_attachment.?.observer;
             const old_pending_pin = surface.pending_attachment.?.pin.buffer;
+            const old_callback = surface.frame_callbacks.items[0];
 
             try attachBufferAt(client, 5, 9, 1, -2);
 
@@ -2906,8 +3159,19 @@ test "scanner wl_surface version 5 and newer reject attach offsets before mutati
             try std.testing.expectEqual(old_pending_resource, surface.pending_attachment.?.resource);
             try std.testing.expectEqual(old_pending_observer, surface.pending_attachment.?.observer);
             try std.testing.expectEqual(old_pending_pin, surface.pending_attachment.?.pin.buffer);
-            try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_x);
-            try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_y);
+            try std.testing.expectEqual(@as(i32, -23), surface.pending_offset_x);
+            try std.testing.expectEqual(@as(i32, 29), surface.pending_offset_y);
+            try std.testing.expectEqual(@as(i32, 0), surface.current_offset_x);
+            try std.testing.expectEqual(@as(i32, 0), surface.current_offset_y);
+            try std.testing.expectEqual(@as(i32, 2), surface.pending_scale);
+            try std.testing.expectEqual(@as(i32, 1), surface.current_scale);
+            try std.testing.expectEqual(render.BufferTransform.rotate_90, surface.pending_transform);
+            try std.testing.expectEqual(render.BufferTransform.normal, surface.current_transform);
+            try std.testing.expect(surface.pending_damage.contains(0, 0));
+            try std.testing.expectEqual(@as(usize, 1), surface.frame_callbacks.items.len);
+            try std.testing.expectEqual(old_callback, surface.frame_callbacks.items[0]);
+            try std.testing.expectEqual(FrameCallback.State.pending, old_callback.state);
+            try std.testing.expectEqual(&old_callback.resource.runtime, client.lookup(10).?);
             try std.testing.expectEqual(old_current_pointer, compositor.currentBuffer(id).?.pixels.ptr);
             try std.testing.expectEqualSlices(u32, old_current_pixels, compositor.currentBuffer(id).?.pixels);
             try std.testing.expectEqual(old_source_cache, surface_registry.renderState(id).?.buffer.source_cache.?);
@@ -2916,6 +3180,11 @@ test "scanner wl_surface version 5 and newer reject attach offsets before mutati
             try std.testing.expectEqual(old_event_count, listener_state.event_count);
             try std.testing.expectEqual(old_current_pointer, listener_state.last_pixel_pointer.?);
             try std.testing.expectEqual(old_source_cache, listener_state.last_source_cache.?);
+
+            const terminal = try drain(client);
+            defer std.testing.allocator.free(terminal);
+            try std.testing.expect(terminal.len >= 8);
+            try std.testing.expectEqual(@as(u32, 1), word(terminal, 0));
 
             const live_before_unused_destroy = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
             client.lookup(9).?.destroy();
@@ -3282,8 +3551,8 @@ test "new attachment invalid size preserves current state and consumes only term
     try std.testing.expectEqual(@as(u32, 5), fatal.object_id);
     try std.testing.expect(!surface.has_pending_attachment);
     try std.testing.expect(surface.pending_attachment == null);
-    try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_x);
-    try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_y);
+    try std.testing.expectEqual(@as(i32, 0), surface.pending_offset_x);
+    try std.testing.expectEqual(@as(i32, 0), surface.pending_offset_y);
     try std.testing.expectEqual(
         live_before_attachment,
         compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes,
@@ -3341,7 +3610,7 @@ test "prepared commit failures preserve all published surface state and reclaim 
                 managed.destroy();
             }
 
-            try bindCompositorVersion(client, 3, 3);
+            try bindCompositorVersion(client, 3, 5);
             try bindShm(&compositor, client, 4);
             try createSurfaceResource(client, 3, 5);
             const id = compositor.surfaceId(client, 5).?;
@@ -3395,7 +3664,8 @@ test "prepared commit failures preserve all published surface state and reclaim 
             try setBufferScale(client, 5, 1);
             try setBufferTransform(client, 5, @intCast(core.wl_output.transform.normal));
             const live_before_attachment = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
-            try attachBufferAt(client, 5, 8, -4, 5);
+            try setSurfaceOffset(client, 5, -4, 5);
+            try attachBuffer(client, 5, 8);
             try std.testing.expect(surface.pending_attachment.?.observer != null);
             compositor.commit_fault = fault;
             try commitSurfaceResource(client, 5);
@@ -3407,8 +3677,10 @@ test "prepared commit failures preserve all published surface state and reclaim 
             try std.testing.expectEqual(expected_fatal, client.fatal().?.kind);
             try std.testing.expect(surface.pending_attachment == null);
             try std.testing.expect(!surface.has_pending_attachment);
-            try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_x);
-            try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_y);
+            try std.testing.expectEqual(@as(i32, -4), surface.pending_offset_x);
+            try std.testing.expectEqual(@as(i32, 5), surface.pending_offset_y);
+            try std.testing.expectEqual(@as(i32, 0), surface.current_offset_x);
+            try std.testing.expectEqual(@as(i32, 0), surface.current_offset_y);
             try std.testing.expectEqual(
                 live_before_attachment,
                 compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes,
@@ -3437,6 +3709,10 @@ test "prepared commit failures preserve all published surface state and reclaim 
             try std.testing.expectEqual(render.Size{ .width = 1, .height = 1 }, surface.current_logical_size.?);
             try std.testing.expectEqual(@as(i32, 2), surface.current_scale);
             try std.testing.expectEqual(render.BufferTransform.rotate_90, surface.current_transform);
+            const terminal = try drain(client);
+            defer std.testing.allocator.free(terminal);
+            try std.testing.expect(terminal.len >= 8);
+            try std.testing.expectEqual(@as(u32, 1), word(terminal, 0));
         }
     };
 

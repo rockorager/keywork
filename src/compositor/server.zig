@@ -11702,6 +11702,10 @@ const WayringHeadlessClient = struct {
         scaled_done,
         damage_buffer_committed,
         damage_buffer_done,
+        offset_attachment_released,
+        offset_attachment_done,
+        offset_only_committed,
+        offset_only_done,
         unmapped,
         unmapped_no_done,
         remapped_released,
@@ -11851,31 +11855,62 @@ const WayringHeadlessClient = struct {
         try waitForWayringCommand(self.command_fd);
 
         try self.requestFrame(surface);
+        try writeWayringScalePixels(scale_shm_fd, .{
+            0x00cc_0000, 0x00cc_0000, 0x0000_dd00, 0x0000_dd00,
+            0x00cc_0000, 0x00cc_0000, 0x0000_dd00, 0x0000_dd00,
+        });
+        surface.offset(-3, 2);
+        surface.attach(scale_buffer, 0, 0);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.release_count.load(.acquire) != 4) return error.UnexpectedBufferRelease;
+        if (self.frame_done_count.load(.acquire) != 4) return error.UnexpectedFrameDone;
+        self.stage.store(@intFromEnum(Stage.offset_attachment_released), .release);
+        try waitForWayringCommand(self.command_fd);
+        try expectClientRoundtrip(display);
+        if (self.frame_done_count.load(.acquire) != 5) return error.MissingFrameDone;
+        self.stage.store(@intFromEnum(Stage.offset_attachment_done), .release);
+        try waitForWayringCommand(self.command_fd);
+
+        try self.requestFrame(surface);
+        surface.offset(7, -5);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.release_count.load(.acquire) != 4) return error.UnexpectedBufferRelease;
+        if (self.frame_done_count.load(.acquire) != 5) return error.UnexpectedFrameDone;
+        self.stage.store(@intFromEnum(Stage.offset_only_committed), .release);
+        try waitForWayringCommand(self.command_fd);
+        try expectClientRoundtrip(display);
+        if (self.frame_done_count.load(.acquire) != 6) return error.MissingFrameDone;
+        self.stage.store(@intFromEnum(Stage.offset_only_done), .release);
+        try waitForWayringCommand(self.command_fd);
+
+        try self.requestFrame(surface);
         surface.setBufferScale(1);
         surface.attach(null, 0, 0);
         surface.commit();
         try expectClientRoundtrip(display);
-        if (self.release_count.load(.acquire) != 3) return error.UnexpectedBufferRelease;
-        if (self.frame_done_count.load(.acquire) != 4) return error.UnexpectedFrameDone;
+        if (self.release_count.load(.acquire) != 4) return error.UnexpectedBufferRelease;
+        if (self.frame_done_count.load(.acquire) != 6) return error.UnexpectedFrameDone;
         self.stage.store(@intFromEnum(Stage.unmapped), .release);
         try waitForWayringCommand(self.command_fd);
         try expectClientRoundtrip(display);
-        if (self.frame_done_count.load(.acquire) != 4) return error.UnexpectedFrameDone;
+        if (self.frame_done_count.load(.acquire) != 6) return error.UnexpectedFrameDone;
         self.stage.store(@intFromEnum(Stage.unmapped_no_done), .release);
         try waitForWayringCommand(self.command_fd);
 
-        try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x00cc_ddee, 0x0001_0203 }, 4);
+        try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x00cc_ddee, 0x0001_0203 }, 5);
         self.stage.store(@intFromEnum(Stage.remapped_released), .release);
         try waitForWayringCommand(self.command_fd);
         try expectClientRoundtrip(display);
-        if (self.frame_done_count.load(.acquire) != 5) return error.MissingFrameDone;
+        if (self.frame_done_count.load(.acquire) != 7) return error.MissingFrameDone;
         self.stage.store(@intFromEnum(Stage.remapped_done), .release);
         try waitForWayringCommand(self.command_fd);
 
         try self.requestFrame(surface);
         surface.commit();
         try expectClientRoundtrip(display);
-        if (self.frame_done_count.load(.acquire) != 5) return error.UnexpectedFrameDone;
+        if (self.frame_done_count.load(.acquire) != 7) return error.UnexpectedFrameDone;
         self.stage.store(@intFromEnum(Stage.outstanding_callback), .release);
         try waitForWayringCommand(self.command_fd);
     }
@@ -12158,7 +12193,7 @@ fn renderPendingWayringFrame(server: *Self, host: anytype, previous_frames: u64)
     return error.WayringFrameTimedOut;
 }
 
-test "Wayring wl_compositor v4 damage_buffer transforms and scales sampled headless content end to end" {
+test "Wayring wl_compositor v5 offset state and sampled headless content end to end" {
     const WayringHost = @import("wayland/WayringHost.zig");
     const wayring = @import("wayring");
     const linux = std.os.linux;
@@ -12241,7 +12276,7 @@ test "Wayring wl_compositor v4 damage_buffer transforms and scales sampled headl
     var previous_frames = output.frame_statistics.frames_presented;
     try waitForWayringClientStage(server, host, &client, .initial_released);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
-    try std.testing.expectEqual(@as(u32, 4), client.compositor_version.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 5), client.compositor_version.load(.acquire));
     try std.testing.expectEqual(@as(u8, 1), client.release_count.load(.acquire));
     try std.testing.expectEqual(registry_baseline + 1, server.surface_registry.len());
     try std.testing.expectEqual(@as(usize, 1), compositor.surfaceCount());
@@ -12353,9 +12388,51 @@ test "Wayring wl_compositor v4 damage_buffer transforms and scales sampled headl
 
     previous_frames = output.frame_statistics.frames_presented;
     try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .offset_attachment_released);
+    try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try std.testing.expectEqual(@as(u8, 4), client.release_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 4), client.frame_done_count.load(.acquire));
+    try expectWayringScaleSnapshot(server, scale_pixels, 4, .{ .width = 2, .height = 1 });
+    try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 1));
+    try std.testing.expect(output.repaint_needed);
+    try std.testing.expect(output.render_scheduled);
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try expectWayringHeadlessPixels(server, .{ 0x00cc_0000, 0x0000_dd00 });
+    const attached_offset_state = server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id).?;
+    const attached_offset_pointer = attached_offset_state.buffer.pixels.ptr;
+    const attached_offset_cache = attached_offset_state.buffer.source_cache.?;
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .offset_attachment_done);
+    try std.testing.expectEqual(@as(u8, 5), client.frame_done_count.load(.acquire));
+
+    previous_frames = output.frame_statistics.frames_presented;
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .offset_only_committed);
+    try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try std.testing.expectEqual(@as(u8, 4), client.release_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 5), client.frame_done_count.load(.acquire));
+    const offset_only_state = server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id).?;
+    try std.testing.expectEqual(attached_offset_pointer, offset_only_state.buffer.pixels.ptr);
+    try std.testing.expectEqual(attached_offset_cache, offset_only_state.buffer.source_cache.?);
+    try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, offset_only_state.logical_size);
+    try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 1));
+    try std.testing.expect(output.repaint_needed);
+    try std.testing.expect(output.render_scheduled);
+    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try expectWayringHeadlessPixels(server, .{ 0x00cc_0000, 0x0000_dd00 });
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .offset_only_done);
+    try std.testing.expectEqual(@as(u8, 6), client.frame_done_count.load(.acquire));
+
+    previous_frames = output.frame_statistics.frames_presented;
+    try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .unmapped);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
-    try std.testing.expectEqual(@as(u8, 4), client.frame_done_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 6), client.frame_done_count.load(.acquire));
     try std.testing.expect(server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id) == null);
     try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
     try renderPendingWayringFrame(server, host, previous_frames);
@@ -12363,7 +12440,7 @@ test "Wayring wl_compositor v4 damage_buffer transforms and scales sampled headl
 
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .unmapped_no_done);
-    try std.testing.expectEqual(@as(u8, 4), client.frame_done_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 6), client.frame_done_count.load(.acquire));
     try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
 
     previous_frames = output.frame_statistics.frames_presented;
@@ -12373,7 +12450,7 @@ test "Wayring wl_compositor v4 damage_buffer transforms and scales sampled headl
     try expectWayringSnapshot(
         server,
         .{ 0x00cc_ddee, 0x0001_0203 },
-        4,
+        5,
         .{ .width = 2, .height = 1 },
         .normal,
     );
@@ -12382,13 +12459,13 @@ test "Wayring wl_compositor v4 damage_buffer transforms and scales sampled headl
 
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .remapped_done);
-    try std.testing.expectEqual(@as(u8, 5), client.frame_done_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 7), client.frame_done_count.load(.acquire));
 
     previous_frames = output.frame_statistics.frames_presented;
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .outstanding_callback);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
-    try std.testing.expectEqual(@as(u8, 5), client.frame_done_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 7), client.frame_done_count.load(.acquire));
     try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
 
     try signalWayringCommand(command_fd);
@@ -12397,7 +12474,7 @@ test "Wayring wl_compositor v4 damage_buffer transforms and scales sampled headl
     joined = true;
     try waitForWayringDisconnect(server, host, &compositor);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
-    try std.testing.expectEqual(@as(u8, 5), client.frame_done_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 7), client.frame_done_count.load(.acquire));
     try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, null);
