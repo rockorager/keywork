@@ -24,13 +24,12 @@ the loop's generic callback and phase contracts.
 
 ### Wayring (`src/wayring/`)
 
-Owns the reusable, policy-free Zig implementation of Wayland protocol framing,
-typed protocol code generation, server object state initially, and transport
-adapters. Client object state is a separate later boundary. Its core is
-sans-I/O: applications supply received bytes and file descriptors, drain
-pending output, and decide how readiness or completions are scheduled. A Linux
-io_uring adapter may drive that core without owning the host application's
-event loop or ring.
+Owns the reusable, policy-free Zig Wayland protocol scanner, generated typed
+bindings, sans-I/O wire and server core, and transport adapters. Client object
+state is a separate later boundary. Applications supply received bytes and
+file descriptors, drain pending output, and decide how readiness or completions
+are scheduled. A Linux io_uring adapter may drive that core without owning the
+host application's event loop or ring.
 
 Wayring must not depend on the Keywork loop, runtime, UI, Lua, compositor,
 shell, or stream components. Those components may consume its public module;
@@ -230,14 +229,19 @@ Current source module roots are:
 | `keywork-lua` | `src/lua/root.zig` | public native modules |
 | `linebreak` | `src/ui/linebreak/root.zig` | `uucode` |
 | `varlink` | `src/varlink/root.zig` | none |
+| `wayring` | `src/wayring/root.zig` | none |
 | `keywork-control` | `src/compositor/control/root.zig` | embedded compositor interface |
 | `keyworkctl-compositor` | `src/compositor/keyworkctl/root.zig` | `keywork-control`, `varlink` |
 | `keywork-stream` | `src/stream/main.zig` | generated Wayland bindings |
 
-The planned `wayring` module root is `src/wayring/root.zig` with no Keywork
-module dependencies. Generated Wayring protocol modules will depend on that
-public module. It becomes a current module root when its first implementation
-checkpoint is wired into `build.zig`.
+Generated Wayring protocol modules depend on the public `wayring` module. The
+compositor's current integration is experimental: a compositor-owned host
+integrates Wayring's io_uring adapter with the existing libwayland event loop.
+A compositor-owned protocol adapter supplies the scanner-backed globals and
+application resources, while compositor state retains ownership of the neutral
+surface registry and all scene and render policy. The scanner-backed socket
+remains a sidecar, and its surfaces are presented only by the headless backend;
+canonical `WAYLAND_DISPLAY` continues to use the libwayland server.
 
 The `keyworkctl` executable root is `src/keyworkctl/main.zig`. It imports the
 compositor adapter through the named `keyworkctl-compositor` module and the
