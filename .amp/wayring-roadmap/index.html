@@ -97,13 +97,13 @@
   <header>
     <h1>Keywork → Wayring</h1>
     <p class="lede">Working roadmap for replacing the compositor's libwayland server path with scanner-generated Wayring, without weakening component boundaries.</p>
-    <p class="meta">Current migration implementation: <code>86d59176</code> on <code>wayring</code> · Updated 2026-08-05 · Production <code>wl_subcompositor</code> v1 and real-client subsurface acceptance are integrated; independent Phase 2 review is next.</p>
+    <p class="meta">Current migration implementation: <code>86d59176</code> on <code>wayring</code> · Updated 2026-08-05 · Phase 2 independently passed at exact shared tip <code>eebee1ab</code>; Phase 3 architecture inventory is next.</p>
   </header>
 
   <section class="summary" aria-label="Migration summary">
-    <div class="metric"><strong>2</strong><span>active phase</span></div>
+    <div class="metric"><strong>3</strong><span>active phase</span></div>
     <div class="metric"><strong>16</strong><span>Phase 2 waves integrated</span></div>
-    <div class="metric"><strong>PASS</strong><span>honest v1 gate</span></div>
+    <div class="metric"><strong>PASS</strong><span>Phase 2 honesty gate</span></div>
     <div class="metric"><strong>Debug</strong><span>validation profile</span></div>
   </section>
 
@@ -122,7 +122,7 @@
     <div class="bar"><span style="width:100%"></span></div>
     <div class="phase-head">
       <div><h2>Phase 2 — Honest core surfaces and subsurfaces</h2><p class="detail">Complete core compositor semantics, then add synchronized topology without migrating mature subsurfaces.</p></div>
-      <span class="status active">Gate pending</span>
+      <span class="status done">Complete</span>
     </div>
     <div class="wave"><span class="wave-label">Wave 0A–0D</span><div><h3>Neutral seams and corrected attach behavior</h3><p class="detail">Neutral transforms, applied forest, versioned attach offsets, and architecture documentation.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">Wave 1</span><div><h3>Atomic v1 region and surface state</h3><p class="detail">Regions, opaque/input state, full copied snapshots, and one allocation-free PreparedCommit publication seam.</p></div><span class="status done">Integrated</span></div>
@@ -138,16 +138,16 @@
     <div class="wave"><span class="wave-label">Wave 4B</span><div><h3>Wayland 1.26 Content Update engine</h3><p class="detail">Exact queued SCU/DCU dependencies, single-owner child-tail claims, projected queued state, callback association, rollback, and one atomic closure batch while roots remain immediate.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">Wave 4C</span><div><h3>Generated subsurface adapter semantics</h3><p class="detail">Heap-stable v1 resources, permanent and active role lifecycles, exact generated request errors, transactional stacking and synchronization, stale-association filtering, teardown, and direct scanner fault coverage without production advertisement.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">Wave 4D</span><div><h3>Real-client acceptance and v1 advertisement</h3><p class="detail">Production v1 publication with reverse-order rollback, nested synchronized libwayland E2E, stacking and lifecycle permutations, and exact sampled callback behavior. Canonical <code>WAYLAND_DISPLAY</code> remains mature libwayland.</p></div><span class="status done">Integrated</span></div>
-    <div class="wave"><span class="wave-label">Phase 2 gate</span><div><h3>Independent core-surface and subsurface honesty review</h3><p class="detail">Review all advertised v1–v6 compositor behavior and v1 subcompositor semantics against the pinned Wayland 1.26.0 contracts, architecture boundaries, lifecycle, rollback, and real-client evidence.</p></div><span class="status active">In progress</span></div>
+    <div class="wave"><span class="wave-label">Phase 2 gate</span><div><h3>Independent core-surface and subsurface honesty review</h3><p class="detail">All advertised v1–v6 compositor behavior and v1 subcompositor semantics passed independent review against pinned Wayland 1.26.0 contracts, architecture boundaries, lifecycle, rollback, and real-client evidence.</p></div><span class="status done">Passed</span></div>
   </section>
 
   <section class="phase">
-    <div class="bar"><span style="width:0%"></span></div>
+    <div class="bar"><span style="width:5%"></span></div>
     <div class="phase-head">
-      <div><h2>Phase 3 — Broader protocol parity and cutover readiness</h2><p class="detail">Scope will be fixed after core surface/subsurface semantics pass their gate.</p></div>
-      <span class="status proposed">Tentative</span>
+      <div><h2>Phase 3 — Broader protocol parity and cutover readiness</h2><p class="detail">Inventory remaining globals and fix dependency-ordered subwaves before any broader protocol implementation begins.</p></div>
+      <span class="status active">Planning</span>
     </div>
-    <div class="wave"><span class="wave-label">Candidate work</span><div><h3>Remaining server protocol families</h3><p class="detail">Inventory and migrate globals in dependency order while preserving the canonical libwayland socket until parity is demonstrated.</p></div><span class="status proposed">Unscoped</span></div>
+    <div class="wave"><span class="wave-label">Architecture inventory</span><div><h3>Remaining server protocol families</h3><p class="detail">Map ownership, dependencies, generated contracts, client compatibility, and acceptance gates while preserving the canonical libwayland socket.</p></div><span class="status active">In progress</span></div>
     <div class="wave"><span class="wave-label">Cutover gate</span><div><h3>Canonical WAYLAND_DISPLAY decision</h3><p class="detail">Only after lifecycle, behavior, compatibility, and real-client equivalence are independently verified.</p></div><span class="status proposed">Unscoped</span></div>
   </section>
 
