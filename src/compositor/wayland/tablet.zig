@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const NativeInput = @import("../backend/native_input.zig");
+const ClientRegistry = @import("../ClientRegistry.zig");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
 
@@ -598,7 +599,7 @@ const ToolResource = struct {
     generation: u64,
     tool: ?*Tool,
     active: bool,
-    proximity_serial: ?u32,
+    proximity_serial: ?ClientRegistry.Serial,
 };
 
 const PadResource = struct {
@@ -807,14 +808,14 @@ fn createToolResource(self: *Self, binding: *SeatBinding, tool: *Tool) !void {
     const surface = tool.focus_resource orelse return;
     if (!tool.in_proximity or binding.client != surface.getClient()) return;
     const tablet = self.tabletResource(binding, tool.device) orelse return;
-    const serial = self.display.nextSerial();
+    const serial = matureSerial(self.display.nextSerial());
     adapter.active = true;
     adapter.proximity_serial = serial;
-    resource.sendProximityIn(serial, tablet.resource, surface);
+    resource.sendProximityIn(serial.value, tablet.resource, surface);
     for (tool.pressed_buttons.items) |button_code| {
-        resource.sendButton(serial, button_code, .pressed);
+        resource.sendButton(serial.value, button_code, .pressed);
     }
-    if (tool.tip_down) resource.sendDown(serial);
+    if (tool.tip_down) resource.sendDown(serial.value);
     resource.sendFrame(0);
 }
 
@@ -1154,7 +1155,8 @@ fn activeToolResource(
     client: *wl.Client,
 ) ?*Tool {
     if (!adapter.active or adapter.binding.client != client or
-        adapter.proximity_serial == null or adapter.proximity_serial.? != serial) return null;
+        adapter.proximity_serial == null or
+        !std.meta.eql(adapter.proximity_serial.?, matureSerial(serial))) return null;
     const tool = adapter.tool orelse return null;
     const surface = tool.focus_resource orelse return null;
     if (!tool.in_proximity or surface.getClient() != client) return null;
@@ -1384,17 +1386,17 @@ fn updateFocus(self: *Self, tool: *Tool, target: ?Seat.PointerFocus, time: u32) 
         1,
     ) catch unreachable;
     @as(*wl.Resource, @ptrCast(surface)).addDestroyListener(&tool.focus_destroy_listener);
-    const serial = self.display.nextSerial();
+    const serial = matureSerial(self.display.nextSerial());
     for (self.tool_resources.items) |adapter| {
         if (adapter.tool != tool or adapter.binding.client != surface.getClient()) continue;
         const tablet = self.tabletResource(adapter.binding, tool.device) orelse continue;
         adapter.active = true;
         adapter.proximity_serial = serial;
-        adapter.resource.sendProximityIn(serial, tablet.resource, surface);
+        adapter.resource.sendProximityIn(serial.value, tablet.resource, surface);
         for (tool.pressed_buttons.items) |button_code| {
-            adapter.resource.sendButton(serial, button_code, .pressed);
+            adapter.resource.sendButton(serial.value, button_code, .pressed);
         }
-        if (tool.tip_down) adapter.resource.sendDown(serial);
+        if (tool.tip_down) adapter.resource.sendDown(serial.value);
     }
     self.refreshPadsForSeat(tool.device.seat, time);
 }
@@ -1740,6 +1742,10 @@ fn high(value: u64) u32 {
 
 fn low(value: u64) u32 {
     return @truncate(value);
+}
+
+fn matureSerial(value: u32) ClientRegistry.Serial {
+    return .{ .domain = .mature_display, .value = value };
 }
 
 fn normalizedUnsigned(value: f64) u32 {

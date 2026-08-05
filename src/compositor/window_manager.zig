@@ -6,6 +6,8 @@ const std = @import("std");
 const wayland = @import("wayland");
 const slot_map = @import("slot_map.zig");
 const SurfaceRegistry = @import("SurfaceRegistry.zig");
+const ClientRegistry = @import("ClientRegistry.zig");
+const MatureClients = @import("wayland/MatureClients.zig");
 const Scene = @import("scene.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const Surface = @import("wayland/surface.zig");
@@ -2841,6 +2843,11 @@ test "each output owns ten numbered workspaces" {
 test "workspace switching targets the pointer output without changing keyboard focus" {
     const display = try wl.Server.create();
     defer display.destroy();
+    var client_registry = ClientRegistry.init(std.testing.allocator);
+    defer client_registry.deinit();
+    var mature_clients: MatureClients = undefined;
+    mature_clients.init(std.testing.allocator, display, &client_registry);
+    defer mature_clients.deinit();
 
     var surfaces: Surface.Store = .{};
     defer surfaces.deinit(std.testing.allocator);
@@ -2872,7 +2879,16 @@ test "workspace switching targets the pointer output without changing keyboard f
     defer std.debug.assert(outputs.remove(second));
 
     var seat: Seat = undefined;
-    try seat.init(std.testing.allocator, std.testing.io, display, "default", &surfaces);
+    try seat.init(
+        std.testing.allocator,
+        std.testing.io,
+        display,
+        "default",
+        &surfaces,
+        &client_registry,
+        &mature_clients,
+        &surface_registry,
+    );
     defer seat.deinit();
     seat.pointerMotion(0, 1280, 0, null);
 
