@@ -20,7 +20,7 @@ const render = @import("../render/types.zig");
 const server = wayring.server;
 const wire = wayring.wire;
 const Shm = server.shm.Protocol(core);
-const compositor_version = 2;
+const compositor_version = 3;
 
 pub const SurfaceId = SurfaceRegistry.Id;
 
@@ -473,6 +473,19 @@ fn handleSurface(
             const surface: *Surface = @fieldParentPtr("resource", resource);
             surface.pending_transform = transform;
         },
+        .set_buffer_scale => |set| {
+            if (set.scale <= 0) {
+                const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
+                client.postProtocolError(
+                    &resource.runtime,
+                    @intCast(core.wl_surface.@"error".invalid_scale),
+                    "buffer scale must be positive",
+                );
+                return;
+            }
+            const surface: *Surface = @fieldParentPtr("resource", resource);
+            surface.pending_scale = set.scale;
+        },
         else => {
             const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
             client.postImplementationError(&resource.runtime, "wl_surface request is not implemented by the Wayring backend");
@@ -641,14 +654,25 @@ fn attachSurface(
 fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     const had_pending_attachment = surface.has_pending_attachment;
     var published = false;
+    // Every preparation failure terminalizes the client. Consume only the
+    // pending attachment so its observer and pin cannot outlive teardown; no
+    // release is sent for a buffer whose transaction was never published.
+    // Other pending state remains intact, matching the existing fatal path.
     defer if (!published and had_pending_attachment) clearPendingAttachment(surface);
 
     var prepared = self.prepareCommit(surface) catch |err| {
         const client = self.clientForResource(&surface.resource.runtime) orelse return error.UntrackedClient;
-        if (err == error.OutOfMemory) {
-            client.postOutOfMemory(&surface.resource.runtime, "preparing wl_surface commit");
-        } else {
-            client.postImplementationError(&surface.resource.runtime, @errorName(err));
+        switch (err) {
+            error.OutOfMemory => client.postOutOfMemory(
+                &surface.resource.runtime,
+                "preparing wl_surface commit",
+            ),
+            error.InvalidSize => client.postProtocolError(
+                &surface.resource.runtime,
+                @intCast(core.wl_surface.@"error".invalid_size),
+                "buffer dimensions are incompatible with surface state",
+            ),
+            else => client.postImplementationError(&surface.resource.runtime, @errorName(err)),
         }
         return;
     };
@@ -754,12 +778,12 @@ fn logicalSize(
     physical_size: render.Size,
     scale: i32,
     transform: render.BufferTransform,
-) error{InvalidBuffer}!render.Size {
-    if (scale <= 0) return error.InvalidBuffer;
+) error{InvalidSize}!render.Size {
+    if (scale <= 0) return error.InvalidSize;
     const transformed = transform.applyToSize(physical_size);
     const divisor: u32 = @intCast(scale);
     if (transformed.width % divisor != 0 or transformed.height % divisor != 0)
-        return error.InvalidBuffer;
+        return error.InvalidSize;
     return .{
         .width = transformed.width / divisor,
         .height = transformed.height / divisor,
@@ -1128,6 +1152,10 @@ fn setBufferTransform(client: *server.Client, surface_id: u32, transform: i32) !
     try send(client, surface_id, 7, &core.wl_surface.request_messages[7], &.{.{ .int = transform }});
 }
 
+fn setBufferScale(client: *server.Client, surface_id: u32, scale: i32) !void {
+    try send(client, surface_id, 8, &core.wl_surface.request_messages[8], &.{.{ .int = scale }});
+}
+
 fn requestFrame(client: *server.Client, surface_id: u32, callback_id: u32) !void {
     try send(client, surface_id, 3, &core.wl_surface.request_messages[3], &.{
         .{ .new_id = .{ .typed = callback_id } },
@@ -1296,7 +1324,7 @@ const TestPresentationListener = struct {
     }
 };
 
-test "production wl_compositor advertises v2 and bound children inherit v2" {
+test "production wl_compositor advertises v3 and bound children inherit v3" {
     var host: server.Server = .init(std.testing.allocator);
     defer host.deinit();
     var surface_registry = SurfaceRegistry.init(std.testing.allocator);
@@ -1304,7 +1332,7 @@ test "production wl_compositor advertises v2 and bound children inherit v2" {
     var compositor: WayringCompositor = undefined;
     try compositor.init(std.testing.allocator, &host, &surface_registry, null);
     defer compositor.deinit();
-    try std.testing.expectEqual(@as(u32, 2), compositor.global.version());
+    try std.testing.expectEqual(@as(u32, 3), compositor.global.version());
     try std.testing.expectEqualStrings("wl_compositor", compositor.global.interface().name);
 
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
@@ -1313,14 +1341,14 @@ test "production wl_compositor advertises v2 and bound children inherit v2" {
         compositor.destroyClientResources(client);
         managed.destroy();
     }
-    try bindCompositorVersion(client, 3, 2);
+    try bindCompositorVersion(client, 3, 3);
     try createSurfaceResource(client, 3, 4);
     try createRegionResource(client, 3, 5);
 
     const objects = compositor.findClient(client).?;
-    try std.testing.expectEqual(@as(u32, 2), objects.compositors.items[0].resource.version());
-    try std.testing.expectEqual(@as(u32, 2), objects.surfaces.items[0].resource.version());
-    try std.testing.expectEqual(@as(u32, 2), objects.regions.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 3), objects.compositors.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 3), objects.surfaces.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 3), objects.regions.items[0].resource.version());
     try std.testing.expect(client.fatal() == null);
 }
 
@@ -1355,6 +1383,46 @@ test "v1 runtime since gate rejects set_buffer_transform before adapter mutation
     try std.testing.expectEqual(render.BufferTransform.normal, surface.current_transform);
     try std.testing.expect(surface.current_logical_size == null);
     try std.testing.expectEqual(@as(usize, 0), listener_state.committed_count);
+}
+
+test "v1 and v2 runtime since gate reject set_buffer_scale before adapter mutation" {
+    const Case = struct {
+        fn run(version: u32) !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+            defer surface_registry.deinit();
+            var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+            defer compositor.deinit();
+            listener_state.compositor = &compositor;
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const client = managed.client();
+            defer {
+                compositor.destroyClientResources(client);
+                managed.destroy();
+            }
+
+            try bindCompositorVersion(client, 3, version);
+            try createSurfaceResource(client, 3, 4);
+            const surface = compositor.findClient(client).?.surfaces.items[0];
+            try setBufferScale(client, 4, 2);
+
+            const fatal = client.fatal().?;
+            try std.testing.expectEqual(server.Fatal.Kind.protocol, fatal.kind);
+            try std.testing.expectEqual(@as(u32, 4), fatal.object_id);
+            try std.testing.expectEqual(@as(?u16, 8), fatal.opcode);
+            try std.testing.expectEqualStrings("request unsupported by object version", fatal.detail());
+            try std.testing.expectEqual(@as(i32, 1), surface.pending_scale);
+            try std.testing.expectEqual(@as(i32, 1), surface.current_scale);
+            try std.testing.expect(surface.current_logical_size == null);
+            try std.testing.expectEqual(@as(usize, 0), listener_state.committed_count);
+        }
+    };
+
+    try Case.run(1);
+    try Case.run(2);
 }
 
 test "v2 unmapped transform commit publishes state without mapping content" {
@@ -1517,6 +1585,197 @@ test "v2 scanner maps every transform and commits attachment and state atomicall
     try std.testing.expectEqual(committed_count, listener_state.committed_count);
     try std.testing.expectEqual(@as(usize, 1), surface.frame_callbacks.items.len);
     try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[0].state);
+}
+
+test "v3 scale composes with every transform without recopying retained content" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 3);
+    try bindShm(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    const id = compositor.surfaceId(client, 5).?;
+    const surface = compositor.surfaceForId(id).?;
+    var pixels: [12 * 8]u32 = undefined;
+    for (&pixels, 0..) |*pixel, index| pixel.* = 0xff00_0000 | @as(u32, @intCast(index));
+    const fd = try memfdWithPixels(&pixels);
+    defer _ = std.c.close(fd);
+    try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
+    try createShmBuffer(client, 6, 7, 0, .{ .width = 12, .height = 8 }, 12 * @sizeOf(u32), .argb8888);
+
+    try setBufferScale(client, 5, 2);
+    try setBufferTransform(client, 5, @intCast(core.wl_output.transform.@"90"));
+    try attachBuffer(client, 5, 7);
+    try std.testing.expectEqual(@as(i32, 2), surface.pending_scale);
+    try std.testing.expectEqual(@as(i32, 1), surface.current_scale);
+    try std.testing.expect(surface_registry.renderState(id) == null);
+    try commitSurfaceResource(client, 5);
+    const release = try drain(client);
+    defer std.testing.allocator.free(release);
+    try std.testing.expectEqual(@as(usize, 8), release.len);
+
+    const current_pointer = compositor.currentBuffer(id).?.pixels.ptr;
+    const source_cache = surface_registry.renderState(id).?.buffer.source_cache.?;
+    try std.testing.expectEqual(@as(i32, 2), surface.current_scale);
+    try std.testing.expectEqual(render.BufferTransform.rotate_90, surface.current_transform);
+    try std.testing.expectEqual(render.Size{ .width = 4, .height = 6 }, surface.current_logical_size.?);
+    try std.testing.expectEqualSlices(u32, &pixels, compositor.currentBuffer(id).?.pixels);
+    try std.testing.expectEqual(@as(u64, 2), surface.next_source_version);
+
+    const Case = struct {
+        protocol: i32,
+        render_transform: render.BufferTransform,
+        logical_size: render.Size,
+    };
+    const cases = [_]Case{
+        .{ .protocol = @intCast(core.wl_output.transform.normal), .render_transform = .normal, .logical_size = .{ .width = 6, .height = 4 } },
+        .{ .protocol = @intCast(core.wl_output.transform.@"90"), .render_transform = .rotate_90, .logical_size = .{ .width = 4, .height = 6 } },
+        .{ .protocol = @intCast(core.wl_output.transform.@"180"), .render_transform = .rotate_180, .logical_size = .{ .width = 6, .height = 4 } },
+        .{ .protocol = @intCast(core.wl_output.transform.@"270"), .render_transform = .rotate_270, .logical_size = .{ .width = 4, .height = 6 } },
+        .{ .protocol = @intCast(core.wl_output.transform.flipped), .render_transform = .flipped, .logical_size = .{ .width = 6, .height = 4 } },
+        .{ .protocol = @intCast(core.wl_output.transform.flipped_90), .render_transform = .flipped_90, .logical_size = .{ .width = 4, .height = 6 } },
+        .{ .protocol = @intCast(core.wl_output.transform.flipped_180), .render_transform = .flipped_180, .logical_size = .{ .width = 6, .height = 4 } },
+        .{ .protocol = @intCast(core.wl_output.transform.flipped_270), .render_transform = .flipped_270, .logical_size = .{ .width = 4, .height = 6 } },
+    };
+    for (cases) |case| {
+        const old_listener_count = listener_state.committed_count;
+        try setBufferTransform(client, 5, case.protocol);
+        try std.testing.expectEqual(case.render_transform, surface.pending_transform);
+        try std.testing.expectEqual(@as(i32, 2), surface.pending_scale);
+        try std.testing.expectEqual(old_listener_count, listener_state.committed_count);
+        try commitSurfaceResource(client, 5);
+
+        const state = surface_registry.renderState(id).?;
+        try std.testing.expectEqual(case.render_transform, surface.current_transform);
+        try std.testing.expectEqual(@as(i32, 2), surface.current_scale);
+        try std.testing.expectEqual(case.logical_size, surface.current_logical_size.?);
+        try std.testing.expectEqual(case.render_transform, state.transform);
+        try std.testing.expectEqual(case.logical_size, state.logical_size);
+        try std.testing.expectEqual(render.Size{ .width = 12, .height = 8 }, state.buffer.size);
+        try std.testing.expectEqual(current_pointer, state.buffer.pixels.ptr);
+        try std.testing.expectEqual(source_cache, state.buffer.source_cache.?);
+        try std.testing.expectEqual(@as(u64, 2), surface.next_source_version);
+        try std.testing.expectEqual(old_listener_count + 1, listener_state.committed_count);
+    }
+
+    const before_scale_state = surface_registry.renderState(id).?;
+    const before_scale_listener_count = listener_state.committed_count;
+    try requestFrame(client, 5, 8);
+    try setBufferScale(client, 5, 4);
+    try std.testing.expectEqual(@as(i32, 4), surface.pending_scale);
+    try std.testing.expectEqual(@as(i32, 2), surface.current_scale);
+    try std.testing.expectEqual(render.Size{ .width = 4, .height = 6 }, surface.current_logical_size.?);
+    try std.testing.expectEqual(before_scale_state.logical_size, surface_registry.renderState(id).?.logical_size);
+    try std.testing.expectEqual(before_scale_state.buffer.pixels.ptr, surface_registry.renderState(id).?.buffer.pixels.ptr);
+    try std.testing.expectEqual(before_scale_listener_count, listener_state.committed_count);
+    try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[0].state);
+    try commitSurfaceResource(client, 5);
+    const scaled_state = surface_registry.renderState(id).?;
+    try std.testing.expectEqual(@as(i32, 4), surface.current_scale);
+    try std.testing.expectEqual(render.Size{ .width = 2, .height = 3 }, scaled_state.logical_size);
+    try std.testing.expectEqual(current_pointer, scaled_state.buffer.pixels.ptr);
+    try std.testing.expectEqual(source_cache, scaled_state.buffer.source_cache.?);
+    try std.testing.expectEqual(@as(u64, 2), surface.next_source_version);
+    try std.testing.expectEqual(FrameCallback.State.committed, surface.frame_callbacks.items[0].state);
+    try std.testing.expect(listener_state.last_callbacks_committed);
+
+    try setBufferScale(client, 5, 3);
+    try attachBuffer(client, 5, null);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(i32, 3), surface.current_scale);
+    try std.testing.expect(surface.current_logical_size == null);
+    try std.testing.expect(surface_registry.renderState(id) == null);
+    try std.testing.expectEqual(@as(u64, 2), surface.next_source_version);
+
+    try setBufferScale(client, 5, 7);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(i32, 7), surface.current_scale);
+    try std.testing.expect(surface.current_logical_size == null);
+    try std.testing.expect(surface_registry.renderState(id) == null);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "zero and negative scale fail immediately without mutating surface state" {
+    const Case = struct {
+        fn run(invalid_scale: i32) !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+            defer surface_registry.deinit();
+            var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+            defer compositor.deinit();
+            listener_state.compositor = &compositor;
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const client = managed.client();
+            defer {
+                compositor.destroyClientResources(client);
+                managed.destroy();
+            }
+
+            try bindCompositorVersion(client, 3, 3);
+            try bindShm(&compositor, client, 4);
+            try createSurfaceResource(client, 3, 5);
+            const id = compositor.surfaceId(client, 5).?;
+            const surface = compositor.surfaceForId(id).?;
+            const pixels = [_]u32{
+                0xff11_0001, 0xff11_0002, 0xff11_0003, 0xff11_0004,
+                0xff22_0001, 0xff22_0002, 0xff22_0003, 0xff22_0004,
+            };
+            const fd = try memfdWithPixels(&pixels);
+            defer _ = std.c.close(fd);
+            try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
+            try createShmBuffer(client, 6, 7, 0, .{ .width = 4, .height = 2 }, 4 * @sizeOf(u32), .argb8888);
+            try setBufferScale(client, 5, 2);
+            try attachBuffer(client, 5, 7);
+            try commitSurfaceResource(client, 5);
+            const release = try drain(client);
+            defer std.testing.allocator.free(release);
+
+            try setBufferScale(client, 5, 3);
+            try setBufferTransform(client, 5, @intCast(core.wl_output.transform.@"90"));
+            try requestFrame(client, 5, 8);
+            const current_pointer = compositor.currentBuffer(id).?.pixels.ptr;
+            const current_cache = surface_registry.renderState(id).?.buffer.source_cache.?;
+            const listener_count = listener_state.committed_count;
+            try setBufferScale(client, 5, invalid_scale);
+
+            const fatal = client.fatal().?;
+            try std.testing.expectEqual(server.Fatal.Kind.protocol, fatal.kind);
+            try std.testing.expectEqual(
+                @as(?u32, @intCast(core.wl_surface.@"error".invalid_scale)),
+                fatal.protocol_code,
+            );
+            try std.testing.expectEqual(@as(u32, 5), fatal.object_id);
+            try std.testing.expectEqual(@as(i32, 3), surface.pending_scale);
+            try std.testing.expectEqual(@as(i32, 2), surface.current_scale);
+            try std.testing.expectEqual(render.BufferTransform.rotate_90, surface.pending_transform);
+            try std.testing.expectEqual(render.BufferTransform.normal, surface.current_transform);
+            try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, surface.current_logical_size.?);
+            try std.testing.expectEqual(current_pointer, compositor.currentBuffer(id).?.pixels.ptr);
+            try std.testing.expectEqual(current_cache, surface_registry.renderState(id).?.buffer.source_cache.?);
+            try std.testing.expectEqual(listener_count, listener_state.committed_count);
+            try std.testing.expectEqual(@as(usize, 1), surface.frame_callbacks.items.len);
+            try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[0].state);
+        }
+    };
+
+    try Case.run(0);
+    try Case.run(-1);
 }
 
 test "frame callback materializes immediately and waits for null commit completion" {
@@ -2707,6 +2966,178 @@ test "listener observes published equal-size resize null and damage-only transac
     );
 }
 
+test "retained content rejects non-divisible transformed scale without publication" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 3);
+    try bindShm(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    const id = compositor.surfaceId(client, 5).?;
+    const surface = compositor.surfaceForId(id).?;
+    var pixels: [6 * 4]u32 = undefined;
+    for (&pixels, 0..) |*pixel, index| pixel.* = 0xff55_0000 | @as(u32, @intCast(index));
+    const fd = try memfdWithPixels(&pixels);
+    defer _ = std.c.close(fd);
+    try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
+    try createShmBuffer(client, 6, 7, 0, .{ .width = 6, .height = 4 }, 6 * @sizeOf(u32), .argb8888);
+    try setBufferScale(client, 5, 2);
+    try attachBuffer(client, 5, 7);
+    try commitSurfaceResource(client, 5);
+    const release = try drain(client);
+    defer std.testing.allocator.free(release);
+
+    const current_pointer = compositor.currentBuffer(id).?.pixels.ptr;
+    const current_cache = surface_registry.renderState(id).?.buffer.source_cache.?;
+    const listener_count = listener_state.committed_count;
+    const listener_events = listener_state.event_count;
+    try setBufferScale(client, 5, 3);
+    try setBufferTransform(client, 5, @intCast(core.wl_output.transform.@"90"));
+    try damageSurface(client, 5, .{ .x = 0, .y = 0, .width = 1, .height = 1 });
+    try requestFrame(client, 5, 8);
+    try commitSurfaceResource(client, 5);
+
+    const fatal = client.fatal().?;
+    try std.testing.expectEqual(server.Fatal.Kind.protocol, fatal.kind);
+    try std.testing.expectEqual(
+        @as(?u32, @intCast(core.wl_surface.@"error".invalid_size)),
+        fatal.protocol_code,
+    );
+    try std.testing.expectEqual(@as(u32, 5), fatal.object_id);
+    try std.testing.expectEqual(@as(i32, 3), surface.pending_scale);
+    try std.testing.expectEqual(@as(i32, 2), surface.current_scale);
+    try std.testing.expectEqual(render.BufferTransform.rotate_90, surface.pending_transform);
+    try std.testing.expectEqual(render.BufferTransform.normal, surface.current_transform);
+    try std.testing.expectEqual(render.Size{ .width = 3, .height = 2 }, surface.current_logical_size.?);
+    try std.testing.expect(surface.pending_damage.contains(0, 0));
+    try std.testing.expectEqual(current_pointer, compositor.currentBuffer(id).?.pixels.ptr);
+    try std.testing.expectEqualSlices(u32, &pixels, compositor.currentBuffer(id).?.pixels);
+    const current_state = surface_registry.renderState(id).?;
+    try std.testing.expectEqual(render.BufferTransform.normal, current_state.transform);
+    try std.testing.expectEqual(render.Size{ .width = 3, .height = 2 }, current_state.logical_size);
+    try std.testing.expectEqual(current_cache, current_state.buffer.source_cache.?);
+    try std.testing.expectEqual(@as(u64, 2), surface.next_source_version);
+    try std.testing.expectEqual(listener_count, listener_state.committed_count);
+    try std.testing.expectEqual(listener_events, listener_state.event_count);
+    try std.testing.expectEqual(current_pointer, listener_state.last_pixel_pointer.?);
+    try std.testing.expectEqual(current_cache, listener_state.last_source_cache.?);
+    try std.testing.expectEqual(@as(usize, 1), surface.frame_callbacks.items.len);
+    try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[0].state);
+    try std.testing.expect(!surface.has_pending_attachment);
+    try std.testing.expect(surface.pending_attachment == null);
+}
+
+test "new attachment invalid size preserves current state and consumes only terminal pin" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var compositor_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(compositor_allocator.allocator(), &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 3);
+    try bindShm(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    const id = compositor.surfaceId(client, 5).?;
+    const surface = compositor.surfaceForId(id).?;
+    var pixels: [8 + 6]u32 = undefined;
+    for (&pixels, 0..) |*pixel, index| pixel.* = 0xff77_0000 | @as(u32, @intCast(index));
+    const fd = try memfdWithPixels(&pixels);
+    defer _ = std.c.close(fd);
+    try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
+    try createShmBuffer(client, 6, 7, 0, .{ .width = 4, .height = 2 }, 4 * @sizeOf(u32), .argb8888);
+    try createShmBuffer(client, 6, 8, 8 * @sizeOf(u32), .{ .width = 3, .height = 2 }, 3 * @sizeOf(u32), .argb8888);
+    try setBufferScale(client, 5, 2);
+    try attachBuffer(client, 5, 7);
+    try commitSurfaceResource(client, 5);
+    const first_release = try drain(client);
+    defer std.testing.allocator.free(first_release);
+
+    const current_pointer = compositor.currentBuffer(id).?.pixels.ptr;
+    const current_cache = surface_registry.renderState(id).?.buffer.source_cache.?;
+    const listener_count = listener_state.committed_count;
+    const listener_events = listener_state.event_count;
+    try setBufferTransform(client, 5, @intCast(core.wl_output.transform.@"90"));
+    try requestFrame(client, 5, 9);
+    const live_before_attachment = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
+    const candidate_resource = client.lookup(8).?;
+    try attachBuffer(client, 5, 8);
+    try std.testing.expect(surface.has_pending_attachment);
+    try std.testing.expect(surface.pending_attachment.?.observer != null);
+    try std.testing.expect(surface.pending_attachment.?.pin.buffer != null);
+    try commitSurfaceResource(client, 5);
+
+    const fatal = client.fatal().?;
+    try std.testing.expectEqual(server.Fatal.Kind.protocol, fatal.kind);
+    try std.testing.expectEqual(
+        @as(?u32, @intCast(core.wl_surface.@"error".invalid_size)),
+        fatal.protocol_code,
+    );
+    try std.testing.expectEqual(@as(u32, 5), fatal.object_id);
+    try std.testing.expect(!surface.has_pending_attachment);
+    try std.testing.expect(surface.pending_attachment == null);
+    try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_x);
+    try std.testing.expectEqual(@as(i32, 0), surface.pending_attach_y);
+    try std.testing.expectEqual(
+        live_before_attachment,
+        compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes,
+    );
+    try std.testing.expectEqual(@as(i32, 2), surface.pending_scale);
+    try std.testing.expectEqual(@as(i32, 2), surface.current_scale);
+    try std.testing.expectEqual(render.BufferTransform.rotate_90, surface.pending_transform);
+    try std.testing.expectEqual(render.BufferTransform.normal, surface.current_transform);
+    try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, surface.current_logical_size.?);
+    try std.testing.expectEqual(current_pointer, compositor.currentBuffer(id).?.pixels.ptr);
+    try std.testing.expectEqualSlices(u32, pixels[0..8], compositor.currentBuffer(id).?.pixels);
+    const current_state = surface_registry.renderState(id).?;
+    try std.testing.expectEqual(render.BufferTransform.normal, current_state.transform);
+    try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, current_state.logical_size);
+    try std.testing.expectEqual(current_cache, current_state.buffer.source_cache.?);
+    try std.testing.expectEqual(@as(u64, 2), surface.next_source_version);
+    try std.testing.expectEqual(listener_count, listener_state.committed_count);
+    try std.testing.expectEqual(listener_events, listener_state.event_count);
+    try std.testing.expectEqual(current_pointer, listener_state.last_pixel_pointer.?);
+    try std.testing.expectEqual(current_cache, listener_state.last_source_cache.?);
+    try std.testing.expectEqual(@as(usize, 1), surface.frame_callbacks.items.len);
+    try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[0].state);
+
+    const terminal = try drain(client);
+    defer std.testing.allocator.free(terminal);
+    try std.testing.expect(terminal.len >= 8);
+    try std.testing.expectEqual(@as(u32, 1), word(terminal, 0));
+
+    const live_before_buffer_destroy = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
+    candidate_resource.destroy();
+    try std.testing.expectEqual(
+        live_before_buffer_destroy - @sizeOf(server.shm.Buffer),
+        compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes,
+    );
+    try std.testing.expectEqual(current_pointer, compositor.currentBuffer(id).?.pixels.ptr);
+}
+
 test "prepared commit failures preserve all published surface state and reclaim candidates" {
     const Case = struct {
         fn run(fault: CommitFault) !void {
@@ -2727,7 +3158,7 @@ test "prepared commit failures preserve all published surface state and reclaim 
                 managed.destroy();
             }
 
-            try bindCompositorVersion(client, 3, 2);
+            try bindCompositorVersion(client, 3, 3);
             try bindShm(&compositor, client, 4);
             try createSurfaceResource(client, 3, 5);
             const id = compositor.surfaceId(client, 5).?;
@@ -2737,12 +3168,16 @@ test "prepared commit failures preserve all published surface state and reclaim 
                 0xff44_5566,
                 0xffaa_bbcc,
                 0xffdd_eeff,
+                0xff10_2030,
+                0xff40_5060,
+                0xff70_8090,
+                0xffa0_b0c0,
             };
             const fd = try memfdWithPixels(&pixels);
             defer _ = std.c.close(fd);
             try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
-            try createShmBuffer(client, 6, 7, 0, .{ .width = 2, .height = 1 }, 2 * @sizeOf(u32), .argb8888);
-            try createShmBuffer(client, 6, 8, 2 * @sizeOf(u32), .{ .width = 2, .height = 1 }, 2 * @sizeOf(u32), .argb8888);
+            try createShmBuffer(client, 6, 7, 0, .{ .width = 2, .height = 2 }, 2 * @sizeOf(u32), .argb8888);
+            try createShmBuffer(client, 6, 8, 4 * @sizeOf(u32), .{ .width = 2, .height = 2 }, 2 * @sizeOf(u32), .argb8888);
             try createRegionResource(client, 3, 9);
             try createRegionResource(client, 3, 10);
             try addRegion(client, 9, 0, 0, 1, 1);
@@ -2750,6 +3185,7 @@ test "prepared commit failures preserve all published surface state and reclaim 
 
             try setSurfaceRegion(client, 5, 4, 9);
             try setSurfaceRegion(client, 5, 5, 9);
+            try setBufferScale(client, 5, 2);
             try setBufferTransform(client, 5, @intCast(core.wl_output.transform.@"90"));
             try attachBuffer(client, 5, 7);
             try commitSurfaceResource(client, 5);
@@ -2773,6 +3209,7 @@ test "prepared commit failures preserve all published surface state and reclaim 
             try setSurfaceRegion(client, 5, 4, 10);
             try setSurfaceRegion(client, 5, 5, 10);
             try damageSurface(client, 5, .{ .x = 0, .y = 0, .width = 1, .height = 1 });
+            try setBufferScale(client, 5, 1);
             try setBufferTransform(client, 5, @intCast(core.wl_output.transform.normal));
             const live_before_attachment = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
             try attachBufferAt(client, 5, 8, -4, 5);
@@ -2794,7 +3231,7 @@ test "prepared commit failures preserve all published surface state and reclaim 
                 compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes,
             );
             try std.testing.expectEqual(old_pointer, compositor.currentBuffer(id).?.pixels.ptr);
-            try std.testing.expectEqualSlices(u32, pixels[0..2], compositor.currentBuffer(id).?.pixels);
+            try std.testing.expectEqualSlices(u32, pixels[0..4], compositor.currentBuffer(id).?.pixels);
             try std.testing.expectEqual(old_source_cache, surface_registry.renderState(id).?.buffer.source_cache.?);
             try std.testing.expect(surface_registry.renderState(id).?.buffer.source_damage == null);
             try std.testing.expectEqual(render.BufferTransform.rotate_90, surface_registry.renderState(id).?.transform);
@@ -2812,9 +3249,10 @@ test "prepared commit failures preserve all published surface state and reclaim 
             try std.testing.expect(!surface.current_input.infinite);
             try std.testing.expect(surface.current_input.value.contains(0, 0));
             try std.testing.expect(!surface.current_input.value.contains(8, 8));
+            try std.testing.expectEqual(@as(i32, 1), surface.pending_scale);
             try std.testing.expectEqual(render.BufferTransform.normal, surface.pending_transform);
-            try std.testing.expectEqual(render.Size{ .width = 1, .height = 2 }, surface.current_logical_size.?);
-            try std.testing.expectEqual(@as(i32, 1), surface.current_scale);
+            try std.testing.expectEqual(render.Size{ .width = 1, .height = 1 }, surface.current_logical_size.?);
+            try std.testing.expectEqual(@as(i32, 2), surface.current_scale);
             try std.testing.expectEqual(render.BufferTransform.rotate_90, surface.current_transform);
         }
     };
