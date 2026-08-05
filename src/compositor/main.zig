@@ -13,6 +13,7 @@ const Server = @import("server.zig");
 const Systemd = @import("systemd.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringHost = @import("wayland/WayringHost.zig");
+const WayringOutput = @import("wayland/WayringOutput.zig");
 const wayring = @import("wayring");
 
 pub const std_options: std.Options = .{
@@ -174,11 +175,25 @@ pub fn main(init: std.process.Init) !void {
     var wayring_protocol_server: ?wayring.server.Server = null;
     var wayring_compositor: WayringCompositor = undefined;
     var wayring_compositor_initialized = false;
+    var wayring_outputs: WayringOutput = undefined;
+    var wayring_outputs_initialized = false;
+    const WayringLifecycle = struct {
+        outputs: ?*WayringOutput,
+        compositor: *WayringCompositor,
+
+        fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
+            const self: *@This() = @ptrCast(@alignCast(erased));
+            if (self.outputs) |outputs| outputs.destroyClientResources(client);
+            self.compositor.destroyClientResources(client);
+        }
+    };
+    var wayring_lifecycle: WayringLifecycle = undefined;
     var wayring_host: ?*WayringHost = null;
     defer {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_outputs_initialized) wayring_outputs.deinit();
         if (wayring_compositor_initialized) wayring_compositor.deinit();
         if (wayring_protocol_server) |*protocol_server| protocol_server.deinit();
     }
@@ -194,18 +209,25 @@ pub fn main(init: std.process.Init) !void {
             server.wayringPresentationListener(),
         );
         wayring_compositor_initialized = true;
-        const Lifecycle = struct {
-            fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
-                const compositor: *WayringCompositor = @ptrCast(@alignCast(erased));
-                compositor.destroyClientResources(client);
-            }
+        if (server.wayringOutputLayout()) |output_layout| {
+            try wayring_outputs.init(
+                init.gpa,
+                &wayring_protocol_server.?,
+                output_layout,
+                &wayring_compositor,
+            );
+            wayring_outputs_initialized = true;
+        }
+        wayring_lifecycle = .{
+            .outputs = if (wayring_outputs_initialized) &wayring_outputs else null,
+            .compositor = &wayring_compositor,
         };
         wayring_host = try WayringHost.create(
             init.gpa,
             server.eventLoop(),
             &wayring_protocol_server.?,
             init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
-            .{ .context = &wayring_compositor, .destroy_resources = Lifecycle.destroy },
+            .{ .context = &wayring_lifecycle, .destroy_resources = WayringLifecycle.destroy },
         );
         if (wayring_host.?.failure()) |err| return err;
     }
@@ -582,6 +604,7 @@ test {
     _ = @import("wayland/compositor.zig");
     _ = @import("wayland/WayringCompositor.zig");
     _ = @import("wayland/WayringHost.zig");
+    _ = @import("wayland/WayringOutput.zig");
     _ = @import("wayland/surface.zig");
     _ = @import("wayland/surface_geometry.zig");
     _ = @import("wayland/region.zig");

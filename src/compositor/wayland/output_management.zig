@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const DrmOutput = @import("../backend/drm.zig");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const render = @import("../render/types.zig");
 const Output = @import("output.zig");
 const SecurityContext = @import("security_context.zig");
@@ -1119,6 +1120,8 @@ test "virtual head mode and scale stay synchronized" {
 
     var surfaces: @import("surface.zig").Store = .{};
     defer surfaces.deinit(std.testing.allocator);
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
     var output: Output = undefined;
     try output.init(
         std.testing.allocator,
@@ -1131,6 +1134,7 @@ test "virtual head mode and scale stay synchronized" {
             .description = "Keywork headless output",
             .model = "headless",
         },
+        &surface_registry,
         &surfaces,
     );
     defer output.deinit();

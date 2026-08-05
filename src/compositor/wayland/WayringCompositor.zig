@@ -27,6 +27,14 @@ const preferred_buffer_transform_event_opcode = 3;
 
 pub const SurfaceId = SurfaceRegistry.Id;
 
+/// Frontend-local delivery endpoint borrowed for one synchronous event fanout.
+/// Callers must not retain either pointer or use it after returning to the
+/// event loop.
+pub const SurfaceEndpoint = struct {
+    client: *server.Client,
+    resource: *core.wl_surface.Resource,
+};
+
 /// Resource-free presentation completion copied by listeners that sample a
 /// surface later. `context` is always a WayringCompositor, never a Wayland
 /// Resource. Callers must retain the canonical SurfaceId supplied with this
@@ -427,6 +435,13 @@ pub fn regionCount(self: *const WayringCompositor) usize {
 
 pub fn containsSurface(self: *const WayringCompositor, id: SurfaceId) bool {
     return self.surfaceForId(id) != null;
+}
+
+pub fn surfaceEndpoint(self: *WayringCompositor, id: SurfaceId) ?SurfaceEndpoint {
+    const surface = self.surfaceForId(id) orelse return null;
+    if (surface.destroying or surface.resource.runtime.state() != .live) return null;
+    const client = self.clientForResource(&surface.resource.runtime) orelse return null;
+    return .{ .client = client, .resource = &surface.resource };
 }
 
 pub fn surfaceId(self: *const WayringCompositor, client: *const server.Client, object_id: u32) ?SurfaceId {

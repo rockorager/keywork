@@ -854,7 +854,7 @@ test "surface color state survives extension recreation and becomes inert" {
     var surface_registry = SurfaceRegistry.init(std.testing.allocator);
     defer surface_registry.deinit();
     var outputs: OutputLayout = undefined;
-    outputs.init(std.testing.allocator, display, &surfaces);
+    outputs.init(std.testing.allocator, display, &surface_registry, &surfaces);
     defer outputs.deinit();
     var manager: Self = undefined;
     try manager.init(std.testing.allocator, display, &outputs, true);
