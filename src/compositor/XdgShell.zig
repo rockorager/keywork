@@ -456,7 +456,8 @@ pub fn createPopup(
     id: XdgSurfaceId,
     parent: ?XdgSurfaceId,
     rules: Rules,
-) (PopupValidationError || error{OutOfMemory})!PopupId {
+) (PopupValidationError || error{ OutOfMemory, PopupOrderExhausted })!PopupId {
+    if (self.next_popup_order == std.math.maxInt(u64)) return error.PopupOrderExhausted;
     try self.validatePopup(id, parent, rules);
     const scene_parent = try self.popupSceneParent(id, parent);
     const state = self.xdg_surfaces.get(id) orelse return error.InvalidSurface;
@@ -477,7 +478,7 @@ pub fn createPopup(
         .order = order,
         .client = state.client,
     });
-    self.next_popup_order +%= 1;
+    self.next_popup_order += 1;
     state.role = .{ .popup = popup };
     return popup;
 }
@@ -1747,6 +1748,75 @@ test "surface-owned configure sequence and generational identity" {
     const second = try store.insert(std.testing.allocator, dummy);
     try std.testing.expect(first.index == second.index and first.generation != second.generation);
     _ = store.remove(second);
+}
+
+test "popup order exhaustion prevents wrap and publication" {
+    const allocator = std.testing.allocator;
+    const client: ClientRegistry.Id = .{ .index = 1, .generation = 1 };
+    const rules: Rules = .{
+        .size = .{ .width = 1, .height = 1 },
+        .anchor_rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+    };
+
+    var shell: XdgShell = undefined;
+    shell.allocator = allocator;
+    shell.scene = undefined;
+    shell.xdg_surfaces = .{};
+    shell.windows = .{};
+    shell.popups = .{};
+    shell.next_popup_order = std.math.maxInt(u64) - 1;
+    defer shell.xdg_surfaces.deinit(allocator);
+    defer shell.windows.deinit(allocator);
+    defer shell.popups.deinit(allocator);
+
+    const first_surface = try shell.xdg_surfaces.insert(allocator, .{
+        .surface_id = undefined,
+        .client = client,
+        .endpoint = undefined,
+    });
+    defer _ = shell.xdg_surfaces.remove(first_surface);
+    const first_popup = try shell.createPopup(first_surface, null, rules);
+    defer {
+        shell.xdg_surfaces.get(first_surface).?.role = null;
+        _ = shell.popups.remove(first_popup);
+    }
+    try std.testing.expectEqual(
+        std.math.maxInt(u64) - 1,
+        shell.popups.get(first_popup).?.order,
+    );
+    try std.testing.expectEqual(std.math.maxInt(u64), shell.next_popup_order);
+
+    const parent_surface = try shell.xdg_surfaces.insert(allocator, .{
+        .surface_id = undefined,
+        .client = client,
+        .endpoint = undefined,
+    });
+    defer _ = shell.xdg_surfaces.remove(parent_surface);
+    const parent_window = try shell.windows.insert(allocator, .{
+        .xdg_surface_id = parent_surface,
+        .scene_id = undefined,
+        .unreliable_pid = 0,
+    });
+    shell.xdg_surfaces.get(parent_surface).?.role = .{ .toplevel = parent_window };
+    defer {
+        shell.xdg_surfaces.get(parent_surface).?.role = null;
+        var removed_parent = shell.windows.remove(parent_window).?;
+        removed_parent.deinit(allocator);
+    }
+    const rejected_surface = try shell.xdg_surfaces.insert(allocator, .{
+        .surface_id = undefined,
+        .client = client,
+        .endpoint = undefined,
+    });
+    defer _ = shell.xdg_surfaces.remove(rejected_surface);
+
+    try std.testing.expectError(
+        error.PopupOrderExhausted,
+        shell.createPopup(rejected_surface, parent_surface, rules),
+    );
+    try std.testing.expect(shell.xdg_surfaces.get(rejected_surface).?.role == null);
+    try std.testing.expectEqual(@as(usize, 1), shell.popups.len());
+    try std.testing.expectEqual(std.math.maxInt(u64), shell.next_popup_order);
 }
 
 test "explicit popup grabs precede popup mapping" {

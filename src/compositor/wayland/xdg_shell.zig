@@ -784,6 +784,10 @@ const PopupResource = struct {
             rules,
         ) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.PopupOrderExhausted => {
+                resource.getClient().postImplementationError("xdg popup order exhausted");
+                return error.ResourceCreateFailed;
+            },
             else => {
                 postPopupValidationError(xdg_surface, @errorCast(err));
                 return error.ResourceCreateFailed;
