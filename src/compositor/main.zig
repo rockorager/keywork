@@ -12,6 +12,7 @@ const render = @import("render/types.zig");
 const Server = @import("server.zig");
 const Systemd = @import("systemd.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
+const WayringClients = @import("wayland/WayringClients.zig");
 const WayringHost = @import("wayland/WayringHost.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
 const wayring = @import("wayring");
@@ -173,18 +174,27 @@ pub fn main(init: std.process.Init) !void {
 
     const socket_name = try server.listen();
     var wayring_protocol_server: ?wayring.server.Server = null;
+    var wayring_clients: WayringClients = undefined;
+    var wayring_clients_initialized = false;
     var wayring_compositor: WayringCompositor = undefined;
     var wayring_compositor_initialized = false;
     var wayring_outputs: WayringOutput = undefined;
     var wayring_outputs_initialized = false;
     const WayringLifecycle = struct {
+        clients: *WayringClients,
         outputs: ?*WayringOutput,
         compositor: *WayringCompositor,
+
+        fn accepted(erased: *anyopaque, client: *wayring.server.Client) !void {
+            const self: *@This() = @ptrCast(@alignCast(erased));
+            _ = try self.clients.register(client);
+        }
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
             if (self.outputs) |outputs| outputs.destroyClientResources(client);
             self.compositor.destroyClientResources(client);
+            if (self.clients.id(client) != null) self.clients.unregister(client);
         }
     };
     var wayring_lifecycle: WayringLifecycle = undefined;
@@ -193,12 +203,15 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_clients_initialized) wayring_clients.deinit();
         if (wayring_outputs_initialized) wayring_outputs.deinit();
         if (wayring_compositor_initialized) wayring_compositor.deinit();
         if (wayring_protocol_server) |*protocol_server| protocol_server.deinit();
     }
     if (options.experimental_wayring) {
         wayring_protocol_server = .init(init.gpa);
+        wayring_clients.init(init.gpa, server.clientRegistry());
+        wayring_clients_initialized = true;
         try wayring_compositor.init(
             init.gpa,
             &wayring_protocol_server.?,
@@ -219,6 +232,7 @@ pub fn main(init: std.process.Init) !void {
             wayring_outputs_initialized = true;
         }
         wayring_lifecycle = .{
+            .clients = &wayring_clients,
             .outputs = if (wayring_outputs_initialized) &wayring_outputs else null,
             .compositor = &wayring_compositor,
         };
@@ -227,7 +241,11 @@ pub fn main(init: std.process.Init) !void {
             server.eventLoop(),
             &wayring_protocol_server.?,
             init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
-            .{ .context = &wayring_lifecycle, .destroy_resources = WayringLifecycle.destroy },
+            .{
+                .context = &wayring_lifecycle,
+                .accepted = WayringLifecycle.accepted,
+                .destroy_resources = WayringLifecycle.destroy,
+            },
         );
         if (wayring_host.?.failure()) |err| return err;
     }
@@ -603,6 +621,7 @@ test {
     _ = @import("window_manager/workspace.zig");
     _ = @import("wayland/compositor.zig");
     _ = @import("wayland/WayringCompositor.zig");
+    _ = @import("wayland/WayringClients.zig");
     _ = @import("wayland/WayringHost.zig");
     _ = @import("wayland/WayringOutput.zig");
     _ = @import("wayland/surface.zig");

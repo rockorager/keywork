@@ -87,6 +87,7 @@ allocator: std.mem.Allocator,
 globals: std.ArrayList(*GlobalRecord) = .empty,
 next_name: u32 = 1,
 names_exhausted: bool = false,
+next_serial: ?u32 = 1,
 observer_head: ?*ObserverRecord = null,
 observer_tail: ?*ObserverRecord = null,
 logger_head: ?*LoggerRecord = null,
@@ -113,6 +114,15 @@ pub fn deinit(self: *Server) void {
     for (self.globals.items) |global| self.allocator.destroy(global);
     self.globals.deinit(self.allocator);
     self.* = undefined;
+}
+
+/// Returns one display-wide authority serial. Values are never zero or reused,
+/// including across client destruction and reconnection. Exhaustion is
+/// permanent so a stale serial can never alias a later authority event.
+pub fn nextSerial(self: *Server) error{SerialExhausted}!u32 {
+    const serial = self.next_serial orelse return error.SerialExhausted;
+    self.next_serial = if (serial == std.math.maxInt(u32)) null else serial + 1;
+    return serial;
 }
 
 /// Publishes a global with a borrowed context. Names start at one and are
@@ -314,6 +324,28 @@ const OtherProtocol = struct {
     pub const interface: wire.Interface = .{ .name = "wl_other", .version = 3 };
     pub const request_messages: []const wire.MessageDescriptor = &.{};
 };
+
+test "display serials start at one emit max once and remain exhausted" {
+    var server: Server = .init(std.testing.allocator);
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), try server.nextSerial());
+    server.next_serial = std.math.maxInt(u32) - 1;
+    try std.testing.expectEqual(std.math.maxInt(u32) - 1, try server.nextSerial());
+    try std.testing.expectEqual(std.math.maxInt(u32), try server.nextSerial());
+    try std.testing.expectError(error.SerialExhausted, server.nextSerial());
+    try std.testing.expectError(error.SerialExhausted, server.nextSerial());
+}
+
+test "display serial allocation is allocation-free" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var server: Server = .init(failing.allocator());
+    defer server.deinit();
+    failing.fail_index = failing.alloc_index;
+
+    try std.testing.expectEqual(@as(u32, 1), try server.nextSerial());
+    try std.testing.expect(!failing.has_induced_failure);
+}
 
 test "globals validate versions preserve stable monotonic publication order and borrow contexts" {
     const Context = struct {

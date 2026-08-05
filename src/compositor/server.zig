@@ -3661,6 +3661,10 @@ pub fn eventLoop(self: *Self) *wl.EventLoop {
     return self.display.getEventLoop();
 }
 
+pub fn clientRegistry(self: *Self) *ClientRegistry {
+    return &self.client_registry;
+}
+
 pub fn surfaceRegistry(self: *Self) *SurfaceRegistry {
     return &self.surface_registry;
 }
@@ -13120,6 +13124,8 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
         outputs: *WayringOutput,
         compositor: *WayringCompositor,
 
+        fn accepted(_: *anyopaque, _: *wayring.server.Client) !void {}
+
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
             self.outputs.destroyClientResources(client);
@@ -13132,7 +13138,11 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
         server.eventLoop(),
         &protocol_server,
         runtime_directory,
-        .{ .context = &lifecycle, .destroy_resources = Lifecycle.destroy },
+        .{
+            .context = &lifecycle,
+            .accepted = Lifecycle.accepted,
+            .destroy_resources = Lifecycle.destroy,
+        },
     );
     var host_live = true;
     defer if (host_live) host.destroy() catch {};
@@ -13451,6 +13461,8 @@ test "Wayring wl_subcompositor v1 nested synchronized state is accepted end to e
         outputs: *WayringOutput,
         compositor: *WayringCompositor,
 
+        fn accepted(_: *anyopaque, _: *wayring.server.Client) !void {}
+
         fn destroy(context: *anyopaque, peer: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.outputs.destroyClientResources(peer);
@@ -13463,7 +13475,11 @@ test "Wayring wl_subcompositor v1 nested synchronized state is accepted end to e
         server.eventLoop(),
         &protocol_server,
         runtime_directory,
-        .{ .context = &lifecycle, .destroy_resources = Lifecycle.destroy },
+        .{
+            .context = &lifecycle,
+            .accepted = Lifecycle.accepted,
+            .destroy_resources = Lifecycle.destroy,
+        },
     );
     defer host.destroy() catch {};
     const raw_command_fd = linux.eventfd(0, linux.EFD.CLOEXEC);

@@ -6,6 +6,7 @@
 
 const WayringHost = @This();
 
+const builtin = @import("builtin");
 const std = @import("std");
 const wayland = @import("wayland");
 const wayring = @import("wayring");
@@ -20,8 +21,12 @@ const route_capacity = submission_capacity * 2;
 
 pub const ClientLifecycle = struct {
     context: *anyopaque,
+    accepted: *const fn (*anyopaque, *server.Client) anyerror!void,
     destroy_resources: *const fn (*anyopaque, *server.Client) void,
 };
+
+const AcceptanceFault = enum { reserve, wrapper };
+const AddConnectionResult = enum { published, rejected };
 
 const Route = struct {
     external: u64,
@@ -64,6 +69,7 @@ next_external: u64 = 1,
 submission_pending: bool = false,
 shutting_down: bool = false,
 failure_value: ?anyerror = null,
+acceptance_fault: if (builtin.is_test) ?AcceptanceFault else void,
 
 pub fn create(
     allocator: std.mem.Allocator,
@@ -88,6 +94,7 @@ pub fn create(
     self.submission_pending = false;
     self.shutting_down = false;
     self.failure_value = null;
+    self.acceptance_fault = if (builtin.is_test) null else {};
     try self.transport.reserveOperationCapacity(route_capacity);
     self.event_source = try event_loop.addFd(
         *WayringHost,
@@ -268,7 +275,7 @@ fn completeOne(self: *WayringHost, cqe: linux.io_uring_cqe) !void {
     const token = self.takeRoute(cqe.user_data) orelse return error.UnknownCompletion;
     const completed = try self.transport.complete(token, cqe.res, cqe.flags);
     switch (completed) {
-        .accepted => |connection| try self.addConnection(connection),
+        .accepted => |connection| _ = try self.addConnection(connection),
         .peer_disconnected => |connection| self.retire(connection),
         .terminal => |connection| {
             if (!connection.client().hasPendingOutput()) self.retire(connection);
@@ -281,19 +288,60 @@ fn completeOne(self: *WayringHost, cqe: linux.io_uring_cqe) !void {
     }
 }
 
-fn addConnection(self: *WayringHost, connection: *wayring.io_uring.Connection) !void {
-    self.connections.ensureUnusedCapacity(self.allocator, 1) catch |err| {
-        self.lifecycle.destroy_resources(self.lifecycle.context, connection.client());
-        try self.transport.release(connection);
-        return err;
+fn addConnection(self: *WayringHost, connection: *wayring.io_uring.Connection) !AddConnectionResult {
+    self.reserveConnection() catch {
+        try self.rejectConnection(connection, null);
+        return .rejected;
     };
-    const managed = self.allocator.create(ManagedConnection) catch |err| {
-        self.lifecycle.destroy_resources(self.lifecycle.context, connection.client());
-        try self.transport.release(connection);
-        return err;
+    const managed = self.createManagedConnection() catch {
+        try self.rejectConnection(connection, null);
+        return .rejected;
     };
     managed.* = .{ .connection = connection };
+    self.lifecycle.accepted(self.lifecycle.context, connection.client()) catch {
+        try self.rejectConnection(connection, managed);
+        return .rejected;
+    };
     self.connections.appendAssumeCapacity(managed);
+    return .published;
+}
+
+fn reserveConnection(self: *WayringHost) !void {
+    if (self.failAcceptanceAt(.reserve)) return error.OutOfMemory;
+    try self.connections.ensureUnusedCapacity(self.allocator, 1);
+}
+
+fn createManagedConnection(self: *WayringHost) !*ManagedConnection {
+    if (self.failAcceptanceAt(.wrapper)) return error.OutOfMemory;
+    return self.allocator.create(ManagedConnection);
+}
+
+fn failAcceptanceAt(self: *WayringHost, point: AcceptanceFault) bool {
+    if (comptime !builtin.is_test) return false;
+    if (self.acceptance_fault != point) return false;
+    self.acceptance_fault = null;
+    return true;
+}
+
+fn rejectConnection(
+    self: *WayringHost,
+    connection: *wayring.io_uring.Connection,
+    managed: ?*ManagedConnection,
+) !void {
+    // This callback is intentionally unconditional so partially completed
+    // application registration follows the same idempotent rollback path.
+    self.lifecycle.destroy_resources(self.lifecycle.context, connection.client());
+    self.transport.release(connection) catch |err| {
+        // A wrapper allocated before application acceptance keeps ownership
+        // recoverable if broken cleanup leaves transport state live.
+        if (managed) |value| {
+            value.retiring = true;
+            value.resources_destroyed = true;
+            self.connections.appendAssumeCapacity(value);
+        }
+        return err;
+    };
+    if (managed) |value| self.allocator.destroy(value);
 }
 
 fn retire(self: *WayringHost, connection: *wayring.io_uring.Connection) void {
@@ -310,6 +358,12 @@ fn releaseReady(self: *WayringHost, release_all: bool) !void {
     var first_failure: ?anyerror = null;
     while (index < self.connections.items.len) {
         const managed = self.connections.items[index];
+        managed.connection.synchronizeFatal();
+        if (!managed.retiring and managed.connection.state() == .terminal and
+            !managed.connection.client().hasPendingOutput())
+        {
+            managed.retiring = true;
+        }
         if (!release_all and !managed.retiring) {
             index += 1;
             continue;
@@ -448,6 +502,8 @@ const CleanupProbe = struct {
     resource: ?*server.Resource = null,
     destroy_on_callback: bool = true,
 
+    fn accepted(_: *anyopaque, _: *server.Client) !void {}
+
     fn destroy(erased: *anyopaque, client: *server.Client) void {
         const self: *CleanupProbe = @ptrCast(@alignCast(erased));
         self.callback_count += 1;
@@ -475,6 +531,293 @@ fn waitForManagedConnection(event_loop: *wl.EventLoop, host: *WayringHost) !*Man
         if (host.connections.items.len != 0) return host.connections.items[0];
     }
     return error.HostBridgeTimedOut;
+}
+
+const AcceptanceProbe = struct {
+    const ClientRegistry = @import("../ClientRegistry.zig");
+    const WayringClients = @import("WayringClients.zig");
+
+    clients: *WayringClients,
+    registry: *ClientRegistry,
+    host: ?*WayringHost = null,
+    accepted_clients: [4]?*server.Client = @splat(null),
+    accepted_ids: [4]?ClientRegistry.Id = @splat(null),
+    accepted_count: usize = 0,
+    destroy_count: usize = 0,
+    disconnect_count: usize = 0,
+    fail_next: bool = false,
+    partial_client: ?*server.Client = null,
+    partial_resource: ?server.Resource = null,
+    resources_destroyed: bool = false,
+    destroying_client: ?*server.Client = null,
+    destroying_id: ?ClientRegistry.Id = null,
+    ordering_valid: bool = true,
+    accepted_before_publication: bool = true,
+    accepted_before_receive: bool = true,
+
+    fn accepted(erased: *anyopaque, client: *server.Client) !void {
+        const self: *AcceptanceProbe = @ptrCast(@alignCast(erased));
+        const host = self.host.?;
+        self.accepted_before_publication = self.accepted_before_publication and
+            self.registry.len() == host.connectionCount();
+        self.accepted_before_receive = self.accepted_before_receive and client.lookup(2) == null;
+        const client_id = try self.clients.register(client);
+        const index = self.accepted_count;
+        self.accepted_clients[index] = client;
+        self.accepted_ids[index] = client_id;
+        self.accepted_count += 1;
+        if (!self.fail_next) return;
+
+        self.fail_next = false;
+        self.partial_client = client;
+        self.partial_resource = .init(
+            std.testing.allocator,
+            2,
+            1,
+            &cleanup_test_interface,
+            &.{},
+            .client,
+            client.ownerHooks(),
+        );
+        try client.installClientInitial(2, &self.partial_resource.?);
+        return error.OutOfMemory;
+    }
+
+    fn destroy(erased: *anyopaque, client: *server.Client) void {
+        const self: *AcceptanceProbe = @ptrCast(@alignCast(erased));
+        self.destroy_count += 1;
+        self.resources_destroyed = false;
+        if (self.partial_client == client) {
+            const resource = &self.partial_resource.?;
+            resource.destroy();
+            resource.deinit();
+            self.partial_resource = null;
+            self.partial_client = null;
+        }
+        self.resources_destroyed = true;
+        if (self.clients.id(client)) |client_id| {
+            self.destroying_client = client;
+            self.destroying_id = client_id;
+            self.clients.unregister(client);
+            self.destroying_client = null;
+            self.destroying_id = null;
+        }
+    }
+
+    fn disconnected(erased: *anyopaque, client_id: ClientRegistry.Id) void {
+        const self: *AcceptanceProbe = @ptrCast(@alignCast(erased));
+        self.disconnect_count += 1;
+        const client = self.destroying_client orelse {
+            self.ordering_valid = false;
+            return;
+        };
+        self.ordering_valid = self.ordering_valid and self.resources_destroyed and
+            std.meta.eql(self.destroying_id.?, client_id) and
+            !self.registry.contains(client_id) and self.clients.id(client) == null;
+    }
+};
+
+test "acceptance is pre-receive and every rejection path is client-local" {
+    const ClientRegistry = @import("../ClientRegistry.zig");
+    const WayringClients = @import("WayringClients.zig");
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/tmp/keywork-wayring-acceptance-{d}-{x}",
+        .{ linux.getpid(), @intFromPtr(&marker) },
+        0,
+    );
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS)
+        return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+
+    const event_loop = try wl.EventLoop.create();
+    defer event_loop.destroy();
+    var protocol_server: server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    var registry = ClientRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var clients: WayringClients = undefined;
+    clients.init(std.testing.allocator, &registry);
+    defer clients.deinit();
+    var probe: AcceptanceProbe = .{ .clients = &clients, .registry = &registry };
+    try registry.addDisconnectListener(.{
+        .context = &probe,
+        .notify = AcceptanceProbe.disconnected,
+    });
+    defer registry.removeDisconnectListener(&probe);
+    const host = try WayringHost.create(
+        std.testing.allocator,
+        event_loop,
+        &protocol_server,
+        runtime_directory,
+        .{
+            .context = &probe,
+            .accepted = AcceptanceProbe.accepted,
+            .destroy_resources = AcceptanceProbe.destroy,
+        },
+    );
+    probe.host = host;
+    var host_live = true;
+    defer if (host_live) host.destroy() catch {};
+    const path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/{s}",
+        .{ runtime_directory, host.displayName() },
+        0,
+    );
+    defer std.testing.allocator.free(path);
+
+    const first_peer = try connectSocket(path);
+    defer _ = linux.close(first_peer);
+    const sync_request = [_]u8{
+        1, 0, 0,  0,
+        0, 0, 12, 0,
+        2, 0, 0,  0,
+    };
+    if (std.c.write(first_peer, &sync_request, sync_request.len) != sync_request.len)
+        return error.TestWriteFailed;
+    _ = try waitForManagedConnection(event_loop, host);
+    for (0..4) |_| try event_loop.dispatch(50);
+    try std.testing.expect(probe.accepted_clients[0].?.fatal() == null);
+
+    probe.fail_next = true;
+    const rejected_peer = try connectSocket(path);
+    defer _ = linux.close(rejected_peer);
+    for (0..200) |_| {
+        try event_loop.dispatch(50);
+        if (host.failure()) |err| return err;
+        if (probe.destroy_count == 1) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.destroy_count);
+    try std.testing.expect(!registry.contains(probe.accepted_ids[1].?));
+
+    inline for (.{ AcceptanceFault.reserve, AcceptanceFault.wrapper }) |fault| {
+        host.acceptance_fault = fault;
+        const peer = try connectSocket(path);
+        const expected_destroy_count = probe.destroy_count + 1;
+        for (0..200) |_| {
+            try event_loop.dispatch(50);
+            if (host.failure()) |err| return err;
+            if (probe.destroy_count == expected_destroy_count) break;
+        }
+        _ = linux.close(peer);
+        try std.testing.expectEqual(expected_destroy_count, probe.destroy_count);
+    }
+
+    try std.testing.expect(probe.accepted_before_publication);
+    try std.testing.expect(probe.accepted_before_receive);
+    try std.testing.expect(probe.ordering_valid);
+    try std.testing.expectEqual(@as(usize, 2), probe.accepted_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.disconnect_count);
+    try std.testing.expectEqual(@as(usize, 1), registry.len());
+    try std.testing.expectEqual(@as(usize, 1), host.connectionCount());
+    try std.testing.expect(host.failure() == null);
+    try std.testing.expect(!host.shutting_down);
+    try std.testing.expect(probe.accepted_clients[0].?.fatal() == null);
+
+    host_live = false;
+    try host.destroy();
+    try std.testing.expectEqual(@as(usize, 4), probe.destroy_count);
+    try std.testing.expectEqual(@as(usize, 2), probe.disconnect_count);
+    try std.testing.expectEqual(@as(usize, 0), registry.len());
+    try std.testing.expect(probe.ordering_valid);
+}
+
+test "asynchronous fatal drains output retires one client and preserves the host" {
+    const ClientRegistry = @import("../ClientRegistry.zig");
+    const WayringClients = @import("WayringClients.zig");
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/tmp/keywork-wayring-async-fatal-{d}-{x}",
+        .{ linux.getpid(), @intFromPtr(&marker) },
+        0,
+    );
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS)
+        return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+
+    const event_loop = try wl.EventLoop.create();
+    defer event_loop.destroy();
+    var protocol_server: server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    var registry = ClientRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var clients: WayringClients = undefined;
+    clients.init(std.testing.allocator, &registry);
+    defer clients.deinit();
+    var probe: AcceptanceProbe = .{ .clients = &clients, .registry = &registry };
+    try registry.addDisconnectListener(.{
+        .context = &probe,
+        .notify = AcceptanceProbe.disconnected,
+    });
+    defer registry.removeDisconnectListener(&probe);
+    const host = try WayringHost.create(
+        std.testing.allocator,
+        event_loop,
+        &protocol_server,
+        runtime_directory,
+        .{
+            .context = &probe,
+            .accepted = AcceptanceProbe.accepted,
+            .destroy_resources = AcceptanceProbe.destroy,
+        },
+    );
+    probe.host = host;
+    var host_live = true;
+    defer if (host_live) host.destroy() catch {};
+    const path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/{s}",
+        .{ runtime_directory, host.displayName() },
+        0,
+    );
+    defer std.testing.allocator.free(path);
+
+    const first_peer = try connectSocket(path);
+    defer _ = linux.close(first_peer);
+    _ = try waitForManagedConnection(event_loop, host);
+    const second_peer = try connectSocket(path);
+    defer _ = linux.close(second_peer);
+    for (0..200) |_| {
+        try event_loop.dispatch(50);
+        if (host.failure()) |err| return err;
+        if (host.connectionCount() == 2) break;
+    }
+    try std.testing.expectEqual(@as(usize, 2), host.connectionCount());
+
+    const retiring_client = host.connections.items[0].connection.client();
+    retiring_client.postOutOfMemory(
+        retiring_client.lookup(1).?,
+        "asynchronous generated output failure",
+    );
+    try host.dispatchReady();
+    for (0..200) |_| {
+        try event_loop.dispatch(50);
+        if (host.failure()) |err| return err;
+        if (host.connectionCount() == 1) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), host.connectionCount());
+    var fatal_frame: [256]u8 = undefined;
+    try std.testing.expect(std.c.read(first_peer, &fatal_frame, fatal_frame.len) > 0);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, fatal_frame[0..4], .native));
+    try std.testing.expectEqual(@as(usize, 1), probe.destroy_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.disconnect_count);
+    try std.testing.expectEqual(@as(usize, 1), registry.len());
+    try std.testing.expect(host.failure() == null);
+    try std.testing.expect(!host.shutting_down);
+    try std.testing.expectEqual(wayring.io_uring.Connection.State.ready, host.connections.items[0].connection.state());
+    try std.testing.expect(host.connections.items[0].connection.client().fatal() == null);
+    try std.testing.expect(probe.ordering_valid);
+
+    host_live = false;
+    try host.destroy();
+    try std.testing.expectEqual(@as(usize, 2), probe.destroy_count);
+    try std.testing.expectEqual(@as(usize, 2), probe.disconnect_count);
+    try std.testing.expectEqual(@as(usize, 0), registry.len());
 }
 
 const CompletionErrorInjector = struct {
@@ -528,7 +871,11 @@ test "destroy drains resources and routes after a completion error" {
         event_loop,
         &protocol_server,
         runtime_directory,
-        .{ .context = &cleanup, .destroy_resources = CleanupProbe.destroy },
+        .{
+            .context = &cleanup,
+            .accepted = CleanupProbe.accepted,
+            .destroy_resources = CleanupProbe.destroy,
+        },
     );
     var host_live = true;
     defer if (host_live) host.destroy() catch {};
@@ -602,7 +949,11 @@ test "completion read failure and stalled destroy are undrainable without repeat
         event_loop,
         &protocol_server,
         runtime_directory,
-        .{ .context = &cleanup, .destroy_resources = CleanupProbe.destroy },
+        .{
+            .context = &cleanup,
+            .accepted = CleanupProbe.accepted,
+            .destroy_resources = CleanupProbe.destroy,
+        },
     );
     var host_live = true;
     defer if (host_live) host.destroy() catch {};
@@ -752,6 +1103,8 @@ test "existing event loop drives scanner-backed Wayring client lifecycle" {
     );
     defer compositor.deinit();
     const Lifecycle = struct {
+        fn accepted(_: *anyopaque, _: *server.Client) !void {}
+
         fn destroy(erased: *anyopaque, client: *server.Client) void {
             const owner: *WayringCompositor = @ptrCast(@alignCast(erased));
             owner.destroyClientResources(client);
@@ -762,7 +1115,11 @@ test "existing event loop drives scanner-backed Wayring client lifecycle" {
         event_loop,
         &protocol_server,
         runtime_directory,
-        .{ .context = &compositor, .destroy_resources = Lifecycle.destroy },
+        .{
+            .context = &compositor,
+            .accepted = Lifecycle.accepted,
+            .destroy_resources = Lifecycle.destroy,
+        },
     );
     var host_live = true;
 

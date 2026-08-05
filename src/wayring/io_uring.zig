@@ -227,6 +227,15 @@ const OperationTable = struct {
         return null;
     }
 
+    fn cancelableRecvFor(self: *const OperationTable, owner: *Connection) ?OperationToken {
+        for (self.slots.items, 0..) |slot, index| if (slot.operation) |operation| switch (operation) {
+            .recv => |value| if (value.owner == @as(*anyopaque, @ptrCast(owner)) and value.cancel == .none)
+                return .{ .slot = @intCast(index), .generation = slot.generation },
+            else => {},
+        };
+        return null;
+    }
+
     fn slotFor(self: *OperationTable, token: OperationToken) !*Slot {
         if (token.slot >= self.slots.items.len) return error.ForeignToken;
         const slot = &self.slots.items[token.slot];
@@ -278,6 +287,13 @@ pub const Connection = struct {
 
     pub fn state(self: *const Connection) State {
         return self.state_value;
+    }
+
+    /// Synchronizes protocol-fatal state into transport scheduling. Once
+    /// terminal, a connection may only drain output or cancel in-flight work.
+    pub fn synchronizeFatal(self: *Connection) void {
+        if (self.state_value == .ready and self.client().fatal() != null)
+            self.state_value = .terminal;
     }
 
     fn resetMessage(self: *Connection) void {
@@ -440,6 +456,9 @@ pub const Server = struct {
             };
             return .{ .prepared = self.operations.commitPrepared() };
         }
+        for (self.connections.items) |connection| connection.synchronizeFatal();
+        if (self.nextTerminalRecvCancellation()) |target|
+            return self.prepareCancellation(ring, target, external_user_data);
         const connection = self.nextConnection();
         const choose_accept = !self.accept_pending and (connection == null or self.prefer_accept);
         if (!choose_accept and connection == null) {
@@ -452,6 +471,31 @@ pub const Server = struct {
         const can_recv = selected.state_value == .ready and !selected.recv_pending;
         if (can_send and (!can_recv or self.prefer_send)) return self.prepareSend(ring, selected, external_user_data);
         return self.prepareRecv(ring, selected, external_user_data);
+    }
+
+    fn nextTerminalRecvCancellation(self: *const Server) ?OperationToken {
+        for (self.connections.items) |connection| {
+            if (connection.state_value != .terminal or !connection.recv_pending) continue;
+            if (self.operations.cancelableRecvFor(connection)) |target| return target;
+        }
+        return null;
+    }
+
+    fn prepareCancellation(
+        self: *Server,
+        ring: *linux.IoUring,
+        target: OperationToken,
+        external_user_data: u64,
+    ) !PrepareResult {
+        try self.operations.prepareCancel(target, self, external_user_data);
+        const original = self.operations.lookup(target) catch unreachable;
+        _ = ring.cancel(external_user_data, original.external(), 0) catch |err| switch (err) {
+            error.SubmissionQueueFull => {
+                self.operations.abortPrepared() catch unreachable;
+                return .submission_queue_full;
+            },
+        };
+        return .{ .prepared = self.operations.commitPrepared() };
     }
 
     fn prepareAccept(self: *Server, ring: *linux.IoUring, external: u64) !PrepareResult {
@@ -551,6 +595,10 @@ pub const Server = struct {
             else => .{ .listener_error = err },
         };
         const fd: linux.fd_t = @intCast(res);
+        return self.acceptConnection(fd) catch .retry;
+    }
+
+    fn acceptConnection(self: *Server, fd: linux.fd_t) !CompleteResult {
         errdefer _ = linux.close(fd);
         const credentials = try peerCredentials(fd);
         const connection = try self.allocator.create(Connection);
@@ -565,6 +613,16 @@ pub const Server = struct {
     fn completeRecv(self: *Server, connection: *Connection, res: i32) !CompleteResult {
         defer connection.recv_pending = false;
         if (self.shutting_down and completionError(res) == .CANCELED) return .{ .peer_disconnected = connection };
+        if (connection.state_value == .terminal) {
+            if (res > 0) {
+                const received: usize = @intCast(res);
+                if (received > connection.data.len) return error.InvalidCompletionResult;
+                const count = parseRights(connection, connection.msg.controllen, connection.msg.flags) catch
+                    return .{ .terminal = connection };
+                closeFds(connection.fd_scratch[0..count]);
+            }
+            return .{ .terminal = connection };
+        }
         if (connection.state_value == .peer_disconnected) {
             if (res > 0) {
                 const received: usize = @intCast(res);
@@ -632,6 +690,7 @@ pub const Server = struct {
         try connection.client().completeSend(token, written);
         self.prefer_send = true;
         if (connection.state_value == .peer_disconnected) return .{ .peer_disconnected = connection };
+        connection.synchronizeFatal();
         return if (written == 0) .retry else .{ .sent = connection };
     }
 
@@ -645,6 +704,7 @@ pub const Server = struct {
         for (0..self.connections.items.len) |offset| {
             const index = (self.connection_cursor + offset) % self.connections.items.len;
             const connection = self.connections.items[index];
+            connection.synchronizeFatal();
             if (connection.state_value == .peer_disconnected) continue;
             const can_recv = connection.state_value == .ready and !connection.recv_pending;
             const can_send = !connection.send_pending and connection.client().hasPendingOutput();
@@ -912,6 +972,105 @@ test "accepted connection is stable and requires explicit release" {
     try std.testing.expect(linux.fcntl(accepted, linux.F.GETFD, 0) <= std.math.maxInt(isize));
     resource.destroy();
     resource.deinit();
+    try transport.release(connection);
+    try transport.deinit();
+}
+
+test "pre-lifecycle acceptance OOM rejects one peer without disturbing existing clients" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const listener: linux.fd_t = @intCast(linux.dup(0));
+    var transport = try Server.init(failing.allocator(), &host, listener);
+    const existing = (try transport.completeAccept(try testPeerSocket())).accepted;
+
+    failing.fail_index = failing.alloc_index;
+    const rejected_fd = try testPeerSocket();
+    try std.testing.expect((try transport.completeAccept(rejected_fd)) == .retry);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(linux.fcntl(rejected_fd, linux.F.GETFD, 0) > std.math.maxInt(isize));
+    try std.testing.expectEqual(@as(usize, 1), transport.connections.items.len);
+    try std.testing.expectEqual(Connection.State.ready, existing.state());
+    try std.testing.expect(existing.client().fatal() == null);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try transport.release(existing);
+    try transport.deinit();
+}
+
+test "asynchronous fatal selects output not receive and leaves peers active" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const listener: linux.fd_t = @intCast(linux.dup(0));
+    var transport = try Server.init(std.testing.allocator, &host, listener);
+    const connection = (try transport.completeAccept(try testPeerSocket())).accepted;
+    const peer = (try transport.completeAccept(try testPeerSocket())).accepted;
+    var ring = try linux.IoUring.init(8, 0);
+    defer ring.deinit();
+
+    const display = connection.client().lookup(1).?;
+    connection.client().postOutOfMemory(display, "asynchronous generated event failure");
+    transport.accept_pending = true;
+    const prepared = try transport.prepareNext(&ring, 100);
+    const token = prepared.prepared;
+    try std.testing.expect((try transport.operations.lookup(token)) == .send);
+    try std.testing.expectEqual(Connection.State.terminal, connection.state());
+    const send_len = connection.send_iov.len;
+    const completed = try transport.complete(token, @intCast(send_len), 0);
+    try std.testing.expect(completed == .sent);
+    try std.testing.expect(!connection.client().hasPendingOutput());
+    try std.testing.expectEqual(Connection.State.ready, peer.state());
+    try std.testing.expect(peer.client().fatal() == null);
+
+    transport.accept_pending = false;
+    try transport.release(connection);
+    try transport.release(peer);
+    try transport.deinit();
+}
+
+test "terminal receive is canceled and raced input is never dispatched" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const listener: linux.fd_t = @intCast(linux.dup(0));
+    var transport = try Server.init(std.testing.allocator, &host, listener);
+    const connection = (try transport.completeAccept(try testPeerSocket())).accepted;
+    var ring = try linux.IoUring.init(8, 0);
+    defer ring.deinit();
+
+    connection.resetMessage();
+    try transport.operations.prepare(.recv(connection), 200);
+    const recv_token = transport.operations.commitPrepared();
+    connection.recv_pending = true;
+    connection.client().postImplementationError(
+        connection.client().lookup(1).?,
+        "fatal outside dispatch",
+    );
+    transport.accept_pending = true;
+    const cancellation = (try transport.prepareNext(&ring, 201)).prepared;
+    const cancel_operation = (try transport.operations.lookup(cancellation)).cancel;
+    try std.testing.expectEqual(recv_token, cancel_operation.target);
+    try std.testing.expectEqual(Connection.State.terminal, connection.state());
+
+    connection.data[0..12].* = .{
+        1, 0, 0,  0,
+        0, 0, 12, 0,
+        2, 0, 0,  0,
+    };
+    connection.msg.controllen = 0;
+    connection.msg.flags = 0;
+    const raced = try transport.complete(recv_token, 12, 0);
+    try std.testing.expect(raced == .terminal);
+    try std.testing.expect(connection.client().lookup(2) == null);
+    try std.testing.expect(!connection.recv_pending);
+    try std.testing.expect((try transport.complete(
+        cancellation,
+        -@as(i32, @intFromEnum(linux.E.NOENT)),
+        0,
+    )) == .cancellation);
+
+    while (try connection.client().beginSend()) |batch|
+        try connection.client().completeSend(batch.token, batch.bytes.len);
+    transport.accept_pending = false;
     try transport.release(connection);
     try transport.deinit();
 }
