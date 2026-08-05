@@ -9,6 +9,7 @@ const SecurityContext = @import("security_context.zig");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
 const TextInput = @import("text_input.zig");
+const MatureSerials = @import("mature_serials.zig");
 
 const wl = wayland.server.wl;
 const zwp = wayland.server.zwp;
@@ -492,7 +493,7 @@ const KeyboardGrab = struct {
     ) void {
         const self: *KeyboardGrab = @ptrCast(@alignCast(context));
         self.resource.sendModifiers(
-            self.method.manager.display.nextSerial(),
+            MatureSerials.issueWire(self.method.manager.display),
             depressed,
             latched,
             locked,

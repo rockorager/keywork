@@ -11,6 +11,7 @@ const ClientRegistry = @import("../ClientRegistry.zig");
 const SeatAuthority = @import("../SeatAuthority.zig");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const MatureClients = @import("MatureClients.zig");
+const MatureSerials = @import("mature_serials.zig");
 
 const wl = wayland.server.wl;
 
@@ -542,7 +543,7 @@ pub fn clearKeyboardGrab(self: *Self, context: *anyopaque, restore_focus: bool) 
     }
     const surface = self.focusedSurface() orelse return;
     if (!self.parent_focused or self.keymap == null) return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     for (self.keyboard_resources.items) |entry| {
         if (!self.keyboardResourceActive(entry)) continue;
         if (entry.resource.getClient() == surface.getClient()) {
@@ -567,7 +568,7 @@ pub fn acceptsSelectionSerial(self: *Self, client: *wl.Client, serial: u32) bool
 
 pub fn selectionOrder(self: *const Self, client: *wl.Client, serial: u32) ?SeatAuthority.Order {
     const client_id = self.matureClient(client) orelse return null;
-    return self.authority.selectionOrder(client_id, matureSerial(serial));
+    return self.authority.selectionOrder(client_id, MatureSerials.fromWire(serial));
 }
 
 pub fn nextSelectionOrder(self: *Self) SeatAuthority.Order {
@@ -582,7 +583,7 @@ pub fn acceptsActivationSerial(
 ) bool {
     if (!self.ownsResource(resource)) return false;
     const client_id = self.matureClient(client) orelse return false;
-    return self.authority.acceptsActivation(client_id, matureSerial(serial));
+    return self.authority.acceptsActivation(client_id, MatureSerials.fromWire(serial));
 }
 
 pub fn activationSurfaceFocused(self: *const Self, surface_id: Surface.Id) bool {
@@ -601,7 +602,7 @@ pub fn activationSurfaceFocused(self: *const Self, surface_id: Surface.Id) bool 
 
 pub fn acceptsClientUserActionSerial(self: *const Self, client: *wl.Client, serial: u32) bool {
     const client_id = self.matureClient(client) orelse return false;
-    return self.authority.acceptsAction(client_id, matureSerial(serial));
+    return self.authority.acceptsAction(client_id, MatureSerials.fromWire(serial));
 }
 
 pub fn acceptsPointerGrabSerial(
@@ -611,7 +612,11 @@ pub fn acceptsPointerGrabSerial(
     serial: u32,
 ) bool {
     const client_id = self.matureClient(client) orelse return false;
-    return self.authority.acceptsPointerGrab(client_id, matureSerial(serial), surface_id);
+    return self.authority.acceptsPointerGrab(
+        client_id,
+        MatureSerials.fromWire(serial),
+        surface_id,
+    );
 }
 
 pub fn hasPressedPointerButton(self: *const Self, button: u32) bool {
@@ -639,31 +644,27 @@ pub fn forgetPressedPointerButton(self: *Self, button: u32) void {
         self.pointer_grab = null;
 }
 
-fn matureSerial(value: u32) ClientRegistry.Serial {
-    return .{ .domain = .mature_display, .value = value };
-}
-
 fn matureClient(self: *const Self, client: *wl.Client) ?ClientRegistry.Id {
     const id = self.mature_clients.id(client) orelse return null;
     if (self.clients.domainOf(id) != .mature_display) return null;
     return id;
 }
 
-fn recordAction(self: *Self, client: *wl.Client, serial: u32) void {
+fn recordAction(self: *Self, client: *wl.Client, serial: ClientRegistry.Serial) void {
     const id = self.matureClient(client) orelse unreachable;
-    const recorded = self.authority.recordAction(id, matureSerial(serial));
+    const recorded = self.authority.recordAction(id, serial);
     std.debug.assert(recorded);
 }
 
-fn recordSelection(self: *Self, client: *wl.Client, serial: u32) void {
+fn recordSelection(self: *Self, client: *wl.Client, serial: ClientRegistry.Serial) void {
     const id = self.matureClient(client) orelse unreachable;
-    const recorded = self.authority.recordSelection(id, matureSerial(serial));
+    const recorded = self.authority.recordSelection(id, serial);
     std.debug.assert(recorded);
 }
 
-fn recordPointerEnter(self: *Self, client: *wl.Client, serial: u32) void {
+fn recordPointerEnter(self: *Self, client: *wl.Client, serial: ClientRegistry.Serial) void {
     const id = self.matureClient(client) orelse unreachable;
-    const recorded = self.authority.recordPointerEnter(id, matureSerial(serial));
+    const recorded = self.authority.recordPointerEnter(id, serial);
     std.debug.assert(recorded);
 }
 
@@ -1073,7 +1074,7 @@ fn keyWithGrab(
         if (grab.token != token) return;
         if (grab.surface) |surface_id| {
             const surface = Surface.resourceFor(self.surface_store, surface_id) orelse return;
-            const serial = self.display.nextSerial();
+            const serial = MatureSerials.issue(self.display);
             if (state == .pressed)
                 self.recordAction(surface.getClient(), serial)
             else
@@ -1083,16 +1084,22 @@ fn keyWithGrab(
                 const resource = entry.resource;
                 if (resource.getClient() != surface.getClient()) continue;
                 if (state == .repeated and resource.getVersion() < 10) continue;
-                resource.sendKey(serial, time, key_code, state);
+                resource.sendKey(serial.value, time, key_code, state);
             }
             return;
         }
         if (state == .repeated) return;
-        grab.key(grab.context, self.display.nextSerial(), time, key_code, state);
+        grab.key(
+            grab.context,
+            MatureSerials.issueWire(self.display),
+            time,
+            key_code,
+            state,
+        );
         return;
     }
     const surface = self.focusedSurface() orelse return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issue(self.display);
     if (state == .pressed)
         self.recordAction(surface.getClient(), serial)
     else
@@ -1102,7 +1109,7 @@ fn keyWithGrab(
         const resource = entry.resource;
         if (resource.getClient() != surface.getClient()) continue;
         if (state == .repeated and resource.getVersion() < 10) continue;
-        resource.sendKey(serial, time, key_code, state);
+        resource.sendKey(serial.value, time, key_code, state);
     }
 }
 
@@ -1161,7 +1168,7 @@ fn sendCurrentModifiers(self: *Self, allow_grab: bool) void {
         if (self.keyboard_grab) |grab| {
             if (grab.surface) |surface_id| {
                 const surface = Surface.resourceFor(self.surface_store, surface_id) orelse return;
-                const serial = self.display.nextSerial();
+                const serial = MatureSerials.issueWire(self.display);
                 for (self.keyboard_resources.items) |entry| {
                     if (!self.keyboardResourceActive(entry)) continue;
                     if (entry.resource.getClient() == surface.getClient()) {
@@ -1182,7 +1189,7 @@ fn sendCurrentModifiers(self: *Self, allow_grab: bool) void {
     }
     const surface = self.focusedSurface() orelse return;
     if (!self.parent_focused or self.keymap == null) return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     for (self.keyboard_resources.items) |entry| {
         if (!self.keyboardResourceActive(entry)) continue;
         if (entry.resource.getClient() == surface.getClient()) {
@@ -1260,12 +1267,11 @@ pub fn pointerButton(
             if (self.authority.hasPointerButton(button)) return false;
             const surface = self.pointerSurface() orelse return false;
             const client_id = self.matureClient(surface.getClient()) orelse return false;
-            const serial = self.display.nextSerial();
-            const typed = matureSerial(serial);
+            const serial = MatureSerials.issue(self.display);
             const starts_grab = !self.authority.hasPointerButtons();
             const added = try self.authority.addPointerPress(
                 client_id,
-                typed,
+                serial,
                 button,
                 self.pointer_focus.?.surface_id,
             );
@@ -1273,13 +1279,13 @@ pub fn pointerButton(
             if (starts_grab) {
                 self.pointer_grab = .{ .surface_id = self.pointer_focus.?.surface_id };
             }
-            const recorded = self.authority.recordAction(client_id, typed);
+            const recorded = self.authority.recordAction(client_id, serial);
             std.debug.assert(recorded);
             for (self.pointer_resources.items) |entry| {
                 if (!self.pointerResourceActive(entry)) continue;
                 const resource = entry.resource;
                 if (resource.getClient() == surface.getClient()) {
-                    resource.sendButton(serial, time, button, state);
+                    resource.sendButton(serial.value, time, button, state);
                 }
             }
             return false;
@@ -1294,14 +1300,14 @@ pub fn pointerButton(
     if (grab_ended) self.pointer_grab = null;
     const surface = self.pointerSurface() orelse return grab_ended;
     const client_id = self.matureClient(surface.getClient()) orelse return grab_ended;
-    const serial = self.display.nextSerial();
-    const recorded = self.authority.recordSelection(client_id, matureSerial(serial));
+    const serial = MatureSerials.issue(self.display);
+    const recorded = self.authority.recordSelection(client_id, serial);
     std.debug.assert(recorded);
     for (self.pointer_resources.items) |entry| {
         if (!self.pointerResourceActive(entry)) continue;
         const resource = entry.resource;
         if (resource.getClient() == surface.getClient()) {
-            resource.sendButton(serial, time, button, state);
+            resource.sendButton(serial.value, time, button, state);
         }
     }
     return grab_ended;
@@ -1428,7 +1434,7 @@ pub fn touchDown(
 
     const destination = target orelse return;
     const surface = Surface.resourceFor(self.surface_store, destination.surface_id) orelse return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issue(self.display);
     self.recordAction(destination.client, serial);
     for (self.touch_resources.items) |entry| {
         if (!self.touchResourceActive(entry)) continue;
@@ -1438,7 +1444,7 @@ pub fn touchDown(
         {
             try self.markTouchFrame(resource);
             resource.sendDown(
-                serial,
+                serial.value,
                 time,
                 surface,
                 id,
@@ -1454,7 +1460,7 @@ pub fn touchUp(self: *Self, time: u32, id: i32) error{OutOfMemory}!void {
     const index = self.findTouchPoint(id) orelse return;
     const point = self.touch_points.items[index];
     if (point.target) |target| {
-        const serial = self.display.nextSerial();
+        const serial = MatureSerials.issue(self.display);
         self.recordSelection(target.client, serial);
         for (self.touch_resources.items) |entry| {
             if (!self.touchResourceActive(entry)) continue;
@@ -1463,7 +1469,7 @@ pub fn touchUp(self: *Self, time: u32, id: i32) error{OutOfMemory}!void {
                 resource.getClient() == target.client)
             {
                 try self.markTouchFrame(resource);
-                resource.sendUp(serial, time, id);
+                resource.sendUp(serial.value, time, id);
             }
         }
     }
@@ -1661,7 +1667,7 @@ fn createKeyboard(self: *Self, seat: *wl.Seat, id: u32) void {
     self.sendRepeatInfo(resource);
     const surface = self.keyboardDeliverySurface() orelse return;
     if (self.parent_focused and resource.getClient() == surface.getClient()) {
-        const serial = self.display.nextSerial();
+        const serial = MatureSerials.issue(self.display);
         self.recordSelection(surface.getClient(), serial);
         self.sendEnterTo(resource, surface, serial);
     }
@@ -1691,7 +1697,7 @@ fn createPointer(self: *Self, seat: *wl.Seat, id: u32) void {
     if (!self.pointerResourceActive(stored.*)) return;
     const surface = self.pointerSurface() orelse return;
     if (resource.getClient() == surface.getClient()) {
-        const serial = self.display.nextSerial();
+        const serial = MatureSerials.issue(self.display);
         self.recordPointerEnter(surface.getClient(), serial);
         self.sendPointerEnterTo(stored, surface, serial);
         if (resource.getVersion() >= wl.Pointer.frame_since_version) resource.sendFrame();
@@ -1948,7 +1954,7 @@ fn sendRepeatInfo(self: *const Self, resource: *wl.Keyboard) void {
 fn sendEnter(self: *Self) void {
     if (self.keymap == null) return;
     const surface = self.keyboardDeliverySurface() orelse return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issue(self.display);
     self.recordSelection(surface.getClient(), serial);
     for (self.keyboard_resources.items) |entry| {
         if (!self.keyboardResourceActive(entry)) continue;
@@ -1959,15 +1965,20 @@ fn sendEnter(self: *Self) void {
     }
 }
 
-fn sendEnterTo(self: *Self, resource: *wl.Keyboard, surface: *wl.Surface, serial: u32) void {
+fn sendEnterTo(
+    self: *Self,
+    resource: *wl.Keyboard,
+    surface: *wl.Surface,
+    serial: ClientRegistry.Serial,
+) void {
     var keys = self.pressed_keys.asWaylandArray();
-    resource.sendEnter(serial, surface, &keys);
-    self.sendModifiers(resource, serial);
+    resource.sendEnter(serial.value, surface, &keys);
+    self.sendModifiers(resource, serial.value);
 }
 
 fn sendLeave(self: *Self) void {
     const surface = self.keyboardDeliverySurface() orelse return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     for (self.keyboard_resources.items) |entry| {
         if (!self.keyboardResourceActive(entry)) continue;
         const resource = entry.resource;
@@ -2020,7 +2031,7 @@ fn pointerSurface(self: *Self) ?*wl.Surface {
 
 fn sendPointerEnter(self: *Self) void {
     const surface = self.pointerSurface() orelse return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issue(self.display);
     self.recordPointerEnter(surface.getClient(), serial);
     for (self.pointer_resources.items) |*entry| {
         if (!self.pointerResourceActive(entry.*)) continue;
@@ -2035,17 +2046,17 @@ fn sendPointerEnterTo(
     self: *const Self,
     entry: *PointerResource,
     surface: *wl.Surface,
-    serial: u32,
+    serial: ClientRegistry.Serial,
 ) void {
     const position = self.pointer_focus orelse return;
-    entry.enter_serial = matureSerial(serial);
+    entry.enter_serial = serial;
     const resource = entry.resource;
-    resource.sendEnter(serial, surface, fixed(position.x), fixed(position.y));
+    resource.sendEnter(serial.value, surface, fixed(position.x), fixed(position.y));
 }
 
 fn sendPointerLeave(self: *Self) void {
     const surface = self.pointerSurface() orelse return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     for (self.pointer_resources.items) |*entry| {
         if (!self.pointerResourceActive(entry.*)) continue;
         const resource = entry.resource;
@@ -2079,7 +2090,10 @@ fn setCursor(
         false;
     const controller = manager_controller or drag_controller;
     if (!controller and (pointer_client == null or
-        !self.authority.acceptsPointerEnter(pointer_client.?, matureSerial(serial)))) return;
+        !self.authority.acceptsPointerEnter(
+            pointer_client.?,
+            MatureSerials.fromWire(serial),
+        ))) return;
     const focused_client = if (self.pointerSurface()) |surface|
         surface.getClient() == pointer.getClient()
     else
@@ -2141,7 +2155,10 @@ pub fn setCursorShape(
         false;
     const controller = manager_controller or drag_controller;
     if (client_id == null) return;
-    if (!controller and (!self.authority.acceptsPointerEnter(client_id.?, matureSerial(serial)))) return;
+    if (!controller and (!self.authority.acceptsPointerEnter(
+        client_id.?,
+        MatureSerials.fromWire(serial),
+    ))) return;
     const focused_client = if (self.pointerSurface()) |surface|
         surface.getClient() == client
     else

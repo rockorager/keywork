@@ -5,6 +5,7 @@ const Self = @This();
 const std = @import("std");
 const wayland = @import("wayland");
 const Seat = @import("seat.zig");
+const MatureSerials = @import("mature_serials.zig");
 
 const wl = wayland.server.wl;
 const zwp = wayland.server.zwp;
@@ -47,7 +48,7 @@ pub fn deinit(self: *Self) void {
 
 pub fn beginSwipe(self: *Self, seat: *Seat, time: u32, fingers: u32) void {
     const surface = seat.pointerFocusedResource() orelse return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     for (self.swipes.items) |swipe| {
         if (!bindingMatches(swipe.binding, seat) or
             swipe.resource.getClient() != surface.getClient()) continue;
@@ -66,7 +67,7 @@ pub fn updateSwipe(self: *Self, seat: *Seat, time: u32, dx: f64, dy: f64) void {
 }
 
 pub fn endSwipe(self: *Self, seat: *Seat, time: u32, cancelled: bool) void {
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     for (self.swipes.items) |swipe| {
         if (!bindingMatches(swipe.binding, seat) or !swipe.active) continue;
         swipe.active = false;
@@ -76,7 +77,7 @@ pub fn endSwipe(self: *Self, seat: *Seat, time: u32, cancelled: bool) void {
 
 pub fn beginPinch(self: *Self, seat: *Seat, time: u32, fingers: u32) void {
     const surface = seat.pointerFocusedResource() orelse return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     for (self.pinches.items) |pinch| {
         if (!bindingMatches(pinch.binding, seat) or
             pinch.resource.getClient() != surface.getClient()) continue;
@@ -109,7 +110,7 @@ pub fn updatePinch(
 }
 
 pub fn endPinch(self: *Self, seat: *Seat, time: u32, cancelled: bool) void {
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     for (self.pinches.items) |pinch| {
         if (!bindingMatches(pinch.binding, seat) or !pinch.active) continue;
         pinch.active = false;
@@ -119,7 +120,7 @@ pub fn endPinch(self: *Self, seat: *Seat, time: u32, cancelled: bool) void {
 
 pub fn beginHold(self: *Self, seat: *Seat, time: u32, fingers: u32) void {
     const surface = seat.pointerFocusedResource() orelse return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     for (self.holds.items) |hold| {
         if (!bindingMatches(hold.binding, seat) or
             hold.resource.getClient() != surface.getClient()) continue;
@@ -130,7 +131,7 @@ pub fn beginHold(self: *Self, seat: *Seat, time: u32, fingers: u32) void {
 }
 
 pub fn endHold(self: *Self, seat: *Seat, time: u32, cancelled: bool) void {
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     for (self.holds.items) |hold| {
         if (!bindingMatches(hold.binding, seat) or !hold.active) continue;
         hold.active = false;

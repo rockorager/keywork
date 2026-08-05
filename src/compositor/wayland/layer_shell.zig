@@ -12,6 +12,7 @@ const OutputLayout = @import("output_layout.zig");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
 const XdgShell = @import("xdg_shell.zig");
+const MatureSerials = @import("mature_serials.zig");
 
 const wl = wayland.server.wl;
 const zwlr = wayland.server.zwlr;
@@ -461,7 +462,7 @@ fn arrangeOutput(self: *Self, output_id: OutputLayout.Id, output: *Output) Rect 
                 @as(i64, state.current.zone) + edgeMargin(state.current, edge.?),
             );
             if (!state.configured or !std.meta.eql(state.last_size, desired)) {
-                const serial = self.display.nextSerial();
+                const serial = MatureSerials.issueWire(self.display);
                 state.serials.append(self.allocator, serial) catch {
                     state.adapter.resource.?.postNoMemory();
                     continue;

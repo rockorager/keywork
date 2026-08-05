@@ -6,6 +6,7 @@ const std = @import("std");
 const wayland = @import("wayland");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
+const MatureSerials = @import("mature_serials.zig");
 const slot_map = @import("../slot_map.zig");
 
 const wl = wayland.server.wl;
@@ -273,7 +274,7 @@ pub fn performSubmit(self: *Self) bool {
     const state = self.inputs.get(self.active orelse return false) orelse return false;
     if (!state.current.enabled or !state.current.submit_available or
         state.resource.getVersion() < 2) return false;
-    state.resource.sendAction(.submit, self.display.nextSerial());
+    state.resource.sendAction(.submit, MatureSerials.issueWire(self.display));
     state.resource.sendDone(state.commit_count);
     return true;
 }

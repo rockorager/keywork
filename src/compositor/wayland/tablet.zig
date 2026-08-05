@@ -8,6 +8,7 @@ const NativeInput = @import("../backend/native_input.zig");
 const ClientRegistry = @import("../ClientRegistry.zig");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
+const MatureSerials = @import("mature_serials.zig");
 
 const wl = wayland.server.wl;
 const zwp = wayland.server.zwp;
@@ -361,7 +362,7 @@ pub fn tip(
     self.sendAxes(tool, target, axes);
     if (tool.tip_down != down) {
         tool.tip_down = down;
-        const serial = if (down) self.display.nextSerial() else 0;
+        const serial = if (down) MatureSerials.issueWire(self.display) else 0;
         for (self.tool_resources.items) |adapter| {
             if (adapter.tool != tool or !adapter.active) continue;
             if (down) {
@@ -407,7 +408,7 @@ pub fn button(
     if (axes.position != null) self.updateFocus(tool, target, time);
     self.sendAxes(tool, target, axes);
     if (state_changed and had_focus) {
-        const serial = self.display.nextSerial();
+        const serial = MatureSerials.issueWire(self.display);
         for (self.tool_resources.items) |adapter| {
             if (adapter.tool == tool and adapter.active) {
                 adapter.resource.sendButton(
@@ -808,7 +809,7 @@ fn createToolResource(self: *Self, binding: *SeatBinding, tool: *Tool) !void {
     const surface = tool.focus_resource orelse return;
     if (!tool.in_proximity or binding.client != surface.getClient()) return;
     const tablet = self.tabletResource(binding, tool.device) orelse return;
-    const serial = matureSerial(self.display.nextSerial());
+    const serial = MatureSerials.issue(self.display);
     adapter.active = true;
     adapter.proximity_serial = serial;
     resource.sendProximityIn(serial.value, tablet.resource, surface);
@@ -1156,7 +1157,7 @@ fn activeToolResource(
 ) ?*Tool {
     if (!adapter.active or adapter.binding.client != client or
         adapter.proximity_serial == null or
-        !std.meta.eql(adapter.proximity_serial.?, matureSerial(serial))) return null;
+        !std.meta.eql(adapter.proximity_serial.?, MatureSerials.fromWire(serial))) return null;
     const tool = adapter.tool orelse return null;
     const surface = tool.focus_resource orelse return null;
     if (!tool.in_proximity or surface.getClient() != client) return null;
@@ -1256,7 +1257,7 @@ fn enterPadResource(
     if (adapter.pad != pad or adapter.binding.client != focus.resource.getClient()) return;
     const tablet = self.findDevice(focus.tablet_id) orelse return;
     const tablet_adapter = self.tabletResource(adapter.binding, tablet) orelse return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     adapter.active = true;
     adapter.resource.sendEnter(serial, tablet_adapter.resource, focus.resource);
     for (self.pad_group_resources.items) |group_adapter| {
@@ -1273,7 +1274,7 @@ fn enterPadResource(
 
 fn leavePadFocus(self: *Self, pad: *Pad) void {
     const focus = pad.focus orelse return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     for (self.pad_resources.items) |adapter| {
         if (adapter.pad != pad or !adapter.active) continue;
         adapter.resource.sendLeave(serial, focus.resource);
@@ -1300,7 +1301,7 @@ fn updatePadMode(self: *Self, pad: *Pad, time: u32, group_index: u32, mode: u32)
     if (mode >= group.mode_count or mode == group.current_mode) return;
     group.current_mode = mode;
     if (pad.focus == null) return;
-    const serial = self.display.nextSerial();
+    const serial = MatureSerials.issueWire(self.display);
     for (self.pad_group_resources.items) |adapter| {
         if (adapter.pad == pad and adapter.group_index == group_index and
             self.padBindingActive(adapter.binding, pad))
@@ -1386,7 +1387,7 @@ fn updateFocus(self: *Self, tool: *Tool, target: ?Seat.PointerFocus, time: u32) 
         1,
     ) catch unreachable;
     @as(*wl.Resource, @ptrCast(surface)).addDestroyListener(&tool.focus_destroy_listener);
-    const serial = matureSerial(self.display.nextSerial());
+    const serial = MatureSerials.issue(self.display);
     for (self.tool_resources.items) |adapter| {
         if (adapter.tool != tool or adapter.binding.client != surface.getClient()) continue;
         const tablet = self.tabletResource(adapter.binding, tool.device) orelse continue;
@@ -1411,7 +1412,7 @@ fn leaveFocus(self: *Self, tool: *Tool, time: u32, release_state: bool) void {
         return;
     }
     if (release_state) {
-        const serial = self.display.nextSerial();
+        const serial = MatureSerials.issueWire(self.display);
         for (self.tool_resources.items) |adapter| {
             if (adapter.tool != tool or !adapter.active) continue;
             for (tool.pressed_buttons.items) |button_code| {
@@ -1556,7 +1557,7 @@ fn handleFocusDestroyed(listener: *wl.Listener(*wl.Resource), _: *wl.Resource) v
     tool.focus = null;
     tool.focus_resource = null;
     tool.focus_generation = 0;
-    const serial = tool.manager.display.nextSerial();
+    const serial = MatureSerials.issueWire(tool.manager.display);
     for (tool.manager.tool_resources.items) |adapter| {
         if (adapter.tool != tool or !adapter.active) continue;
         for (tool.pressed_buttons.items) |button_code| {
@@ -1742,10 +1743,6 @@ fn high(value: u64) u32 {
 
 fn low(value: u64) u32 {
     return @truncate(value);
-}
-
-fn matureSerial(value: u32) ClientRegistry.Serial {
-    return .{ .domain = .mature_display, .value = value };
 }
 
 fn normalizedUnsigned(value: f64) u32 {
