@@ -151,6 +151,15 @@ pub fn surfaceUnavailable(self: *FocusArbiter, surface: SurfaceRegistry.Id) bool
     return true;
 }
 
+/// Synchronously clears a target whose frontend client has terminalized but
+/// has not yet reached registry destruction.
+pub fn clientUnavailable(self: *FocusArbiter, client: ClientRegistry.Id) bool {
+    const current = self.target_value orelse return false;
+    if (!std.meta.eql(current.client, client)) return false;
+    self.clear();
+    return true;
+}
+
 fn clear(self: *FocusArbiter) void {
     self.target_value = null;
     self.generated_mature_fallback = null;
@@ -167,8 +176,7 @@ fn targetLive(self: *const FocusArbiter, value: Target) bool {
 
 fn clientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
     const self: *FocusArbiter = @ptrCast(@alignCast(context));
-    const current = self.target_value orelse return;
-    if (std.meta.eql(current.client, client)) self.clear();
+    _ = self.clientUnavailable(client);
 }
 
 fn idEqual(first: SurfaceRegistry.Id, second: SurfaceRegistry.Id) bool {
@@ -267,6 +275,9 @@ test "surface and client generations synchronously retire generated focus" {
     try std.testing.expectEqual(stale_surface.index, current_surface.index);
     try std.testing.expect(stale_surface.generation != current_surface.generation);
     try std.testing.expect(!arbiter.focusGenerated(stale_surface, current_client, null));
+    try std.testing.expect(arbiter.focusGenerated(current_surface, current_client, null));
+    try std.testing.expect(arbiter.clientUnavailable(current_client));
+    try std.testing.expect(arbiter.target() == null);
     try std.testing.expect(arbiter.focusGenerated(current_surface, current_client, null));
     try std.testing.expect(arbiter.surfaceUnavailable(current_surface));
     try std.testing.expect(arbiter.target() == null);

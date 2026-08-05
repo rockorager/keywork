@@ -404,13 +404,21 @@ pub fn clearDeliverySink(self: *Self, context: *anyopaque) void {
     self.delivery.clearSink(context);
 }
 
-pub fn generatedRequestSink(self: *Self) SeatDelivery.RequestSink {
+pub fn generatedPointerEnterSnapshot(
+    self: *const Self,
+    client: ClientRegistry.Id,
+    capability_generation: SeatDelivery.ResourceGeneration,
+) ?SeatDelivery.PointerEnterSnapshot {
+    const focus = self.pointer_focus orelse return null;
+    const target = focus.generated orelse return null;
+    if (!std.meta.eql(target.client, client) or
+        !self.delivery.capability(.pointer).resourceActive(capability_generation)) return null;
+    const serial = self.authority.latestPointerEnterSerial(client) orelse return null;
     return .{
-        .context = self,
-        .set_cursor = generatedSetCursorCallback,
-        .cursor_committed = generatedCursorCommittedCallback,
-        .cursor_removed = generatedCursorRemovedCallback,
-        .client_retiring = generatedClientRetiringCallback,
+        .surface = focus.surface_id,
+        .serial = serial,
+        .x = pointerFixed(focus.x),
+        .y = pointerFixed(focus.y),
     };
 }
 
@@ -512,6 +520,7 @@ pub fn acceptsPointerEnterSerial(
     serial: u32,
 ) bool {
     const focus = self.pointer_focus orelse return false;
+    if (focus.generated != null) return false;
     if (!std.meta.eql(focus.surface_id, surface_id)) return false;
     const surface = Surface.resourceFor(self.surface_store, surface_id) orelse return false;
     for (self.pointer_resources.items) |entry| {
@@ -681,7 +690,7 @@ pub fn activationSurfaceFocused(self: *const Self, surface_id: Surface.Id) bool 
     if (self.focus) |focus| {
         if (std.meta.eql(focus, surface_id)) return true;
     }
-    if (self.pointer_focus) |focus| {
+    if (self.maturePointerFocus()) |focus| {
         if (std.meta.eql(focus.surface_id, surface_id)) return true;
     }
     for (self.touch_points.items) |point| {
@@ -796,6 +805,14 @@ pub fn pointerFocusedSurface(self: *const Self) ?Surface.Id {
 
 pub fn pointerFocus(self: *const Self) ?PointerFocus {
     return self.pointer_focus;
+}
+
+/// Mature-only view for wlroots-owned protocol consumers. Generated surface
+/// IDs may be numerically equal and must never be resolved through Store.
+pub fn maturePointerFocus(self: *const Self) ?PointerFocus {
+    const focus = self.pointer_focus orelse return null;
+    if (focus.generated != null) return null;
+    return focus;
 }
 
 pub fn pointerFocusedClient(self: *const Self) ?*wl.Client {
@@ -1327,7 +1344,7 @@ pub fn warpPointer(
     surface_x: f64,
     surface_y: f64,
 ) ?struct { x: f64, y: f64 } {
-    const focus = self.pointer_focus orelse return null;
+    const focus = self.maturePointerFocus() orelse return null;
     if (!std.meta.eql(focus.surface_id, surface_id)) return null;
     const position = self.pointer_position orelse return null;
     const warped = PointerPosition{
@@ -1351,6 +1368,24 @@ pub fn pointerLeave(self: *Self) void {
     self.pointer_grab = null;
     self.authority.clearPointerPresses();
     if (fallback_visible) self.notifyCursorChanged(old_cursor);
+}
+
+/// Cancels stale generated endpoint state after an applied topology mutation
+/// while retaining the physical pointer position. The replacement is a fresh
+/// canonical focus transition, never a continuation of an invalid grab.
+pub fn reconcileGeneratedPointerFocus(self: *Self, replacement: ?PointerFocus) void {
+    const current = self.pointer_focus orelse return;
+    if (current.generated == null) return;
+    self.clearCursor();
+    self.sendPointerLeave();
+    self.pointer_focus = null;
+    self.authority.clearPointerEnter();
+    self.pointer_grab = null;
+    self.authority.cancelPointerPressesAndGrants();
+    if (replacement) |focus|
+        self.updatePointerFocus(focus, null)
+    else
+        self.restoreControllerCursor();
 }
 
 pub fn pointerButton(
@@ -2380,17 +2415,13 @@ fn setCursor(
         self.cursor_controller.?.cursor = requested;
         self.cursor_controller.?.configured = true;
         if (self.pointer_focus) |focus| {
+            if (focus.generated != null) return;
             const focused_surface = self.surface_store.get(focus.surface_id);
             if (focused_surface == null or focused_surface.?.resource.getClient() != pointer.getClient()) return;
         }
     }
     self.active_cursor = requested;
     self.notifyCursorChanged(old_cursor);
-}
-
-fn generatedSetCursorCallback(context: *anyopaque, request: SeatDelivery.CursorRequest) SeatDelivery.CursorRequestResult {
-    const self: *Self = @ptrCast(@alignCast(context));
-    return self.setGeneratedCursor(request);
 }
 
 pub fn setGeneratedCursor(self: *Self, request: SeatDelivery.CursorRequest) SeatDelivery.CursorRequestResult {
@@ -2423,8 +2454,7 @@ pub fn setGeneratedCursor(self: *Self, request: SeatDelivery.CursorRequest) Seat
     return .accepted;
 }
 
-fn generatedCursorCommittedCallback(context: *anyopaque, id: SurfaceRegistry.Id, x: i32, y: i32) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+pub fn generatedCursorCommitted(self: *Self, id: SurfaceRegistry.Id, x: i32, y: i32) void {
     if (self.active_cursor) |*cursor| switch (cursor.*) {
         .generated => |*generated| if (std.meta.eql(generated.surface_id, id)) {
             const old_cursor = self.cursorInfo();
@@ -2436,17 +2466,11 @@ fn generatedCursorCommittedCallback(context: *anyopaque, id: SurfaceRegistry.Id,
     };
 }
 
-fn generatedCursorRemovedCallback(context: *anyopaque, id: SurfaceRegistry.Id) void {
-    const self: *Self = @ptrCast(@alignCast(context));
+pub fn generatedCursorRemoved(self: *Self, id: SurfaceRegistry.Id) void {
     if (self.active_cursor) |cursor| switch (cursor) {
         .generated => |generated| if (std.meta.eql(generated.surface_id, id)) self.clearCursor(),
         .surface, .shape => {},
     };
-}
-
-fn generatedClientRetiringCallback(context: *anyopaque, client: ClientRegistry.Id) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    self.retireGeneratedClient(client);
 }
 
 pub fn setCursorShape(
@@ -2480,6 +2504,7 @@ pub fn setCursorShape(
         self.cursor_controller.?.cursor = requested;
         self.cursor_controller.?.configured = true;
         if (self.pointer_focus) |focus| {
+            if (focus.generated != null) return;
             const focused_surface = self.surface_store.get(focus.surface_id);
             if (focused_surface == null or focused_surface.?.resource.getClient() != client) return;
         }
@@ -2664,7 +2689,7 @@ fn samePointerEndpoint(a: PointerFocus, b: PointerFocus) bool {
     return std.meta.eql(a.generated, b.generated);
 }
 
-fn retireGeneratedClient(self: *Self, client: ClientRegistry.Id) void {
+pub fn retireGeneratedClient(self: *Self, client: ClientRegistry.Id) void {
     if (self.pointer_focus) |focus| if (focus.generated) |target| {
         if (std.meta.eql(target.client, client)) {
             self.pointer_focus = null;
@@ -2893,6 +2918,30 @@ test "generated implicit grab cannot alias a mature endpoint with the same surfa
         .x = adjusted.x,
         .y = adjusted.y,
     }));
+}
+
+test "generated focus cannot prove mature focus for an equal surface id" {
+    const surface_id: Surface.Id = .{ .index = 1, .generation = 2 };
+    const generated: GeneratedPointerTarget = .{
+        .root = surface_id,
+        .client = .{ .index = 3, .generation = 4 },
+    };
+    var seat: Self = undefined;
+    seat.pointer_focus = .{
+        .surface_id = surface_id,
+        .x = 5,
+        .y = 6,
+        .generated = generated,
+    };
+    seat.focus = null;
+    seat.touch_points = .empty;
+
+    try std.testing.expectEqual(surface_id, seat.pointerFocus().?.surface_id);
+    try std.testing.expect(seat.maturePointerFocus() == null);
+    try std.testing.expect(!seat.activationSurfaceFocused(surface_id));
+    try std.testing.expect(seat.warpPointer(surface_id, 1, 2) == null);
+    const unused_handle: PointerHandle = .{ .resource = undefined, .generation = 1 };
+    try std.testing.expect(!seat.acceptsPointerEnterSerial(unused_handle, surface_id, 7));
 }
 
 test "implicit pointer grab uses current coordinates for its surface" {

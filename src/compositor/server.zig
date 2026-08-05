@@ -3697,7 +3697,44 @@ pub fn clearGeneratedSeatDeliverySink(self: *Self, context: *anyopaque) void {
 }
 
 pub fn generatedSeatRequestSink(self: *Self) SeatDelivery.RequestSink {
-    return self.seat.generatedRequestSink();
+    return .{
+        .context = self,
+        .pointer_enter_snapshot = generatedPointerEnterSnapshot,
+        .set_cursor = generatedSetCursor,
+        .cursor_committed = generatedCursorCommitted,
+        .cursor_removed = generatedCursorRemoved,
+        .client_retiring = generatedClientRetiring,
+    };
+}
+
+fn generatedPointerEnterSnapshot(
+    context: *anyopaque,
+    client: ClientRegistry.Id,
+    generation: SeatDelivery.ResourceGeneration,
+) ?SeatDelivery.PointerEnterSnapshot {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.seat.generatedPointerEnterSnapshot(client, generation);
+}
+
+fn generatedSetCursor(context: *anyopaque, request: SeatDelivery.CursorRequest) SeatDelivery.CursorRequestResult {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.seat.setGeneratedCursor(request);
+}
+
+fn generatedCursorCommitted(context: *anyopaque, id: SurfaceRegistry.Id, x: i32, y: i32) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.generatedCursorCommitted(id, x, y);
+}
+
+fn generatedCursorRemoved(context: *anyopaque, id: SurfaceRegistry.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.generatedCursorRemoved(id);
+}
+
+fn generatedClientRetiring(context: *anyopaque, client: ClientRegistry.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.seat.retireGeneratedClient(client);
+    _ = self.focus_arbiter.clientUnavailable(client);
 }
 
 pub fn generatedSeatName(self: *const Self) [:0]const u8 {
@@ -3705,6 +3742,7 @@ pub fn generatedSeatName(self: *const Self) [:0]const u8 {
 }
 
 pub fn wayringPresentationListener(self: *Self) ?WayringCompositor.PresentationListener {
+    if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return null;
     return .{
         .context = self,
         .added = wayringSurfaceAdded,
@@ -3720,6 +3758,8 @@ fn wayringSurfaceCursorRole(context: *anyopaque, id: SurfaceRegistry.Id) void {
     self.damageHeadlessCompound(id);
     self.damageActiveGeneratedCursor();
     self.headless_surface_forest.markCursorRole(id);
+    self.reconcileGeneratedPointerTopology();
+    self.repairGeneratedFocus();
     self.damageActiveGeneratedCursor();
 }
 
@@ -3773,6 +3813,7 @@ fn removeHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
     std.debug.assert(self.surface_registry.contains(id));
     self.damageHeadlessCompound(id);
     self.headless_surface_forest.remove(id);
+    self.reconcileGeneratedPointerTopology();
     self.repairGeneratedFocus();
 }
 
@@ -3780,14 +3821,38 @@ fn detachHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
     std.debug.assert(self.surface_registry.contains(id));
     self.damageHeadlessCompound(id);
     self.headless_surface_forest.detach(id);
+    self.reconcileGeneratedPointerTopology();
     self.repairGeneratedFocus();
 }
 
 fn applyHeadlessBatch(self: *Self, batch: WayringCompositor.AppliedBatch) void {
     self.damageHeadlessBatch(batch);
     self.headless_surface_forest.apply(batch);
+    self.reconcileGeneratedPointerTopology();
     self.repairGeneratedFocus();
     self.damageHeadlessBatch(batch);
+}
+
+fn reconcileGeneratedPointerTopology(self: *Self) void {
+    const focus = self.seat.pointerFocus() orelse return;
+    const generated = focus.generated orelse return;
+    const owner = self.seat.generatedSurfaceOwner(focus.surface_id);
+    const valid = self.headless_surface_forest.presentedInCompound(focus.surface_id, generated.root) and
+        owner != null and std.meta.eql(owner.?, generated.client);
+    const position = self.seat.pointerPosition();
+    const replacement = if (position) |point| self.pointerRoute(point.x, point.y).focus else null;
+    if (valid) {
+        if (self.seat.implicitPointerGrabActive()) return;
+        if (replacement) |next| {
+            if (std.meta.eql(next.surface_id, focus.surface_id) and
+                std.meta.eql(next.generated, focus.generated))
+            {
+                self.seat.pointerEnter(position.?.x, position.?.y, next);
+                return;
+            }
+        }
+    }
+    self.seat.reconcileGeneratedPointerFocus(replacement);
 }
 
 fn repairGeneratedFocus(self: *Self) void {
@@ -3797,6 +3862,10 @@ fn repairGeneratedFocus(self: *Self) void {
         _ = self.focus_arbiter.surfaceUnavailable(target.root);
         return;
     };
+    if (self.headless_surface_forest.isCursorRole(root)) {
+        _ = self.focus_arbiter.surfaceUnavailable(target.root);
+        return;
+    }
     const state = self.headless_surface_forest.state(root) orelse {
         _ = self.focus_arbiter.surfaceUnavailable(target.root);
         return;
@@ -11268,8 +11337,9 @@ const TestGeneratedSeatSink = struct {
     event_count: usize = 0,
     next_serial: u32 = 1,
     pointer_event_count: usize = 0,
-    pointer_events: [16]PointerTag = undefined,
-    pointer_surfaces: [16]SurfaceRegistry.Id = undefined,
+    pointer_events: [64]PointerTag = undefined,
+    pointer_surfaces: [64]SurfaceRegistry.Id = undefined,
+    last_button_serial: ?ClientRegistry.Serial = null,
 
     fn sink(self: *TestGeneratedSeatSink) SeatDelivery.Sink {
         return .{
@@ -11354,6 +11424,7 @@ const TestGeneratedSeatSink = struct {
         std.debug.assert(self.pointer_event_count < self.pointer_events.len);
         self.pointer_events[self.pointer_event_count] = event;
         self.pointer_surfaces[self.pointer_event_count] = surface;
+        if (event == .button) self.last_button_serial = event.button.serial;
         self.pointer_event_count += 1;
         self.event_count += 1;
     }
@@ -11644,11 +11715,11 @@ test "generated cursor subtree paints stack and completes callbacks only while s
     try std.testing.expectEqual(@as(usize, 2), completion.count);
     try std.testing.expect(completion.demand_cleared_before_call);
 
-    // The permanent cursor role is not background membership. Once hidden,
-    // new demand remains pending even though the headless plane is rendered.
+    // The cursor-role commit re-picks stale pointer focus and clears this
+    // cursor. New demand remains pending during headless-plane rendering.
     server.commitHeadlessSurface(root_id, root.logical_size, true);
     server.commitHeadlessSurface(child_id, child.logical_size, true);
-    try std.testing.expectEqual(SeatDelivery.CursorRequestResult.accepted, server.seat.setGeneratedCursor(.{
+    try std.testing.expectEqual(SeatDelivery.CursorRequestResult.ignored, server.seat.setGeneratedCursor(.{
         .client = generated_client,
         .resource_generation = 1,
         .capability_generation = server.seat.deliverySnapshot().capabilities.pointer.generation,
@@ -12300,6 +12371,246 @@ test "headless click and first touch focus compound root with synchronous repair
     server.removeHeadlessSurface(child);
     server.surface_registry.remove(child);
     child_live = false;
+}
+
+test "generated topology mutation retargets hover and cancels invalid grabs" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 4, .height = 4 } },
+    );
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+
+    var root_a_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff11_1111,
+        .logical_size = .{ .width = 4, .height = 4 },
+    };
+    var root_b_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff22_2222,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    var child_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff33_3333,
+        .logical_size = .{ .width = 2, .height = 2 },
+    };
+    const root_a = try server.surface_registry.add(root_a_provider.provider());
+    const root_b = try server.surface_registry.add(root_b_provider.provider());
+    const child = try server.surface_registry.add(child_provider.provider());
+    var root_a_live = true;
+    var root_b_live = true;
+    var child_live = true;
+    try server.addHeadlessSurface(root_a, null);
+    try server.addHeadlessSurface(root_b, null);
+    try server.addHeadlessSurface(child, null);
+    defer {
+        if (child_live) {
+            server.removeHeadlessSurface(child);
+            server.surface_registry.remove(child);
+        }
+        if (root_b_live) {
+            server.removeHeadlessSurface(root_b);
+            server.surface_registry.remove(root_b);
+        }
+        if (root_a_live) {
+            server.removeHeadlessSurface(root_a);
+            server.surface_registry.remove(root_a);
+        }
+    }
+
+    const child_on_a = [_]WayringCompositor.AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = child, .position = .{ .x = 1, .y = 1 } } },
+    };
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{
+            .{ .id = root_a, .mapped_size = root_a_provider.logical_size, .callbacks_committed = false },
+            .{ .id = root_b, .mapped_size = root_b_provider.logical_size, .callbacks_committed = false },
+            .{ .id = child, .mapped_size = child_provider.logical_size, .callbacks_committed = false },
+        },
+        .parents = &.{.{ .id = root_a, .stack = &child_on_a }},
+    });
+
+    const generated_client = try server.client_registry.register(.wayring_server);
+    var generated_client_live = true;
+    defer if (generated_client_live) server.client_registry.unregister(generated_client);
+    var sink: TestGeneratedSeatSink = .{
+        .clients = &server.client_registry,
+        .client = generated_client,
+    };
+    server.setGeneratedSeatDeliverySink(sink.sink());
+    defer server.clearGeneratedSeatDeliverySink(&sink);
+    server.seat.setPointerAvailable(true);
+    defer server.seat.setPointerAvailable(false);
+
+    pointerMotion(output, 1, 2, 2);
+    try std.testing.expectEqual(child, server.seat.pointerFocus().?.surface_id);
+    try std.testing.expectEqual(root_a, server.seat.pointerFocus().?.generated.?.root);
+    const first_enter: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 1 };
+    try std.testing.expect(server.seat.authority.acceptsPointerEnter(generated_client, first_enter));
+    const enter_snapshot = server.seat.generatedPointerEnterSnapshot(
+        generated_client,
+        server.seat.deliverySnapshot().capabilities.pointer.generation,
+    ).?;
+    try std.testing.expectEqual(child, enter_snapshot.surface);
+    try std.testing.expectEqual(first_enter, enter_snapshot.serial);
+    try std.testing.expectEqual(@as(i32, 256), enter_snapshot.x);
+    try std.testing.expectEqual(@as(i32, 256), enter_snapshot.y);
+
+    // Reparenting the live endpoint to another compound is a leave/enter, not
+    // continuation of the old root or enter authority.
+    sink.pointer_event_count = 0;
+    const child_on_b = [_]WayringCompositor.AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = child, .position = .{ .x = 1, .y = 1 } } },
+    };
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{},
+        .parents = &.{
+            .{ .id = root_a, .stack = &.{.parent} },
+            .{ .id = root_b, .stack = &child_on_b },
+        },
+    });
+    try std.testing.expectEqual(child, server.seat.pointerFocus().?.surface_id);
+    try std.testing.expectEqual(root_b, server.seat.pointerFocus().?.generated.?.root);
+    try std.testing.expect(!server.seat.authority.acceptsPointerEnter(generated_client, first_enter));
+    try std.testing.expect(server.seat.authority.acceptsPointerEnter(generated_client, .{
+        .domain = .wayring_server,
+        .value = 3,
+    }));
+    try std.testing.expectEqualSlices(TestGeneratedSeatSink.PointerTag, &.{ .leave, .frame, .enter }, sink.pointer_events[0..sink.pointer_event_count]);
+    try std.testing.expectEqualSlices(SurfaceRegistry.Id, &.{ child, child, child }, sink.pointer_surfaces[0..sink.pointer_event_count]);
+
+    // Detaching a hovered endpoint retargets synchronously to the exposed root.
+    sink.pointer_event_count = 0;
+    server.detachHeadlessSurface(child);
+    try std.testing.expectEqual(root_a, server.seat.pointerFocus().?.surface_id);
+    try std.testing.expectEqualSlices(TestGeneratedSeatSink.PointerTag, &.{ .leave, .frame, .enter }, sink.pointer_events[0..sink.pointer_event_count]);
+    try std.testing.expectEqualSlices(SurfaceRegistry.Id, &.{ child, child, root_a }, sink.pointer_surfaces[0..sink.pointer_event_count]);
+
+    // Reattach and begin an exact implicit grab on the child.
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{},
+        .parents = &.{.{ .id = root_b, .stack = &child_on_b }},
+    });
+    pointerMotion(output, 2, 2, 2);
+    try std.testing.expectEqual(child, server.seat.pointerFocus().?.surface_id);
+
+    // A same-compound position mutation also re-picks hover; mere endpoint
+    // liveness cannot keep delivery on content no longer under the pointer.
+    sink.pointer_event_count = 0;
+    const child_moved = [_]WayringCompositor.AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = child, .position = .{ .x = 3, .y = 3 } } },
+    };
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{},
+        .parents = &.{.{ .id = root_b, .stack = &child_moved }},
+    });
+    try std.testing.expectEqual(root_a, server.seat.pointerFocus().?.surface_id);
+    try std.testing.expectEqualSlices(TestGeneratedSeatSink.PointerTag, &.{ .leave, .frame, .enter }, sink.pointer_events[0..sink.pointer_event_count]);
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{},
+        .parents = &.{.{ .id = root_b, .stack = &child_on_b }},
+    });
+    pointerMotion(output, 2, 2, 2);
+    try std.testing.expectEqual(child, server.seat.pointerFocus().?.surface_id);
+    sink.pointer_event_count = 0;
+    pointerButton(output, 3, linux_button_left, .pressed);
+    const unmap_press = sink.last_button_serial.?;
+    try std.testing.expect(server.seat.implicitPointerGrabActive());
+    try std.testing.expect(server.seat.authority.acceptsAction(generated_client, unmap_press));
+    sink.pointer_event_count = 0;
+
+    // Unmapping an ancestor invalidates the endpoint: no press/action/grab or
+    // old enter survives, and delivery immediately targets the exposed root.
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{.{ .id = root_b, .mapped_size = null, .callbacks_committed = false }},
+        .parents = &.{},
+    });
+    try std.testing.expectEqual(root_a, server.seat.pointerFocus().?.surface_id);
+    try std.testing.expect(!server.seat.implicitPointerGrabActive());
+    try std.testing.expect(!server.seat.authority.acceptsAction(generated_client, unmap_press));
+    try std.testing.expect(server.seat.authority.selectionOrder(generated_client, unmap_press) == null);
+    try std.testing.expect(!server.seat.authority.acceptsPointerGrab(generated_client, unmap_press, child));
+    try std.testing.expectEqualSlices(TestGeneratedSeatSink.PointerTag, &.{ .leave, .frame, .enter }, sink.pointer_events[0..sink.pointer_event_count]);
+    try std.testing.expectEqualSlices(SurfaceRegistry.Id, &.{ child, child, root_a }, sink.pointer_surfaces[0..sink.pointer_event_count]);
+    sink.pointer_event_count = 0;
+    server.seat.pointerAxisValue120(.vertical_scroll, 120);
+    try std.testing.expectEqualSlices(SurfaceRegistry.Id, &.{root_a}, sink.pointer_surfaces[0..sink.pointer_event_count]);
+
+    // Remap, then remove the hovered endpoint. Later axis delivery cannot use
+    // the removed generation.
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{.{ .id = root_b, .mapped_size = root_b_provider.logical_size, .callbacks_committed = false }},
+        .parents = &.{},
+    });
+    pointerMotion(output, 4, 2, 2);
+    try std.testing.expectEqual(child, server.seat.pointerFocus().?.surface_id);
+    sink.pointer_event_count = 0;
+    server.removeHeadlessSurface(child);
+    try std.testing.expectEqual(root_a, server.seat.pointerFocus().?.surface_id);
+    try std.testing.expectEqualSlices(TestGeneratedSeatSink.PointerTag, &.{ .leave, .frame, .enter }, sink.pointer_events[0..sink.pointer_event_count]);
+    try std.testing.expectEqualSlices(SurfaceRegistry.Id, &.{ child, child, root_a }, sink.pointer_surfaces[0..sink.pointer_event_count]);
+    server.surface_registry.remove(child);
+    child_live = false;
+    sink.pointer_event_count = 0;
+    server.seat.pointerAxisValue120(.vertical_scroll, 120);
+    try std.testing.expectEqualSlices(SurfaceRegistry.Id, &.{root_a}, sink.pointer_surfaces[0..sink.pointer_event_count]);
+
+    // Removal while grabbed follows the same cancellation path.
+    var grabbed_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff44_4444,
+        .logical_size = .{ .width = 2, .height = 2 },
+    };
+    const grabbed = try server.surface_registry.add(grabbed_provider.provider());
+    var grabbed_live = true;
+    try server.addHeadlessSurface(grabbed, null);
+    defer if (grabbed_live) {
+        server.removeHeadlessSurface(grabbed);
+        server.surface_registry.remove(grabbed);
+    };
+    const grabbed_on_b = [_]WayringCompositor.AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = grabbed, .position = .{ .x = 1, .y = 1 } } },
+    };
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{.{ .id = grabbed, .mapped_size = grabbed_provider.logical_size, .callbacks_committed = false }},
+        .parents = &.{.{ .id = root_b, .stack = &grabbed_on_b }},
+    });
+    pointerMotion(output, 5, 2, 2);
+    sink.pointer_event_count = 0;
+    pointerButton(output, 6, linux_button_left, .pressed);
+    const removal_press = sink.last_button_serial.?;
+    sink.pointer_event_count = 0;
+    server.removeHeadlessSurface(grabbed);
+    try std.testing.expectEqual(root_a, server.seat.pointerFocus().?.surface_id);
+    try std.testing.expect(!server.seat.implicitPointerGrabActive());
+    try std.testing.expect(!server.seat.authority.acceptsAction(generated_client, removal_press));
+    try std.testing.expect(server.seat.authority.selectionOrder(generated_client, removal_press) == null);
+    try std.testing.expect(!server.seat.authority.acceptsPointerGrab(generated_client, removal_press, grabbed));
+    try std.testing.expectEqualSlices(TestGeneratedSeatSink.PointerTag, &.{ .leave, .frame, .enter }, sink.pointer_events[0..sink.pointer_event_count]);
+    try std.testing.expectEqualSlices(SurfaceRegistry.Id, &.{ grabbed, grabbed, root_a }, sink.pointer_surfaces[0..sink.pointer_event_count]);
+    server.surface_registry.remove(grabbed);
+    grabbed_live = false;
+
+    try std.testing.expect(server.focus_arbiter.target() != null);
+    const request_sink = server.generatedSeatRequestSink();
+    request_sink.client_retiring(request_sink.context, generated_client);
+    try std.testing.expect(server.seat.pointerFocus() == null);
+    try std.testing.expect(!server.seat.implicitPointerGrabActive());
+    try std.testing.expect(server.focus_arbiter.target() == null);
+    server.removeHeadlessSurface(root_b);
+    server.surface_registry.remove(root_b);
+    root_b_live = false;
+    server.removeHeadlessSurface(root_a);
+    server.surface_registry.remove(root_a);
+    root_a_live = false;
+    server.client_registry.unregister(generated_client);
+    generated_client_live = false;
 }
 
 test "headless surface damage respects output geometry and conservative blur dependencies" {
