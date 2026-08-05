@@ -97,7 +97,7 @@
   <header>
     <h1>Keywork → Wayring</h1>
     <p class="lede">Working roadmap for replacing the compositor's libwayland server path with scanner-generated Wayring, without weakening component boundaries.</p>
-    <p class="meta">Current migration implementation: <code>bdfb3938</code> on <code>wayring</code> · Updated 2026-08-05 · The corrected P3-B1 authority and allocator gate passed; P3-B2 generated-seat design is in progress.</p>
+    <p class="meta">Current migration implementation: <code>bdfb3938</code> on <code>wayring</code> · Updated 2026-08-05 · P3-B2 design is approved; Wave 0 is implementing generated-client identity, fatal retirement, and the server serial boundary without publishing a seat.</p>
   </header>
 
   <section class="summary" aria-label="Migration summary">
@@ -153,7 +153,7 @@
     <div class="wave"><span class="wave-label">P3-B1a</span><div><h3>Identity, authority, and ordering</h3><p class="detail">Neutral generational client liveness, mature connection adaptation, typed seat grants and live presses, disconnect cleanup, and cross-domain-safe clipboard ordering landed without changing globals.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">P3-B1b</span><div><h3>Complete mature serial issuance</h3><p class="detail">All 38 remaining mature display serial sites now use one checked, allocation-free transport adapter with typed authority issuance and fail-before-reuse coverage.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">P3-B1 gate</span><div><h3>Independent authority and allocator review</h3><p class="detail">Combined identity lifetime, authority purpose and age, disconnect teardown, selection ordering, allocator completeness, mature parity, and unchanged Wayring globals passed after focused corrections.</p></div><span class="status done">Passed</span></div>
-    <div class="wave"><span class="wave-label">P3-B2</span><div><h3>Wayring core seat</h3><p class="detail">Design, then publish one generated seat with pointer, keyboard, touch, capability generations, keymap/repeat state, focus ordering, and cursor-surface role.</p></div><span class="status active">Design in progress</span></div>
+    <div class="wave"><span class="wave-label">P3-B2</span><div><h3>Wayring core seat</h3><p class="detail">Approved design splits identity/serials, neutral delivery, focus, pointer/cursor, keyboard, touch, and final publication into independently gated waves.</p></div><span class="status active">Wave 0 in progress</span></div>
     <div class="wave"><span class="wave-label">P3-C</span><div><h3>Atomic XDG window roles</h3><p class="detail">Integrate wm-base, surface, toplevel, popup, and positioner into real window policy for the first meaningful scale-1 SHM runtime milestone.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">P3-D</span><div><h3>Scale and interaction ergonomics</h3><p class="detail">Viewporter plus fractional scale, decoration, cursor-shape with SHM fallback, and activation on shared output/seat/XDG owners.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">P3-E1–E3</span><div><h3>Selection, drag, and text input</h3><p class="detail">Core data-device/DnD, primary and privileged data-control, then text-input/input-method as coherent shared-state families.</p></div><span class="status proposed">Planned</span></div>
