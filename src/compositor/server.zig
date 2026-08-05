@@ -11700,8 +11700,8 @@ const WayringHeadlessClient = struct {
         scale_buffer_released,
         scaled_committed,
         scaled_done,
-        callback_only_committed,
-        callback_only_done,
+        damage_buffer_committed,
+        damage_buffer_done,
         unmapped,
         unmapped_no_done,
         remapped_released,
@@ -11839,15 +11839,15 @@ const WayringHeadlessClient = struct {
         try waitForWayringCommand(self.command_fd);
 
         try self.requestFrame(surface);
-        surface.setBufferTransform(.normal);
+        surface.damageBuffer(0, 0, 4, 2);
         surface.commit();
         try expectClientRoundtrip(display);
         if (self.frame_done_count.load(.acquire) != 3) return error.UnexpectedFrameDone;
-        self.stage.store(@intFromEnum(Stage.callback_only_committed), .release);
+        self.stage.store(@intFromEnum(Stage.damage_buffer_committed), .release);
         try waitForWayringCommand(self.command_fd);
         try expectClientRoundtrip(display);
         if (self.frame_done_count.load(.acquire) != 4) return error.MissingFrameDone;
-        self.stage.store(@intFromEnum(Stage.callback_only_done), .release);
+        self.stage.store(@intFromEnum(Stage.damage_buffer_done), .release);
         try waitForWayringCommand(self.command_fd);
 
         try self.requestFrame(surface);
@@ -12158,7 +12158,7 @@ fn renderPendingWayringFrame(server: *Self, host: anytype, previous_frames: u64)
     return error.WayringFrameTimedOut;
 }
 
-test "Wayring wl_compositor v3 transforms and scales sampled headless content end to end" {
+test "Wayring wl_compositor v4 damage_buffer transforms and scales sampled headless content end to end" {
     const WayringHost = @import("wayland/WayringHost.zig");
     const wayring = @import("wayring");
     const linux = std.os.linux;
@@ -12241,7 +12241,7 @@ test "Wayring wl_compositor v3 transforms and scales sampled headless content en
     var previous_frames = output.frame_statistics.frames_presented;
     try waitForWayringClientStage(server, host, &client, .initial_released);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
-    try std.testing.expectEqual(@as(u32, 3), client.compositor_version.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 4), client.compositor_version.load(.acquire));
     try std.testing.expectEqual(@as(u8, 1), client.release_count.load(.acquire));
     try std.testing.expectEqual(registry_baseline + 1, server.surface_registry.len());
     try std.testing.expectEqual(@as(usize, 1), compositor.surfaceCount());
@@ -12336,7 +12336,7 @@ test "Wayring wl_compositor v3 transforms and scales sampled headless content en
 
     previous_frames = output.frame_statistics.frames_presented;
     try signalWayringCommand(command_fd);
-    try waitForWayringClientStage(server, host, &client, .callback_only_committed);
+    try waitForWayringClientStage(server, host, &client, .damage_buffer_committed);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
     try std.testing.expectEqual(@as(u8, 3), client.frame_done_count.load(.acquire));
     try expectWayringScaleSnapshot(server, scale_pixels, 3, .{ .width = 2, .height = 1 });
@@ -12348,7 +12348,7 @@ test "Wayring wl_compositor v3 transforms and scales sampled headless content en
     try expectWayringHeadlessPixels(server, .{ 0x00cc_0000, 0x0000_dd00 });
 
     try signalWayringCommand(command_fd);
-    try waitForWayringClientStage(server, host, &client, .callback_only_done);
+    try waitForWayringClientStage(server, host, &client, .damage_buffer_done);
     try std.testing.expectEqual(@as(u8, 4), client.frame_done_count.load(.acquire));
 
     previous_frames = output.frame_statistics.frames_presented;
