@@ -22,6 +22,16 @@ const Shm = server.shm.Protocol(core);
 
 pub const SurfaceId = SurfaceRegistry.Id;
 
+/// Resource-free presentation completion copied by listeners that sample a
+/// surface later. `context` is always a WayringCompositor, never a Wayland
+/// Resource. Callers must retain the canonical SurfaceId supplied with this
+/// value and must not invoke it after compositor deinit; removed or reused IDs
+/// are harmless no-ops.
+pub const FrameCompletion = struct {
+    context: *anyopaque,
+    complete: *const fn (*anyopaque, SurfaceId, u32) void,
+};
+
 /// Presentation lifecycle copied by init. The context remains borrowed until
 /// compositor deinit; callbacks never receive Wayland resources or policy and
 /// must not reenter surface lifecycle. During creation rollback, `removing`
@@ -29,14 +39,23 @@ pub const SurfaceId = SurfaceRegistry.Id;
 /// not been published in its per-client list.
 pub const PresentationListener = struct {
     context: *anyopaque,
-    added: *const fn (*anyopaque, SurfaceId) error{OutOfMemory}!void,
-    committed: *const fn (*anyopaque, SurfaceId, ?render.Size) void,
+    added: *const fn (*anyopaque, SurfaceId, FrameCompletion) error{OutOfMemory}!void,
+    committed: *const fn (*anyopaque, SurfaceId, ?render.Size, bool) void,
     removing: *const fn (*anyopaque, SurfaceId) void,
+};
+
+const FrameCallback = struct {
+    const State = enum { pending, committed };
+
+    resource: core.wl_callback.Resource,
+    state: State,
 };
 
 const Surface = struct {
     resource: core.wl_surface.Resource,
     id: SurfaceId,
+    destroying: bool = false,
+    frame_callbacks: std.ArrayList(*FrameCallback) = .empty,
     pending_attachment: ?PendingAttachment = null,
     has_pending_attachment: bool = false,
     pending_attach_x: i32 = 0,
@@ -87,14 +106,15 @@ const InputRegion = struct {
     }
 };
 
-/// One fully validated, independently owned candidate publication. Wave 2 can
-/// extend this value with a pending callback boundary, and subsurface roles can
-/// retain it later, without changing the root surface publication seam.
+/// One fully validated, independently owned candidate publication. The
+/// callback count freezes the pending prefix owned by this transaction so
+/// later frame requests remain pending if publication is delayed.
 const PreparedCommit = struct {
     damage: Region,
     opaque_region: ?Region = null,
     input: ?InputRegion = null,
     buffer: ?CopiedBufferSnapshot = null,
+    pending_frame_callback_count: usize,
     attachment_changed: bool,
     publishes_snapshot: bool = false,
     logical_size: ?render.Size,
@@ -106,6 +126,7 @@ const PreparedCommit = struct {
     fn init(surface: *const Surface) PreparedCommit {
         return .{
             .damage = Region.init(),
+            .pending_frame_callback_count = pendingFrameCallbackCount(surface),
             .attachment_changed = surface.has_pending_attachment,
             .logical_size = surface.current_logical_size,
             .scale = surface.pending_scale,
@@ -174,6 +195,7 @@ global: *const server.Server.Global,
 shm: Shm,
 clients: std.ArrayList(*ClientObjects) = .empty,
 owned_provider_count: usize = 0,
+completing_frame_callbacks: bool = false,
 commit_fault: if (builtin.is_test) ?CommitFault else void,
 
 /// Borrows the shared registry and copies the optional presentation listener.
@@ -192,6 +214,7 @@ pub fn init(
         .presentation_listener = presentation_listener,
         .global = undefined,
         .shm = .init(allocator),
+        .completing_frame_callbacks = false,
         .commit_fault = if (builtin.is_test) null else {},
     };
     self.global = try protocol_server.addGlobal(core.wl_compositor, 1, WayringCompositor, self, bind);
@@ -265,6 +288,38 @@ pub fn currentBuffer(self: *WayringCompositor, id: SurfaceId) ?*CopiedBufferSnap
     return if (surface.current) |*current| current else null;
 }
 
+/// Completes every callback committed for the canonical surface ID. Event
+/// enqueue failure terminalizes the client but never escapes this entrypoint;
+/// each one-shot callback is retired regardless. Pending callbacks are left
+/// for a later successful commit.
+pub fn completeFrame(self: *WayringCompositor, id: SurfaceId, timestamp_ms: u32) void {
+    if (self.completing_frame_callbacks) {
+        if (builtin.mode == .Debug) std.debug.assert(false);
+        return;
+    }
+    self.completing_frame_callbacks = true;
+    defer self.completing_frame_callbacks = false;
+
+    const surface = self.surfaceForId(id) orelse return;
+    if (surface.destroying) return;
+    const client = self.clientForResource(&surface.resource.runtime) orelse return;
+    while (surface.frame_callbacks.items.len > 0) {
+        const callback = surface.frame_callbacks.items[0];
+        if (callback.state == .pending) break;
+        core.wl_callback.@"send:done"(&callback.resource, timestamp_ms) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed => client.postOutOfMemory(&callback.resource.runtime, "queueing wl_callback.done"),
+            error.OutputSealed, error.ClientFatal => {},
+            else => client.postImplementationError(&callback.resource.runtime, "queueing wl_callback.done"),
+        };
+        destroyFrameCallback(self, surface, 0);
+    }
+}
+
+fn completeFrameThunk(context: *anyopaque, id: SurfaceId, timestamp_ms: u32) void {
+    const self: *WayringCompositor = @ptrCast(@alignCast(context));
+    self.completeFrame(id, timestamp_ms);
+}
+
 fn bind(client: *server.Client, id: u32, version: u32, self: *WayringCompositor) !void {
     const objects = try self.clientObjects(client);
     try objects.compositors.ensureUnusedCapacity(self.allocator, 1);
@@ -329,7 +384,10 @@ fn createSurface(self: *WayringCompositor, compositor: *core.wl_compositor.Resou
         listener.removing(listener.context, surface.id);
     };
     if (self.presentation_listener) |listener| {
-        try listener.added(listener.context, surface.id);
+        try listener.added(listener.context, surface.id, .{
+            .context = self,
+            .complete = completeFrameThunk,
+        });
         listener_added = true;
     }
     try objects.surfaces.ensureUnusedCapacity(self.allocator, 1);
@@ -393,6 +451,7 @@ fn handleSurface(
                 };
             }
         },
+        .frame => |frame| try self.frameSurface(resource, frame.callback),
         .set_opaque_region => |set| self.setOpaqueRegion(resource, set.region),
         .set_input_region => |set| self.setInputRegion(resource, set.region),
         .commit => try self.commitSurface(@fieldParentPtr("resource", resource)),
@@ -401,6 +460,33 @@ fn handleSurface(
             client.postImplementationError(&resource.runtime, "wl_surface request is not implemented by the Wayring backend");
         },
     }
+}
+
+fn frameSurface(
+    self: *WayringCompositor,
+    resource: *core.wl_surface.Resource,
+    callback_id: u32,
+) !void {
+    const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
+    const surface: *Surface = @fieldParentPtr("resource", resource);
+    const had_callback_storage = surface.frame_callbacks.capacity != 0;
+    try surface.frame_callbacks.ensureUnusedCapacity(self.allocator, 1);
+    errdefer if (!had_callback_storage and surface.frame_callbacks.items.len == 0) {
+        surface.frame_callbacks.deinit(self.allocator);
+        surface.frame_callbacks = .empty;
+    };
+    const callback = try self.allocator.create(FrameCallback);
+    errdefer self.allocator.destroy(callback);
+    const callback_version = @min(resource.version(), core.wl_callback.interface.version);
+    std.debug.assert(callback_version == 1);
+    callback.* = .{
+        .resource = .init(self.allocator, callback_id, callback_version, .client, client.ownerHooks()),
+        .state = .pending,
+    };
+    // Dispatch has already reserved and type-checked this new_id. Materialize
+    // before publishing the pointer; no fallible work remains afterward.
+    client.materialize(&callback.resource.runtime) catch unreachable;
+    surface.frame_callbacks.appendAssumeCapacity(callback);
 }
 
 fn handleRegion(
@@ -666,9 +752,23 @@ fn publishPreparedCommit(self: *WayringCompositor, surface: *Surface, prepared: 
     clearPendingAttachment(surface);
     if (prepared.publishes_snapshot) surface.next_source_version +%= 1;
 
+    var callbacks_to_commit = prepared.pending_frame_callback_count;
+    for (surface.frame_callbacks.items) |callback| {
+        if (callback.state == .committed) continue;
+        if (callbacks_to_commit == 0) break;
+        callback.state = .committed;
+        callbacks_to_commit -= 1;
+    }
+    std.debug.assert(callbacks_to_commit == 0);
+
     std.debug.assert((surface.current != null) == (surface.current_logical_size != null));
     if (self.presentation_listener) |listener|
-        listener.committed(listener.context, surface.id, surface.current_logical_size);
+        listener.committed(
+            listener.context,
+            surface.id,
+            surface.current_logical_size,
+            prepared.pending_frame_callback_count != 0,
+        );
 }
 
 fn failCommitAt(self: *WayringCompositor, point: CommitFault) bool {
@@ -686,6 +786,19 @@ fn clearPendingAttachment(surface: *Surface) void {
     surface.has_pending_attachment = false;
     surface.pending_attach_x = 0;
     surface.pending_attach_y = 0;
+}
+
+fn pendingFrameCallbackCount(surface: *const Surface) usize {
+    var count: usize = 0;
+    var saw_pending = false;
+    for (surface.frame_callbacks.items) |callback| switch (callback.state) {
+        .committed => std.debug.assert(!saw_pending),
+        .pending => {
+            saw_pending = true;
+            count += 1;
+        },
+    };
+    return count;
 }
 
 fn clientObjects(self: *WayringCompositor, client: *server.Client) !*ClientObjects {
@@ -721,12 +834,17 @@ fn clientForResource(self: *WayringCompositor, resource: *server.Resource) ?*ser
 fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     const client = self.clientForResource(&surface.resource.runtime) orelse unreachable;
     const objects = self.findClient(client) orelse unreachable;
+    std.debug.assert(!surface.destroying);
+    surface.destroying = true;
     if (self.presentation_listener) |listener|
         listener.removing(listener.context, surface.id);
     self.surface_registry.remove(surface.id);
     std.debug.assert(self.owned_provider_count > 0);
     self.owned_provider_count -= 1;
     removePointer(Surface, &objects.surfaces, surface);
+    while (surface.frame_callbacks.items.len > 0)
+        destroyFrameCallback(self, surface, 0);
+    surface.frame_callbacks.deinit(self.allocator);
     clearPendingAttachment(surface);
     if (surface.current) |*current| current.deinit();
     surface.current_input.deinit();
@@ -737,6 +855,13 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     surface.resource.destroy();
     surface.resource.deinit();
     self.allocator.destroy(surface);
+}
+
+fn destroyFrameCallback(self: *WayringCompositor, surface: *Surface, index: usize) void {
+    const callback = surface.frame_callbacks.orderedRemove(index);
+    callback.resource.destroy();
+    callback.resource.deinit();
+    self.allocator.destroy(callback);
 }
 
 fn destroyRegion(self: *WayringCompositor, region: *RegionResource) void {
@@ -828,6 +953,34 @@ fn drain(client: *server.Client) ![]u8 {
 
 fn word(bytes: []const u8, offset: usize) u32 {
     return std.mem.readInt(u32, bytes[offset..][0..4], .native);
+}
+
+fn expectCallbackDoneAndDelete(
+    bytes: []const u8,
+    offset: usize,
+    callback_id: u32,
+    timestamp_ms: u32,
+) !void {
+    try std.testing.expect(offset + 24 <= bytes.len);
+    try std.testing.expectEqual(callback_id, word(bytes, offset));
+    try std.testing.expectEqual(@as(u16, 0), @as(u16, @truncate(word(bytes, offset + 4))));
+    try std.testing.expectEqual(@as(u16, 12), @as(u16, @truncate(word(bytes, offset + 4) >> 16)));
+    try std.testing.expectEqual(timestamp_ms, word(bytes, offset + 8));
+    try std.testing.expectEqual(@as(u32, 1), word(bytes, offset + 12));
+    try std.testing.expectEqual(@as(u16, 1), @as(u16, @truncate(word(bytes, offset + 16))));
+    try std.testing.expectEqual(@as(u16, 12), @as(u16, @truncate(word(bytes, offset + 16) >> 16)));
+    try std.testing.expectEqual(callback_id, word(bytes, offset + 20));
+}
+
+fn expectDeleteIds(bytes: []const u8, ids: []const u32) !void {
+    try std.testing.expectEqual(ids.len * 12, bytes.len);
+    for (ids, 0..) |id, index| {
+        const offset = index * 12;
+        try std.testing.expectEqual(@as(u32, 1), word(bytes, offset));
+        try std.testing.expectEqual(@as(u16, 1), @as(u16, @truncate(word(bytes, offset + 4))));
+        try std.testing.expectEqual(@as(u16, 12), @as(u16, @truncate(word(bytes, offset + 4) >> 16)));
+        try std.testing.expectEqual(id, word(bytes, offset + 8));
+    }
 }
 
 fn bindCompositor(client: *server.Client, compositor_id: u32) !void {
@@ -935,6 +1088,12 @@ fn commitSurfaceResource(client: *server.Client, surface_id: u32) !void {
     try send(client, surface_id, 6, &core.wl_surface.request_messages[6], &.{});
 }
 
+fn requestFrame(client: *server.Client, surface_id: u32, callback_id: u32) !void {
+    try send(client, surface_id, 3, &core.wl_surface.request_messages[3], &.{
+        .{ .new_id = .{ .typed = callback_id } },
+    });
+}
+
 // Scanner tests construct exact negotiated versions without changing the
 // production global or its v1 child construction policy.
 fn replaceCompositorResourceForTest(
@@ -1018,6 +1177,9 @@ const TestPresentationListener = struct {
     last_source_cache: ?render.SourceCache = null,
     last_pixel_pointer: ?[*]u32 = null,
     last_first_pixel: ?u32 = null,
+    frame_completion: ?FrameCompletion = null,
+    last_callbacks_committed: bool = false,
+    callbacks_committed_count: usize = 0,
     removing_had_render_state: bool = false,
 
     fn listener(self: *TestPresentationListener) PresentationListener {
@@ -1029,17 +1191,27 @@ const TestPresentationListener = struct {
         };
     }
 
-    fn added(context: *anyopaque, id: SurfaceId) error{OutOfMemory}!void {
+    fn added(
+        context: *anyopaque,
+        id: SurfaceId,
+        frame_completion: FrameCompletion,
+    ) error{OutOfMemory}!void {
         const self: *TestPresentationListener = @ptrCast(@alignCast(context));
         std.debug.assert(self.registry.contains(id));
         std.debug.assert(self.registry.renderState(id) == null);
         self.record(.added);
         self.added_count += 1;
         self.last_id = id;
+        self.frame_completion = frame_completion;
         if (self.fail_added) return error.OutOfMemory;
     }
 
-    fn committed(context: *anyopaque, id: SurfaceId, size: ?render.Size) void {
+    fn committed(
+        context: *anyopaque,
+        id: SurfaceId,
+        size: ?render.Size,
+        callbacks_committed: bool,
+    ) void {
         const self: *TestPresentationListener = @ptrCast(@alignCast(context));
         std.debug.assert(self.registry.contains(id));
         const state = self.registry.renderState(id);
@@ -1059,6 +1231,8 @@ const TestPresentationListener = struct {
         self.committed_count += 1;
         self.last_id = id;
         self.last_size = size;
+        self.last_callbacks_committed = callbacks_committed;
+        if (callbacks_committed) self.callbacks_committed_count += 1;
     }
 
     fn removing(context: *anyopaque, id: SurfaceId) void {
@@ -1081,6 +1255,295 @@ const TestPresentationListener = struct {
         self.event_count += 1;
     }
 };
+
+test "frame callback materializes immediately and waits for null commit completion" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try createSurfaceResource(client, 3, 4);
+    const id = compositor.surfaceId(client, 4).?;
+    const surface = compositor.surfaceForId(id).?;
+    try compositor.replaceSurfaceResourceForTest(client, surface, 4);
+    const completion = listener_state.frame_completion.?;
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&compositor)), completion.context);
+
+    try requestFrame(client, 4, 5);
+    try std.testing.expect(client.fatal() == null);
+    try std.testing.expectEqual(@as(usize, 1), surface.frame_callbacks.items.len);
+    const callback = surface.frame_callbacks.items[0];
+    try std.testing.expectEqual(FrameCallback.State.pending, callback.state);
+    try std.testing.expectEqual(@as(u32, 1), callback.resource.version());
+    try std.testing.expectEqual(&callback.resource.runtime, client.lookup(5).?);
+
+    completion.complete(completion.context, id, 10);
+    const before_commit = try drain(client);
+    defer std.testing.allocator.free(before_commit);
+    try std.testing.expectEqual(@as(usize, 0), before_commit.len);
+    try std.testing.expectEqual(FrameCallback.State.pending, callback.state);
+
+    try commitSurfaceResource(client, 4);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
+    try std.testing.expect(listener_state.last_size == null);
+    try std.testing.expect(listener_state.last_callbacks_committed);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.callbacks_committed_count);
+    try std.testing.expectEqual(FrameCallback.State.committed, callback.state);
+    const no_automatic_done = try drain(client);
+    defer std.testing.allocator.free(no_automatic_done);
+    try std.testing.expectEqual(@as(usize, 0), no_automatic_done.len);
+
+    completion.complete(completion.context, id, 0xaabb_ccdd);
+    const completed = try drain(client);
+    defer std.testing.allocator.free(completed);
+    try std.testing.expectEqual(@as(usize, 24), completed.len);
+    try expectCallbackDoneAndDelete(completed, 0, 5, 0xaabb_ccdd);
+    try std.testing.expectEqual(@as(usize, 0), surface.frame_callbacks.items.len);
+    try std.testing.expect(client.lookup(5) == null);
+
+    completion.complete(completion.context, id, 99);
+    const completed_again = try drain(client);
+    defer std.testing.allocator.free(completed_again);
+    try std.testing.expectEqual(@as(usize, 0), completed_again.len);
+    try commitSurfaceResource(client, 4);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.committed_count);
+    try std.testing.expect(!listener_state.last_callbacks_committed);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.callbacks_committed_count);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "prepared callback boundary leaves later requests pending and preserves order across commits" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try createSurfaceResource(client, 3, 4);
+    const id = compositor.surfaceId(client, 4).?;
+    const surface = compositor.surfaceForId(id).?;
+    const completion = listener_state.frame_completion.?;
+    try requestFrame(client, 4, 5);
+    try requestFrame(client, 4, 6);
+    var prepared = try compositor.prepareCommit(surface);
+    defer prepared.deinit();
+    try requestFrame(client, 4, 7);
+    compositor.publishPreparedCommit(surface, &prepared);
+
+    try std.testing.expectEqual(FrameCallback.State.committed, surface.frame_callbacks.items[0].state);
+    try std.testing.expectEqual(FrameCallback.State.committed, surface.frame_callbacks.items[1].state);
+    try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[2].state);
+    try std.testing.expect(listener_state.last_callbacks_committed);
+    completion.complete(completion.context, id, 100);
+    const first_completion = try drain(client);
+    defer std.testing.allocator.free(first_completion);
+    try std.testing.expectEqual(@as(usize, 48), first_completion.len);
+    try expectCallbackDoneAndDelete(first_completion, 0, 5, 100);
+    try expectCallbackDoneAndDelete(first_completion, 24, 6, 100);
+    try std.testing.expectEqual(@as(usize, 1), surface.frame_callbacks.items.len);
+    try std.testing.expectEqual(@as(u32, 7), surface.frame_callbacks.items[0].resource.id());
+    try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[0].state);
+
+    try requestFrame(client, 4, 8);
+    completion.complete(completion.context, id, 101);
+    const still_pending = try drain(client);
+    defer std.testing.allocator.free(still_pending);
+    try std.testing.expectEqual(@as(usize, 0), still_pending.len);
+    try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[0].state);
+    try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[1].state);
+
+    try commitSurfaceResource(client, 4);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.committed_count);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.callbacks_committed_count);
+    completion.complete(completion.context, id, 102);
+    const second_completion = try drain(client);
+    defer std.testing.allocator.free(second_completion);
+    try std.testing.expectEqual(@as(usize, 48), second_completion.len);
+    try expectCallbackDoneAndDelete(second_completion, 0, 7, 102);
+    try expectCallbackDoneAndDelete(second_completion, 24, 8, 102);
+    try std.testing.expectEqual(@as(usize, 0), surface.frame_callbacks.items.len);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "frame callback allocation failure leaves no resource or list storage" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var compositor_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(compositor_allocator.allocator(), &host, &surface_registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try createSurfaceResource(client, 3, 4);
+    const surface = compositor.findClient(client).?.surfaces.items[0];
+    const live_before = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
+    const frame = try encode(4, 3, &core.wl_surface.request_messages[3], &.{
+        .{ .new_id = .{ .typed = 5 } },
+    });
+    defer std.testing.allocator.free(frame);
+    try client.receive(frame, &.{});
+    // Capacity reservation succeeds, then callback allocation fails. The
+    // pre-materialization rollback must reclaim both allocations.
+    compositor_allocator.fail_index = compositor_allocator.alloc_index + 1;
+    try client.dispatch();
+
+    try std.testing.expect(compositor_allocator.has_induced_failure);
+    try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+    try std.testing.expectEqual(@as(usize, 0), surface.frame_callbacks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), surface.frame_callbacks.capacity);
+    try std.testing.expect(client.lookup(5) == null);
+    try std.testing.expectEqual(live_before, compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes);
+}
+
+test "done enqueue failure terminalizes client and still frees callback" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var compositor_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(compositor_allocator.allocator(), &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    var client_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const managed = try server.CoreClient.create(client_allocator.allocator(), &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try createSurfaceResource(client, 3, 4);
+    const id = compositor.surfaceId(client, 4).?;
+    const surface = compositor.surfaceForId(id).?;
+    const live_before_frame = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
+    try requestFrame(client, 4, 5);
+    try commitSurfaceResource(client, 4);
+    const before_failure = try drain(client);
+    defer std.testing.allocator.free(before_failure);
+    try std.testing.expectEqual(@as(usize, 0), before_failure.len);
+    const live_with_frame = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
+    try std.testing.expect(live_with_frame >= live_before_frame + @sizeOf(FrameCallback));
+
+    client_allocator.fail_index = client_allocator.alloc_index;
+    const completion = listener_state.frame_completion.?;
+    completion.complete(completion.context, id, 55);
+
+    try std.testing.expect(client_allocator.has_induced_failure);
+    try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+    try std.testing.expectEqual(@as(usize, 0), surface.frame_callbacks.items.len);
+    try std.testing.expect(client.lookup(5) == null);
+    try std.testing.expectEqual(
+        live_with_frame - @sizeOf(FrameCallback),
+        compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes,
+    );
+}
+
+test "surface destroy and disconnect retire pending and committed callbacks without done" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const first = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    var first_live = true;
+    defer if (first_live) {
+        compositor.destroyClientResources(first.client());
+        first.destroy();
+    };
+    const second = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    var second_live = true;
+    defer if (second_live) {
+        compositor.destroyClientResources(second.client());
+        second.destroy();
+    };
+
+    try bindCompositor(first.client(), 3);
+    try createSurfaceResource(first.client(), 3, 4);
+    const stale_id = compositor.surfaceId(first.client(), 4).?;
+    const stale_completion = listener_state.frame_completion.?;
+    try requestFrame(first.client(), 4, 5);
+    try commitSurfaceResource(first.client(), 4);
+    try requestFrame(first.client(), 4, 6);
+    try send(first.client(), 4, 0, &core.wl_surface.request_messages[0], &.{});
+    const explicit_destroy = try drain(first.client());
+    defer std.testing.allocator.free(explicit_destroy);
+    try expectDeleteIds(explicit_destroy, &.{ 5, 6, 4 });
+    try std.testing.expect(first.client().lookup(5) == null);
+    try std.testing.expect(first.client().lookup(6) == null);
+    try std.testing.expect(!compositor.containsSurface(stale_id));
+
+    try bindCompositor(second.client(), 3);
+    try createSurfaceResource(second.client(), 3, 4);
+    const current_id = compositor.surfaceId(second.client(), 4).?;
+    try std.testing.expectEqual(stale_id.index, current_id.index);
+    try std.testing.expect(stale_id.generation != current_id.generation);
+    try requestFrame(second.client(), 4, 5);
+    try commitSurfaceResource(second.client(), 4);
+    try requestFrame(second.client(), 4, 6);
+    stale_completion.complete(stale_completion.context, stale_id, 70);
+    const stale_noop = try drain(second.client());
+    defer std.testing.allocator.free(stale_noop);
+    try std.testing.expectEqual(@as(usize, 0), stale_noop.len);
+    try std.testing.expectEqual(@as(usize, 2), compositor.surfaceForId(current_id).?.frame_callbacks.items.len);
+
+    const current_completion = listener_state.frame_completion.?;
+    compositor.destroyClientResources(second.client());
+    try std.testing.expect(!compositor.containsSurface(current_id));
+    try std.testing.expect(second.client().lookup(5) == null);
+    try std.testing.expect(second.client().lookup(6) == null);
+    const disconnected = try drain(second.client());
+    defer std.testing.allocator.free(disconnected);
+    try expectDeleteIds(disconnected, &.{ 5, 6, 4, 3 });
+    current_completion.complete(current_completion.context, current_id, 71);
+    const removed_noop = try drain(second.client());
+    defer std.testing.allocator.free(removed_noop);
+    try std.testing.expectEqual(@as(usize, 0), removed_noop.len);
+    second.destroy();
+    second_live = false;
+
+    compositor.destroyClientResources(first.client());
+    first.destroy();
+    first_live = false;
+    try std.testing.expectEqual(@as(usize, 2), listener_state.removing_count);
+}
 
 test "scanner wl_region inherits compositor version and owns rectangle state through teardown" {
     var host: server.Server = .init(std.testing.allocator);
@@ -1479,6 +1942,8 @@ test "listener-added failure unregisters provider without calling removing" {
     try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
     try std.testing.expectEqual(@as(usize, 0), surface_registry.len());
     try std.testing.expect(client.lookup(4) == null);
+    const stale_completion = listener_state.frame_completion.?;
+    stale_completion.complete(stale_completion.context, listener_state.last_id.?, 1);
 }
 
 test "post-added resource-list materialization OOM removes listener before provider rollback" {
@@ -2027,11 +2492,15 @@ test "prepared commit failures preserve all published surface state and reclaim 
             const old_source_cache = surface_registry.renderState(id).?.buffer.source_cache.?;
             const old_version = surface.next_source_version;
             const old_listener_count = listener_state.committed_count;
+            const old_callbacks_committed_count = listener_state.callbacks_committed_count;
             try std.testing.expect(surface.current_opaque.contains(0, 0));
             try std.testing.expect(!surface.current_opaque.contains(8, 8));
             try std.testing.expect(!surface.current_input.infinite);
             try std.testing.expect(surface.current_input.value.contains(0, 0));
 
+            try requestFrame(client, 5, 11);
+            try std.testing.expectEqual(@as(usize, 1), surface.frame_callbacks.items.len);
+            try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[0].state);
             try setSurfaceRegion(client, 5, 4, 10);
             try setSurfaceRegion(client, 5, 5, 10);
             try damageSurface(client, 5, .{ .x = 0, .y = 0, .width = 1, .height = 1 });
@@ -2060,6 +2529,13 @@ test "prepared commit failures preserve all published surface state and reclaim 
             try std.testing.expect(surface_registry.renderState(id).?.buffer.source_damage == null);
             try std.testing.expectEqual(old_version, surface.next_source_version);
             try std.testing.expectEqual(old_listener_count, listener_state.committed_count);
+            try std.testing.expectEqual(old_callbacks_committed_count, listener_state.callbacks_committed_count);
+            try std.testing.expectEqual(@as(usize, 1), surface.frame_callbacks.items.len);
+            try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[0].state);
+            try std.testing.expectEqual(&surface.frame_callbacks.items[0].resource.runtime, client.lookup(11).?);
+            const completion = listener_state.frame_completion.?;
+            completion.complete(completion.context, id, 7);
+            try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[0].state);
             try std.testing.expect(surface.current_opaque.contains(0, 0));
             try std.testing.expect(!surface.current_opaque.contains(8, 8));
             try std.testing.expect(!surface.current_input.infinite);

@@ -711,14 +711,23 @@ test "existing event loop drives scanner-backed Wayring client lifecycle" {
             };
         }
 
-        fn added(context: *anyopaque, id: SurfaceRegistry.Id) error{OutOfMemory}!void {
+        fn added(
+            context: *anyopaque,
+            id: SurfaceRegistry.Id,
+            _: WayringCompositor.FrameCompletion,
+        ) error{OutOfMemory}!void {
             const self: *@This() = @ptrCast(@alignCast(context));
             std.debug.assert(self.registry.contains(id));
             std.debug.assert(self.registry.renderState(id) == null);
             self.added_count += 1;
         }
 
-        fn committed(context: *anyopaque, id: SurfaceRegistry.Id, size: ?render.Size) void {
+        fn committed(
+            context: *anyopaque,
+            id: SurfaceRegistry.Id,
+            size: ?render.Size,
+            _: bool,
+        ) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             std.debug.assert(self.registry.contains(id));
             std.debug.assert(size != null and self.registry.renderState(id) != null);
