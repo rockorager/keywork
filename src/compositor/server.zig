@@ -849,6 +849,7 @@ const PointerRoute = struct {
 const GeneratedPointerFocus = struct {
     surface_id: SurfaceRegistry.Id,
     root: SurfaceRegistry.Id,
+    client: ClientRegistry.Id,
     x: f64,
     y: f64,
 };
@@ -3695,18 +3696,31 @@ pub fn clearGeneratedSeatDeliverySink(self: *Self, context: *anyopaque) void {
     self.seat.clearDeliverySink(context);
 }
 
-/// Phase 1 presentation policy is deliberately limited to the headless
-/// backend. Other experimental sidecars share registry identity and buffer
-/// lifetime without becoming visible.
+pub fn generatedSeatRequestSink(self: *Self) SeatDelivery.RequestSink {
+    return self.seat.generatedRequestSink();
+}
+
+pub fn generatedSeatName(self: *const Self) [:0]const u8 {
+    return self.seat.name();
+}
+
 pub fn wayringPresentationListener(self: *Self) ?WayringCompositor.PresentationListener {
-    if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return null;
     return .{
         .context = self,
         .added = wayringSurfaceAdded,
         .detached = wayringSurfaceDetached,
         .applied = wayringSurfaceApplied,
         .removing = wayringSurfaceRemoving,
+        .cursor_role = wayringSurfaceCursorRole,
     };
+}
+
+fn wayringSurfaceCursorRole(context: *anyopaque, id: SurfaceRegistry.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.damageHeadlessCompound(id);
+    self.damageActiveGeneratedCursor();
+    self.headless_surface_forest.markCursorRole(id);
+    self.damageActiveGeneratedCursor();
 }
 
 /// Output globals use the same presentation gate as scanner-backed surfaces.
@@ -3817,16 +3831,21 @@ fn wayringSurfaceAdded(
     const self: *Self = @ptrCast(@alignCast(context));
     std.debug.assert(self.surface_registry.contains(id));
     std.debug.assert(self.surface_registry.renderState(id) == null);
+    self.damageActiveGeneratedCursor();
     try self.addHeadlessSurface(id, frame_completion);
+    self.damageActiveGeneratedCursor();
 }
 
 fn wayringSurfaceDetached(context: *anyopaque, id: SurfaceRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    self.damageActiveGeneratedCursor();
     self.detachHeadlessSurface(id);
+    self.damageActiveGeneratedCursor();
 }
 
 fn wayringSurfaceApplied(context: *anyopaque, batch: WayringCompositor.AppliedBatch) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    self.damageActiveGeneratedCursor();
     for (batch.surfaces) |surface| {
         const render_state = self.surface_registry.renderState(surface.id);
         if (surface.mapped_size) |mapped_size| {
@@ -3837,15 +3856,24 @@ fn wayringSurfaceApplied(context: *anyopaque, batch: WayringCompositor.AppliedBa
         }
     }
     self.applyHeadlessBatch(batch);
+    self.damageActiveGeneratedCursor();
 }
 
 fn wayringSurfaceRemoving(context: *anyopaque, id: SurfaceRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    self.damageActiveGeneratedCursor();
     if (self.headless_surface_forest.state(id).?.mapped_size) |mapped_size| {
         const render_state = self.surface_registry.renderState(id) orelse unreachable;
         std.debug.assert(std.meta.eql(mapped_size, render_state.logical_size));
     }
     self.removeHeadlessSurface(id);
+    self.damageActiveGeneratedCursor();
+}
+
+fn damageActiveGeneratedCursor(self: *Self) void {
+    const info = self.seat.cursorInfo() orelse return;
+    if (info != .generated) return;
+    cursorChanged(self, info, info);
 }
 
 noinline fn requestRepaint(context: *anyopaque) void {
@@ -3881,7 +3909,7 @@ fn shapeCursorForOutput(self: *Self, output: *RenderOutput, info: ?Seat.CursorIn
     const cursor = info orelse return null;
     const shape = switch (cursor) {
         .shape => |shape| shape,
-        .surface => return null,
+        .surface, .generated => return null,
     };
     const bounds = self.cursorBounds(cursor) orelse return null;
     if (bounds.intersection(self.outputs.get(output.protocol_id).?.logicalRect()) == null) return null;
@@ -5057,6 +5085,15 @@ fn scheduleSurfaceFrameCallback(self: *Self, surface_id: Surface.Id) void {
 
 fn cursorBounds(self: *Self, cursor: Seat.CursorInfo) ?render.Rect {
     return switch (cursor) {
+        .generated => |generated| switch (self.headless_surface_forest.compoundBounds(generated.surface_id)) {
+            .hidden => .{ .x = generated.x, .y = generated.y, .width = 0, .height = 0 },
+            .full_damage => null,
+            .rect => |bounds| translated: {
+                const x = std.math.add(i32, bounds.x, generated.x) catch break :translated null;
+                const y = std.math.add(i32, bounds.y, generated.y) catch break :translated null;
+                break :translated .{ .x = x, .y = y, .width = bounds.width, .height = bounds.height };
+            },
+        },
         .shape => |shape| .{
             .x = shape.x,
             .y = shape.y,
@@ -5259,6 +5296,8 @@ fn damageHeadlessSurfaceBounds(
 }
 
 fn damageHeadlessCompound(self: *Self, id: SurfaceRegistry.Id) void {
+    if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind()) or
+        self.headless_surface_forest.isCursorRole(id)) return;
     switch (self.headless_surface_forest.compoundBounds(id)) {
         .hidden => {},
         .rect => |rectangle| self.damageHeadlessSurfaceBounds(rectangle, id),
@@ -5288,6 +5327,7 @@ fn expandHeadlessSurfaceBlurDamage(
         var reached_source = after_id == null;
         var iterator = self.headless_surface_forest.renderIterator();
         while (iterator.next()) |entry| {
+            if (self.headless_surface_forest.isCursorRole(entry.id)) continue;
             if (!reached_source) {
                 if (std.meta.eql(entry.id, after_id.?)) reached_source = true;
                 continue;
@@ -5375,6 +5415,7 @@ fn completeSampledHeadlessFrames(self: *Self) void {
     var callback_timestamp_ms: ?u32 = null;
     var iterator = self.headless_surface_forest.nodeIterator();
     while (iterator.next()) |node| {
+        if (self.headless_surface_forest.isCursorRole(node.id)) continue;
         if (!node.frame_demand or !self.renderer.wasSampled(surfaceSampleTag(node.id))) continue;
         const completion = self.headless_surface_forest.takeFrameCompletion(node.id) orelse unreachable;
         const timestamp_ms = callback_timestamp_ms orelse timestamp: {
@@ -5383,6 +5424,26 @@ fn completeSampledHeadlessFrames(self: *Self) void {
             break :timestamp value;
         };
         completion.complete(completion.context, node.id, timestamp_ms);
+    }
+}
+
+fn completeSampledGeneratedCursorFrames(self: *Self) void {
+    const info = self.seatCursorInfo(&self.seat, self.session_lock.isLocked()) orelse return;
+    const generated = switch (info) {
+        .generated => |value| value,
+        else => return,
+    };
+    var timestamp_ms: ?u32 = null;
+    var iterator = self.headless_surface_forest.subtreeRenderIterator(generated.surface_id);
+    while (iterator.next()) |entry| {
+        if (!self.renderer.wasSampled(surfaceSampleTag(entry.id))) continue;
+        const completion = self.headless_surface_forest.takeFrameCompletion(entry.id) orelse continue;
+        const timestamp = timestamp_ms orelse value: {
+            const now = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io)).milliseconds();
+            timestamp_ms = now;
+            break :value now;
+        };
+        completion.complete(completion.context, entry.id, timestamp);
     }
 }
 
@@ -6251,23 +6312,31 @@ fn routeTouchDown(
             self.session_lock.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
         }
     } else if (seat == &self.seat) {
-        if (focus) |target| {
+        if (focus != null and focus.?.generated == null) {
+            const target = focus.?;
             const root = self.subcompositor.rootSurface(target.surface_id);
             _ = self.focus_arbiter.clearGenerated();
             self.window_manager.pointerButton(root, .pressed);
             self.layer_shell.pointerPressed(root);
             requestRepaint(self);
-        } else if (route.generated) |generated| {
+        } else if (if (route.generated) |generated|
+            generated.root
+        else if (focus) |target|
+            if (target.generated) |generated| generated.root else null
+        else
+            null) |generated_root|
+        {
             self.window_manager.pointerButton(null, .pressed);
             self.layer_shell.pointerPressed(null);
-            if (first_touch) _ = self.focusGeneratedSurface(generated.root);
+            if (first_touch) _ = self.focusGeneratedSurface(generated_root);
             requestRepaint(self);
         } else {
             self.window_manager.pointerButton(null, .pressed);
             if (self.xdg_shell.hasPopupGrab()) self.xdg_shell.dismissPopupGrab();
         }
     }
-    seat.touchDown(time, protocol_id, point.x, point.y, focus) catch {
+    const touch_focus = if (focus != null and focus.?.generated == null) focus else null;
+    seat.touchDown(time, protocol_id, point.x, point.y, touch_focus) catch {
         _ = self.routed_touches.pop();
         self.terminate();
     };
@@ -6515,7 +6584,7 @@ fn pointerMotionGlobalForSeat(
     }
     if (seat != &self.seat) {
         const route = self.pointerRoute(x, y);
-        seat.pointerMotion(time, x, y, route.focus);
+        seat.pointerMotion(time, x, y, maturePointerFocus(route.focus));
         return;
     }
     const motion = self.pointer_constraints.constrainMotion(.{ .x = x, .y = y });
@@ -6967,7 +7036,11 @@ fn dragEnded(context: *anyopaque) void {
 fn restoreSeatPointerFocus(self: *Self, seat: *Seat) void {
     const position = seat.pointerPosition() orelse return;
     const route = self.pointerRoute(position.x, position.y);
-    seat.pointerEnter(position.x, position.y, route.focus);
+    seat.pointerEnter(
+        position.x,
+        position.y,
+        if (seat == &self.seat) route.focus else maturePointerFocus(route.focus),
+    );
     if (seat != &self.seat or self.session_lock.isLocked()) return;
     if (!self.xdg_shell.hasPopupGrab()) {
         self.window_manager.pointerMoved(route.root);
@@ -7007,9 +7080,9 @@ fn routeActiveDrag(
         }
     }
     if (motion) {
-        self.data_device.pointerMotion(time, route.focus);
+        self.data_device.pointerMotion(time, maturePointerFocus(route.focus));
     } else {
-        self.data_device.pointerEntered(route.focus);
+        self.data_device.pointerEntered(maturePointerFocus(route.focus));
     }
 }
 
@@ -7080,7 +7153,8 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
         };
         return;
     }
-    if (focus) |target| {
+    if (focus != null and focus.?.generated == null) {
+        const target = focus.?;
         const root = self.subcompositor.rootSurface(target.surface_id);
         _ = self.focus_arbiter.clearGenerated();
         self.window_manager.pointerButton(root, .pressed);
@@ -7095,7 +7169,8 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
         self.window_manager.pointerButton(null, .pressed);
         if (self.xdg_shell.hasPopupGrab()) self.xdg_shell.dismissPopupGrab();
     }
-    self.seat.touchDown(time, id, point.x, point.y, focus) catch {
+    const touch_focus = if (focus != null and focus.?.generated == null) focus else null;
+    self.seat.touchDown(time, id, point.x, point.y, touch_focus) catch {
         log.err("failed to store touch point", .{});
         self.terminate();
     };
@@ -7136,7 +7211,12 @@ fn touchOrientation(context: *anyopaque, id: i32, orientation: f64) void {
 }
 
 fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
-    return self.pointerFocusExcluding(x, y, null);
+    return maturePointerFocus(self.pointerFocusExcluding(x, y, null));
+}
+
+fn maturePointerFocus(focus: ?Seat.PointerFocus) ?Seat.PointerFocus {
+    const value = focus orelse return null;
+    return if (value.generated == null) value else null;
 }
 
 fn pointerFocusExcluding(
@@ -7185,7 +7265,8 @@ fn pointerRouteExcluding(
         .focus = null,
         .root = null,
     };
-    if (route.focus) |candidate| {
+    if (route.focus != null and route.focus.?.generated == null) {
+        const candidate = route.focus.?;
         if (self.xdg_shell.hasPopupGrab() and
             !self.xdg_shell.popupGrabOwnsSurface(candidate.surface_id))
         {
@@ -7194,11 +7275,13 @@ fn pointerRouteExcluding(
         }
     } else if (route.generated != null and self.xdg_shell.hasPopupGrab()) {
         route.generated = null;
+        route.focus = null;
     } else if (route.generated != null) {
         // Mature window chrome paints above the headless plane and keeps its
         // existing resize/move policy even where generated content overlaps.
         if (self.borderRoot(x, y, excluded_window)) |root| {
             route.generated = null;
+            route.focus = null;
             route.root = root;
         }
     }
@@ -7301,7 +7384,12 @@ fn scenePointerRoute(
     };
     if (fullscreen != null) return null;
     if (self.headlessPointerFocus(x, y)) |focus| return .{
-        .focus = null,
+        .focus = .{
+            .surface_id = focus.surface_id,
+            .x = focus.x,
+            .y = focus.y,
+            .generated = .{ .root = focus.root, .client = focus.client },
+        },
         .root = null,
         .generated = focus,
     };
@@ -7311,14 +7399,17 @@ fn scenePointerRoute(
 }
 
 fn headlessPointerFocus(self: *Self, x: f64, y: f64) ?GeneratedPointerFocus {
+    if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return null;
     const hit = self.headless_surface_forest.inputHit(x, y, .{
         .context = self,
         .accepts = generatedSurfaceAcceptsInput,
     }) orelse return null;
     const root = self.headless_surface_forest.compoundRoot(hit.id) orelse return null;
+    const client = self.seat.generatedSurfaceOwner(hit.id) orelse return null;
     return .{
         .surface_id = hit.id,
         .root = root,
+        .client = client,
         .x = hit.x,
         .y = hit.y,
     };
@@ -9188,6 +9279,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     }
     self.rememberSampledSurfaces(render_output);
     self.completeSampledHeadlessFrames();
+    self.completeSampledGeneratedCursorFrames();
     output.endFrame();
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(render_output.protocol_id);
@@ -9475,6 +9567,7 @@ fn presentSessionLockFrame(
     frame.render_output.lock_frame_pending = true;
     self.rememberSampledSurfaces(frame.render_output);
     self.completeSampledHeadlessFrames();
+    self.completeSampledGeneratedCursorFrames();
     frame.output.endFrame();
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);
@@ -9571,6 +9664,7 @@ fn applyMatureKeyboardFocus(self: *Self, requested: ?Surface.Id) void {
 }
 
 fn focusGeneratedSurface(self: *Self, requested_root: SurfaceRegistry.Id) bool {
+    if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return false;
     if (!generatedFocusPolicyAllows(
         self.session_lock.isLocked(),
         self.xdg_shell.hasPopupGrab(),
@@ -9633,6 +9727,26 @@ fn renderCursor(
     info: Seat.CursorInfo,
 ) Renderer.Error!void {
     switch (info) {
+        .generated => |generated| {
+            var iterator = self.headless_surface_forest.subtreeRenderIterator(generated.surface_id);
+            while (iterator.next()) |entry| {
+                const render_state = self.surface_registry.renderState(entry.id) orelse continue;
+                std.debug.assert(std.meta.eql(entry.mapped_size, render_state.logical_size));
+                const command = [_]render.Command{.{ .image = imageFromRenderState(
+                    render_state,
+                    .{
+                        .position = .{
+                            .x = generated.x +| entry.position.x,
+                            .y = generated.y +| entry.position.y,
+                        },
+                        .rounded_clip = null,
+                        .clip = null,
+                    },
+                    surfaceSampleTag(entry.id),
+                ) }};
+                try self.renderCommands(frame, &command);
+            }
+        },
         .surface => |surface| try self.renderSurfaceTree(
             frame,
             surface.surface_id,
@@ -9668,6 +9782,7 @@ fn submitTabletCursors(self: *Self, output: *Output, locked: bool) void {
 
 fn submitCursor(self: *Self, output: *Output, info: Seat.CursorInfo) void {
     switch (info) {
+        .generated => {},
         .surface => |surface| self.submitSurfaceTree(output, surface.surface_id),
         .shape => {},
     }
@@ -9746,6 +9861,7 @@ fn renderHeadlessSurfaces(self: *Self, frame: *const OutputFrame) Renderer.Error
     if (!frame.render_output.backend.isHeadless()) return;
     var iterator = self.headless_surface_forest.renderIterator();
     while (iterator.next()) |entry| {
+        if (self.headless_surface_forest.isCursorRole(entry.id)) continue;
         const mapped_size = entry.mapped_size;
         const render_state = self.surface_registry.renderState(entry.id) orelse continue;
         std.debug.assert(std.meta.eql(mapped_size, render_state.logical_size));
@@ -11145,9 +11261,15 @@ const SyntheticSurfaceProvider = struct {
 };
 
 const TestGeneratedSeatSink = struct {
+    const PointerTag = std.meta.Tag(SeatDelivery.PointerEvent);
+
     clients: *ClientRegistry,
     client: ClientRegistry.Id,
     event_count: usize = 0,
+    next_serial: u32 = 1,
+    pointer_event_count: usize = 0,
+    pointer_events: [16]PointerTag = undefined,
+    pointer_surfaces: [16]SurfaceRegistry.Id = undefined,
 
     fn sink(self: *TestGeneratedSeatSink) SeatDelivery.Sink {
         return .{
@@ -11155,7 +11277,9 @@ const TestGeneratedSeatSink = struct {
             .owner_for_surface = ownerForSurface,
             .surface_accepts_input = surfaceAcceptsInput,
             .issue_serial = issueSerial,
+            .terminalize = terminalize,
             .touch_target = touchTarget,
+            .assign_cursor_role = assignCursorRole,
             .capabilities = capabilities,
             .keyboard_state = keyboardState,
             .keyboard = keyboard,
@@ -11184,8 +11308,23 @@ const TestGeneratedSeatSink = struct {
         return true;
     }
 
-    fn issueSerial(_: *anyopaque, _: ClientRegistry.Id) ?ClientRegistry.Serial {
-        return null;
+    fn issueSerial(context: *anyopaque, client: ClientRegistry.Id) ?ClientRegistry.Serial {
+        const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
+        if (!std.meta.eql(client, self.client) or !self.clients.contains(client)) return null;
+        const value = self.next_serial;
+        self.next_serial += 1;
+        return .{ .domain = .wayring_server, .value = value };
+    }
+
+    fn terminalize(_: *anyopaque, _: ClientRegistry.Id, _: SeatDelivery.TerminalReason) void {}
+
+    fn assignCursorRole(
+        context: *anyopaque,
+        client: ClientRegistry.Id,
+        _: SurfaceRegistry.Id,
+    ) SeatDelivery.CursorRoleResult {
+        const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
+        return if (std.meta.eql(client, self.client)) .assigned else .wrong_client;
     }
 
     fn touchTarget(_: *anyopaque, _: SurfaceRegistry.Id) ?SeatDelivery.TouchTarget {
@@ -11208,10 +11347,14 @@ const TestGeneratedSeatSink = struct {
     fn pointer(
         context: *anyopaque,
         _: ClientRegistry.Id,
-        _: SurfaceRegistry.Id,
-        _: SeatDelivery.PointerEvent,
+        surface: SurfaceRegistry.Id,
+        event: SeatDelivery.PointerEvent,
     ) void {
         const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
+        std.debug.assert(self.pointer_event_count < self.pointer_events.len);
+        self.pointer_events[self.pointer_event_count] = event;
+        self.pointer_surfaces[self.pointer_event_count] = surface;
+        self.pointer_event_count += 1;
         self.event_count += 1;
     }
 
@@ -11433,6 +11576,99 @@ test "applied nested topology paints exact order and completes only sampled chil
     server.surface_registry.remove(grandchild_id);
     server.removeHeadlessSurface(replacement_id);
     server.surface_registry.remove(replacement_id);
+}
+
+test "generated cursor subtree paints stack and completes callbacks only while sampled" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 3, .height = 1 } },
+    );
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+    var completion: TestFrameCompletion = .{ .forest = &server.headless_surface_forest };
+    var root: SyntheticSurfaceProvider = .{
+        .pixel = 0xffff_0000,
+        .logical_size = .{ .width = 3, .height = 1 },
+    };
+    var child: SyntheticSurfaceProvider = .{
+        .pixel = 0xff00_ff00,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const root_id = try server.surface_registry.add(root.provider());
+    const child_id = try server.surface_registry.add(child.provider());
+    try server.addHeadlessSurface(root_id, completion.frameCompletion());
+    try server.addHeadlessSurface(child_id, completion.frameCompletion());
+    server.commitHeadlessSurface(root_id, root.logical_size, true);
+    server.commitHeadlessSurface(child_id, child.logical_size, true);
+    const root_stack = [_]WayringCompositor.AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = child_id, .position = .{ .x = 1 } } },
+    };
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{},
+        .parents = &.{.{ .id = root_id, .stack = &root_stack }},
+    });
+
+    const generated_client = try server.client_registry.register(.wayring_server);
+    var sink: TestGeneratedSeatSink = .{
+        .clients = &server.client_registry,
+        .client = generated_client,
+    };
+    server.setGeneratedSeatDeliverySink(sink.sink());
+    server.seat.setPointerAvailable(true);
+    pointerMotion(output, 1, 1, 0);
+    try std.testing.expectEqual(child_id, server.seat.pointerFocus().?.surface_id);
+    server.headless_surface_forest.markCursorRole(root_id);
+    try std.testing.expectEqual(SeatDelivery.CursorRequestResult.accepted, server.seat.setGeneratedCursor(.{
+        .client = generated_client,
+        .resource_generation = 1,
+        .capability_generation = server.seat.deliverySnapshot().capabilities.pointer.generation,
+        .serial = .{ .domain = .wayring_server, .value = 1 },
+        .surface = root_id,
+        .hotspot_x = 1,
+        .hotspot_y = 0,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), completion.count);
+    try renderPendingTestOutput(server, output);
+    const target = switch (output.backend.acquire().?) {
+        .pixels => |pixels| pixels,
+        else => return error.ExpectedCpuHeadlessTarget,
+    };
+    try std.testing.expectEqualSlices(u32, &.{ root.pixel, child.pixel, root.pixel }, target.pixels);
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(root_id)));
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(child_id)));
+    try std.testing.expectEqual(@as(usize, 2), completion.count);
+    try std.testing.expect(completion.demand_cleared_before_call);
+
+    // The permanent cursor role is not background membership. Once hidden,
+    // new demand remains pending even though the headless plane is rendered.
+    server.commitHeadlessSurface(root_id, root.logical_size, true);
+    server.commitHeadlessSurface(child_id, child.logical_size, true);
+    try std.testing.expectEqual(SeatDelivery.CursorRequestResult.accepted, server.seat.setGeneratedCursor(.{
+        .client = generated_client,
+        .resource_generation = 1,
+        .capability_generation = server.seat.deliverySnapshot().capabilities.pointer.generation,
+        .serial = .{ .domain = .wayring_server, .value = 1 },
+        .surface = null,
+        .hotspot_x = 0,
+        .hotspot_y = 0,
+    }));
+    try renderPendingTestOutput(server, output);
+    try std.testing.expectEqual(@as(usize, 2), completion.count);
+    try std.testing.expect(server.headless_surface_forest.state(root_id).?.frame_demand);
+    try std.testing.expect(server.headless_surface_forest.state(child_id).?.frame_demand);
+
+    server.seat.setPointerAvailable(false);
+    server.clearGeneratedSeatDeliverySink(&sink);
+    server.client_registry.unregister(generated_client);
+    server.removeHeadlessSurface(child_id);
+    server.surface_registry.remove(child_id);
+    server.removeHeadlessSurface(root_id);
+    server.surface_registry.remove(root_id);
 }
 
 test "applied topology damages old and new compounds for movement stacking mapping detach and removal" {
@@ -11977,17 +12213,57 @@ test "headless click and first touch focus compound root with synchronous repair
     pointerButton(output, 2, linux_button_left, .pressed);
     try std.testing.expectEqual(root, server.focus_arbiter.target().?.root);
     try std.testing.expectEqual(FocusArbiter.Frontend.generated, server.focus_arbiter.target().?.frontend);
-    pointerButton(output, 3, linux_button_left, .released);
+    try std.testing.expect(server.seat.implicitPointerGrabActive());
+    const press_serial: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 2 };
+    try std.testing.expect(server.seat.authority.acceptsAction(generated_client, press_serial));
+    try std.testing.expect(server.seat.authority.selectionOrder(generated_client, press_serial) != null);
+    try std.testing.expect(server.seat.authority.acceptsPointerGrab(generated_client, press_serial, child));
+    try std.testing.expect(!server.seat.authority.acceptsPointerGrab(generated_client, .{
+        .domain = .mature_display,
+        .value = press_serial.value,
+    }, child));
+
+    // Crossing to another generated compound stays pinned to the pressed
+    // surface until release, then performs leave/frame/enter in that order.
+    pointerMotion(output, 3, 0.5, 0.5);
+    try std.testing.expectEqual(child, server.seat.pointerFocus().?.surface_id);
+    try std.testing.expectEqual(root, server.seat.pointerFocus().?.generated.?.root);
+    pointerButton(output, 4, linux_button_left, .released);
+    try std.testing.expect(!server.seat.implicitPointerGrabActive());
+    try std.testing.expect(!server.seat.authority.acceptsPointerGrab(generated_client, press_serial, child));
+    try std.testing.expect(server.seat.authority.selectionOrder(generated_client, .{
+        .domain = .wayring_server,
+        .value = 3,
+    }) != null);
+    try std.testing.expectEqual(top, server.seat.pointerFocus().?.surface_id);
+    try std.testing.expectEqualSlices(TestGeneratedSeatSink.PointerTag, &.{
+        .enter,
+        .button,
+        .motion,
+        .button,
+        .leave,
+        .frame,
+        .enter,
+    }, sink.pointer_events[0..sink.pointer_event_count]);
+    try std.testing.expectEqualSlices(SurfaceRegistry.Id, &.{
+        child,
+        child,
+        child,
+        child,
+        child,
+        child,
+        top,
+    }, sink.pointer_surfaces[0..sink.pointer_event_count]);
 
     _ = server.focus_arbiter.focusMature(null, null);
-    touchDown(output, 4, 10, 2, 2);
+    touchDown(output, 5, 10, 2, 2);
     try std.testing.expectEqual(root, server.focus_arbiter.target().?.root);
-    touchDown(output, 5, 11, 0.5, 0.5);
+    touchDown(output, 6, 11, 0.5, 0.5);
     try std.testing.expectEqual(top, server.pointerRoute(0.5, 0.5).generated.?.root);
     try std.testing.expectEqual(root, server.focus_arbiter.target().?.root);
-    touchUp(output, 6, 11);
-    touchUp(output, 7, 10);
-    try std.testing.expectEqual(@as(usize, 0), sink.event_count);
+    touchUp(output, 7, 11);
+    touchUp(output, 8, 10);
+    try std.testing.expectEqual(@as(usize, 7), sink.event_count);
 
     server.commitHeadlessSurface(root, null, false);
     try std.testing.expect(server.focus_arbiter.target() == null);

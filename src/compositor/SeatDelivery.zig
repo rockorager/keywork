@@ -13,6 +13,27 @@ const SurfaceRegistry = @import("SurfaceRegistry.zig");
 
 pub const ResourceGeneration = u64;
 
+pub const CursorRoleResult = enum { assigned, already_cursor, role_conflict, not_live, wrong_client };
+pub const CursorRequestResult = enum { accepted, ignored, role_conflict, unavailable };
+pub const CursorRequest = struct {
+    client: ClientRegistry.Id,
+    resource_generation: ResourceGeneration,
+    capability_generation: u64,
+    serial: ClientRegistry.Serial,
+    surface: ?SurfaceRegistry.Id,
+    hotspot_x: i32,
+    hotspot_y: i32,
+};
+
+/// Canonical request boundary copied by a generated frontend adapter.
+pub const RequestSink = struct {
+    context: *anyopaque,
+    set_cursor: *const fn (*anyopaque, CursorRequest) CursorRequestResult,
+    cursor_committed: *const fn (*anyopaque, SurfaceRegistry.Id, i32, i32) void,
+    cursor_removed: *const fn (*anyopaque, SurfaceRegistry.Id) void,
+    client_retiring: *const fn (*anyopaque, ClientRegistry.Id) void,
+};
+
 pub const Capability = struct {
     available: bool = false,
     ever_available: bool = false,
@@ -94,6 +115,10 @@ pub const KeyState = enum(u32) {
 pub const ButtonState = enum(u32) {
     released = 0,
     pressed = 1,
+};
+
+pub const TerminalReason = enum {
+    pointer_state_out_of_memory,
 };
 
 pub const KeyboardStateEvent = union(enum) {
@@ -217,13 +242,19 @@ pub const Sink = struct {
     owner_for_surface: *const fn (*anyopaque, SurfaceRegistry.Id) ?ClientRegistry.Id,
     surface_accepts_input: *const fn (*anyopaque, SurfaceRegistry.Id, f64, f64) bool,
     issue_serial: *const fn (*anyopaque, ClientRegistry.Id) ?ClientRegistry.Serial,
+    terminalize: *const fn (*anyopaque, ClientRegistry.Id, TerminalReason) void,
     touch_target: *const fn (*anyopaque, SurfaceRegistry.Id) ?TouchTarget,
+    assign_cursor_role: *const fn (*anyopaque, ClientRegistry.Id, SurfaceRegistry.Id) CursorRoleResult = unavailableCursorRole,
     capabilities: *const fn (*anyopaque, CapabilitySnapshot) void,
     keyboard_state: *const fn (*anyopaque, KeyboardStateEvent) void,
     keyboard: *const fn (*anyopaque, ClientRegistry.Id, SurfaceRegistry.Id, KeyboardEvent) void,
     pointer: *const fn (*anyopaque, ClientRegistry.Id, SurfaceRegistry.Id, PointerEvent) void,
     touch: *const fn (*anyopaque, ClientRegistry.Id, TouchEvent) void,
 };
+
+fn unavailableCursorRole(_: *anyopaque, _: ClientRegistry.Id, _: SurfaceRegistry.Id) CursorRoleResult {
+    return .not_live;
+}
 
 capabilities: CapabilitySnapshot = .{},
 sink: ?Sink = null,
@@ -291,9 +322,21 @@ pub fn issueSerial(self: *const SeatDelivery, client: ClientRegistry.Id) ?Client
     return sink.issue_serial(sink.context, client);
 }
 
+pub fn terminalize(self: *SeatDelivery, client: ClientRegistry.Id, reason: TerminalReason) void {
+    const sink = self.sink orelse return;
+    self.beginNotify();
+    defer self.endNotify();
+    sink.terminalize(sink.context, client, reason);
+}
+
 pub fn touchTarget(self: *const SeatDelivery, surface: SurfaceRegistry.Id) ?TouchTarget {
     const sink = self.sink orelse return null;
     return sink.touch_target(sink.context, surface);
+}
+
+pub fn assignCursorRole(self: *const SeatDelivery, client: ClientRegistry.Id, surface: SurfaceRegistry.Id) CursorRoleResult {
+    const sink = self.sink orelse return .not_live;
+    return sink.assign_cursor_role(sink.context, client, surface);
 }
 
 pub fn notifyCapabilities(self: *SeatDelivery) void {
@@ -406,6 +449,8 @@ test "sink forwards neutral snapshots identity serial and touch cutoff queries" 
             return if (std.meta.eql(self.client, client)) self.serial else null;
         }
 
+        fn terminalize(_: *anyopaque, _: ClientRegistry.Id, _: TerminalReason) void {}
+
         fn target(context: *anyopaque, surface: SurfaceRegistry.Id) ?TouchTarget {
             const self: *@This() = @ptrCast(@alignCast(context));
             if (!std.meta.eql(self.surface, surface)) return null;
@@ -435,6 +480,7 @@ test "sink forwards neutral snapshots identity serial and touch cutoff queries" 
         .owner_for_surface = Probe.owner,
         .surface_accepts_input = Probe.acceptsInput,
         .issue_serial = Probe.issue,
+        .terminalize = Probe.terminalize,
         .touch_target = Probe.target,
         .capabilities = Probe.capabilities,
         .keyboard_state = Probe.keyboardState,

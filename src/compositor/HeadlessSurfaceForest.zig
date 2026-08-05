@@ -100,6 +100,7 @@ const Node = struct {
     mapped_size: ?render.Size = null,
     frame_completion: ?SurfaceFrameCompletion = null,
     frame_demand: bool = false,
+    cursor_role: bool = false,
 
     placement: PlacementTag = .detached,
     parent: ?SurfaceRegistry.Id = null,
@@ -266,6 +267,17 @@ pub fn takeFrameCompletion(
     return completion;
 }
 
+/// Permanently marks the root as cursor-role presentation content.
+pub fn markCursorRole(self: *HeadlessSurfaceForest, id: SurfaceRegistry.Id) void {
+    const target = self.node(id) orelse return;
+    target.cursor_role = true;
+}
+
+pub fn isCursorRole(self: *const HeadlessSurfaceForest, id: SurfaceRegistry.Id) bool {
+    const root = self.compoundRoot(id) orelse return false;
+    return self.nodeConst(root).?.cursor_role;
+}
+
 pub fn state(self: *const HeadlessSurfaceForest, id: SurfaceRegistry.Id) ?NodeState {
     const target = self.nodeConst(id) orelse return null;
     return nodeState(target);
@@ -430,6 +442,31 @@ pub fn renderIterator(self: *const HeadlessSurfaceForest) RenderIterator {
     };
 }
 
+/// Iterates one attached compound in exact bottom-to-top paint order. Entry
+/// positions are relative to the compound root.
+pub fn subtreeRenderIterator(
+    self: *const HeadlessSurfaceForest,
+    root: SurfaceRegistry.Id,
+) RenderIterator {
+    const target = self.nodeConst(root) orelse return .{
+        .forest = self,
+        .next_root = null,
+        .steps_remaining = 0,
+    };
+    if (target.placement != .root) return .{
+        .forest = self,
+        .next_root = null,
+        .steps_remaining = 0,
+    };
+    return .{
+        .forest = self,
+        .next_root = null,
+        .owner = root,
+        .entry = target.stack_head,
+        .steps_remaining = self.node_count *| 2 +| 1,
+    };
+}
+
 /// Returns the topmost visible node accepted by the frontend-local input
 /// filter. Iteration follows exact paint order and retains only one candidate;
 /// neither topology traversal nor filtering allocates.
@@ -443,6 +480,7 @@ pub fn inputHit(
     var hit: ?InputHit = null;
     var iterator = self.renderIterator();
     while (iterator.next()) |entry| {
+        if (self.isCursorRole(entry.id)) continue;
         const surface_x = x - @as(f64, @floatFromInt(entry.position.x));
         const surface_y = y - @as(f64, @floatFromInt(entry.position.y));
         if (surface_x < 0 or surface_y < 0 or
@@ -1218,4 +1256,52 @@ test "failed growth leaves existing topology unchanged" {
     try std.testing.expectEqual(@as(usize, 1), forest.len());
     forest.validate();
     forest.remove(root);
+}
+
+test "subtree iterator preserves nested stack order and rejects stale roots" {
+    var forest = HeadlessSurfaceForest.init(std.testing.allocator);
+    defer forest.deinit();
+    const root: SurfaceRegistry.Id = .{ .index = 0, .generation = 1 };
+    const below: SurfaceRegistry.Id = .{ .index = 1, .generation = 1 };
+    const above: SurfaceRegistry.Id = .{ .index = 2, .generation = 1 };
+    const nested: SurfaceRegistry.Id = .{ .index = 3, .generation = 1 };
+    inline for (.{ root, below, above, nested }) |id| {
+        try forest.addRoot(id, null);
+        applyOne(&forest, id, .{ .width = 2, .height = 2 }, false);
+    }
+    const root_stack = [_]AppliedStackEntry{
+        .{ .child = .{ .id = below, .position = .{ .x = -3, .y = 4 } } },
+        .parent,
+        .{ .child = .{ .id = above, .position = .{ .x = 5, .y = 6 } } },
+    };
+    const below_stack = [_]AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = nested, .position = .{ .x = 7, .y = -2 } } },
+    };
+    const parents = [_]AppliedParentState{
+        .{ .id = root, .stack = &root_stack },
+        .{ .id = below, .stack = &below_stack },
+    };
+    forest.apply(.{ .surfaces = &.{}, .parents = &parents });
+
+    const expected_ids = [_]SurfaceRegistry.Id{ below, nested, root, above };
+    const expected_positions = [_]Position{
+        .{ .x = -3, .y = 4 }, .{ .x = 4, .y = 2 }, .{}, .{ .x = 5, .y = 6 },
+    };
+    var iterator = forest.subtreeRenderIterator(root);
+    for (expected_ids, expected_positions) |id, position| {
+        const entry = iterator.next().?;
+        try std.testing.expectEqual(id, entry.id);
+        try std.testing.expectEqual(position, entry.position);
+    }
+    try std.testing.expect(iterator.next() == null);
+
+    forest.detach(root);
+    var detached_iterator = forest.subtreeRenderIterator(root);
+    try std.testing.expect(detached_iterator.next() == null);
+    inline for (.{ root, below, above, nested }) |id| forest.remove(id);
+    try forest.addRoot(.{ .index = 0, .generation = 2 }, null);
+    var stale_iterator = forest.subtreeRenderIterator(root);
+    try std.testing.expect(stale_iterator.next() == null);
+    forest.remove(.{ .index = 0, .generation = 2 });
 }

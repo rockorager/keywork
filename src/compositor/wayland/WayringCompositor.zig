@@ -61,7 +61,16 @@ pub const PresentationListener = struct {
     detached: *const fn (*anyopaque, SurfaceId) void,
     applied: *const fn (*anyopaque, AppliedBatch) void,
     removing: *const fn (*anyopaque, SurfaceId) void,
+    cursor_role: ?*const fn (*anyopaque, SurfaceId) void = null,
 };
+
+pub const CursorListener = struct {
+    context: *anyopaque,
+    committed: *const fn (*anyopaque, SurfaceId, i32, i32) void,
+    removed: *const fn (*anyopaque, SurfaceId) void,
+};
+
+pub const CursorRoleResult = enum { assigned, already_cursor, role_conflict, not_live, wrong_client };
 
 const UpdateToken = struct {
     surface: SurfaceId,
@@ -80,7 +89,7 @@ const FrameCallback = struct {
 };
 
 const Surface = struct {
-    const Role = enum { none, subsurface, other };
+    const Role = enum { none, subsurface, cursor, other };
     resource: core.wl_surface.Resource,
     id: SurfaceId,
     destroying: bool = false,
@@ -331,6 +340,7 @@ allocator: std.mem.Allocator,
 protocol_server: *server.Server,
 surface_registry: *SurfaceRegistry,
 presentation_listener: ?PresentationListener,
+cursor_listener: ?CursorListener = null,
 global: *const server.Server.Global,
 subcompositor_global: *const server.Server.Global,
 shm: Shm,
@@ -491,6 +501,43 @@ pub fn surfaceId(self: *const WayringCompositor, client: *const server.Client, o
         return null;
     }
     return null;
+}
+
+pub fn setCursorListener(self: *WayringCompositor, listener: CursorListener) void {
+    std.debug.assert(self.cursor_listener == null);
+    self.cursor_listener = listener;
+}
+
+pub fn clearCursorListener(self: *WayringCompositor, context: *anyopaque) void {
+    std.debug.assert(self.cursor_listener != null and self.cursor_listener.?.context == context);
+    self.cursor_listener = null;
+}
+
+pub fn assignCursorRole(self: *WayringCompositor, client: *const server.Client, id: SurfaceId) CursorRoleResult {
+    const surface = self.surfaceForId(id) orelse return .not_live;
+    if (surface.destroying or surface.resource.runtime.state() != .live) return .not_live;
+    const owner = self.clientForResource(&surface.resource.runtime) orelse return .not_live;
+    if (owner != client) return .wrong_client;
+    return switch (surface.role) {
+        .none => blk: {
+            surface.role = .cursor;
+            if (self.presentation_listener) |listener| if (listener.cursor_role) |assigned|
+                assigned(listener.context, id);
+            break :blk .assigned;
+        },
+        .cursor => .already_cursor,
+        .subsurface, .other => .role_conflict,
+    };
+}
+
+pub fn surfaceRoleIsCursor(self: *const WayringCompositor, id: SurfaceId) bool {
+    const surface = self.surfaceForId(id) orelse return false;
+    return surface.role == .cursor;
+}
+
+pub fn currentOffset(self: *const WayringCompositor, id: SurfaceId) ?Position {
+    const surface = self.surfaceForId(id) orelse return null;
+    return .{ .x = surface.current_offset_x, .y = surface.current_offset_y };
 }
 
 pub fn currentBuffer(self: *WayringCompositor, id: SurfaceId) ?*CopiedBufferSnapshot {
@@ -1764,6 +1811,8 @@ fn publishPreparedCommit(
     surface.current_transform = prepared.transform;
     surface.current_offset_x = prepared.offset_x;
     surface.current_offset_y = prepared.offset_y;
+    if (surface.role == .cursor) if (self.cursor_listener) |listener|
+        listener.committed(listener.context, surface.id, prepared.offset_x, prepared.offset_y);
 
     // Offset is applied protocol metadata for this content update. Phase 2's
     // roleless root policy intentionally keeps rendering at the global origin;
@@ -1909,6 +1958,8 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     const objects = self.findClient(client) orelse unreachable;
     std.debug.assert(!surface.destroying);
     surface.destroying = true;
+    if (surface.role == .cursor) if (self.cursor_listener) |listener|
+        listener.removed(listener.context, surface.id);
     self.discardSurfaceQueue(surface);
     if (surface.relationship) |relationship| if (self.surfaceForId(relationship.identity.parent)) |parent| {
         for (parent.children.items, 0..) |entry, index| if (std.meta.eql(entry.identity, relationship.identity)) {
@@ -6599,4 +6650,81 @@ test "hostile-depth CU traversal is iterative and relationship cycles are reject
         compositor.surfaceForId(id).?.content_updates.items.len,
     );
     try std.testing.expect(client.fatal() == null);
+}
+
+test "cursor role is permanent client-owned and reports applied root offsets" {
+    const CursorProbe = struct {
+        commits: usize = 0,
+        removed: usize = 0,
+        last_id: ?SurfaceId = null,
+        last_offset: Position = .{},
+
+        fn listener(self: *@This()) CursorListener {
+            return .{ .context = self, .committed = committed, .removed = surfaceRemoved };
+        }
+
+        fn committed(context: *anyopaque, id: SurfaceId, x: i32, y: i32) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.commits += 1;
+            self.last_id = id;
+            self.last_offset = .{ .x = x, .y = y };
+        }
+
+        fn surfaceRemoved(context: *anyopaque, id: SurfaceId) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.removed += 1;
+            self.last_id = id;
+        }
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    var cursor_probe: CursorProbe = .{};
+    compositor.setCursorListener(cursor_probe.listener());
+    defer compositor.clearCursorListener(&cursor_probe);
+
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+    const other_managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const other_client = other_managed.client();
+    defer {
+        compositor.destroyClientResources(other_client);
+        other_managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 6);
+    try createSurfaceResource(client, 3, 4);
+    try createSurfaceResource(client, 3, 5);
+    const root = compositor.surfaceId(client, 4).?;
+    const child = compositor.surfaceId(client, 5).?;
+    try std.testing.expectEqual(CursorRoleResult.assigned, compositor.assignCursorRole(client, root));
+    try std.testing.expectEqual(CursorRoleResult.already_cursor, compositor.assignCursorRole(client, root));
+    try std.testing.expect(compositor.surfaceRoleIsCursor(root));
+    try std.testing.expectEqual(CursorRoleResult.wrong_client, compositor.assignCursorRole(other_client, root));
+
+    try setSurfaceOffset(client, 4, -7, 11);
+    try commitSurfaceResource(client, 4);
+    try std.testing.expectEqual(@as(usize, 1), cursor_probe.commits);
+    try std.testing.expectEqual(root, cursor_probe.last_id.?);
+    try std.testing.expectEqual(Position{ .x = -7, .y = 11 }, cursor_probe.last_offset);
+    try std.testing.expectEqual(Position{ .x = -7, .y = 11 }, compositor.currentOffset(root).?);
+
+    try bindTestSubcompositor(&compositor, client, 6);
+    try getSubsurface(client, 6, 7, 5, 4);
+    try std.testing.expectEqual(CursorRoleResult.role_conflict, compositor.assignCursorRole(client, child));
+    try std.testing.expect(!compositor.surfaceRoleIsCursor(child));
+
+    try send(client, 4, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expectEqual(@as(usize, 1), cursor_probe.removed);
+    try std.testing.expectEqual(root, cursor_probe.last_id.?);
+    try std.testing.expect(!compositor.containsSurface(root));
 }

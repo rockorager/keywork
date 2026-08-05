@@ -187,6 +187,7 @@ pub fn main(init: std.process.Init) !void {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
         compositor: *WayringCompositor,
+        seat: *WayringSeatAdapter,
 
         fn accepted(erased: *anyopaque, client: *wayring.server.Client) !void {
             const self: *@This() = @ptrCast(@alignCast(erased));
@@ -195,6 +196,7 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            self.seat.destroyClientResources(client);
             if (self.outputs) |outputs| outputs.destroyClientResources(client);
             self.compositor.destroyClientResources(client);
             if (self.clients.id(client) != null) self.clients.unregister(client);
@@ -207,7 +209,9 @@ pub fn main(init: std.process.Init) !void {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
         if (wayring_seat_adapter_initialized) {
+            wayring_seat_adapter.clearCursorListener();
             server.clearGeneratedSeatDeliverySink(&wayring_seat_adapter);
+            wayring_seat_adapter.deinit();
             wayring_seat_adapter_initialized = false;
         }
         if (wayring_clients_initialized) wayring_clients.deinit();
@@ -230,10 +234,14 @@ pub fn main(init: std.process.Init) !void {
         );
         wayring_compositor_initialized = true;
         wayring_seat_adapter = .init(
+            init.gpa,
             &wayring_protocol_server.?,
             &wayring_clients,
             &wayring_compositor,
+            server.generatedSeatRequestSink(),
+            server.generatedSeatName(),
         );
+        wayring_seat_adapter.installCursorListener();
         server.setGeneratedSeatDeliverySink(wayring_seat_adapter.sink());
         wayring_seat_adapter_initialized = true;
         if (server.wayringOutputLayout()) |output_layout| {
@@ -249,6 +257,7 @@ pub fn main(init: std.process.Init) !void {
             .clients = &wayring_clients,
             .outputs = if (wayring_outputs_initialized) &wayring_outputs else null,
             .compositor = &wayring_compositor,
+            .seat = &wayring_seat_adapter,
         };
         wayring_host = try WayringHost.create(
             init.gpa,

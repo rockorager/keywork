@@ -142,6 +142,7 @@ const PointerResource = struct {
 
 const PointerGrab = struct {
     surface_id: Surface.Id,
+    generated: ?GeneratedPointerTarget = null,
     suppressed: bool = false,
 };
 
@@ -153,7 +154,15 @@ const SurfaceCursor = struct {
 
 const ActiveCursor = union(enum) {
     surface: SurfaceCursor,
+    generated: GeneratedCursor,
     shape: OwnedShapeCursor,
+};
+
+const GeneratedCursor = struct {
+    client: ClientRegistry.Id,
+    surface_id: SurfaceRegistry.Id,
+    hotspot_x: i32,
+    hotspot_y: i32,
 };
 
 const OwnedShapeCursor = struct {
@@ -171,6 +180,12 @@ pub const PointerFocus = struct {
     surface_id: Surface.Id,
     x: f64,
     y: f64,
+    generated: ?GeneratedPointerTarget = null,
+};
+
+pub const GeneratedPointerTarget = struct {
+    root: SurfaceRegistry.Id,
+    client: ClientRegistry.Id,
 };
 
 pub const PointerHandle = struct {
@@ -208,6 +223,11 @@ pub const CursorImage = struct {
 pub const CursorInfo = union(enum) {
     surface: struct {
         surface_id: Surface.Id,
+        x: i32,
+        y: i32,
+    },
+    generated: struct {
+        surface_id: SurfaceRegistry.Id,
         x: i32,
         y: i32,
     },
@@ -382,6 +402,16 @@ pub fn setDeliverySink(self: *Self, sink: SeatDelivery.Sink) void {
 
 pub fn clearDeliverySink(self: *Self, context: *anyopaque) void {
     self.delivery.clearSink(context);
+}
+
+pub fn generatedRequestSink(self: *Self) SeatDelivery.RequestSink {
+    return .{
+        .context = self,
+        .set_cursor = generatedSetCursorCallback,
+        .cursor_committed = generatedCursorCommittedCallback,
+        .cursor_removed = generatedCursorRemovedCallback,
+        .client_retiring = generatedClientRetiringCallback,
+    };
 }
 
 /// Returns canonical resource-free state. Borrowed slices and file descriptors
@@ -733,8 +763,16 @@ fn clientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
     std.debug.assert(!self.clients.contains(client));
     if (self.authority.clientDisconnected(client)) self.pointer_grab = null;
+    if (self.pointer_focus) |focus| if (focus.generated) |generated| {
+        if (std.meta.eql(generated.client, client)) {
+            self.pointer_focus = null;
+            self.pointer_grab = null;
+            self.authority.clearPointerEnter();
+        }
+    };
     const clear_active_shape = if (self.active_cursor) |cursor| switch (cursor) {
         .surface => false,
+        .generated => |generated| std.meta.eql(generated.client, client),
         .shape => |shape| std.meta.eql(shape.client, client),
     } else false;
     if (self.cursor_controller) |controller| {
@@ -752,6 +790,7 @@ fn clientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
 
 pub fn pointerFocusedSurface(self: *const Self) ?Surface.Id {
     const focus = self.pointer_focus orelse return null;
+    if (focus.generated != null) return null;
     return focus.surface_id;
 }
 
@@ -761,6 +800,7 @@ pub fn pointerFocus(self: *const Self) ?PointerFocus {
 
 pub fn pointerFocusedClient(self: *const Self) ?*wl.Client {
     const focus = self.pointer_focus orelse return null;
+    if (focus.generated != null) return null;
     const resource = Surface.resourceFor(self.surface_store, focus.surface_id) orelse return null;
     return resource.getClient();
 }
@@ -853,6 +893,11 @@ pub fn cursorInfo(self: *const Self) ?CursorInfo {
             .surface_id = surface.surface_id,
             .x = cursorCoordinate(position.x, surface.hotspot_x),
             .y = cursorCoordinate(position.y, surface.hotspot_y),
+        } },
+        .generated => |generated| .{ .generated = .{
+            .surface_id = generated.surface_id,
+            .x = cursorCoordinate(position.x, generated.hotspot_x),
+            .y = cursorCoordinate(position.y, generated.hotspot_y),
         } },
         .shape => |shape| .{ .shape = .{
             .buffer = shape.image.buffer,
@@ -1314,6 +1359,52 @@ pub fn pointerButton(
     button: u32,
     state: wl.Pointer.ButtonState,
 ) error{OutOfMemory}!bool {
+    if (self.generatedPointerTarget()) |target| {
+        if (state == .pressed and self.authority.hasPointerButton(button)) return false;
+        if (state == .released and !self.authority.hasPointerButton(button)) return false;
+        const serial = self.delivery.issueSerial(target.client) orelse {
+            self.clearGeneratedPointerClient(target.client);
+            return !self.authority.hasPointerButtons();
+        };
+        switch (state) {
+            .pressed => {
+                const starts_grab = !self.authority.hasPointerButtons();
+                const added = self.authority.addPointerPress(
+                    target.client,
+                    serial,
+                    button,
+                    self.pointer_focus.?.surface_id,
+                ) catch {
+                    self.delivery.terminalize(target.client, .pointer_state_out_of_memory);
+                    self.clearGeneratedPointerClient(target.client);
+                    return false;
+                };
+                if (!added) {
+                    self.clearGeneratedPointerClient(target.client);
+                    return false;
+                }
+                if (starts_grab) self.pointer_grab = .{
+                    .surface_id = self.pointer_focus.?.surface_id,
+                    .generated = self.pointer_focus.?.generated,
+                };
+                std.debug.assert(self.authority.recordAction(target.client, serial));
+            },
+            .released => {
+                std.debug.assert(self.authority.forgetPointerPress(button));
+                std.debug.assert(self.authority.recordSelection(target.client, serial));
+            },
+            else => return false,
+        }
+        self.delivery.deliverPointer(target.client, self.pointer_focus.?.surface_id, .{ .button = .{
+            .serial = serial,
+            .time = time,
+            .button = button,
+            .state = @enumFromInt(@intFromEnum(state)),
+        } });
+        const grab_ended = !self.authority.hasPointerButtons();
+        if (grab_ended) self.pointer_grab = null;
+        return state == .released and grab_ended;
+    }
     switch (state) {
         .pressed => {
             if (self.authority.hasPointerButton(button)) return false;
@@ -1366,6 +1457,10 @@ pub fn pointerButton(
 }
 
 pub fn pointerAxis(self: *Self, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
+    if (self.generatedPointerTarget()) |target| {
+        self.delivery.deliverPointer(target.client, self.pointer_focus.?.surface_id, .{ .axis = .{ .time = time, .axis = @intCast(@intFromEnum(axis)), .value = @intFromEnum(value) } });
+        return;
+    }
     const surface = self.pointerSurface() orelse return;
     for (self.pointer_resources.items) |entry| {
         if (!self.pointerResourceActive(entry)) continue;
@@ -1375,6 +1470,10 @@ pub fn pointerAxis(self: *Self, time: u32, axis: wl.Pointer.Axis, value: wl.Fixe
 }
 
 pub fn pointerFrame(self: *Self) void {
+    if (self.generatedPointerTarget()) |target| {
+        self.delivery.deliverPointer(target.client, self.pointer_focus.?.surface_id, .frame);
+        return;
+    }
     const surface = self.pointerSurface() orelse return;
     for (self.pointer_resources.items) |entry| {
         if (!self.pointerResourceActive(entry)) continue;
@@ -1388,6 +1487,10 @@ pub fn pointerFrame(self: *Self) void {
 }
 
 pub fn pointerAxisSource(self: *Self, source: wl.Pointer.AxisSource) void {
+    if (self.generatedPointerTarget()) |target| {
+        self.delivery.deliverPointer(target.client, self.pointer_focus.?.surface_id, .{ .axis_source = @intCast(@intFromEnum(source)) });
+        return;
+    }
     const surface = self.pointerSurface() orelse return;
     for (self.pointer_resources.items) |entry| {
         if (!self.pointerResourceActive(entry)) continue;
@@ -1401,6 +1504,10 @@ pub fn pointerAxisSource(self: *Self, source: wl.Pointer.AxisSource) void {
 }
 
 pub fn pointerAxisStop(self: *Self, time: u32, axis: wl.Pointer.Axis) void {
+    if (self.generatedPointerTarget()) |target| {
+        self.delivery.deliverPointer(target.client, self.pointer_focus.?.surface_id, .{ .axis_stop = .{ .time = time, .axis = @intCast(@intFromEnum(axis)) } });
+        return;
+    }
     const surface = self.pointerSurface() orelse return;
     for (self.pointer_resources.items) |entry| {
         if (!self.pointerResourceActive(entry)) continue;
@@ -1414,6 +1521,10 @@ pub fn pointerAxisStop(self: *Self, time: u32, axis: wl.Pointer.Axis) void {
 }
 
 pub fn pointerAxisDiscrete(self: *Self, axis: wl.Pointer.Axis, discrete: i32) void {
+    if (self.generatedPointerTarget()) |target| {
+        self.delivery.deliverPointer(target.client, self.pointer_focus.?.surface_id, .{ .axis_discrete = .{ .axis = @intCast(@intFromEnum(axis)), .discrete = discrete } });
+        return;
+    }
     const surface = self.pointerSurface() orelse return;
     for (self.pointer_resources.items) |entry| {
         if (!self.pointerResourceActive(entry)) continue;
@@ -1428,6 +1539,10 @@ pub fn pointerAxisDiscrete(self: *Self, axis: wl.Pointer.Axis, discrete: i32) vo
 }
 
 pub fn pointerAxisValue120(self: *Self, axis: wl.Pointer.Axis, value120: i32) void {
+    if (self.generatedPointerTarget()) |target| {
+        self.delivery.deliverPointer(target.client, self.pointer_focus.?.surface_id, .{ .axis_value120 = .{ .axis = @intCast(@intFromEnum(axis)), .value120 = value120 } });
+        return;
+    }
     const surface = self.pointerSurface() orelse return;
     for (self.pointer_resources.items) |entry| {
         if (!self.pointerResourceActive(entry)) continue;
@@ -1445,6 +1560,10 @@ pub fn pointerAxisRelativeDirection(
     axis: wl.Pointer.Axis,
     direction: wl.Pointer.AxisRelativeDirection,
 ) void {
+    if (self.generatedPointerTarget()) |target| {
+        self.delivery.deliverPointer(target.client, self.pointer_focus.?.surface_id, .{ .axis_relative_direction = .{ .axis = @intCast(@intFromEnum(axis)), .direction = @intCast(@intFromEnum(direction)) } });
+        return;
+    }
     const surface = self.pointerSurface() orelse return;
     for (self.pointer_resources.items) |entry| {
         if (!self.pointerResourceActive(entry)) continue;
@@ -2089,7 +2208,7 @@ fn sendModifiers(self: *const Self, resource: *wl.Keyboard, serial: u32) void {
 
 fn updatePointerFocus(self: *Self, focus: ?PointerFocus, motion_time: ?u32) void {
     const changed = if (self.pointer_focus) |current|
-        if (focus) |next| !std.meta.eql(current.surface_id, next.surface_id) else true
+        if (focus) |next| !samePointerEndpoint(current, next) else true
     else
         focus != null;
     if (changed) {
@@ -2103,6 +2222,15 @@ fn updatePointerFocus(self: *Self, focus: ?PointerFocus, motion_time: ?u32) void
     }
     self.pointer_focus = focus;
     const time = motion_time orelse return;
+    if (self.generatedPointerTarget()) |target| {
+        const position = self.pointer_focus.?;
+        self.delivery.deliverPointer(target.client, position.surface_id, .{ .motion = .{
+            .time = time,
+            .x = pointerFixed(position.x),
+            .y = pointerFixed(position.y),
+        } });
+        return;
+    }
     const surface = self.pointerSurface() orelse return;
     const position = self.pointer_focus orelse return;
     for (self.pointer_resources.items) |entry| {
@@ -2116,10 +2244,33 @@ fn updatePointerFocus(self: *Self, focus: ?PointerFocus, motion_time: ?u32) void
 
 fn pointerSurface(self: *Self) ?*wl.Surface {
     const focus = self.pointer_focus orelse return null;
+    if (focus.generated != null) return null;
     return Surface.resourceFor(self.surface_store, focus.surface_id);
 }
 
+fn generatedPointerTarget(self: *const Self) ?GeneratedPointerTarget {
+    const focus = self.pointer_focus orelse return null;
+    return focus.generated;
+}
+
 fn sendPointerEnter(self: *Self) void {
+    if (self.generatedPointerTarget()) |target| {
+        const serial = self.delivery.issueSerial(target.client) orelse {
+            self.clearGeneratedPointerClient(target.client);
+            return;
+        };
+        if (!self.authority.recordPointerEnter(target.client, serial)) {
+            self.clearGeneratedPointerClient(target.client);
+            return;
+        }
+        const position = self.pointer_focus.?;
+        self.delivery.deliverPointer(target.client, position.surface_id, .{ .enter = .{
+            .serial = serial,
+            .x = pointerFixed(position.x),
+            .y = pointerFixed(position.y),
+        } });
+        return;
+    }
     const surface = self.pointerSurface() orelse return;
     const serial = MatureSerials.issue(self.display);
     self.recordPointerEnter(surface.getClient(), serial);
@@ -2145,6 +2296,13 @@ fn sendPointerEnterTo(
 }
 
 fn sendPointerLeave(self: *Self) void {
+    if (self.generatedPointerTarget()) |target| {
+        const serial = self.delivery.issueSerial(target.client) orelse return;
+        const surface = self.pointer_focus.?.surface_id;
+        self.delivery.deliverPointer(target.client, surface, .{ .leave = .{ .serial = serial.value } });
+        self.delivery.deliverPointer(target.client, surface, .frame);
+        return;
+    }
     const surface = self.pointerSurface() orelse return;
     const serial = MatureSerials.issueWire(self.display);
     for (self.pointer_resources.items) |*entry| {
@@ -2230,6 +2388,67 @@ fn setCursor(
     self.notifyCursorChanged(old_cursor);
 }
 
+fn generatedSetCursorCallback(context: *anyopaque, request: SeatDelivery.CursorRequest) SeatDelivery.CursorRequestResult {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.setGeneratedCursor(request);
+}
+
+pub fn setGeneratedCursor(self: *Self, request: SeatDelivery.CursorRequest) SeatDelivery.CursorRequestResult {
+    if (!self.clients.contains(request.client) or request.serial.domain != .wayring_server or
+        !self.delivery.capability(.pointer).resourceActive(request.capability_generation) or
+        !self.authority.acceptsPointerEnter(request.client, request.serial)) return .ignored;
+    const focused = if (self.generatedPointerTarget()) |target|
+        std.meta.eql(target.client, request.client)
+    else
+        false;
+    const owns_current = if (self.active_cursor) |cursor| switch (cursor) {
+        .generated => |generated| std.meta.eql(generated.client, request.client),
+        .surface, .shape => false,
+    } else false;
+    if (!focused and !owns_current) return .ignored;
+
+    if (request.surface) |surface| switch (self.delivery.assignCursorRole(request.client, surface)) {
+        .assigned, .already_cursor => {},
+        .role_conflict => return .role_conflict,
+        .not_live, .wrong_client => return .unavailable,
+    };
+    const old_cursor = self.cursorInfo();
+    self.active_cursor = if (request.surface) |surface| .{ .generated = .{
+        .client = request.client,
+        .surface_id = surface,
+        .hotspot_x = request.hotspot_x,
+        .hotspot_y = request.hotspot_y,
+    } } else null;
+    self.notifyCursorChanged(old_cursor);
+    return .accepted;
+}
+
+fn generatedCursorCommittedCallback(context: *anyopaque, id: SurfaceRegistry.Id, x: i32, y: i32) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.active_cursor) |*cursor| switch (cursor.*) {
+        .generated => |*generated| if (std.meta.eql(generated.surface_id, id)) {
+            const old_cursor = self.cursorInfo();
+            generated.hotspot_x -|= x;
+            generated.hotspot_y -|= y;
+            self.notifyCursorChanged(old_cursor);
+        },
+        .surface, .shape => {},
+    };
+}
+
+fn generatedCursorRemovedCallback(context: *anyopaque, id: SurfaceRegistry.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.active_cursor) |cursor| switch (cursor) {
+        .generated => |generated| if (std.meta.eql(generated.surface_id, id)) self.clearCursor(),
+        .surface, .shape => {},
+    };
+}
+
+fn generatedClientRetiringCallback(context: *anyopaque, client: ClientRegistry.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.retireGeneratedClient(client);
+}
+
 pub fn setCursorShape(
     self: *Self,
     client: *wl.Client,
@@ -2275,10 +2494,12 @@ pub fn clearCursorShapes(self: *Self) void {
     self.default_cursor = null;
     if (self.active_cursor) |cursor| switch (cursor) {
         .surface => {},
+        .generated => {},
         .shape => self.active_cursor = null,
     };
     if (self.cursor_controller) |*controller| if (controller.cursor) |cursor| switch (cursor) {
         .surface => {},
+        .generated => {},
         .shape => controller.cursor = null,
     };
     self.notifyCursorChanged(old_cursor);
@@ -2291,6 +2512,7 @@ fn activeCursorOwnedBy(self: *Self, client: *wl.Client) bool {
             resource.getClient() == client
         else
             false,
+        .generated => false,
         .shape => |shape| if (self.matureClient(client)) |client_id|
             self.clients.contains(shape.client) and std.meta.eql(shape.client, client_id)
         else
@@ -2315,6 +2537,7 @@ fn cursorSurfaceCommitted(self: *Self, id: Surface.Id, info: Surface.CommitInfo)
     var repaint = false;
     if (self.active_cursor) |*cursor| switch (cursor.*) {
         .shape => {},
+        .generated => {},
         .surface => |*surface| if (std.meta.eql(surface.surface_id, id)) {
             surface.hotspot_x -|= info.offset_x;
             surface.hotspot_y -|= info.offset_y;
@@ -2323,6 +2546,7 @@ fn cursorSurfaceCommitted(self: *Self, id: Surface.Id, info: Surface.CommitInfo)
     };
     if (self.cursor_controller) |*controller| if (controller.cursor) |*remembered| switch (remembered.*) {
         .shape => {},
+        .generated => {},
         .surface => |*surface| if (std.meta.eql(surface.surface_id, id)) {
             surface.hotspot_x -|= info.offset_x;
             surface.hotspot_y -|= info.offset_y;
@@ -2335,6 +2559,7 @@ fn cursorSurfaceDestroyed(self: *Self, id: Surface.Id) void {
     if (self.active_cursor) |cursor| {
         switch (cursor) {
             .shape => {},
+            .generated => {},
             .surface => |surface| {
                 if (std.meta.eql(surface.surface_id, id)) self.clearCursor();
             },
@@ -2343,6 +2568,7 @@ fn cursorSurfaceDestroyed(self: *Self, id: Surface.Id) void {
     if (self.cursor_controller) |*controller| if (controller.cursor) |cursor| {
         switch (cursor) {
             .shape => {},
+            .generated => {},
             .surface => |surface| {
                 if (std.meta.eql(surface.surface_id, id)) controller.cursor = null;
             },
@@ -2429,6 +2655,40 @@ fn fixed(value: f64) wl.Fixed {
     return wl.Fixed.fromDouble(std.math.clamp(value, minimum, maximum));
 }
 
+fn pointerFixed(value: f64) i32 {
+    return @intFromEnum(fixed(value));
+}
+
+fn samePointerEndpoint(a: PointerFocus, b: PointerFocus) bool {
+    if (!std.meta.eql(a.surface_id, b.surface_id)) return false;
+    return std.meta.eql(a.generated, b.generated);
+}
+
+fn retireGeneratedClient(self: *Self, client: ClientRegistry.Id) void {
+    if (self.pointer_focus) |focus| if (focus.generated) |target| {
+        if (std.meta.eql(target.client, client)) {
+            self.pointer_focus = null;
+            self.pointer_grab = null;
+            self.authority.clearPointerEnter();
+        }
+    };
+    _ = self.authority.clientDisconnected(client);
+    if (self.active_cursor) |cursor| switch (cursor) {
+        .generated => |generated| if (std.meta.eql(generated.client, client)) self.clearCursor(),
+        .surface, .shape => {},
+    };
+    if (self.cursor_controller) |controller| {
+        if (std.meta.eql(controller.client, client)) self.cursor_controller = null;
+    }
+    if (self.drag_cursor_client) |controller| {
+        if (std.meta.eql(controller, client)) self.drag_cursor_client = null;
+    }
+}
+
+fn clearGeneratedPointerClient(self: *Self, client: ClientRegistry.Id) void {
+    self.retireGeneratedClient(client);
+}
+
 fn adjustedPointerGrabFocus(
     grab: ?PointerGrab,
     current: ?PointerFocus,
@@ -2440,15 +2700,18 @@ fn adjustedPointerGrabFocus(
     const active = grab orelse return candidate;
     if (active.suppressed) return null;
     if (candidate) |focus| {
-        if (std.meta.eql(focus.surface_id, active.surface_id)) return focus;
+        if (std.meta.eql(focus.surface_id, active.surface_id) and
+            std.meta.eql(focus.generated, active.generated)) return focus;
     }
     const focus = current orelse return null;
     std.debug.assert(std.meta.eql(focus.surface_id, active.surface_id));
+    std.debug.assert(std.meta.eql(focus.generated, active.generated));
     const position = old_position orelse return focus;
     return .{
         .surface_id = active.surface_id,
         .x = focus.x + x - position.x,
         .y = focus.y + y - position.y,
+        .generated = active.generated,
     };
 }
 
@@ -2608,6 +2871,28 @@ test "implicit pointer grab freezes focus to the pressed surface" {
     try std.testing.expect(std.meta.eql(grabbed_surface, adjusted.surface_id));
     try std.testing.expectEqual(@as(f64, 13), adjusted.x);
     try std.testing.expectEqual(@as(f64, 16), adjusted.y);
+}
+
+test "generated implicit grab cannot alias a mature endpoint with the same surface id" {
+    const surface_id: Surface.Id = .{ .index = 1, .generation = 2 };
+    const client: ClientRegistry.Id = .{ .index = 3, .generation = 4 };
+    const generated: GeneratedPointerTarget = .{ .root = surface_id, .client = client };
+    const adjusted = adjustedPointerGrabFocus(
+        .{ .surface_id = surface_id, .generated = generated },
+        .{ .surface_id = surface_id, .x = 10, .y = 20, .generated = generated },
+        .{ .x = 100, .y = 200 },
+        .{ .surface_id = surface_id, .x = 1, .y = 2 },
+        103,
+        196,
+    ).?;
+    try std.testing.expectEqual(generated, adjusted.generated.?);
+    try std.testing.expectEqual(@as(f64, 13), adjusted.x);
+    try std.testing.expectEqual(@as(f64, 16), adjusted.y);
+    try std.testing.expect(!samePointerEndpoint(adjusted, .{
+        .surface_id = surface_id,
+        .x = adjusted.x,
+        .y = adjusted.y,
+    }));
 }
 
 test "implicit pointer grab uses current coordinates for its surface" {
