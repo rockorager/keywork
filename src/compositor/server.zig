@@ -3765,6 +3765,7 @@ pub fn wayringPresentationListener(self: *Self) ?WayringCompositor.PresentationL
 
 fn wayringSurfaceCursorRole(context: *anyopaque, id: SurfaceRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    self.cancelGeneratedTouchesInSubtree(id);
     self.damageHeadlessCompound(id);
     self.damageActiveGeneratedCursor();
     self.headless_surface_forest.markCursorRole(id);
@@ -3821,6 +3822,7 @@ fn commitHeadlessSurface(
 
 fn removeHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
     std.debug.assert(self.surface_registry.contains(id));
+    self.cancelGeneratedTouchesInSubtree(id);
     self.damageHeadlessCompound(id);
     self.headless_surface_forest.remove(id);
     self.reconcileGeneratedPointerTopology();
@@ -3829,6 +3831,7 @@ fn removeHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
 
 fn detachHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
     std.debug.assert(self.surface_registry.contains(id));
+    self.cancelGeneratedTouchesInSubtree(id);
     self.damageHeadlessCompound(id);
     self.headless_surface_forest.detach(id);
     self.reconcileGeneratedPointerTopology();
@@ -3836,11 +3839,92 @@ fn detachHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
 }
 
 fn applyHeadlessBatch(self: *Self, batch: WayringCompositor.AppliedBatch) void {
+    var invalidation: GeneratedTouchBatchInvalidation = .{
+        .forest = &self.headless_surface_forest,
+        .batch = batch,
+    };
+    self.seat.cancelGeneratedTouchesMatching(
+        &invalidation,
+        generatedTouchAffectedByBatch,
+    );
     self.damageHeadlessBatch(batch);
     self.headless_surface_forest.apply(batch);
     self.reconcileGeneratedPointerTopology();
     self.repairGeneratedFocus();
     self.damageHeadlessBatch(batch);
+}
+
+const GeneratedTouchSubtreeInvalidation = struct {
+    forest: *const HeadlessSurfaceForest,
+    ancestor: SurfaceRegistry.Id,
+};
+
+const GeneratedTouchBatchInvalidation = struct {
+    forest: *const HeadlessSurfaceForest,
+    batch: WayringCompositor.AppliedBatch,
+};
+
+fn cancelGeneratedTouchesInSubtree(self: *Self, ancestor: SurfaceRegistry.Id) void {
+    var invalidation: GeneratedTouchSubtreeInvalidation = .{
+        .forest = &self.headless_surface_forest,
+        .ancestor = ancestor,
+    };
+    self.seat.cancelGeneratedTouchesMatching(
+        &invalidation,
+        generatedTouchInSubtree,
+    );
+}
+
+fn generatedTouchInSubtree(
+    context: *anyopaque,
+    surface: SurfaceRegistry.Id,
+    _: SurfaceRegistry.Id,
+) bool {
+    const invalidation: *const GeneratedTouchSubtreeInvalidation = @ptrCast(@alignCast(context));
+    return headlessSurfaceDescendsFrom(invalidation.forest, surface, invalidation.ancestor);
+}
+
+fn generatedTouchAffectedByBatch(
+    context: *anyopaque,
+    surface: SurfaceRegistry.Id,
+    _: SurfaceRegistry.Id,
+) bool {
+    const invalidation: *const GeneratedTouchBatchInvalidation = @ptrCast(@alignCast(context));
+    for (invalidation.batch.parents) |parent_state| {
+        if (headlessSurfaceDescendsFrom(invalidation.forest, surface, parent_state.id)) return true;
+        for (parent_state.stack) |entry| switch (entry) {
+            .parent => {},
+            .child => |child| if (headlessSurfaceDescendsFrom(
+                invalidation.forest,
+                surface,
+                child.id,
+            )) return true,
+        };
+    }
+    for (invalidation.batch.surfaces) |state| {
+        if (state.mapped_size != null) continue;
+        if (headlessSurfaceDescendsFrom(invalidation.forest, surface, state.id)) return true;
+    }
+    return false;
+}
+
+fn headlessSurfaceDescendsFrom(
+    forest: *const HeadlessSurfaceForest,
+    surface: SurfaceRegistry.Id,
+    ancestor: SurfaceRegistry.Id,
+) bool {
+    var current = surface;
+    var steps: usize = 0;
+    while (forest.state(current)) |state| {
+        if (std.meta.eql(current, ancestor)) return true;
+        steps += 1;
+        if (steps > forest.len()) return false;
+        current = switch (state.placement) {
+            .child => |child| child.parent,
+            .detached, .root => return false,
+        };
+    }
+    return false;
 }
 
 fn reconcileGeneratedPointerTopology(self: *Self) void {
@@ -6416,8 +6500,7 @@ fn routeTouchDown(
             if (self.xdg_shell.hasPopupGrab()) self.xdg_shell.dismissPopupGrab();
         }
     }
-    const touch_focus = if (focus != null and focus.?.generated == null) focus else null;
-    seat.touchDown(time, protocol_id, point.x, point.y, touch_focus) catch {
+    seat.touchDown(time, protocol_id, point.x, point.y, focus) catch {
         _ = self.routed_touches.pop();
         self.terminate();
     };
@@ -7252,8 +7335,7 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
         self.window_manager.pointerButton(null, .pressed);
         if (self.xdg_shell.hasPopupGrab()) self.xdg_shell.dismissPopupGrab();
     }
-    const touch_focus = if (focus != null and focus.?.generated == null) focus else null;
-    self.seat.touchDown(time, id, point.x, point.y, touch_focus) catch {
+    self.seat.touchDown(time, id, point.x, point.y, focus) catch {
         log.err("failed to store touch point", .{});
         self.terminate();
     };
@@ -11351,6 +11433,7 @@ const SyntheticSurfaceProvider = struct {
 const TestGeneratedSeatSink = struct {
     const KeyboardTag = std.meta.Tag(SeatDelivery.KeyboardEvent);
     const PointerTag = std.meta.Tag(SeatDelivery.PointerEvent);
+    const TouchTag = std.meta.Tag(SeatDelivery.TouchEvent);
 
     clients: *ClientRegistry,
     client: ClientRegistry.Id,
@@ -11370,6 +11453,16 @@ const TestGeneratedSeatSink = struct {
     pointer_events: [64]PointerTag = undefined,
     pointer_surfaces: [64]SurfaceRegistry.Id = undefined,
     last_button_serial: ?ClientRegistry.Serial = null,
+    touch_max_resource_generation: ?SeatDelivery.ResourceGeneration = null,
+    touch_event_count: usize = 0,
+    touch_events: [64]TouchTag = undefined,
+    touch_clients: [64]ClientRegistry.Id = undefined,
+    touch_surfaces: [64]?SurfaceRegistry.Id = undefined,
+    touch_serials: [64]?ClientRegistry.Serial = undefined,
+    touch_ids: [64]?i32 = undefined,
+    touch_x: [64]?i32 = undefined,
+    touch_y: [64]?i32 = undefined,
+    touch_cutoffs: [64]?SeatDelivery.ResourceGeneration = undefined,
 
     fn sink(self: *TestGeneratedSeatSink) SeatDelivery.Sink {
         return .{
@@ -11385,6 +11478,7 @@ const TestGeneratedSeatSink = struct {
             .keyboard = keyboard,
             .pointer = pointer,
             .touch = touch,
+            .touch_frame = TestGeneratedSeatSink.touchFrame,
         };
     }
 
@@ -11435,8 +11529,14 @@ const TestGeneratedSeatSink = struct {
         return if (std.meta.eql(client, self.client)) .assigned else .wrong_client;
     }
 
-    fn touchTarget(_: *anyopaque, _: SurfaceRegistry.Id) ?SeatDelivery.TouchTarget {
-        return null;
+    fn touchTarget(context: *anyopaque, surface: SurfaceRegistry.Id) ?SeatDelivery.TouchTarget {
+        const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
+        const max_resource_generation = self.touch_max_resource_generation orelse return null;
+        const client = ownerForSurface(self, surface) orelse return null;
+        return .{
+            .client = client,
+            .max_resource_generation = max_resource_generation,
+        };
     }
 
     fn capabilities(_: *anyopaque, _: SeatDelivery.CapabilitySnapshot) void {}
@@ -11488,11 +11588,57 @@ const TestGeneratedSeatSink = struct {
 
     fn touch(
         context: *anyopaque,
-        _: ClientRegistry.Id,
-        _: SeatDelivery.TouchEvent,
+        client: ClientRegistry.Id,
+        event: SeatDelivery.TouchEvent,
     ) void {
         const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
+        std.debug.assert(self.touch_event_count < self.touch_events.len);
+        const index = self.touch_event_count;
+        self.touch_events[index] = event;
+        self.touch_clients[index] = client;
+        self.touch_surfaces[index] = if (event == .down) event.down.surface else null;
+        self.touch_serials[index] = switch (event) {
+            .down => |value| value.serial,
+            .up => |value| value.serial,
+            else => null,
+        };
+        self.touch_ids[index] = switch (event) {
+            .down => |value| value.id,
+            .up => |value| value.id,
+            .motion => |value| value.id,
+            .shape => |value| value.id,
+            .orientation => |value| value.id,
+            .frame, .cancel => null,
+        };
+        self.touch_x[index] = switch (event) {
+            .down => |value| value.x,
+            .motion => |value| value.x,
+            .shape => |value| value.major,
+            .orientation => |value| value.orientation,
+            else => null,
+        };
+        self.touch_y[index] = switch (event) {
+            .down => |value| value.y,
+            .motion => |value| value.y,
+            .shape => |value| value.minor,
+            else => null,
+        };
+        self.touch_cutoffs[index] = switch (event) {
+            .down => |value| value.max_resource_generation,
+            .up => |value| value.max_resource_generation,
+            .motion => |value| value.max_resource_generation,
+            .cancel => |value| value.max_resource_generation,
+            .shape => |value| value.max_resource_generation,
+            .orientation => |value| value.max_resource_generation,
+            .frame => null,
+        };
+        self.touch_event_count += 1;
         self.event_count += 1;
+    }
+
+    fn touchFrame(context: *anyopaque) void {
+        const self: *TestGeneratedSeatSink = @ptrCast(@alignCast(context));
+        touch(context, self.client, .frame);
     }
 };
 
@@ -12482,6 +12628,7 @@ test "headless click and first touch focus compound root with synchronous repair
     var sink: TestGeneratedSeatSink = .{
         .clients = &server.client_registry,
         .client = generated_client,
+        .touch_max_resource_generation = 7,
     };
     server.setGeneratedSeatDeliverySink(sink.sink());
     defer server.clearGeneratedSeatDeliverySink(&sink);
@@ -12542,16 +12689,52 @@ test "headless click and first touch focus compound root with synchronous repair
     }, sink.pointer_surfaces[0..sink.pointer_event_count]);
 
     _ = server.focus_arbiter.focusMature(null, null);
+    const touch_start = sink.touch_event_count;
     touchDown(output, 5, 10, 2, 2);
     try std.testing.expectEqual(root, server.focus_arbiter.target().?.root);
     touchDown(output, 6, 11, 0.5, 0.5);
     try std.testing.expectEqual(top, server.pointerRoute(0.5, 0.5).generated.?.root);
     try std.testing.expectEqual(root, server.focus_arbiter.target().?.root);
-    touchUp(output, 7, 11);
-    touchUp(output, 8, 10);
-    try std.testing.expectEqual(@as(usize, 7), sink.event_count);
+    touchMotion(output, 7, 10, 3, 3);
+    touchShape(output, 10, 2, 1);
+    touchOrientation(output, 10, 0.5);
+    touchFrame(output);
+    touchUp(output, 8, 11);
+    touchUp(output, 9, 10);
+    touchFrame(output);
+    try std.testing.expectEqualSlices(TestGeneratedSeatSink.TouchTag, &.{
+        .down,
+        .down,
+        .motion,
+        .shape,
+        .orientation,
+        .frame,
+        .up,
+        .up,
+        .frame,
+    }, sink.touch_events[touch_start..sink.touch_event_count]);
+    try std.testing.expectEqual(@as(usize, 16), sink.event_count);
+    try std.testing.expectEqual(child, sink.touch_surfaces[touch_start].?);
+    try std.testing.expectEqual(top, sink.touch_surfaces[touch_start + 1].?);
+    try std.testing.expectEqual(@as(?i32, 256), sink.touch_x[touch_start]);
+    try std.testing.expectEqual(@as(?i32, 256), sink.touch_y[touch_start]);
+    try std.testing.expectEqual(@as(?i32, 512), sink.touch_x[touch_start + 2]);
+    try std.testing.expectEqual(@as(?i32, 512), sink.touch_y[touch_start + 2]);
+    for (sink.touch_cutoffs[touch_start .. touch_start + 5]) |cutoff|
+        try std.testing.expectEqual(@as(?SeatDelivery.ResourceGeneration, 7), cutoff);
+    const down_serial = sink.touch_serials[touch_start + 1].?;
+    try std.testing.expectEqual(ClientRegistry.SerialDomain.wayring_server, down_serial.domain);
+    try std.testing.expect(server.seat.authority.acceptsAction(generated_client, down_serial));
+    const up_serial = sink.touch_serials[touch_start + 7].?;
+    try std.testing.expect(server.seat.authority.selectionOrder(generated_client, up_serial) != null);
 
+    const invalidation_start = sink.touch_event_count;
+    touchDown(output, 10, 12, 2, 2);
     server.commitHeadlessSurface(root, null, false);
+    try std.testing.expectEqualSlices(TestGeneratedSeatSink.TouchTag, &.{ .down, .cancel }, sink.touch_events[invalidation_start..sink.touch_event_count]);
+    touchMotion(output, 11, 12, 3, 3);
+    touchUp(output, 12, 12);
+    try std.testing.expectEqual(invalidation_start + 2, sink.touch_event_count);
     try std.testing.expect(server.focus_arbiter.target() == null);
     server.commitHeadlessSurface(root, root_provider.logical_size, false);
     try std.testing.expect(server.focusGeneratedSurface(root));

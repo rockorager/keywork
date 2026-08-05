@@ -1,4 +1,4 @@
-//! Unpublished generated wl_seat/wl_keyboard/wl_pointer adapter.
+//! Unpublished generated wl_seat/wl_keyboard/wl_pointer/wl_touch adapter.
 //!
 //! The seat is deliberately available only through `bind`: production does
 //! not install a global. Canonical seat policy calls the resource-free sink;
@@ -26,9 +26,11 @@ snapshot: SeatDelivery.CapabilitySnapshot = .{},
 seats: std.ArrayList(*SeatResource) = .empty,
 keyboards: std.ArrayList(*KeyboardResource) = .empty,
 pointers: std.ArrayList(*PointerResource) = .empty,
+touches: std.ArrayList(*TouchResource) = .empty,
 terminal_clients: std.ArrayList(TerminalClient) = .empty,
 next_keyboard_resource_generation: ?SeatDelivery.ResourceGeneration = 1,
 next_pointer_resource_generation: ?SeatDelivery.ResourceGeneration = 1,
+next_touch_resource_generation: ?SeatDelivery.ResourceGeneration = 1,
 
 const TerminalClient = struct {
     client: *wayring.server.Client,
@@ -60,6 +62,15 @@ const PointerResource = struct {
     frame_pending: bool = false,
 };
 
+const TouchResource = struct {
+    resource: core.wl_touch.Resource,
+    client: *wayring.server.Client,
+    adapter: *WayringSeatAdapter,
+    generation: SeatDelivery.ResourceGeneration,
+    resource_generation: SeatDelivery.ResourceGeneration,
+    frame_pending: bool = false,
+};
+
 pub fn init(
     allocator: std.mem.Allocator,
     protocol_server: *wayring.server.Server,
@@ -80,10 +91,12 @@ pub fn init(
 
 pub fn deinit(self: *WayringSeatAdapter) void {
     std.debug.assert(self.seats.items.len == 0 and self.keyboards.items.len == 0 and
-        self.pointers.items.len == 0 and self.terminal_clients.items.len == 0);
+        self.pointers.items.len == 0 and self.touches.items.len == 0 and
+        self.terminal_clients.items.len == 0);
     self.seats.deinit(self.allocator);
     self.keyboards.deinit(self.allocator);
     self.pointers.deinit(self.allocator);
+    self.touches.deinit(self.allocator);
     self.terminal_clients.deinit(self.allocator);
     self.* = undefined;
 }
@@ -149,6 +162,11 @@ pub fn destroyClientResources(self: *WayringSeatAdapter, client: *wayring.server
         i -= 1;
         if (self.pointers.items[i].client == client) destroyPointer(self.pointers.items[i]);
     }
+    i = self.touches.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (self.touches.items[i].client == client) destroyTouch(self.touches.items[i]);
+    }
     i = self.seats.items.len;
     while (i > 0) {
         i -= 1;
@@ -185,9 +203,19 @@ fn seatRequest(_: *core.wl_seat.Resource, request: core.wl_seat.Request, seat: *
             };
         },
         .release => destroySeat(seat),
-        // Wave 4 deliberately does not claim touch. A typed new_id must never
-        // be left as a successful, unmaterialized request.
-        .get_touch => missingCapability(seat, "generated touch is unavailable"),
+        .get_touch => |args| {
+            if (!seat.adapter.snapshot.touch.ever_available) {
+                missingCapability(seat, "seat has never had a touch capability");
+                return;
+            }
+            createTouch(seat, args.id) catch |err| {
+                seat.adapter.retireClient(seat.client);
+                if (err == error.OutOfMemory)
+                    seat.client.postOutOfMemory(&seat.resource.runtime, "creating generated touch")
+                else
+                    seat.client.postImplementationError(&seat.resource.runtime, "creating generated touch");
+            };
+        },
     }
 }
 
@@ -333,6 +361,43 @@ fn pointerRequest(_: *core.wl_pointer.Resource, request: core.wl_pointer.Request
     }
 }
 
+fn createTouch(seat: *SeatResource, id: u32) !void {
+    const self = seat.adapter;
+    const resource_generation = self.next_touch_resource_generation orelse {
+        self.retireClient(seat.client);
+        seat.client.postImplementationError(&seat.resource.runtime, "generated touch resource generation exhausted");
+        return;
+    };
+    self.next_touch_resource_generation = std.math.add(
+        SeatDelivery.ResourceGeneration,
+        resource_generation,
+        1,
+    ) catch null;
+    try self.touches.ensureUnusedCapacity(self.allocator, 1);
+    const touch_resource = try self.allocator.create(TouchResource);
+    errdefer self.allocator.destroy(touch_resource);
+    touch_resource.* = .{
+        .resource = .init(self.allocator, id, seat.resource.version(), .client, seat.client.ownerHooks()),
+        .client = seat.client,
+        .adapter = self,
+        .generation = self.snapshot.touch.generation,
+        .resource_generation = resource_generation,
+    };
+    errdefer {
+        touch_resource.resource.destroy();
+        touch_resource.resource.deinit();
+    }
+    try touch_resource.resource.setHandler(TouchResource, touch_resource, touchRequest, null);
+    try seat.client.materialize(&touch_resource.resource.runtime);
+    self.touches.appendAssumeCapacity(touch_resource);
+}
+
+fn touchRequest(_: *core.wl_touch.Resource, request: core.wl_touch.Request, touch_resource: *TouchResource) !void {
+    switch (request) {
+        .release => destroyTouch(touch_resource),
+    }
+}
+
 fn destroySeat(seat: *SeatResource) void {
     const self = seat.adapter;
     for (self.seats.items, 0..) |item, i| if (item == seat) {
@@ -363,12 +428,22 @@ fn destroyPointer(pointer_resource: *PointerResource) void {
         return;
     };
 }
+fn destroyTouch(touch_resource: *TouchResource) void {
+    const self = touch_resource.adapter;
+    for (self.touches.items, 0..) |item, i| if (item == touch_resource) {
+        _ = self.touches.orderedRemove(i);
+        touch_resource.resource.destroy();
+        touch_resource.resource.deinit();
+        self.allocator.destroy(touch_resource);
+        return;
+    };
+}
 
 fn capabilityBits(snapshot: SeatDelivery.CapabilitySnapshot) u32 {
     var bits: u32 = 0;
     if (snapshot.pointer.available) bits |= @intCast(core.wl_seat.capability.pointer);
     if (snapshot.keyboard.available) bits |= @intCast(core.wl_seat.capability.keyboard);
-    // Touch resources remain deliberately deferred to Wave 5.
+    if (snapshot.touch.available) bits |= @intCast(core.wl_seat.capability.touch);
     return bits;
 }
 fn sendCapabilities(seat: *SeatResource) !void {
@@ -398,6 +473,7 @@ pub fn sink(self: *WayringSeatAdapter) SeatDelivery.Sink {
         .keyboard = keyboard,
         .pointer = pointer,
         .touch = touch,
+        .touch_frame = touchFrame,
     };
 }
 
@@ -436,6 +512,12 @@ fn terminalize(context: *anyopaque, client_id: ClientRegistry.Id, _: SeatDeliver
         if (pointer_resource.client != client) continue;
         self.retireClient(client);
         client.postOutOfMemory(&pointer_resource.resource.runtime, "storing generated pointer state");
+        return;
+    }
+    for (self.touches.items) |touch_resource| {
+        if (touch_resource.client != client) continue;
+        self.retireClient(client);
+        client.postOutOfMemory(&touch_resource.resource.runtime, "storing generated touch state");
         return;
     }
     for (self.seats.items) |seat| {
@@ -497,18 +579,40 @@ fn terminalizeSerialExhaustion(self: *WayringSeatAdapter, client: *wayring.serve
         client.postImplementationError(&pointer_resource.resource.runtime, "generated seat serial exhausted");
         return;
     }
+    for (self.touches.items) |touch_resource| {
+        if (touch_resource.client != client) continue;
+        client.postImplementationError(&touch_resource.resource.runtime, "generated seat serial exhausted");
+        return;
+    }
     for (self.seats.items) |seat| {
         if (seat.client != client) continue;
         client.postImplementationError(&seat.resource.runtime, "generated seat serial exhausted");
         return;
     }
     // A live generated client cannot receive seat events without having had a
-    // seat/pointer resource. If teardown raced the lookup, there is nothing
+    // seat child resource. If teardown raced the lookup, there is nothing
     // left to deliver or terminalize through this adapter.
 }
 
-fn touchTarget(_: *anyopaque, _: SurfaceRegistry.Id) ?SeatDelivery.TouchTarget {
-    return null;
+fn touchTarget(context: *anyopaque, surface: SurfaceRegistry.Id) ?SeatDelivery.TouchTarget {
+    const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
+    if (!self.snapshot.touch.available) return null;
+    const endpoint = self.compositor.surfaceEndpoint(surface) orelse return null;
+    if (endpoint.client.fatal() != null) return null;
+    const client = self.clients.id(endpoint.client) orelse return null;
+    var max_resource_generation: ?SeatDelivery.ResourceGeneration = null;
+    for (self.touches.items) |touch_resource| {
+        if (touch_resource.client != endpoint.client or
+            !self.snapshot.touch.resourceActive(touch_resource.generation)) continue;
+        max_resource_generation = if (max_resource_generation) |current|
+            @max(current, touch_resource.resource_generation)
+        else
+            touch_resource.resource_generation;
+    }
+    return .{
+        .client = client,
+        .max_resource_generation = max_resource_generation orelse return null,
+    };
 }
 
 fn capabilities(context: *anyopaque, snapshot: SeatDelivery.CapabilitySnapshot) void {
@@ -522,6 +626,9 @@ fn capabilities(context: *anyopaque, snapshot: SeatDelivery.CapabilitySnapshot) 
             pointer_resource.last_enter_serial = null;
             pointer_resource.frame_pending = false;
         }
+    }
+    if (!snapshot.touch.available) {
+        for (self.touches.items) |touch_resource| touch_resource.frame_pending = false;
     }
     for (self.seats.items) |seat| sendCapabilities(seat) catch |err| self.eventFailure(seat.client, &seat.resource.runtime, err);
 }
@@ -720,14 +827,153 @@ fn sendFrame(pointer_resource: *PointerResource) !void {
     pointer_resource.frame_pending = false;
 }
 
-fn touch(_: *anyopaque, _: ClientRegistry.Id, _: SeatDelivery.TouchEvent) void {}
+fn touch(context: *anyopaque, client_id: ClientRegistry.Id, event: SeatDelivery.TouchEvent) void {
+    const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
+    if (!self.snapshot.touch.available) return;
+    const client = self.clients.rawClient(client_id) orelse return;
+    if (client.fatal() != null) return;
+    const surface_id: ?u32 = switch (event) {
+        .down => |down| surface: {
+            const endpoint = self.compositor.surfaceEndpoint(down.surface) orelse return;
+            if (endpoint.client != client or endpoint.client.fatal() != null) return;
+            break :surface endpoint.resource.id();
+        },
+        else => null,
+    };
+    const max_resource_generation: ?SeatDelivery.ResourceGeneration = switch (event) {
+        .down => |value| value.max_resource_generation,
+        .up => |value| value.max_resource_generation,
+        .motion => |value| value.max_resource_generation,
+        .frame => null,
+        .cancel => |value| value.max_resource_generation,
+        .shape => |value| value.max_resource_generation,
+        .orientation => |value| value.max_resource_generation,
+    };
+    for (self.touches.items) |touch_resource| {
+        if (touch_resource.client != client or touch_resource.client.fatal() != null or
+            !self.snapshot.touch.resourceActive(touch_resource.generation)) continue;
+        if (max_resource_generation) |cutoff| {
+            if (!SeatDelivery.resourceInSequence(touch_resource.resource_generation, cutoff)) continue;
+        } else if (!touch_resource.frame_pending) continue;
+        const result: anyerror!void = switch (event) {
+            .down => |value| sendTouchDown(touch_resource, surface_id.?, value),
+            .up => |value| sendTouchUp(touch_resource, value),
+            .motion => |value| sendTouchMotion(touch_resource, value),
+            .frame => sendTouchFrame(touch_resource),
+            .cancel => sendTouchCancel(touch_resource),
+            .shape => |value| sendTouchShape(touch_resource, value),
+            .orientation => |value| sendTouchOrientation(touch_resource, value),
+        };
+        result catch |err| self.eventFailure(client, &touch_resource.resource.runtime, err);
+    }
+    if (event == .cancel) {
+        for (self.touches.items) |touch_resource| {
+            if (touch_resource.client == client) touch_resource.frame_pending = false;
+        }
+    }
+}
+
+fn touchFrame(context: *anyopaque) void {
+    const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
+    if (!self.snapshot.touch.available) return;
+    for (self.touches.items) |touch_resource| {
+        if (touch_resource.client.fatal() != null or
+            !self.snapshot.touch.resourceActive(touch_resource.generation) or
+            !touch_resource.frame_pending) continue;
+        sendTouchFrame(touch_resource) catch |err|
+            self.eventFailure(touch_resource.client, &touch_resource.resource.runtime, err);
+    }
+}
+
+fn sendTouchDown(
+    touch_resource: *TouchResource,
+    surface_id: u32,
+    event: @FieldType(SeatDelivery.TouchEvent, "down"),
+) !void {
+    std.debug.assert(event.serial.domain == .wayring_server);
+    try core.wl_touch.@"send:down"(
+        &touch_resource.resource,
+        event.serial.value,
+        event.time,
+        surface_id,
+        event.id,
+        event.x,
+        event.y,
+    );
+    touch_resource.frame_pending = true;
+}
+
+fn sendTouchUp(
+    touch_resource: *TouchResource,
+    event: @FieldType(SeatDelivery.TouchEvent, "up"),
+) !void {
+    std.debug.assert(event.serial.domain == .wayring_server);
+    try core.wl_touch.@"send:up"(
+        &touch_resource.resource,
+        event.serial.value,
+        event.time,
+        event.id,
+    );
+    touch_resource.frame_pending = true;
+}
+
+fn sendTouchMotion(
+    touch_resource: *TouchResource,
+    event: @FieldType(SeatDelivery.TouchEvent, "motion"),
+) !void {
+    try core.wl_touch.@"send:motion"(
+        &touch_resource.resource,
+        event.time,
+        event.id,
+        event.x,
+        event.y,
+    );
+    touch_resource.frame_pending = true;
+}
+
+fn sendTouchFrame(touch_resource: *TouchResource) !void {
+    try core.wl_touch.@"send:frame"(&touch_resource.resource);
+    touch_resource.frame_pending = false;
+}
+
+fn sendTouchCancel(touch_resource: *TouchResource) !void {
+    defer touch_resource.frame_pending = false;
+    try core.wl_touch.@"send:cancel"(&touch_resource.resource);
+}
+
+fn sendTouchShape(
+    touch_resource: *TouchResource,
+    event: @FieldType(SeatDelivery.TouchEvent, "shape"),
+) !void {
+    if (touch_resource.resource.version() < 6) return;
+    try core.wl_touch.@"send:shape"(
+        &touch_resource.resource,
+        event.id,
+        event.major,
+        event.minor,
+    );
+    touch_resource.frame_pending = true;
+}
+
+fn sendTouchOrientation(
+    touch_resource: *TouchResource,
+    event: @FieldType(SeatDelivery.TouchEvent, "orientation"),
+) !void {
+    if (touch_resource.resource.version() < 6) return;
+    try core.wl_touch.@"send:orientation"(
+        &touch_resource.resource,
+        event.id,
+        event.orientation,
+    );
+    touch_resource.frame_pending = true;
+}
 
 fn retireClient(self: *WayringSeatAdapter, client: *wayring.server.Client) void {
     const client_id = self.clients.id(client) orelse return;
     self.request_sink.client_retiring(self.request_sink.context, client_id);
 }
 
-test "capability bits and generations gate generated keyboard and pointer resources" {
+test "capability bits and generations gate generated seat child resources" {
     var snapshot: SeatDelivery.CapabilitySnapshot = .{};
     try std.testing.expectEqual(@as(u32, 0), capabilityBits(snapshot));
     try std.testing.expect(snapshot.pointer.setAvailable(true));
@@ -750,8 +996,15 @@ test "capability bits and generations gate generated keyboard and pointer resour
     try std.testing.expect(snapshot.keyboard.generation > first_keyboard);
     try std.testing.expect(!snapshot.keyboard.resourceActive(first_keyboard));
 
-    _ = snapshot.touch.setAvailable(true);
+    try std.testing.expect(snapshot.touch.setAvailable(true));
+    const first_touch = snapshot.touch.generation;
+    try std.testing.expectEqual(@as(u32, 7), capabilityBits(snapshot));
+    try std.testing.expect(snapshot.touch.resourceActive(first_touch));
+    try std.testing.expect(snapshot.touch.setAvailable(false));
     try std.testing.expectEqual(@as(u32, 3), capabilityBits(snapshot));
+    try std.testing.expect(snapshot.touch.setAvailable(true));
+    try std.testing.expect(snapshot.touch.generation > first_touch);
+    try std.testing.expect(!snapshot.touch.resourceActive(first_touch));
 }
 
 const TestRequestProbe = struct {
@@ -953,6 +1206,88 @@ const TestKeyboardLog = struct {
     }
 };
 
+const TestTouchLog = struct {
+    const Entry = struct {
+        client: *wayring.server.Client,
+        object_id: u32,
+        name: []const u8,
+        serial: ?u32 = null,
+        time: ?u32 = null,
+        surface: ?u32 = null,
+        id: ?i32 = null,
+        x: ?i32 = null,
+        y: ?i32 = null,
+    };
+
+    entries: std.ArrayList(Entry) = .empty,
+
+    fn observe(self: *TestTouchLog, client: *wayring.server.Client, message: wayring.server.Client.ProtocolMessage) void {
+        if (message.direction != .event or
+            !std.mem.eql(u8, message.resource.interface().name, "wl_touch")) return;
+        var entry: Entry = .{
+            .client = client,
+            .object_id = message.resource.id(),
+            .name = message.descriptor.name,
+        };
+        if (std.mem.eql(u8, entry.name, "down")) {
+            entry.serial = message.values[0].uint;
+            entry.time = message.values[1].uint;
+            entry.surface = message.values[2].object;
+            entry.id = message.values[3].int;
+            entry.x = message.values[4].fixed;
+            entry.y = message.values[5].fixed;
+        } else if (std.mem.eql(u8, entry.name, "up")) {
+            entry.serial = message.values[0].uint;
+            entry.time = message.values[1].uint;
+            entry.id = message.values[2].int;
+        } else if (std.mem.eql(u8, entry.name, "motion")) {
+            entry.time = message.values[0].uint;
+            entry.id = message.values[1].int;
+            entry.x = message.values[2].fixed;
+            entry.y = message.values[3].fixed;
+        } else if (std.mem.eql(u8, entry.name, "shape")) {
+            entry.id = message.values[0].int;
+            entry.x = message.values[1].fixed;
+            entry.y = message.values[2].fixed;
+        } else if (std.mem.eql(u8, entry.name, "orientation")) {
+            entry.id = message.values[0].int;
+            entry.x = message.values[1].fixed;
+        }
+        self.entries.append(std.testing.allocator, entry) catch unreachable;
+    }
+
+    fn deinit(self: *TestTouchLog) void {
+        self.entries.deinit(std.testing.allocator);
+    }
+
+    fn clear(self: *TestTouchLog) void {
+        self.entries.clearRetainingCapacity();
+    }
+
+    fn namesFor(
+        self: *const TestTouchLog,
+        client: *wayring.server.Client,
+        object_id: u32,
+        buffer: [][]const u8,
+    ) []const []const u8 {
+        var count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.client != client or entry.object_id != object_id) continue;
+            buffer[count] = entry.name;
+            count += 1;
+        }
+        return buffer[0..count];
+    }
+
+    fn find(self: *const TestTouchLog, client: *wayring.server.Client, object_id: u32, name: []const u8) ?Entry {
+        for (self.entries.items) |entry| {
+            if (entry.client == client and entry.object_id == object_id and
+                std.mem.eql(u8, entry.name, name)) return entry;
+        }
+        return null;
+    }
+};
+
 const AdapterTestSetup = struct {
     client_registry: ClientRegistry,
     surface_registry: SurfaceRegistry,
@@ -1094,6 +1429,12 @@ fn testGetKeyboard(client: *wayring.server.Client, seat_id: u32, keyboard_id: u3
     });
 }
 
+fn testGetTouch(client: *wayring.server.Client, seat_id: u32, touch_id: u32) !void {
+    try testSend(client, seat_id, 2, &core.wl_seat.request_messages[2], &.{
+        .{ .new_id = .{ .typed = touch_id } },
+    });
+}
+
 fn expectEventNames(expected: []const []const u8, actual: []const []const u8) !void {
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |expected_name, actual_name|
@@ -1118,6 +1459,7 @@ test "scanner seat bind negotiates exactly stays unpublished and releases resour
     var snapshot: SeatDelivery.CapabilitySnapshot = .{};
     _ = snapshot.pointer.setAvailable(true);
     _ = snapshot.keyboard.setAvailable(true);
+    _ = snapshot.touch.setAvailable(true);
     capabilities(&setup.adapter, snapshot);
     const seat_global = try setup.protocol_server.addGlobal(
         core.wl_seat,
@@ -1160,6 +1502,11 @@ test "scanner seat bind negotiates exactly stays unpublished and releases resour
     try std.testing.expectEqual(@as(u32, 11), setup.adapter.pointers.items[0].resource.version());
     try testGetKeyboard(client, 3, 5);
     try std.testing.expectEqual(@as(u32, 11), setup.adapter.keyboards.items[0].resource.version());
+    try testGetTouch(client, 3, 6);
+    try std.testing.expectEqual(@as(u32, 11), setup.adapter.touches.items[0].resource.version());
+    try testSend(client, 6, 0, &core.wl_touch.request_messages[0], &.{});
+    try std.testing.expectEqual(@as(usize, 0), setup.adapter.touches.items.len);
+    try std.testing.expect(client.lookup(6) == null);
     try testSend(client, 5, 0, &core.wl_keyboard.request_messages[0], &.{});
     try std.testing.expectEqual(@as(usize, 0), setup.adapter.keyboards.items.len);
     try std.testing.expect(client.lookup(5) == null);
@@ -1502,6 +1849,168 @@ test "scanner pointer events preserve exact order version gates isolation and st
     }
 }
 
+test "scanner touch preserves cutoff ordering version gates batching and cancellation" {
+    var setup: AdapterTestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+    var snapshot: SeatDelivery.CapabilitySnapshot = .{};
+    _ = snapshot.touch.setAvailable(true);
+    capabilities(&setup.adapter, snapshot);
+    const seat_global = try setup.protocol_server.addGlobal(
+        core.wl_seat,
+        core.wl_seat.interface.version,
+        WayringSeatAdapter,
+        &setup.adapter,
+        testSeatBind,
+    );
+    defer setup.protocol_server.removeGlobal(seat_global) catch {};
+
+    const managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client = managed.client();
+    const client_id = try setup.registerClient(client);
+    var client_live = true;
+    defer if (client_live) setup.destroyClient(managed);
+    var log: TestTouchLog = .{};
+    defer log.deinit();
+    const logger = try setup.protocol_server.addProtocolLogger(TestTouchLog, &log, TestTouchLog.observe);
+    defer setup.protocol_server.removeProtocolLogger(logger);
+
+    try testPrepareRegistry(client);
+    try testBindGlobal(client, testGlobal(&setup.protocol_server, "wl_compositor"), 6, 3);
+    try testCreateSurface(client, 3, 4);
+    const surface = setup.compositor.surfaceId(client, 4).?;
+    try testBindGlobal(client, seat_global, 5, 5);
+    try testGetTouch(client, 5, 6);
+    try testBindGlobal(client, seat_global, 6, 7);
+    try testGetTouch(client, 7, 8);
+    try std.testing.expectEqual(@as(u32, 5), setup.adapter.touches.items[0].resource.version());
+    try std.testing.expectEqual(@as(u32, 6), setup.adapter.touches.items[1].resource.version());
+    const down_target = touchTarget(&setup.adapter, surface).?;
+    try std.testing.expectEqual(client_id, down_target.client);
+    try std.testing.expectEqual(@as(SeatDelivery.ResourceGeneration, 2), down_target.max_resource_generation);
+
+    try testDrain(client);
+    log.clear();
+    touch(&setup.adapter, client_id, .{ .down = .{
+        .serial = .{ .domain = .wayring_server, .value = 41 },
+        .time = 10,
+        .surface = surface,
+        .id = 3,
+        .x = 320,
+        .y = -128,
+        .max_resource_generation = down_target.max_resource_generation,
+    } });
+
+    // This resource was materialized after down and cannot join contact 3.
+    try testGetTouch(client, 7, 9);
+    try std.testing.expectEqual(@as(SeatDelivery.ResourceGeneration, 3), touchTarget(&setup.adapter, surface).?.max_resource_generation);
+    touch(&setup.adapter, client_id, .{ .shape = .{
+        .id = 3,
+        .major = 512,
+        .minor = 256,
+        .max_resource_generation = down_target.max_resource_generation,
+    } });
+    touch(&setup.adapter, client_id, .{ .orientation = .{
+        .id = 3,
+        .orientation = -64,
+        .max_resource_generation = down_target.max_resource_generation,
+    } });
+    touch(&setup.adapter, client_id, .{ .motion = .{
+        .time = 11,
+        .id = 3,
+        .x = 384,
+        .y = -64,
+        .max_resource_generation = down_target.max_resource_generation,
+    } });
+    touchFrame(&setup.adapter);
+    touch(&setup.adapter, client_id, .{ .up = .{
+        .serial = .{ .domain = .wayring_server, .value = 42 },
+        .time = 12,
+        .id = 3,
+        .max_resource_generation = down_target.max_resource_generation,
+    } });
+    touchFrame(&setup.adapter);
+
+    var names_buffer: [16][]const u8 = undefined;
+    try expectEventNames(
+        &.{ "down", "motion", "frame", "up", "frame" },
+        log.namesFor(client, 6, &names_buffer),
+    );
+    try expectEventNames(
+        &.{ "down", "shape", "orientation", "motion", "frame", "up", "frame" },
+        log.namesFor(client, 8, &names_buffer),
+    );
+    try std.testing.expectEqual(@as(usize, 0), log.namesFor(client, 9, &names_buffer).len);
+    const down = log.find(client, 8, "down").?;
+    try std.testing.expectEqual(@as(?u32, 41), down.serial);
+    try std.testing.expectEqual(@as(?u32, 10), down.time);
+    try std.testing.expectEqual(@as(?u32, 4), down.surface);
+    try std.testing.expectEqual(@as(?i32, 3), down.id);
+    try std.testing.expectEqual(@as(?i32, 320), down.x);
+    try std.testing.expectEqual(@as(?i32, -128), down.y);
+    const motion = log.find(client, 8, "motion").?;
+    try std.testing.expectEqual(@as(?u32, 11), motion.time);
+    try std.testing.expectEqual(@as(?i32, 384), motion.x);
+    try std.testing.expectEqual(@as(?i32, -64), motion.y);
+    const shape = log.find(client, 8, "shape").?;
+    try std.testing.expectEqual(@as(?i32, 512), shape.x);
+    try std.testing.expectEqual(@as(?i32, 256), shape.y);
+    try std.testing.expectEqual(@as(?i32, -64), log.find(client, 8, "orientation").?.x);
+
+    log.clear();
+    const cancel_target = touchTarget(&setup.adapter, surface).?;
+    touch(&setup.adapter, client_id, .{ .down = .{
+        .serial = .{ .domain = .wayring_server, .value = 43 },
+        .time = 13,
+        .surface = surface,
+        .id = 4,
+        .x = 0,
+        .y = 0,
+        .max_resource_generation = cancel_target.max_resource_generation,
+    } });
+    touch(&setup.adapter, client_id, .{ .cancel = .{
+        .max_resource_generation = cancel_target.max_resource_generation,
+    } });
+    touchFrame(&setup.adapter);
+    inline for (.{ 6, 8, 9 }) |object_id| {
+        try expectEventNames(
+            &.{ "down", "cancel" },
+            log.namesFor(client, object_id, &names_buffer),
+        );
+    }
+    for (setup.adapter.touches.items) |touch_resource|
+        try std.testing.expect(!touch_resource.frame_pending);
+
+    const stale_client: ClientRegistry.Id = .{
+        .index = client_id.index,
+        .generation = client_id.generation + 1,
+    };
+    log.clear();
+    touch(&setup.adapter, stale_client, .{ .down = .{
+        .serial = .{ .domain = .wayring_server, .value = 44 },
+        .time = 14,
+        .surface = surface,
+        .id = 5,
+        .x = 0,
+        .y = 0,
+        .max_resource_generation = cancel_target.max_resource_generation,
+    } });
+    try std.testing.expectEqual(@as(usize, 0), log.entries.items.len);
+
+    snapshot.touch.available = false;
+    capabilities(&setup.adapter, snapshot);
+    try std.testing.expect(touchTarget(&setup.adapter, surface) == null);
+    snapshot.touch.available = true;
+    snapshot.touch.generation += 1;
+    capabilities(&setup.adapter, snapshot);
+    try std.testing.expect(touchTarget(&setup.adapter, surface) == null);
+
+    setup.destroyClient(managed);
+    client_live = false;
+    setup.protocol_server.removeGlobal(seat_global) catch unreachable;
+    try std.testing.expectEqual(@as(usize, 0), countPublished(&setup.protocol_server, "wl_seat"));
+}
+
 test "late pointer bind joins canonical focus with enter before later delivery" {
     var setup: AdapterTestSetup = undefined;
     try setup.init();
@@ -1660,6 +2169,187 @@ test "set_cursor accepts only the entering resource and terminalizes role confli
 
     setup.destroyClient(managed);
     client_live = false;
+}
+
+test "touch materialization OOM and generation exhaustion isolate generated clients" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var setup: AdapterTestSetup = undefined;
+    try setup.initWithAdapterAllocator(failing.allocator());
+    defer setup.deinit();
+    var snapshot: SeatDelivery.CapabilitySnapshot = .{};
+    _ = snapshot.touch.setAvailable(true);
+    capabilities(&setup.adapter, snapshot);
+    const seat_global = try setup.protocol_server.addGlobal(
+        core.wl_seat,
+        core.wl_seat.interface.version,
+        WayringSeatAdapter,
+        &setup.adapter,
+        testSeatBind,
+    );
+    defer setup.protocol_server.removeGlobal(seat_global) catch {};
+
+    const managed_a = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client_a = managed_a.client();
+    const id_a = try setup.registerClient(client_a);
+    var live_a = true;
+    defer if (live_a) setup.destroyClient(managed_a);
+    const managed_b = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client_b = managed_b.client();
+    const id_b = try setup.registerClient(client_b);
+    var live_b = true;
+    defer if (live_b) setup.destroyClient(managed_b);
+    const managed_c = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client_c = managed_c.client();
+    const id_c = try setup.registerClient(client_c);
+    var live_c = true;
+    defer if (live_c) setup.destroyClient(managed_c);
+    inline for (.{ client_a, client_b, client_c }) |client| {
+        try testPrepareRegistry(client);
+        try testBindGlobal(client, seat_global, 10, 3);
+    }
+
+    setup.probe.watched_terminal_client = client_a;
+    failing.fail_index = failing.alloc_index;
+    try testGetTouch(client_a, 3, 4);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.out_of_memory, client_a.fatal().?.kind);
+    try std.testing.expect(setup.probe.retiring_before_fatal);
+    try std.testing.expectEqual(id_a, setup.probe.last_retiring.?);
+    try std.testing.expectEqual(@as(usize, 0), setup.adapter.touches.items.len);
+    failing.fail_index = std.math.maxInt(usize);
+
+    setup.adapter.next_touch_resource_generation = std.math.maxInt(SeatDelivery.ResourceGeneration);
+    try testGetTouch(client_b, 3, 4);
+    try std.testing.expect(client_b.fatal() == null);
+    try std.testing.expectEqual(
+        std.math.maxInt(SeatDelivery.ResourceGeneration),
+        setup.adapter.touches.items[0].resource_generation,
+    );
+    try std.testing.expect(setup.adapter.next_touch_resource_generation == null);
+
+    setup.probe.watched_terminal_client = client_c;
+    setup.probe.retiring_before_fatal = false;
+    try testGetTouch(client_c, 3, 4);
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.implementation, client_c.fatal().?.kind);
+    try std.testing.expect(setup.probe.retiring_before_fatal);
+    try std.testing.expectEqual(id_c, setup.probe.last_retiring.?);
+    try std.testing.expectEqual(@as(usize, 1), setup.adapter.touches.items.len);
+    try std.testing.expectEqual(client_b, setup.adapter.touches.items[0].client);
+    try std.testing.expect(client_b.fatal() == null);
+    _ = id_b;
+
+    setup.destroyClient(managed_c);
+    live_c = false;
+    setup.destroyClient(managed_b);
+    live_b = false;
+    setup.destroyClient(managed_a);
+    live_a = false;
+}
+
+test "touch event OOM and serial exhaustion retire only affected generated clients" {
+    var setup: AdapterTestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+    var snapshot: SeatDelivery.CapabilitySnapshot = .{};
+    _ = snapshot.touch.setAvailable(true);
+    capabilities(&setup.adapter, snapshot);
+    const seat_global = try setup.protocol_server.addGlobal(
+        core.wl_seat,
+        core.wl_seat.interface.version,
+        WayringSeatAdapter,
+        &setup.adapter,
+        testSeatBind,
+    );
+    defer setup.protocol_server.removeGlobal(seat_global) catch {};
+
+    var client_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const managed_a = try wayring.server.CoreClient.create(client_allocator.allocator(), &setup.protocol_server, .{});
+    const client_a = managed_a.client();
+    const id_a = try setup.registerClient(client_a);
+    var live_a = true;
+    defer if (live_a) setup.destroyClient(managed_a);
+    const managed_b = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client_b = managed_b.client();
+    const id_b = try setup.registerClient(client_b);
+    var live_b = true;
+    defer if (live_b) setup.destroyClient(managed_b);
+    const managed_c = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client_c = managed_c.client();
+    const id_c = try setup.registerClient(client_c);
+    var live_c = true;
+    defer if (live_c) setup.destroyClient(managed_c);
+
+    var surfaces: [3]SurfaceRegistry.Id = undefined;
+    inline for (.{
+        .{ client_a, id_a },
+        .{ client_b, id_b },
+        .{ client_c, id_c },
+    }, 0..) |entry, index| {
+        try testPrepareRegistry(entry[0]);
+        try testBindGlobal(entry[0], testGlobal(&setup.protocol_server, "wl_compositor"), 6, 3);
+        try testCreateSurface(entry[0], 3, 4);
+        surfaces[index] = setup.compositor.surfaceId(entry[0], 4).?;
+        try testBindGlobal(entry[0], seat_global, 10, 5);
+        try testGetTouch(entry[0], 5, 6);
+        try testDrain(entry[0]);
+    }
+
+    setup.probe.watched_terminal_client = client_a;
+    client_allocator.fail_index = client_allocator.alloc_index;
+    touch(&setup.adapter, id_a, .{ .down = .{
+        .serial = .{ .domain = .wayring_server, .value = 51 },
+        .time = 1,
+        .surface = surfaces[0],
+        .id = 1,
+        .x = 0,
+        .y = 0,
+        .max_resource_generation = setup.adapter.touches.items[0].resource_generation,
+    } });
+    var motion_count: u32 = 0;
+    while (!client_allocator.has_induced_failure and motion_count < 4096) : (motion_count += 1) {
+        touch(&setup.adapter, id_a, .{ .motion = .{
+            .time = motion_count + 2,
+            .id = 1,
+            .x = @intCast(motion_count),
+            .y = 0,
+            .max_resource_generation = setup.adapter.touches.items[0].resource_generation,
+        } });
+    }
+    try std.testing.expect(client_allocator.has_induced_failure);
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.out_of_memory, client_a.fatal().?.kind);
+    try std.testing.expect(setup.probe.retiring_before_fatal);
+    try std.testing.expectEqual(id_a, setup.probe.last_retiring.?);
+    try std.testing.expect(client_b.fatal() == null);
+    try std.testing.expect(client_c.fatal() == null);
+
+    const target_b = touchTarget(&setup.adapter, surfaces[1]).?;
+    touch(&setup.adapter, id_b, .{ .down = .{
+        .serial = .{ .domain = .wayring_server, .value = 52 },
+        .time = 2,
+        .surface = surfaces[1],
+        .id = 2,
+        .x = 0,
+        .y = 0,
+        .max_resource_generation = target_b.max_resource_generation,
+    } });
+    try std.testing.expect((try client_b.beginSend()) != null);
+    try std.testing.expect(client_b.fatal() == null);
+
+    setup.probe.watched_terminal_client = client_c;
+    setup.probe.retiring_before_fatal = false;
+    setup.protocol_server.next_serial = null;
+    try std.testing.expect(issueSerial(&setup.adapter, id_c) == null);
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.implementation, client_c.fatal().?.kind);
+    try std.testing.expect(setup.probe.retiring_before_fatal);
+    try std.testing.expectEqual(id_c, setup.probe.last_retiring.?);
+    try std.testing.expect(client_b.fatal() == null);
+
+    setup.destroyClient(managed_c);
+    live_c = false;
+    setup.destroyClient(managed_b);
+    live_b = false;
+    setup.destroyClient(managed_a);
+    live_a = false;
 }
 
 test "keyboard resource materialization OOM retires only its generated client" {
