@@ -662,7 +662,6 @@ test {
     _ = @import("wayland/PressedKeyState.zig");
     _ = @import("wayland/mature_serials.zig");
     _ = @import("ClientRegistry.zig");
-    _ = @import("FocusArbiter.zig");
     _ = @import("wayland/MatureClients.zig");
     _ = @import("SeatAuthority.zig");
     _ = @import("SeatDelivery.zig");

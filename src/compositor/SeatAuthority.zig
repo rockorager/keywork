@@ -90,7 +90,7 @@ pub fn clearKeyboardEnter(self: *SeatAuthority) void {
     self.latest_keyboard_enter = null;
 }
 
-/// Returns the retained generated keyboard-enter serial only to its exact
+/// Returns the retained logical keyboard-enter serial only to its exact
 /// client. This is a read-only late-resource seam, not a new authority grant.
 pub fn latestKeyboardEnterSerial(self: *const SeatAuthority, client: ClientRegistry.Id) ?ClientRegistry.Serial {
     const grant = self.latest_keyboard_enter orelse return null;
@@ -302,7 +302,7 @@ test "selection, action, domain, capacity, and issuance order are independent" {
     _ = authority.clientDisconnected(wayring);
 }
 
-test "generated keyboard enter remains one retained selection grant for late resources" {
+test "keyboard enter remains one retained selection grant for late resources" {
     var clients = ClientRegistry.init(std.testing.allocator);
     defer clients.deinit();
     var surfaces = SurfaceRegistry.init(std.testing.allocator);

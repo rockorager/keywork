@@ -82,7 +82,6 @@ const FrameStatistics = @import("FrameStatistics.zig");
 const Region = @import("region.zig");
 const Scene = @import("scene.zig");
 const ClientRegistry = @import("ClientRegistry.zig");
-const FocusArbiter = @import("FocusArbiter.zig");
 const SurfaceRegistry = @import("SurfaceRegistry.zig");
 const HeadlessSurfaceForest = @import("HeadlessSurfaceForest.zig");
 const SurfaceFrameCompletion = @import("SurfaceFrameCompletion.zig");
@@ -160,7 +159,6 @@ client_registry: ClientRegistry,
 mature_clients: MatureClients,
 surface_registry: SurfaceRegistry,
 headless_surface_forest: HeadlessSurfaceForest,
-focus_arbiter: FocusArbiter,
 control: Control,
 control_initialized: bool,
 appearance_client: AppearanceClient,
@@ -979,7 +977,6 @@ pub fn createWithVirtualOutput(
         .mature_clients = undefined,
         .surface_registry = SurfaceRegistry.init(allocator),
         .headless_surface_forest = HeadlessSurfaceForest.init(allocator),
-        .focus_arbiter = undefined,
         .control = undefined,
         .control_initialized = false,
         .appearance_client = undefined,
@@ -1109,8 +1106,6 @@ pub fn createWithVirtualOutput(
     errdefer self.mature_clients.deinit();
     errdefer self.surface_registry.deinit();
     errdefer self.headless_surface_forest.deinit();
-    try self.focus_arbiter.init(&self.client_registry, &self.surface_registry);
-    errdefer self.focus_arbiter.deinit();
     errdefer self.routed_touches.deinit(allocator);
     errdefer self.routed_gestures.deinit(allocator);
     errdefer self.routed_buttons.deinit(allocator);
@@ -1969,7 +1964,6 @@ pub fn destroy(self: *Self) void {
     self.routed_keys.deinit(allocator);
     self.seat.deinit();
     self.compositor.deinit();
-    self.focus_arbiter.deinit();
     std.debug.assert(self.headless_surface_forest.len() == 0);
     self.headless_surface_forest.deinit();
     std.debug.assert(self.surface_registry.len() == 0);
@@ -3744,8 +3738,7 @@ fn generatedCursorRemoved(context: *anyopaque, id: SurfaceRegistry.Id) void {
 
 fn generatedClientRetiring(context: *anyopaque, client: ClientRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.seat.retireGeneratedClient(client);
-    if (self.focus_arbiter.clientUnavailable(client)) self.refreshKeyboardFocus();
+    if (self.seat.retireGeneratedClient(client)) self.refreshKeyboardFocus();
 }
 
 pub fn generatedSeatName(self: *const Self) [:0]const u8 {
@@ -3951,30 +3944,32 @@ fn reconcileGeneratedPointerTopology(self: *Self) void {
 }
 
 fn repairGeneratedFocus(self: *Self) void {
-    const target = self.focus_arbiter.target() orelse return;
-    if (target.frontend != .generated) return;
-    defer self.refreshKeyboardFocus();
-    const root = self.headless_surface_forest.compoundRoot(target.root) orelse {
-        _ = self.focus_arbiter.surfaceUnavailable(target.root);
+    const target = self.seat.generatedKeyboardFocus() orelse return;
+    const root = self.headless_surface_forest.compoundRoot(target.surface) orelse {
+        self.refreshKeyboardFocusReplacingGenerated();
         return;
     };
     if (self.headless_surface_forest.isCursorRole(root)) {
-        _ = self.focus_arbiter.surfaceUnavailable(target.root);
+        self.refreshKeyboardFocusReplacingGenerated();
         return;
     }
     const state = self.headless_surface_forest.state(root) orelse {
-        _ = self.focus_arbiter.surfaceUnavailable(target.root);
+        self.refreshKeyboardFocusReplacingGenerated();
         return;
     };
     if (state.mapped_size == null) {
-        _ = self.focus_arbiter.surfaceUnavailable(target.root);
+        self.refreshKeyboardFocusReplacingGenerated();
         return;
     }
     const client = self.seat.generatedSurfaceOwner(root) orelse {
-        _ = self.focus_arbiter.surfaceUnavailable(target.root);
+        self.refreshKeyboardFocusReplacingGenerated();
         return;
     };
-    _ = self.focus_arbiter.repairGenerated(target.root, root, client);
+    _ = self.seat.repairGeneratedKeyboardFocus(target.surface, .{
+        .surface = root,
+        .client = client,
+    });
+    self.refreshKeyboardFocus();
 }
 
 fn damageHeadlessBatch(self: *Self, batch: WayringCompositor.AppliedBatch) void {
@@ -5680,7 +5675,6 @@ fn xdgActivationRequested(
 
 fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    _ = self.focus_arbiter.focusMature(null, null);
     if (self.window_manager_initialized) self.window_manager.setSessionLocked(locked);
     if (locked) {
         finishAllWindowTransitions(self);
@@ -5702,9 +5696,9 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     if (locked) {
         self.virtual_keyboard.setInhibited(true);
         self.input_method.setInhibited(true);
-        self.seat.setKeyboardFocus(null);
+        _ = self.seat.applyMatureKeyboardFocus(null);
     } else {
-        self.seat.setKeyboardFocus(null);
+        _ = self.seat.applyMatureKeyboardFocus(null);
         self.input_method.setInhibited(false);
         self.virtual_keyboard.setInhibited(false);
         if (self.seat.pointerPosition()) |position| {
@@ -6480,10 +6474,10 @@ fn routeTouchDown(
         if (focus != null and focus.?.generated == null) {
             const target = focus.?;
             const root = self.subcompositor.rootSurface(target.surface_id);
-            const cleared_generated = self.focus_arbiter.clearGenerated();
+            const replace_generated = self.seat.generatedKeyboardFocus() != null;
             self.window_manager.pointerButton(root, .pressed);
             self.layer_shell.pointerPressed(root);
-            if (cleared_generated) self.refreshKeyboardFocus();
+            if (replace_generated) self.refreshKeyboardFocusReplacingGenerated();
             requestRepaint(self);
         } else if (if (route.generated) |generated|
             generated.root
@@ -7099,10 +7093,10 @@ fn pointerButtonForSeat(
             }
         }
     }
-    const cleared_generated = seat == &self.seat and state == .pressed and
-        route.generated == null and root != null and self.focus_arbiter.clearGenerated();
+    const replace_generated = seat == &self.seat and state == .pressed and
+        route.generated == null and root != null and self.seat.generatedKeyboardFocus() != null;
     self.window_manager.pointerButton(root, state);
-    if (cleared_generated) self.refreshKeyboardFocus();
+    if (replace_generated) self.refreshKeyboardFocusReplacingGenerated();
     if (state == .pressed) {
         const focused = if (seat.pointerFocusedSurface()) |surface_id|
             self.subcompositor.rootSurface(surface_id)
@@ -7322,10 +7316,10 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     if (focus != null and focus.?.generated == null) {
         const target = focus.?;
         const root = self.subcompositor.rootSurface(target.surface_id);
-        const cleared_generated = self.focus_arbiter.clearGenerated();
+        const replace_generated = self.seat.generatedKeyboardFocus() != null;
         self.window_manager.pointerButton(root, .pressed);
         self.layer_shell.pointerPressed(root);
-        if (cleared_generated) self.refreshKeyboardFocus();
+        if (replace_generated) self.refreshKeyboardFocusReplacingGenerated();
         requestRepaint(self);
     } else if (route.generated) |generated| {
         self.window_manager.pointerButton(null, .pressed);
@@ -9783,6 +9777,14 @@ fn renderSessionLockContents(
 }
 
 fn refreshKeyboardFocus(self: *Self) void {
+    self.refreshKeyboardFocusWithGeneratedRetention(true);
+}
+
+fn refreshKeyboardFocusReplacingGenerated(self: *Self) void {
+    self.refreshKeyboardFocusWithGeneratedRetention(false);
+}
+
+fn refreshKeyboardFocusWithGeneratedRetention(self: *Self, retain_generated: bool) void {
     if (self.session_lock.isLocked()) {
         const focus = self.session_lock.keyboardFocus();
         self.applyMatureKeyboardFocus(focus);
@@ -9790,17 +9792,13 @@ fn refreshKeyboardFocus(self: *Self) void {
         return;
     }
     const default_focus = self.maturePolicyKeyboardFocus();
-    if (self.focus_arbiter.retainGenerated(default_focus)) |target| {
+    if (retain_generated and self.seat.retainGeneratedKeyboardFocus(default_focus) != null) {
         if (generatedFocusPolicyAllows(
             false,
             self.xdg_shell.hasPopupGrab(),
             self.layer_shell.keyboardFocus(self.xdg_shell.popupKeyboardFocus()) != null,
             self.xwayland_override_redirect_focus != null,
         )) {
-            self.seat.setGeneratedKeyboardFocus(.{
-                .surface = target.root,
-                .client = target.client,
-            });
             self.syncXwaylandFocus(null);
             return;
         }
@@ -9818,18 +9816,7 @@ fn maturePolicyKeyboardFocus(self: *Self) ?Surface.Id {
 }
 
 fn applyMatureKeyboardFocus(self: *Self, requested: ?Surface.Id) void {
-    const focus = requested orelse {
-        _ = self.focus_arbiter.focusMature(null, null);
-        self.seat.setKeyboardFocus(null);
-        return;
-    };
-    const client = self.seat.matureSurfaceOwner(focus) orelse {
-        _ = self.focus_arbiter.focusMature(null, null);
-        self.seat.setKeyboardFocus(null);
-        return;
-    };
-    _ = self.focus_arbiter.focusMature(focus, client);
-    self.seat.setKeyboardFocus(focus);
+    _ = self.seat.applyMatureKeyboardFocus(requested);
 }
 
 fn focusGeneratedSurface(self: *Self, requested_root: SurfaceRegistry.Id) bool {
@@ -9844,9 +9831,8 @@ fn focusGeneratedSurface(self: *Self, requested_root: SurfaceRegistry.Id) bool {
     const state = self.headless_surface_forest.state(root) orelse return false;
     if (state.mapped_size == null) return false;
     const client = self.seat.generatedSurfaceOwner(root) orelse return false;
-    const changed = self.focus_arbiter.focusGenerated(
-        root,
-        client,
+    const changed = self.seat.applyGeneratedKeyboardFocus(
+        .{ .surface = root, .client = client },
         self.maturePolicyKeyboardFocus(),
     );
     self.refreshKeyboardFocus();
@@ -12403,6 +12389,180 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
     try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
 }
 
+test "mature keyboard late bind reuses one logical enter serial and authority grant" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 4, .height = 4 } },
+    );
+    defer server.destroy();
+
+    server.seat.parentKeyboardLeave();
+    var keymap_pipe: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&keymap_pipe) != 0) return error.Unexpected;
+    defer _ = std.c.close(keymap_pipe[1]);
+    server.seat.setKeymap(.xkb_v1, keymap_pipe[0], 8);
+    server.seat.setRepeatInfo(25, 500);
+    server.seat.setKeyboardAvailable(true);
+    defer server.seat.setKeyboardAvailable(false);
+
+    var sockets: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &sockets),
+    );
+    const mature_client = wl.Client.create(server.display, sockets[0]) orelse return error.OutOfMemory;
+    const client_id = server.mature_clients.id(mature_client) orelse return error.TestUnexpectedResult;
+    const raw_command_fd = std.os.linux.eventfd(0, std.os.linux.EFD.CLOEXEC);
+    if (std.os.linux.errno(raw_command_fd) != .SUCCESS) return error.EventFdFailed;
+    const command_fd: std.posix.fd_t = @intCast(raw_command_fd);
+    defer _ = std.os.linux.close(command_fd);
+    var client: MatureKeyboardClient = .{
+        .fd = sockets[1],
+        .command_fd = command_fd,
+    };
+    const thread = try std.Thread.spawn(.{}, MatureKeyboardClient.run, .{&client});
+    var joined = false;
+    defer if (!joined) {
+        client.shutdown();
+        thread.join();
+    };
+
+    try waitForMatureKeyboardStage(server, &client, .resources_bound);
+    var surfaces = server.compositor.surfaceStore().iterator();
+    const surface = (surfaces.next() orelse return error.MatureSurfaceMissing).id;
+    try std.testing.expect(surfaces.next() == null);
+    _ = server.seat.applyMatureKeyboardFocus(surface);
+    server.seat.setModifiers(1, 2, 4, 3);
+    try server.seat.parentKeyboardEnter(&.{30});
+    const first_serial = server.seat.authority.latestKeyboardEnterSerial(client_id) orelse
+        return error.MatureKeyboardEnterGrantMissing;
+    const first_order = server.seat.authority.selectionOrder(client_id, first_serial) orelse
+        return error.MatureKeyboardEnterOrderMissing;
+    try std.testing.expectEqual(ClientRegistry.SerialDomain.mature_display, first_serial.domain);
+    try std.testing.expectEqual(surface, server.seat.matureKeyboardFocus().?);
+
+    try signalWayringCommand(command_fd);
+    try waitForMatureKeyboardStage(server, &client, .focused);
+    try std.testing.expectEqual(first_serial.value, client.first.enter_serials[0]);
+
+    try signalWayringCommand(command_fd);
+    try waitForMatureKeyboardStage(server, &client, .late_bound);
+    try std.testing.expectEqual(first_serial.value, client.second.enter_serials[0]);
+    try std.testing.expectEqual(@as(usize, 1), client.first.enter_count);
+    try std.testing.expectEqual(
+        first_order,
+        server.seat.authority.selectionOrder(client_id, first_serial).?,
+    );
+    try std.testing.expectEqual(
+        first_serial,
+        server.seat.authority.latestKeyboardEnterSerial(client_id).?,
+    );
+
+    _ = server.seat.applyMatureKeyboardFocus(null);
+    try std.testing.expect(server.seat.authority.latestKeyboardEnterSerial(client_id) == null);
+    _ = server.seat.applyMatureKeyboardFocus(surface);
+    const second_serial = server.seat.authority.latestKeyboardEnterSerial(client_id) orelse
+        return error.MatureKeyboardReenterGrantMissing;
+    const second_order = server.seat.authority.selectionOrder(client_id, second_serial) orelse
+        return error.MatureKeyboardReenterOrderMissing;
+    try std.testing.expect(second_serial.value != first_serial.value);
+    try std.testing.expect(second_order > first_order);
+
+    try signalWayringCommand(command_fd);
+    try waitForMatureKeyboardStage(server, &client, .reentered);
+    try std.testing.expectEqual(second_serial.value, client.first.enter_serials[1]);
+    try std.testing.expectEqual(second_serial.value, client.second.enter_serials[1]);
+
+    const GrabProbe = struct {
+        fn cancel(_: *anyopaque) void {}
+        fn keymap(_: *anyopaque, _: wl.Keyboard.KeymapFormat, _: std.posix.fd_t, _: u32) void {}
+        fn key(_: *anyopaque, _: u32, _: u32, _: u32, _: wl.Keyboard.KeyState) void {}
+        fn modifiers(_: *anyopaque, _: u32, _: u32, _: u32, _: u32) void {}
+        fn repeatInfo(_: *anyopaque, _: i32, _: i32) void {}
+    };
+    var grab_probe: GrabProbe = .{};
+    server.seat.setKeyboardGrab(.{
+        .context = &grab_probe,
+        .token = 1,
+        .surface = surface,
+        .cancel = GrabProbe.cancel,
+        .keymap = GrabProbe.keymap,
+        .key = GrabProbe.key,
+        .modifiers = GrabProbe.modifiers,
+        .repeat_info = GrabProbe.repeatInfo,
+    });
+    const grab_serial = server.seat.authority.latestKeyboardEnterSerial(client_id) orelse
+        return error.MatureKeyboardGrabEnterGrantMissing;
+    const grab_order = server.seat.authority.selectionOrder(client_id, grab_serial) orelse
+        return error.MatureKeyboardGrabEnterOrderMissing;
+    try std.testing.expect(grab_serial.value != second_serial.value);
+    try std.testing.expect(grab_order > second_order);
+    _ = server.seat.applyMatureKeyboardFocus(null);
+    try std.testing.expectEqual(
+        grab_serial,
+        server.seat.authority.latestKeyboardEnterSerial(client_id).?,
+    );
+
+    var generated_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff12_3456,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const generated_surface = try server.surface_registry.add(generated_provider.provider());
+    defer server.surface_registry.remove(generated_surface);
+    const disconnecting_generated = try server.client_registry.register(.wayring_server);
+    try std.testing.expect(server.seat.applyGeneratedKeyboardFocus(.{
+        .surface = generated_surface,
+        .client = disconnecting_generated,
+    }, null));
+    server.client_registry.unregister(disconnecting_generated);
+    try std.testing.expectEqual(
+        grab_serial,
+        server.seat.authority.latestKeyboardEnterSerial(client_id).?,
+    );
+    const retiring_generated = try server.client_registry.register(.wayring_server);
+    try std.testing.expect(server.seat.applyGeneratedKeyboardFocus(.{
+        .surface = generated_surface,
+        .client = retiring_generated,
+    }, null));
+    try std.testing.expect(server.seat.retireGeneratedClient(retiring_generated));
+    try std.testing.expectEqual(
+        grab_serial,
+        server.seat.authority.latestKeyboardEnterSerial(client_id).?,
+    );
+    server.client_registry.unregister(retiring_generated);
+
+    try signalWayringCommand(command_fd);
+    try waitForMatureKeyboardStage(server, &client, .resource_rebound);
+    try std.testing.expectEqual(grab_serial.value, client.third.enter_serials[0]);
+    try std.testing.expectEqual(@as(usize, 3), client.first.enter_count);
+    try std.testing.expectEqual(
+        grab_order,
+        server.seat.authority.selectionOrder(client_id, grab_serial).?,
+    );
+    try std.testing.expectEqual(
+        grab_serial,
+        server.seat.authority.latestKeyboardEnterSerial(client_id).?,
+    );
+    server.seat.clearKeyboardGrab(&grab_probe, false);
+    try std.testing.expect(server.seat.authority.latestKeyboardEnterSerial(client_id) == null);
+
+    try signalWayringCommand(command_fd);
+    try waitForMatureKeyboardStage(server, &client, .disconnected);
+    thread.join();
+    joined = true;
+    for (0..1_000) |_| {
+        if (server.client_registry.len() == 0) break;
+        try server.eventLoop().dispatch(1);
+    } else return error.MatureKeyboardClientTimedOut;
+    try std.testing.expect(server.seat.matureKeyboardFocus() == null);
+    try std.testing.expect(server.seat.authority.latestKeyboardEnterSerial(client_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), server.compositor.surfaceStore().len());
+}
+
 test "canonical generated keyboard delivery preserves focus aggregation authority grabs and repeats" {
     const server = try Self.createWithVirtualOutput(
         std.testing.allocator,
@@ -12548,7 +12708,7 @@ test "canonical generated keyboard delivery preserves focus aggregation authorit
     try std.testing.expectEqual(mature_transition + 1, sink.keyboard_event_count);
     try std.testing.expectEqual(TestGeneratedSeatSink.KeyboardTag.leave, sink.keyboard_events[mature_transition]);
     try std.testing.expectEqual(client_b, sink.keyboard_clients[mature_transition]);
-    try std.testing.expect(server.focus_arbiter.target() == null);
+    try std.testing.expect(server.seat.generatedKeyboardFocus() == null);
 
     server.client_registry.unregister(client_b);
     client_b_live = false;
@@ -12645,8 +12805,7 @@ test "headless click and first touch focus compound root with synchronous repair
     try std.testing.expectEqual(root, child_route.generated.?.root);
     pointerMotion(output, 1, 2, 2);
     pointerButton(output, 2, linux_button_left, .pressed);
-    try std.testing.expectEqual(root, server.focus_arbiter.target().?.root);
-    try std.testing.expectEqual(FocusArbiter.Frontend.generated, server.focus_arbiter.target().?.frontend);
+    try std.testing.expectEqual(root, server.seat.generatedKeyboardFocus().?.surface);
     try std.testing.expect(server.seat.implicitPointerGrabActive());
     const press_serial: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 2 };
     try std.testing.expect(server.seat.authority.acceptsAction(generated_client, press_serial));
@@ -12689,13 +12848,13 @@ test "headless click and first touch focus compound root with synchronous repair
         top,
     }, sink.pointer_surfaces[0..sink.pointer_event_count]);
 
-    _ = server.focus_arbiter.focusMature(null, null);
+    _ = server.seat.applyMatureKeyboardFocus(null);
     const touch_start = sink.touch_event_count;
     touchDown(output, 5, 10, 2, 2);
-    try std.testing.expectEqual(root, server.focus_arbiter.target().?.root);
+    try std.testing.expectEqual(root, server.seat.generatedKeyboardFocus().?.surface);
     touchDown(output, 6, 11, 0.5, 0.5);
     try std.testing.expectEqual(top, server.pointerRoute(0.5, 0.5).generated.?.root);
-    try std.testing.expectEqual(root, server.focus_arbiter.target().?.root);
+    try std.testing.expectEqual(root, server.seat.generatedKeyboardFocus().?.surface);
     touchMotion(output, 7, 10, 3, 3);
     touchShape(output, 10, 2, 1);
     touchOrientation(output, 10, 0.5);
@@ -12714,7 +12873,7 @@ test "headless click and first touch focus compound root with synchronous repair
         .up,
         .frame,
     }, sink.touch_events[touch_start..sink.touch_event_count]);
-    try std.testing.expectEqual(@as(usize, 16), sink.event_count);
+    try std.testing.expectEqual(@as(usize, 17), sink.event_count);
     try std.testing.expectEqual(child, sink.touch_surfaces[touch_start].?);
     try std.testing.expectEqual(top, sink.touch_surfaces[touch_start + 1].?);
     try std.testing.expectEqual(@as(?i32, 256), sink.touch_x[touch_start]);
@@ -12736,7 +12895,7 @@ test "headless click and first touch focus compound root with synchronous repair
     touchMotion(output, 11, 12, 3, 3);
     touchUp(output, 12, 12);
     try std.testing.expectEqual(invalidation_start + 2, sink.touch_event_count);
-    try std.testing.expect(server.focus_arbiter.target() == null);
+    try std.testing.expect(server.seat.generatedKeyboardFocus() == null);
     server.commitHeadlessSurface(root, root_provider.logical_size, false);
     try std.testing.expect(server.focusGeneratedSurface(root));
 
@@ -12748,11 +12907,11 @@ test "headless click and first touch focus compound root with synchronous repair
         .surfaces = &.{},
         .parents = &.{.{ .id = top, .stack = &top_stack }},
     });
-    try std.testing.expectEqual(top, server.focus_arbiter.target().?.root);
+    try std.testing.expectEqual(top, server.seat.generatedKeyboardFocus().?.surface);
 
     server.client_registry.unregister(generated_client);
     generated_client_live = false;
-    try std.testing.expect(server.focus_arbiter.target() == null);
+    try std.testing.expect(server.seat.generatedKeyboardFocus() == null);
     generated_client = try server.client_registry.register(.wayring_server);
     generated_client_live = true;
     sink.client = generated_client;
@@ -12761,7 +12920,7 @@ test "headless click and first touch focus compound root with synchronous repair
     server.removeHeadlessSurface(top);
     server.surface_registry.remove(top);
     top_live = false;
-    try std.testing.expect(server.focus_arbiter.target() == null);
+    try std.testing.expect(server.seat.generatedKeyboardFocus() == null);
     try std.testing.expectEqual(HeadlessSurfaceForest.Placement.detached, server.headless_surface_forest.state(root).?.placement);
 
     server.removeHeadlessSurface(root);
@@ -12996,12 +13155,12 @@ test "generated topology mutation retargets hover and cancels invalid grabs" {
     server.surface_registry.remove(grabbed);
     grabbed_live = false;
 
-    try std.testing.expect(server.focus_arbiter.target() != null);
+    try std.testing.expect(server.seat.generatedKeyboardFocus() != null);
     const request_sink = server.generatedSeatRequestSink();
     request_sink.client_retiring(request_sink.context, generated_client);
     try std.testing.expect(server.seat.pointerFocus() == null);
     try std.testing.expect(!server.seat.implicitPointerGrabActive());
-    try std.testing.expect(server.focus_arbiter.target() == null);
+    try std.testing.expect(server.seat.generatedKeyboardFocus() == null);
     server.removeHeadlessSurface(root_b);
     server.surface_registry.remove(root_b);
     root_b_live = false;
@@ -14600,6 +14759,271 @@ const WayringSeatClient = struct {
     }
 };
 
+const MatureKeyboardClient = struct {
+    const client_wl = wayland.client.wl;
+    const Stage = enum(u8) {
+        starting,
+        resources_bound,
+        focused,
+        late_bound,
+        reentered,
+        resource_rebound,
+        disconnected,
+        failed,
+    };
+    const KeyboardTag = enum { keymap, repeat_info, enter, modifiers, leave };
+    const KeyboardLog = struct {
+        tags: [12]KeyboardTag = undefined,
+        count: usize = 0,
+        enter_serials: [3]u32 = @splat(0),
+        enter_keys: [3][8]u32 = @splat(@splat(0)),
+        enter_key_counts: [3]usize = @splat(0),
+        enter_count: usize = 0,
+        modifier_serials: [3]u32 = @splat(0),
+        modifiers: [3]SeatDelivery.Modifiers = @splat(.{}),
+        modifier_count: usize = 0,
+
+        fn handleEvent(_: *client_wl.Keyboard, event: client_wl.Keyboard.Event, self: *KeyboardLog) void {
+            if (self.count == self.tags.len) return;
+            const tag: KeyboardTag = switch (event) {
+                .keymap => |keymap| value: {
+                    _ = std.os.linux.close(keymap.fd);
+                    break :value .keymap;
+                },
+                .repeat_info => .repeat_info,
+                .enter => |enter| value: {
+                    if (self.enter_count < self.enter_serials.len) {
+                        const index = self.enter_count;
+                        const keys = enter.keys.slice(u32);
+                        self.enter_serials[index] = enter.serial;
+                        self.enter_key_counts[index] = @min(keys.len, self.enter_keys[index].len);
+                        @memcpy(
+                            self.enter_keys[index][0..self.enter_key_counts[index]],
+                            keys[0..self.enter_key_counts[index]],
+                        );
+                    }
+                    self.enter_count += 1;
+                    break :value .enter;
+                },
+                .modifiers => |modifiers| value: {
+                    if (self.modifier_count < self.modifier_serials.len) {
+                        const index = self.modifier_count;
+                        self.modifier_serials[index] = modifiers.serial;
+                        self.modifiers[index] = .{
+                            .depressed = modifiers.mods_depressed,
+                            .latched = modifiers.mods_latched,
+                            .locked = modifiers.mods_locked,
+                            .group = modifiers.group,
+                        };
+                    }
+                    self.modifier_count += 1;
+                    break :value .modifiers;
+                },
+                .leave => .leave,
+                .key => return,
+            };
+            self.tags[self.count] = tag;
+            self.count += 1;
+        }
+
+        fn expectInitial(self: *const KeyboardLog, serial: u32) !void {
+            try std.testing.expectEqualSlices(
+                KeyboardTag,
+                &.{ .keymap, .repeat_info, .enter, .modifiers },
+                self.tags[0..self.count],
+            );
+            try std.testing.expectEqual(@as(usize, 1), self.enter_count);
+            try std.testing.expectEqual(serial, self.enter_serials[0]);
+            try std.testing.expectEqualSlices(
+                u32,
+                &.{30},
+                self.enter_keys[0][0..self.enter_key_counts[0]],
+            );
+            try std.testing.expectEqual(@as(usize, 1), self.modifier_count);
+            try std.testing.expectEqual(serial, self.modifier_serials[0]);
+            try std.testing.expectEqual(
+                SeatDelivery.Modifiers{ .depressed = 1, .latched = 2, .locked = 4, .group = 3 },
+                self.modifiers[0],
+            );
+        }
+
+        fn expectReentered(self: *const KeyboardLog, first_serial: u32) !void {
+            try std.testing.expectEqualSlices(
+                KeyboardTag,
+                &.{ .keymap, .repeat_info, .enter, .modifiers, .leave, .enter, .modifiers },
+                self.tags[0..self.count],
+            );
+            try std.testing.expectEqual(@as(usize, 2), self.enter_count);
+            try std.testing.expectEqual(first_serial, self.enter_serials[0]);
+            try std.testing.expect(self.enter_serials[1] != first_serial);
+            try std.testing.expectEqualSlices(
+                u32,
+                &.{30},
+                self.enter_keys[1][0..self.enter_key_counts[1]],
+            );
+            try std.testing.expectEqual(self.enter_serials[1], self.modifier_serials[1]);
+            try std.testing.expectEqual(self.modifiers[0], self.modifiers[1]);
+        }
+
+        fn expectGrabbed(self: *const KeyboardLog, first_serial: u32, grab_serial: u32) !void {
+            try std.testing.expectEqualSlices(
+                KeyboardTag,
+                &.{
+                    .keymap,
+                    .repeat_info,
+                    .enter,
+                    .modifiers,
+                    .leave,
+                    .enter,
+                    .modifiers,
+                    .leave,
+                    .enter,
+                    .modifiers,
+                },
+                self.tags[0..self.count],
+            );
+            try std.testing.expectEqual(@as(usize, 3), self.enter_count);
+            try std.testing.expectEqual(first_serial, self.enter_serials[0]);
+            try std.testing.expectEqual(grab_serial, self.enter_serials[2]);
+            try std.testing.expectEqualSlices(
+                u32,
+                &.{30},
+                self.enter_keys[2][0..self.enter_key_counts[2]],
+            );
+            try std.testing.expectEqual(grab_serial, self.modifier_serials[2]);
+            try std.testing.expectEqual(self.modifiers[0], self.modifiers[2]);
+        }
+    };
+
+    fd: std.posix.fd_t,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    seat: ?*client_wl.Seat = null,
+    first: KeyboardLog = .{},
+    second: KeyboardLog = .{},
+    third: KeyboardLog = .{},
+
+    fn run(self: *MatureKeyboardClient) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *MatureKeyboardClient) !void {
+        const raw_wake_fd = std.os.linux.dup(self.fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+
+        const display = try client_wl.Display.connectToFd(self.fd);
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*MatureKeyboardClient, registryEvent, self);
+        try expectClientRoundtrip(display);
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        defer compositor.destroy();
+        const seat = self.seat orelse return error.SeatMissing;
+        var seat_live = true;
+        defer if (seat_live) seat.release();
+        const surface = try compositor.createSurface();
+        defer surface.destroy();
+        const first = try seat.getKeyboard();
+        var first_live = true;
+        defer if (first_live) first.release();
+        first.setListener(*KeyboardLog, KeyboardLog.handleEvent, &self.first);
+        try expectClientRoundtrip(display);
+        try self.pause(.resources_bound);
+
+        try expectClientRoundtrip(display);
+        const first_serial = self.first.enter_serials[0];
+        if (first_serial == 0) return error.KeyboardEnterMissing;
+        try self.first.expectInitial(first_serial);
+        try self.pause(.focused);
+
+        const second = try seat.getKeyboard();
+        var second_live = true;
+        defer if (second_live) second.release();
+        second.setListener(*KeyboardLog, KeyboardLog.handleEvent, &self.second);
+        try expectClientRoundtrip(display);
+        try self.first.expectInitial(first_serial);
+        try self.second.expectInitial(first_serial);
+        try self.pause(.late_bound);
+
+        try expectClientRoundtrip(display);
+        try self.first.expectReentered(first_serial);
+        try self.second.expectReentered(first_serial);
+        if (self.first.enter_serials[1] != self.second.enter_serials[1])
+            return error.KeyboardReenterSerialMismatch;
+        try self.pause(.reentered);
+
+        second.release();
+        second_live = false;
+        try expectClientRoundtrip(display);
+        const third = try seat.getKeyboard();
+        var third_live = true;
+        defer if (third_live) third.release();
+        third.setListener(*KeyboardLog, KeyboardLog.handleEvent, &self.third);
+        try expectClientRoundtrip(display);
+        const grab_serial = self.first.enter_serials[2];
+        try self.first.expectGrabbed(first_serial, grab_serial);
+        try self.third.expectInitial(grab_serial);
+        try self.pause(.resource_rebound);
+
+        third.release();
+        third_live = false;
+        first.release();
+        first_live = false;
+        seat.release();
+        seat_live = false;
+        try expectClientRoundtrip(display);
+    }
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *MatureKeyboardClient) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor") and self.compositor == null)
+                    self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null
+                else if (std.mem.eql(u8, interface, "wl_seat") and self.seat == null) {
+                    self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null;
+                    if (self.seat) |seat| seat.setListener(*MatureKeyboardClient, seatEvent, self);
+                }
+            },
+            .global_remove => {},
+        }
+    }
+
+    fn seatEvent(_: *client_wl.Seat, _: client_wl.Seat.Event, _: *MatureKeyboardClient) void {}
+
+    fn pause(self: *MatureKeyboardClient, stage_value: Stage) !void {
+        self.stage.store(@intFromEnum(stage_value), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+
+    fn closeWake(self: *MatureKeyboardClient, shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(-2, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+
+    fn shutdown(self: *MatureKeyboardClient) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
 fn connectWayringTestSocket(path: [:0]const u8) !std.posix.fd_t {
     const linux = std.os.linux;
     var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
@@ -14699,6 +15123,21 @@ fn waitForWayringSeatStage(
         if (host.failure()) |err| return err;
     }
     return error.WayringClientTimedOut;
+}
+
+fn waitForMatureKeyboardStage(
+    server: *Self,
+    client: *MatureKeyboardClient,
+    expected: MatureKeyboardClient.Stage,
+) !void {
+    for (0..1_000) |_| {
+        const stage: MatureKeyboardClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure.?;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+    }
+    return error.MatureKeyboardClientTimedOut;
 }
 
 fn wayringSurfaceWithPixel(server: *Self, pixel: u32) ?SurfaceRegistry.Id {
@@ -15958,7 +16397,7 @@ test "production Wayring seat global accepts canonical input through the real ho
     try waitForWayringSeatStage(server, host, &client, .resources_released);
     try std.testing.expectEqual(@as(usize, 1), server.client_registry.len());
     try std.testing.expectEqual(@as(usize, 2), compositor.surfaceCount());
-    try std.testing.expectEqual(FocusArbiter.Frontend.generated, server.focus_arbiter.target().?.frontend);
+    try std.testing.expect(server.seat.generatedKeyboardFocus() != null);
     try std.testing.expect(server.seat.pointerFocus().?.generated != null);
 
     try signalWayringCommand(command_fd);
@@ -15967,7 +16406,7 @@ test "production Wayring seat global accepts canonical input through the real ho
     joined = true;
     try waitForWayringDisconnect(server, host, &compositor);
     try std.testing.expectEqual(@as(usize, 0), server.client_registry.len());
-    try std.testing.expect(server.focus_arbiter.target() == null);
+    try std.testing.expect(server.seat.generatedKeyboardFocus() == null);
     try std.testing.expect(server.seat.pointerFocus() == null);
     if (server.seat.cursorInfo()) |cursor| switch (cursor) {
         .generated => return error.StaleGeneratedCursor,

@@ -46,7 +46,9 @@ repaint_listener: ?RepaintListener,
 keyboard_focus_listeners: std.ArrayList(KeyboardFocusListener),
 parent_focused: bool,
 focus: ?Surface.Id,
+mature_keyboard_focus_client: ?ClientRegistry.Id,
 generated_keyboard_focus: ?GeneratedKeyboardFocus,
+generated_keyboard_mature_fallback: ?Surface.Id,
 pointer_focus: ?PointerFocus,
 pointer_position: ?PointerPosition,
 touch_points: std.ArrayList(TouchPoint),
@@ -320,7 +322,9 @@ pub fn init(
         .keyboard_focus_listeners = .empty,
         .parent_focused = false,
         .focus = null,
+        .mature_keyboard_focus_client = null,
         .generated_keyboard_focus = null,
+        .generated_keyboard_mature_fallback = null,
         .pointer_focus = null,
         .pointer_position = null,
         .touch_points = .empty,
@@ -698,7 +702,7 @@ pub fn clearKeyboardGrab(self: *Self, context: *anyopaque, restore_focus: bool) 
         },
         .generated => |generated| {
             const serial = self.delivery.issueSerial(generated.client) orelse {
-                self.retireGeneratedClient(generated.client);
+                _ = self.retireGeneratedClient(generated.client);
                 return;
             };
             self.delivery.deliverKeyboard(generated.client, generated.surface, .{ .modifiers = .{
@@ -868,8 +872,17 @@ fn clientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
     std.debug.assert(!self.clients.contains(client));
     if (self.authority.clientDisconnected(client)) self.pointer_grab = null;
+    if (self.mature_keyboard_focus_client) |focused_client| {
+        if (std.meta.eql(focused_client, client)) {
+            self.focus = null;
+            self.mature_keyboard_focus_client = null;
+        }
+    }
     if (self.generated_keyboard_focus) |focus| {
-        if (std.meta.eql(focus.client, client)) self.generated_keyboard_focus = null;
+        if (std.meta.eql(focus.client, client)) {
+            self.generated_keyboard_focus = null;
+            self.generated_keyboard_mature_fallback = null;
+        }
     }
     if (self.pointer_focus) |focus| if (focus.generated) |generated| {
         if (std.meta.eql(generated.client, client)) {
@@ -1168,46 +1181,144 @@ pub fn setRepeatInfo(self: *Self, rate: i32, delay: i32) void {
     }
 }
 
-pub fn setKeyboardFocus(self: *Self, focus: ?Surface.Id) void {
-    if (self.generated_keyboard_focus == null and std.meta.eql(self.focus, focus)) return;
+/// Applies one mature server-policy candidate. Invalid or absent candidates
+/// clear focus; protocol resources and frontend-discriminated state never
+/// cross this boundary.
+pub fn applyMatureKeyboardFocus(self: *Self, requested: ?Surface.Id) bool {
+    const focus: ?Surface.Id = if (requested) |surface|
+        if (self.matureSurfaceOwner(surface) != null) surface else null
+    else
+        null;
+    const client: ?ClientRegistry.Id = if (focus) |surface|
+        self.matureSurfaceOwner(surface)
+    else
+        null;
+    const changed = self.generated_keyboard_focus != null or
+        !std.meta.eql(self.focus, focus) or
+        !std.meta.eql(self.mature_keyboard_focus_client, client);
+    self.generated_keyboard_mature_fallback = null;
+    if (!changed) return false;
     if (self.keyboard_grab) |grab| if (grab.surface != null) {
         self.focus = focus;
+        self.mature_keyboard_focus_client = client;
         self.generated_keyboard_focus = null;
-        self.authority.clearKeyboardEnter();
-        return;
+        return true;
     };
     if (self.parent_focused) self.sendLeave();
     self.focus = focus;
+    self.mature_keyboard_focus_client = client;
     self.generated_keyboard_focus = null;
     self.authority.clearKeyboardEnter();
     if (self.parent_focused) {
         self.notifyKeyboardFocus();
         self.sendEnter();
     }
+    return true;
 }
 
-/// Mirrors the FocusArbiter's selected generated target into the canonical
-/// seat delivery stream. The target remains resource-free and generational.
-pub fn setGeneratedKeyboardFocus(self: *Self, focus: ?GeneratedKeyboardFocus) void {
-    if (focus) |target| {
-        std.debug.assert(self.clients.domainOf(target.client) == .wayring_server);
-        std.debug.assert(self.surface_registry.contains(target.surface));
-    }
-    if (std.meta.eql(self.generated_keyboard_focus, focus) and self.focus == null) return;
+/// Applies one validated generated server-policy candidate and remembers the
+/// mature candidate it displaced. Arbitration is allocation-free and stores
+/// only neutral generational identities.
+pub fn applyGeneratedKeyboardFocus(
+    self: *Self,
+    focus: GeneratedKeyboardFocus,
+    mature_fallback: ?Surface.Id,
+) bool {
+    if (!self.generatedKeyboardFocusLive(focus)) return false;
+    const changed = !std.meta.eql(self.generated_keyboard_focus, focus) or self.focus != null;
+    self.generated_keyboard_mature_fallback = mature_fallback;
+    if (!changed) return false;
     if (self.keyboard_grab) |grab| if (grab.surface != null) {
         self.focus = null;
+        self.mature_keyboard_focus_client = null;
         self.generated_keyboard_focus = focus;
-        self.authority.clearKeyboardEnter();
-        return;
+        return true;
     };
     if (self.parent_focused) self.sendLeave();
     self.focus = null;
+    self.mature_keyboard_focus_client = null;
     self.generated_keyboard_focus = focus;
     self.authority.clearKeyboardEnter();
     if (self.parent_focused) {
         self.notifyKeyboardFocus();
         self.sendEnter();
     }
+    return true;
+}
+
+/// Returns a still-authoritative generated target. The server applies its
+/// mature candidate when this rejects a changed fallback or stale generation,
+/// keeping the resulting leave/enter transition atomic inside Seat.
+pub fn retainGeneratedKeyboardFocus(
+    self: *Self,
+    mature_fallback: ?Surface.Id,
+) ?GeneratedKeyboardFocus {
+    const focus = self.generated_keyboard_focus orelse return null;
+    if (!self.generatedKeyboardFocusLive(focus) or
+        !optionalSurfaceIdEqual(self.generated_keyboard_mature_fallback, mature_fallback))
+    {
+        return null;
+    }
+    return focus;
+}
+
+/// Repairs one generated compound root after a topology mutation. The
+/// expected generation prevents an unrelated or reused target from changing.
+pub fn repairGeneratedKeyboardFocus(
+    self: *Self,
+    expected: SurfaceRegistry.Id,
+    repaired: GeneratedKeyboardFocus,
+) bool {
+    const current = self.generated_keyboard_focus orelse return false;
+    if (!surfaceIdEqual(current.surface, expected)) return false;
+    if (!self.generatedKeyboardFocusLive(repaired)) return self.clearGeneratedKeyboardFocus();
+    if (std.meta.eql(current, repaired)) return false;
+    if (self.keyboard_grab) |grab| if (grab.surface != null) {
+        self.generated_keyboard_focus = repaired;
+        return true;
+    };
+    if (self.parent_focused) self.sendLeave();
+    self.generated_keyboard_focus = repaired;
+    self.authority.clearKeyboardEnter();
+    if (self.parent_focused) {
+        self.notifyKeyboardFocus();
+        self.sendEnter();
+    }
+    return true;
+}
+
+pub fn clearGeneratedKeyboardFocus(self: *Self) bool {
+    if (self.generated_keyboard_focus == null) return false;
+    if (self.keyboard_grab) |grab| if (grab.surface != null) {
+        self.generated_keyboard_focus = null;
+        self.generated_keyboard_mature_fallback = null;
+        return true;
+    };
+    if (self.parent_focused) self.sendLeave();
+    self.generated_keyboard_focus = null;
+    self.generated_keyboard_mature_fallback = null;
+    self.authority.clearKeyboardEnter();
+    if (self.parent_focused) self.notifyKeyboardFocus();
+    return true;
+}
+
+pub fn generatedKeyboardFocus(self: *const Self) ?GeneratedKeyboardFocus {
+    const focus = self.generated_keyboard_focus orelse return null;
+    return if (self.generatedKeyboardFocusLive(focus)) focus else null;
+}
+
+pub fn matureKeyboardFocus(self: *const Self) ?Surface.Id {
+    const focus = self.focus orelse return null;
+    const client = self.mature_keyboard_focus_client orelse return null;
+    if (self.clients.domainOf(client) != .mature_display) return null;
+    const surface = Surface.resourceFor(self.surface_store, focus) orelse return null;
+    const current_client = self.matureClient(surface.getClient()) orelse return null;
+    return if (std.meta.eql(client, current_client)) focus else null;
+}
+
+fn generatedKeyboardFocusLive(self: *const Self, focus: GeneratedKeyboardFocus) bool {
+    return self.clients.domainOf(focus.client) == .wayring_server and
+        self.surface_registry.contains(focus.surface);
 }
 
 pub fn parentKeyboardEnter(self: *Self, pressed_keys: []const u32) error{OutOfMemory}!void {
@@ -1366,7 +1477,7 @@ fn keyWithGrab(
                 10,
             )) return;
             const serial = self.delivery.issueSerial(generated.client) orelse {
-                self.retireGeneratedClient(generated.client);
+                _ = self.retireGeneratedClient(generated.client);
                 return;
             };
             const recorded = if (state == .pressed)
@@ -1374,7 +1485,7 @@ fn keyWithGrab(
             else
                 self.recordSelectionForClient(generated.client, serial);
             if (!recorded) {
-                self.retireGeneratedClient(generated.client);
+                _ = self.retireGeneratedClient(generated.client);
                 return;
             }
             self.delivery.deliverKeyboard(generated.client, generated.surface, .{ .key = .{
@@ -1475,7 +1586,7 @@ fn sendCurrentModifiers(self: *Self, allow_grab: bool) void {
         },
         .generated => |generated| {
             const serial = self.delivery.issueSerial(generated.client) orelse {
-                self.retireGeneratedClient(generated.client);
+                _ = self.retireGeneratedClient(generated.client);
                 return;
             };
             self.delivery.deliverKeyboard(generated.client, generated.surface, .{ .modifiers = .{
@@ -1834,11 +1945,11 @@ pub fn touchDown(
     if (destination.generated_root != null) {
         if (!self.generatedTouchTargetLive(destination)) return;
         const serial = self.delivery.issueSerial(destination.client) orelse {
-            self.retireGeneratedClient(destination.client);
+            _ = self.retireGeneratedClient(destination.client);
             return;
         };
         if (!self.authority.recordAction(destination.client, serial)) {
-            self.retireGeneratedClient(destination.client);
+            _ = self.retireGeneratedClient(destination.client);
             return;
         }
         self.delivery.deliverTouch(destination.client, .{ .down = .{
@@ -1893,12 +2004,12 @@ pub fn touchUp(self: *Self, time: u32, id: i32) void {
                 return;
             }
             const serial = self.delivery.issueSerial(target.client) orelse {
-                self.retireGeneratedClient(target.client);
+                _ = self.retireGeneratedClient(target.client);
                 _ = self.touch_points.orderedRemove(index);
                 return;
             };
             if (!self.recordSelectionForClient(target.client, serial)) {
-                self.retireGeneratedClient(target.client);
+                _ = self.retireGeneratedClient(target.client);
                 _ = self.touch_points.orderedRemove(index);
                 return;
             }
@@ -2199,8 +2310,8 @@ fn createKeyboard(self: *Self, seat: *wl.Seat, id: u32) void {
     self.sendRepeatInfo(resource);
     const surface = self.keyboardDeliverySurface() orelse return;
     if (self.parent_focused and resource.getClient() == surface.getClient()) {
-        const serial = MatureSerials.issue(self.display);
-        self.recordSelection(surface.getClient(), serial);
+        const client = self.matureClient(surface.getClient()) orelse return;
+        const serial = self.authority.latestKeyboardEnterSerial(client) orelse return;
         self.sendEnterTo(resource, surface, serial);
     }
 }
@@ -2535,7 +2646,8 @@ fn sendEnter(self: *Self) void {
     switch (target) {
         .mature => |surface| {
             const serial = MatureSerials.issue(self.display);
-            self.recordSelection(surface.getClient(), serial);
+            const client = self.matureClient(surface.getClient()) orelse return;
+            std.debug.assert(self.authority.recordKeyboardEnter(client, serial));
             for (self.keyboard_resources.items) |entry| {
                 if (!self.keyboardResourceActive(entry)) continue;
                 const resource = entry.resource;
@@ -2546,11 +2658,11 @@ fn sendEnter(self: *Self) void {
         },
         .generated => |generated| {
             const serial = self.delivery.issueSerial(generated.client) orelse {
-                self.retireGeneratedClient(generated.client);
+                _ = self.retireGeneratedClient(generated.client);
                 return;
             };
             if (!self.authority.recordKeyboardEnter(generated.client, serial)) {
-                self.retireGeneratedClient(generated.client);
+                _ = self.retireGeneratedClient(generated.client);
                 return;
             }
             self.delivery.deliverKeyboard(generated.client, generated.surface, .{ .enter = .{
@@ -2574,6 +2686,7 @@ fn sendEnterTo(
 }
 
 fn sendLeave(self: *Self) void {
+    defer self.authority.clearKeyboardEnter();
     const target = self.keyboardDeliveryTarget() orelse return;
     switch (target) {
         .mature => |surface| {
@@ -2585,9 +2698,8 @@ fn sendLeave(self: *Self) void {
             }
         },
         .generated => |generated| {
-            defer self.authority.clearKeyboardEnter();
             const serial = self.delivery.issueSerial(generated.client) orelse {
-                self.retireGeneratedClient(generated.client);
+                _ = self.retireGeneratedClient(generated.client);
                 return;
             };
             self.delivery.deliverKeyboard(generated.client, generated.surface, .{
@@ -3056,11 +3168,13 @@ fn samePointerEndpoint(a: PointerFocus, b: PointerFocus) bool {
     return std.meta.eql(a.generated, b.generated);
 }
 
-pub fn retireGeneratedClient(self: *Self, client: ClientRegistry.Id) void {
+pub fn retireGeneratedClient(self: *Self, client: ClientRegistry.Id) bool {
+    var keyboard_focus_retired = false;
     if (self.generated_keyboard_focus) |focus| {
         if (std.meta.eql(focus.client, client)) {
             self.generated_keyboard_focus = null;
-            self.authority.clearKeyboardEnter();
+            self.generated_keyboard_mature_fallback = null;
+            keyboard_focus_retired = true;
         }
     }
     if (self.pointer_focus) |focus| if (focus.generated) |target| {
@@ -3085,10 +3199,20 @@ pub fn retireGeneratedClient(self: *Self, client: ClientRegistry.Id) void {
         const target = point.target orelse continue;
         if (std.meta.eql(target.client, client)) point.target = null;
     }
+    return keyboard_focus_retired;
 }
 
 fn clearGeneratedPointerClient(self: *Self, client: ClientRegistry.Id) void {
-    self.retireGeneratedClient(client);
+    _ = self.retireGeneratedClient(client);
+}
+
+fn surfaceIdEqual(first: SurfaceRegistry.Id, second: SurfaceRegistry.Id) bool {
+    return first.index == second.index and first.generation == second.generation;
+}
+
+fn optionalSurfaceIdEqual(first: ?SurfaceRegistry.Id, second: ?SurfaceRegistry.Id) bool {
+    if (first == null or second == null) return first == null and second == null;
+    return surfaceIdEqual(first.?, second.?);
 }
 
 fn adjustedPointerGrabFocus(
@@ -3249,6 +3373,61 @@ test "neutral authority forwarding preserves grant purpose and rejects stale cli
     try std.testing.expect(!seat.recordPointerEnterForClient(client, enter));
 }
 
+test "generated focus arbitration is allocation-free and generation-safe" {
+    const TestProvider = struct {
+        fn renderState(_: *anyopaque) ?SurfaceRegistry.RenderState {
+            return null;
+        }
+
+        fn provider(self: *@This()) SurfaceRegistry.Provider {
+            return .{ .context = self, .render_state = renderState };
+        }
+    };
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var clients = ClientRegistry.init(failing.allocator());
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(failing.allocator());
+    defer surfaces.deinit();
+    var provider: TestProvider = .{};
+    const surface = try surfaces.add(provider.provider());
+    defer surfaces.remove(surface);
+    const client = try clients.register(.wayring_server);
+    var seat: Self = undefined;
+    seat.clients = &clients;
+    seat.surface_registry = &surfaces;
+    seat.authority = SeatAuthority.init(failing.allocator(), &clients, &surfaces);
+    defer seat.authority.deinit();
+    seat.parent_focused = false;
+    seat.keyboard_grab = null;
+    seat.focus = null;
+    seat.mature_keyboard_focus_client = null;
+    seat.generated_keyboard_focus = null;
+    seat.generated_keyboard_mature_fallback = null;
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expect(seat.applyGeneratedKeyboardFocus(.{
+        .surface = surface,
+        .client = client,
+    }, null));
+    try std.testing.expectEqual(surface, seat.generatedKeyboardFocus().?.surface);
+    try std.testing.expectEqual(surface, seat.retainGeneratedKeyboardFocus(null).?.surface);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expect(seat.clearGeneratedKeyboardFocus());
+    try std.testing.expect(seat.generatedKeyboardFocus() == null);
+
+    const stale_client = client;
+    clients.unregister(stale_client);
+    const current_client = try clients.register(.wayring_server);
+    try std.testing.expectEqual(stale_client.index, current_client.index);
+    try std.testing.expect(stale_client.generation != current_client.generation);
+    try std.testing.expect(!seat.applyGeneratedKeyboardFocus(.{
+        .surface = surface,
+        .client = stale_client,
+    }, null));
+    clients.unregister(current_client);
+}
+
 test "v10 repeated key event gate requires down key zero rate and recipient version" {
     try std.testing.expect(keyboardKeyEventEligible(.pressed, false, 10, 1));
     try std.testing.expect(keyboardKeyEventEligible(.released, false, 10, 1));
@@ -3312,7 +3491,9 @@ test "generated focus cannot prove mature focus for an equal surface id" {
         .generated = generated,
     };
     seat.focus = null;
+    seat.mature_keyboard_focus_client = null;
     seat.generated_keyboard_focus = .{ .surface = surface_id, .client = client };
+    seat.generated_keyboard_mature_fallback = null;
     seat.keyboard_grab = null;
     seat.touch_points = .empty;
 
