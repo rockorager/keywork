@@ -97,7 +97,7 @@
   <header>
     <h1>Keywork → Wayring</h1>
     <p class="lede">Working roadmap for replacing the compositor's libwayland server path with scanner-generated Wayring, without weakening component boundaries.</p>
-    <p class="meta">Current migration implementation: <code>2dca3847</code> on <code>wayring</code> · Updated 2026-08-05 · P3-B2 generated-seat parity passed independent re-gating. P3-C is now defining the canonical ownership and atomic commit plan for generated XDG surfaces, toplevels, popups, and positioners.</p>
+    <p class="meta">Current migration implementation: <code>2707f507</code> on <code>wayring</code> · Updated 2026-08-05 · P3-C Wave 0 extracted one protocol-resource-free XDG semantic owner with mature-wire parity. The independent ownership/parity gate is in progress.</p>
   </header>
 
   <section class="summary" aria-label="Migration summary">
@@ -142,7 +142,7 @@
   </section>
 
   <section class="phase">
-    <div class="bar"><span style="width:52%"></span></div>
+    <div class="bar"><span style="width:55%"></span></div>
     <div class="phase-head">
       <div><h2>Phase 3 — Broader protocol parity and cutover readiness</h2><p class="detail">Migrate dependency-ordered protocol families while preserving one owner for output, input, windows, selection, and security policy.</p></div>
       <span class="status active">In progress</span>
@@ -162,7 +162,9 @@
     <div class="wave"><span class="wave-label">P3-B2 Wave 6</span><div><h3>Generated seat publication and acceptance</h3><p class="detail">One generated <code>wl_seat</code> v11 is now published in deterministic sidecar registry order, with real-client pointer, keyboard, touch, cursor, release, disconnect, and reconnect acceptance. <code>WAYLAND_DISPLAY</code> remains mature libwayland.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">P3-B2 repair</span><div><h3>Canonical focus and late-keyboard parity</h3><p class="detail">Cross-frontend focus now belongs exclusively to the canonical Seat; mature late keyboard resources reuse retained logical enter authority, and focused mature-client retirement clears listener state synchronously.</p></div><span class="status done">Integrated</span></div>
     <div class="wave"><span class="wave-label">P3-B2 gate</span><div><h3>Independent generated-seat honesty and parity review</h3><p class="detail">Global honesty, sole Seat ownership, input delivery, authority, failure isolation, listener teardown, real-client acceptance, and the unchanged mature socket passed independent re-review.</p></div><span class="status done">Passed</span></div>
-    <div class="wave"><span class="wave-label">P3-C design</span><div><h3>Atomic XDG window roles</h3><p class="detail">Define the ownership boundary and dependency-ordered waves for generated wm-base, surface, toplevel, popup, and positioner integration into canonical window policy.</p></div><span class="status active">In progress</span></div>
+    <div class="wave"><span class="wave-label">P3-C design</span><div><h3>Single neutral XDG semantic core</h3><p class="detail">Settled one protocol-resource-free owner for XDG surface, toplevel, popup, positioner, configure, and window-state semantics, with mature and generated frontends limited to wire adaptation.</p></div><span class="status done">Complete</span></div>
+    <div class="wave"><span class="wave-label">P3-C Wave 0</span><div><h3>Neutral XDG shell core</h3><p class="detail">Generational IDs, neutral configure tokens, popup placement, and canonical Scene/state ownership now live in one protocol-resource-free core while the mature adapter retains wire-resource ownership.</p></div><span class="status done">Integrated</span></div>
+    <div class="wave"><span class="wave-label">P3-C Wave 0 gate</span><div><h3>Independent ownership and parity review</h3><p class="detail">Resource isolation, token and ack behavior, role and popup semantics, observer ordering, teardown, mature parity, and no-generated-publication checks are under independent review.</p></div><span class="status active">In progress</span></div>
     <div class="wave"><span class="wave-label">P3-D</span><div><h3>Scale and interaction ergonomics</h3><p class="detail">Viewporter plus fractional scale, decoration, cursor-shape with SHM fallback, and activation on shared output/seat/XDG owners.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">P3-E1–E3</span><div><h3>Selection, drag, and text input</h3><p class="detail">Core data-device/DnD, primary and privileged data-control, then text-input/input-method as coherent shared-state families.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">P3-F</span><div><h3>Session shell roles</h3><p class="detail">Layer shell, session lock, idle notification, and workspace behavior needed by the Keywork shell.</p></div><span class="status proposed">Planned</span></div>
