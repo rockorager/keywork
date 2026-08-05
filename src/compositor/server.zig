@@ -11727,6 +11727,10 @@ const WayringHeadlessClient = struct {
     release_count: std.atomic.Value(u8) = .init(0),
     frame_done_count: std.atomic.Value(u8) = .init(0),
     last_frame_timestamp_ms: std.atomic.Value(u32) = .init(0),
+    preferred_buffer_scale_count: std.atomic.Value(u8) = .init(0),
+    preferred_buffer_scale: std.atomic.Value(i32) = .init(0),
+    preferred_buffer_transform_count: std.atomic.Value(u8) = .init(0),
+    preferred_buffer_transform: std.atomic.Value(i32) = .init(std.math.maxInt(i32)),
 
     fn run(self: *WayringHeadlessClient) void {
         self.runFallible() catch |err| {
@@ -11771,6 +11775,14 @@ const WayringHeadlessClient = struct {
         const shm = self.shm orelse return error.ShmMissing;
         const surface = try compositor.createSurface();
         defer surface.destroy();
+        surface.setListener(*WayringHeadlessClient, surfaceEvent, self);
+        try expectClientRoundtrip(display);
+        if (self.preferred_buffer_scale_count.load(.acquire) != 1 or
+            self.preferred_buffer_scale.load(.acquire) != 1)
+            return error.UnexpectedPreferredBufferScale;
+        if (self.preferred_buffer_transform_count.load(.acquire) != 1 or
+            self.preferred_buffer_transform.load(.acquire) != @intFromEnum(wayland.client.wl.Output.Transform.normal))
+            return error.UnexpectedPreferredBufferTransform;
         const region = try compositor.createRegion();
         region.add(0, 0, 2, 1);
         region.subtract(1, 0, 1, 1);
@@ -12004,6 +12016,24 @@ const WayringHeadlessClient = struct {
         }
     }
 
+    fn surfaceEvent(
+        _: *wayland.client.wl.Surface,
+        event: wayland.client.wl.Surface.Event,
+        self: *WayringHeadlessClient,
+    ) void {
+        switch (event) {
+            .preferred_buffer_scale => |preferred| {
+                self.preferred_buffer_scale.store(preferred.factor, .monotonic);
+                _ = self.preferred_buffer_scale_count.fetchAdd(1, .release);
+            },
+            .preferred_buffer_transform => |preferred| {
+                self.preferred_buffer_transform.store(@intFromEnum(preferred.transform), .monotonic);
+                _ = self.preferred_buffer_transform_count.fetchAdd(1, .release);
+            },
+            .enter, .leave => {},
+        }
+    }
+
     fn frameEvent(
         callback: *wayland.client.wl.Callback,
         event: wayland.client.wl.Callback.Event,
@@ -12193,7 +12223,7 @@ fn renderPendingWayringFrame(server: *Self, host: anytype, previous_frames: u64)
     return error.WayringFrameTimedOut;
 }
 
-test "Wayring wl_compositor v5 offset state and sampled headless content end to end" {
+test "Wayring wl_compositor v6 preferences offset state and sampled headless content end to end" {
     const WayringHost = @import("wayland/WayringHost.zig");
     const wayring = @import("wayring");
     const linux = std.os.linux;
@@ -12276,7 +12306,14 @@ test "Wayring wl_compositor v5 offset state and sampled headless content end to 
     var previous_frames = output.frame_statistics.frames_presented;
     try waitForWayringClientStage(server, host, &client, .initial_released);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
-    try std.testing.expectEqual(@as(u32, 5), client.compositor_version.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 6), client.compositor_version.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 1), client.preferred_buffer_scale_count.load(.acquire));
+    try std.testing.expectEqual(@as(i32, 1), client.preferred_buffer_scale.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 1), client.preferred_buffer_transform_count.load(.acquire));
+    try std.testing.expectEqual(
+        @as(i32, @intFromEnum(wayland.client.wl.Output.Transform.normal)),
+        client.preferred_buffer_transform.load(.acquire),
+    );
     try std.testing.expectEqual(@as(u8, 1), client.release_count.load(.acquire));
     try std.testing.expectEqual(registry_baseline + 1, server.surface_registry.len());
     try std.testing.expectEqual(@as(usize, 1), compositor.surfaceCount());
@@ -12475,6 +12512,8 @@ test "Wayring wl_compositor v5 offset state and sampled headless content end to 
     try waitForWayringDisconnect(server, host, &compositor);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
     try std.testing.expectEqual(@as(u8, 7), client.frame_done_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 1), client.preferred_buffer_scale_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 1), client.preferred_buffer_transform_count.load(.acquire));
     try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, null);
