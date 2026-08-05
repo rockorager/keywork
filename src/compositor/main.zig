@@ -183,6 +183,7 @@ pub fn main(init: std.process.Init) !void {
     var wayring_outputs_initialized = false;
     var wayring_seat_adapter: WayringSeatAdapter = undefined;
     var wayring_seat_adapter_initialized = false;
+    var wayring_seat_published = false;
     const WayringLifecycle = struct {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
@@ -210,14 +211,15 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_outputs_initialized) wayring_outputs.deinit();
         if (wayring_seat_adapter_initialized) {
-            wayring_seat_adapter.clearCursorListener();
+            if (wayring_seat_published) wayring_seat_adapter.unpublish();
             server.clearGeneratedSeatDeliverySink(&wayring_seat_adapter);
+            wayring_seat_adapter.clearCursorListener();
             wayring_seat_adapter.deinit();
             wayring_seat_adapter_initialized = false;
         }
         if (wayring_clients_initialized) wayring_clients.deinit();
-        if (wayring_outputs_initialized) wayring_outputs.deinit();
         if (wayring_compositor_initialized) wayring_compositor.deinit();
         if (wayring_protocol_server) |*protocol_server| protocol_server.deinit();
     }
@@ -243,9 +245,11 @@ pub fn main(init: std.process.Init) !void {
             server.generatedSeatRequestSink(),
             server.generatedSeatName(),
         );
+        wayring_seat_adapter_initialized = true;
         wayring_seat_adapter.installCursorListener();
         server.setGeneratedSeatDeliverySink(wayring_seat_adapter.sink());
-        wayring_seat_adapter_initialized = true;
+        try wayring_seat_adapter.publish();
+        wayring_seat_published = true;
         if (server.wayringOutputLayout()) |output_layout| {
             try wayring_outputs.init(
                 init.gpa,
