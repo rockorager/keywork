@@ -1,5 +1,6 @@
-//! Scanner-backed Wayring ownership slice for wl_compositor, wl_surface, and
-//! wl_shm.
+//! Scanner-backed Wayring ownership slice for wl_compositor, wl_surface,
+//! wl_subcompositor/wl_subsurface, and wl_shm. Subcompositor publication is
+//! test-only until the production-advertisement wave.
 //!
 //! Surfaces use the compositor-wide registry for identity and borrowed render
 //! state. Wayring object ownership remains isolated per client; presentation
@@ -70,6 +71,7 @@ const FrameCallback = struct {
 };
 
 const Surface = struct {
+    const Role = enum { none, subsurface, other };
     resource: core.wl_surface.Resource,
     id: SurfaceId,
     destroying: bool = false,
@@ -100,7 +102,10 @@ const Surface = struct {
     next_content_sequence: ?u64 = 1,
     content_updates: std.ArrayList(ContentUpdate) = .empty,
     relationship: ?Relationship = null,
+    role: Role = .none,
+    active_subsurface: ?*Subsurface = null,
     children: std.ArrayList(ChildPlacement) = .empty,
+    parent_sentinel_index: usize = 0,
     topology_dirty: bool = false,
 };
 
@@ -114,6 +119,7 @@ const Relationship = struct {
     identity: AssociationIdentity,
     local_sync: bool = true,
     position: Position = .{},
+    detached: bool = true,
 };
 
 const ChildPlacement = struct {
@@ -172,6 +178,17 @@ const ApplyScratch = struct {
         self.plan.deinit(allocator);
         self.active.deinit(allocator);
         self.visits.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const DesyncTransition = struct {
+    affected: std.ArrayList(SurfaceId) = .empty,
+    scratch: ?ApplyScratch = null,
+
+    fn deinit(self: *DesyncTransition, allocator: std.mem.Allocator) void {
+        if (self.scratch) |*scratch| scratch.deinit(allocator);
+        self.affected.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -266,6 +283,12 @@ const Compositor = struct {
     resource: core.wl_compositor.Resource,
 };
 
+const Subcompositor = struct { resource: core.wl_subcompositor.Resource };
+const Subsurface = struct {
+    resource: core.wl_subsurface.Resource,
+    identity: AssociationIdentity,
+};
+
 const RegionResource = struct {
     resource: core.wl_region.Resource,
     value: Region,
@@ -274,6 +297,8 @@ const RegionResource = struct {
 const ClientObjects = struct {
     client: *server.Client,
     compositors: std.ArrayList(*Compositor) = .empty,
+    subcompositors: std.ArrayList(*Subcompositor) = .empty,
+    subsurfaces: std.ArrayList(*Subsurface) = .empty,
     surfaces: std.ArrayList(*Surface) = .empty,
     regions: std.ArrayList(*RegionResource) = .empty,
 };
@@ -298,6 +323,7 @@ protocol_server: *server.Server,
 surface_registry: *SurfaceRegistry,
 presentation_listener: ?PresentationListener,
 global: *const server.Server.Global,
+subcompositor_global: if (builtin.is_test) ?*const server.Server.Global else void,
 shm: Shm,
 clients: std.ArrayList(*ClientObjects) = .empty,
 owned_provider_count: usize = 0,
@@ -321,6 +347,7 @@ pub fn init(
         .presentation_listener = presentation_listener,
         .global = undefined,
         .shm = .init(allocator),
+        .subcompositor_global = if (builtin.is_test) null else {},
         .completing_frame_callbacks = false,
         .commit_fault = if (builtin.is_test) null else {},
     };
@@ -342,6 +369,11 @@ pub fn deinit(self: *WayringCompositor) void {
         error.AlreadyRemoved => {},
         error.ForeignGlobal => unreachable,
     };
+    if (builtin.is_test) if (self.subcompositor_global) |global|
+        self.protocol_server.removeGlobal(global) catch |err| switch (err) {
+            error.AlreadyRemoved => {},
+            error.ForeignGlobal => unreachable,
+        };
     self.shm.deinit();
     self.clients.deinit(self.allocator);
     self.* = undefined;
@@ -350,6 +382,8 @@ pub fn deinit(self: *WayringCompositor) void {
 pub fn destroyClientResources(self: *WayringCompositor, client: *server.Client) void {
     for (self.clients.items, 0..) |objects, index| {
         if (objects.client != client) continue;
+        while (objects.subsurfaces.items.len > 0)
+            self.destroySubsurface(objects.subsurfaces.items[objects.subsurfaces.items.len - 1]);
         while (objects.surfaces.items.len > 0) {
             self.destroySurface(objects.surfaces.items[objects.surfaces.items.len - 1]);
         }
@@ -359,6 +393,10 @@ pub fn destroyClientResources(self: *WayringCompositor, client: *server.Client) 
         while (objects.compositors.items.len > 0) {
             self.destroyCompositor(objects.compositors.items[objects.compositors.items.len - 1]);
         }
+        while (objects.subcompositors.items.len > 0)
+            self.destroySubcompositor(objects.subcompositors.items[objects.subcompositors.items.len - 1]);
+        objects.subsurfaces.deinit(self.allocator);
+        objects.subcompositors.deinit(self.allocator);
         objects.surfaces.deinit(self.allocator);
         objects.regions.deinit(self.allocator);
         objects.compositors.deinit(self.allocator);
@@ -373,6 +411,18 @@ pub fn surfaceCount(self: *const WayringCompositor) usize {
     var count: usize = 0;
     for (self.clients.items) |objects| count += objects.surfaces.items.len;
     return count;
+}
+
+fn publishTestSubcompositor(self: *WayringCompositor) !void {
+    if (comptime !builtin.is_test) unreachable;
+    std.debug.assert(self.subcompositor_global == null);
+    self.subcompositor_global = try self.protocol_server.addGlobal(
+        core.wl_subcompositor,
+        1,
+        WayringCompositor,
+        self,
+        bindSubcompositor,
+    );
 }
 
 pub fn regionCount(self: *const WayringCompositor) usize {
@@ -401,12 +451,13 @@ pub fn currentBuffer(self: *WayringCompositor, id: SurfaceId) ?*CopiedBufferSnap
     return if (surface.current) |*current| current else null;
 }
 
-// Private resource-free controls exercise CU relationships until Wave 4C
-// supplies the real wl_subsurface producer. They create no protocol state.
+// Private resource-free controls exercise CU relationships without protocol
+// state. They deliberately share the production association implementation.
 fn testAssociate(self: *WayringCompositor, child_id: SurfaceId, parent_id: SurfaceId) !u64 {
     const child = self.surfaceForId(child_id) orelse return error.UnknownSurface;
     const parent = self.surfaceForId(parent_id) orelse return error.UnknownSurface;
-    if (child.relationship != null or std.meta.eql(child_id, parent_id)) return error.BadRelationship;
+    if ((child.role != .none and child.role != .subsurface) or child.relationship != null or
+        std.meta.eql(child_id, parent_id)) return error.BadRelationship;
     var cursor = parent;
     var depth: usize = 0;
     while (true) {
@@ -423,52 +474,80 @@ fn testAssociate(self: *WayringCompositor, child_id: SurfaceId, parent_id: Surfa
         .parent = parent_id,
         .generation = generation,
     };
-    self.next_relationship_generation = std.math.add(u64, generation, 1) catch null;
-    child.relationship = .{ .identity = identity };
-    parent.children.appendAssumeCapacity(.{ .identity = identity });
-    parent.topology_dirty = true;
+    self.publishRelationship(child, parent, identity);
     return generation;
 }
 
 fn testSetPosition(self: *WayringCompositor, child_id: SurfaceId, position: Position) !void {
     const child = self.surfaceForId(child_id) orelse return error.UnknownSurface;
-    var relationship = child.relationship orelse return error.BadRelationship;
-    const parent = self.surfaceForId(relationship.identity.parent) orelse return error.BadRelationship;
-    relationship.position = position;
-    child.relationship = relationship;
-    for (parent.children.items) |*entry| if (std.meta.eql(entry.identity, relationship.identity)) {
-        entry.position = position;
-        parent.topology_dirty = true;
-        return;
-    };
-    unreachable;
+    const identity = (child.relationship orelse return error.BadRelationship).identity;
+    return self.setRelationshipPosition(child, identity, position);
 }
 
 fn testSetSync(self: *WayringCompositor, child_id: SurfaceId) !void {
     const child = self.surfaceForId(child_id) orelse return error.UnknownSurface;
-    if (child.relationship) |*relationship| relationship.local_sync = true else return error.BadRelationship;
+    const identity = (child.relationship orelse return error.BadRelationship).identity;
+    const relationship = self.exactRelationship(child, identity) orelse return error.BadRelationship;
+    relationship.local_sync = true;
 }
 
 fn testSetDesync(self: *WayringCompositor, child_id: SurfaceId) !void {
     const child = self.surfaceForId(child_id) orelse return error.UnknownSurface;
-    const relationship = child.relationship orelse return error.BadRelationship;
+    const identity = (child.relationship orelse return error.BadRelationship).identity;
+    return self.setRelationshipDesync(child, identity);
+}
+
+fn setRelationshipDesync(self: *WayringCompositor, child: *Surface, identity: AssociationIdentity) !void {
+    const relationship = self.exactRelationship(child, identity) orelse return error.BadRelationship;
     if (!relationship.local_sync) return;
     const parent = self.surfaceForId(relationship.identity.parent) orelse return error.BadRelationship;
     if (self.effectivelySynchronized(parent)) {
-        child.relationship.?.local_sync = false;
+        relationship.local_sync = false;
         return;
     }
 
-    var affected: std.ArrayList(SurfaceId) = .empty;
-    defer affected.deinit(self.allocator);
+    var transition = try self.prepareDesyncTransition(child, true);
+    defer transition.deinit(self.allocator);
+    relationship.local_sync = false;
+    self.applyDesyncTransition(&transition);
+}
+
+/// Prebuilds every allocation needed to convert one newly desynchronized
+/// surface or the local-desync descendants exposed by removing an ancestor's
+/// role. No modes, claims, queues, or applied state change before this returns.
+fn prepareDesyncTransition(
+    self: *WayringCompositor,
+    start: *Surface,
+    include_start: bool,
+) !DesyncTransition {
+    var transition: DesyncTransition = .{};
+    errdefer transition.deinit(self.allocator);
+    if (!include_start) {
+        const has_local_desync_child = for (start.children.items) |entry| {
+            const descendant = self.surfaceForId(entry.identity.child) orelse continue;
+            const relationship = descendant.relationship orelse continue;
+            if (std.meta.eql(relationship.identity, entry.identity) and !relationship.local_sync) break true;
+        } else false;
+        if (!has_local_desync_child) return transition;
+    }
     var roots: std.ArrayList(UpdateToken) = .empty;
     defer roots.deinit(self.allocator);
-    try affected.ensureTotalCapacity(self.allocator, self.surfaceCount());
+    try transition.affected.ensureTotalCapacity(self.allocator, self.surfaceCount());
     try roots.ensureTotalCapacity(self.allocator, self.surfaceCount());
-    affected.appendAssumeCapacity(child.id);
+    if (include_start) {
+        transition.affected.appendAssumeCapacity(start.id);
+    } else {
+        for (start.children.items) |entry| {
+            const descendant = self.surfaceForId(entry.identity.child) orelse continue;
+            const descendant_relationship = descendant.relationship orelse continue;
+            if (!std.meta.eql(descendant_relationship.identity, entry.identity) or descendant_relationship.local_sync)
+                continue;
+            transition.affected.appendAssumeCapacity(descendant.id);
+        }
+    }
     var index: usize = 0;
-    while (index < affected.items.len) : (index += 1) {
-        const surface = self.surfaceForId(affected.items[index]) orelse continue;
+    while (index < transition.affected.items.len) : (index += 1) {
+        const surface = self.surfaceForId(transition.affected.items[index]) orelse continue;
         if (surface.content_updates.items.len != 0)
             roots.appendAssumeCapacity(surface.content_updates.items[surface.content_updates.items.len - 1].token);
         for (surface.children.items) |entry| {
@@ -476,44 +555,39 @@ fn testSetDesync(self: *WayringCompositor, child_id: SurfaceId) !void {
             const descendant_relationship = descendant.relationship orelse continue;
             if (!std.meta.eql(descendant_relationship.identity, entry.identity) or descendant_relationship.local_sync)
                 continue;
-            affected.appendAssumeCapacity(descendant.id);
+            transition.affected.appendAssumeCapacity(descendant.id);
         }
     }
 
-    var scratch: ?ApplyScratch = if (roots.items.len == 0)
+    transition.scratch = if (roots.items.len == 0)
         null
     else
         try self.prepareApplyScratch(roots.items, null);
-    defer if (scratch) |*value| value.deinit(self.allocator);
+    return transition;
+}
 
+fn applyDesyncTransition(self: *WayringCompositor, transition: *DesyncTransition) void {
     // With no fifo, commit-timing, or explicit-sync constraints in Wave 4B,
     // every converted queue is immediately eligible as a whole. Adding any
     // such constraint invalidates this simplification and requires selecting
     // candidates after constraint evaluation instead.
-    child.relationship.?.local_sync = false;
-    for (affected.items) |id| {
+    for (transition.affected.items) |id| {
         const surface = self.surfaceForId(id) orelse continue;
         for (surface.content_updates.items) |*update| {
             update.kind = .dcu;
             self.unlinkIncomingClaim(update);
         }
     }
-    if (scratch) |*value| self.applyScratch(value);
+    if (transition.scratch) |*scratch| self.applyScratch(scratch);
 }
 
 fn testDissociate(self: *WayringCompositor, child_id: SurfaceId) !void {
     const child = self.surfaceForId(child_id) orelse return error.UnknownSurface;
-    const relationship = child.relationship orelse return error.BadRelationship;
-    const parent = self.surfaceForId(relationship.identity.parent) orelse return error.BadRelationship;
-    self.discardSurfaceQueue(child);
-    for (parent.children.items, 0..) |entry, index| {
-        if (!std.meta.eql(entry.identity, relationship.identity)) continue;
-        _ = parent.children.orderedRemove(index);
-        break;
-    }
-    parent.topology_dirty = true;
-    child.relationship = null;
-    if (self.presentation_listener) |listener| listener.detached(listener.context, child.id);
+    const identity = (child.relationship orelse return error.BadRelationship).identity;
+    var transition = try self.prepareDesyncTransition(child, false);
+    defer transition.deinit(self.allocator);
+    if (!self.dissociate(child, identity)) return error.BadRelationship;
+    self.applyDesyncTransition(&transition);
 }
 
 /// Completes every callback committed for the canonical surface ID. Event
@@ -564,6 +638,209 @@ fn bind(client: *server.Client, id: u32, version: u32, self: *WayringCompositor)
     try compositor.resource.setHandler(WayringCompositor, self, handleCompositor, null);
     try client.materialize(&compositor.resource.runtime);
     objects.compositors.appendAssumeCapacity(compositor);
+}
+
+fn bindSubcompositor(client: *server.Client, id: u32, version: u32, self: *WayringCompositor) !void {
+    const objects = try self.clientObjects(client);
+    const had_storage = objects.subcompositors.capacity != 0;
+    try objects.subcompositors.ensureUnusedCapacity(self.allocator, 1);
+    errdefer if (!had_storage and objects.subcompositors.items.len == 0) {
+        objects.subcompositors.deinit(self.allocator);
+        objects.subcompositors = .empty;
+    };
+    const value = try self.allocator.create(Subcompositor);
+    errdefer self.allocator.destroy(value);
+    value.* = .{ .resource = .init(self.allocator, id, version, .client, client.ownerHooks()) };
+    value.resource.setHandler(WayringCompositor, self, handleSubcompositor, null) catch unreachable;
+    client.materialize(&value.resource.runtime) catch unreachable;
+    objects.subcompositors.appendAssumeCapacity(value);
+}
+
+fn handleSubcompositor(resource: *core.wl_subcompositor.Resource, request: core.wl_subcompositor.Request, self: *WayringCompositor) !void {
+    switch (request) {
+        .destroy => self.destroySubcompositor(@fieldParentPtr("resource", resource)),
+        .get_subsurface => |get| try self.createSubsurface(resource, get.id, get.surface, get.parent),
+    }
+}
+
+fn adapterSurface(objects: *ClientObjects, resource: *server.Resource) ?*Surface {
+    for (objects.surfaces.items) |surface|
+        if (&surface.resource.runtime == resource and resource.state() == .live and !surface.destroying) return surface;
+    return null;
+}
+
+fn createSubsurface(self: *WayringCompositor, manager: *core.wl_subcompositor.Resource, id: u32, child_id: u32, parent_id: u32) !void {
+    const client = self.clientForResource(&manager.runtime) orelse return error.UntrackedClient;
+    const objects = self.findClient(client) orelse return error.UntrackedClient;
+    const child = adapterSurface(objects, client.lookup(child_id) orelse {
+        client.postProtocolError(&manager.runtime, @intCast(core.wl_subcompositor.@"error".bad_surface), "invalid child surface");
+        return;
+    }) orelse {
+        client.postProtocolError(&manager.runtime, @intCast(core.wl_subcompositor.@"error".bad_surface), "invalid child surface");
+        return;
+    };
+    const parent = adapterSurface(objects, client.lookup(parent_id) orelse {
+        client.postProtocolError(&manager.runtime, @intCast(core.wl_subcompositor.@"error".bad_parent), "invalid parent surface");
+        return;
+    }) orelse {
+        client.postProtocolError(&manager.runtime, @intCast(core.wl_subcompositor.@"error".bad_parent), "invalid parent surface");
+        return;
+    };
+    if ((child.role != .none and child.role != .subsurface) or child.active_subsurface != null or child.relationship != null) {
+        client.postProtocolError(&manager.runtime, @intCast(core.wl_subcompositor.@"error".bad_surface), "surface already has a role");
+        return;
+    }
+    if (child == parent or self.wouldCreateCycle(child, parent)) {
+        client.postProtocolError(&manager.runtime, @intCast(core.wl_subcompositor.@"error".bad_parent), "parent creates a cycle");
+        return;
+    }
+    const generation = self.next_relationship_generation orelse return error.GenerationExhausted;
+    const had_subsurface_storage = objects.subsurfaces.capacity != 0;
+    try objects.subsurfaces.ensureUnusedCapacity(self.allocator, 1);
+    errdefer if (!had_subsurface_storage and objects.subsurfaces.items.len == 0) {
+        objects.subsurfaces.deinit(self.allocator);
+        objects.subsurfaces = .empty;
+    };
+    const had_children_storage = parent.children.capacity != 0;
+    try parent.children.ensureUnusedCapacity(self.allocator, 1);
+    errdefer if (!had_children_storage and parent.children.items.len == 0) {
+        parent.children.deinit(self.allocator);
+        parent.children = .empty;
+    };
+    const value = try self.allocator.create(Subsurface);
+    errdefer self.allocator.destroy(value);
+    const identity: AssociationIdentity = .{ .child = child.id, .parent = parent.id, .generation = generation };
+    value.* = .{ .resource = .init(self.allocator, id, 1, .client, client.ownerHooks()), .identity = identity };
+    value.resource.setHandler(WayringCompositor, self, handleSubsurface, null) catch unreachable;
+    client.materialize(&value.resource.runtime) catch unreachable;
+    self.publishRelationship(child, parent, identity);
+    child.active_subsurface = value;
+    objects.subsurfaces.appendAssumeCapacity(value);
+}
+
+fn publishRelationship(self: *WayringCompositor, child: *Surface, parent: *Surface, identity: AssociationIdentity) void {
+    self.next_relationship_generation = if (identity.generation == std.math.maxInt(u64)) null else identity.generation + 1;
+    child.role = .subsurface;
+    child.relationship = .{ .identity = identity };
+    parent.children.appendAssumeCapacity(.{ .identity = identity });
+    parent.topology_dirty = true;
+    if (self.presentation_listener) |listener| listener.detached(listener.context, child.id);
+}
+
+fn exactRelationship(self: *WayringCompositor, child: *Surface, identity: AssociationIdentity) ?*Relationship {
+    _ = self;
+    const relationship = if (child.relationship) |*value| value else return null;
+    return if (std.meta.eql(relationship.identity, identity)) relationship else null;
+}
+
+fn wouldCreateCycle(self: *WayringCompositor, child: *Surface, parent: *Surface) bool {
+    var cursor = parent;
+    var depth: usize = 0;
+    while (true) {
+        if (cursor == child) return true;
+        const relationship = cursor.relationship orelse return false;
+        cursor = self.surfaceForId(relationship.identity.parent) orelse return false;
+        depth += 1;
+        if (depth >= self.surfaceCount()) return true;
+    }
+}
+
+fn handleSubsurface(resource: *core.wl_subsurface.Resource, request: core.wl_subsurface.Request, self: *WayringCompositor) !void {
+    const value: *Subsurface = @fieldParentPtr("resource", resource);
+    if (request == .destroy) {
+        try self.destroySubsurfaceRequest(value);
+        return;
+    }
+    const child = self.surfaceForId(value.identity.child) orelse return;
+    const parent = self.surfaceForId(value.identity.parent) orelse return;
+    const relationship = self.exactRelationship(child, value.identity) orelse return;
+    if (child.active_subsurface != value) return;
+    switch (request) {
+        .destroy => unreachable,
+        .set_position => |set| try self.setRelationshipPosition(child, value.identity, .{ .x = set.x, .y = set.y }),
+        .place_above => |place| self.restackSubsurface(value, child, parent, place.sibling, true),
+        .place_below => |place| self.restackSubsurface(value, child, parent, place.sibling, false),
+        .set_sync => relationship.local_sync = true,
+        .set_desync => try self.setRelationshipDesync(child, value.identity),
+    }
+}
+
+fn destroySubsurfaceRequest(self: *WayringCompositor, value: *Subsurface) !void {
+    const child = self.surfaceForId(value.identity.child) orelse {
+        self.destroySubsurface(value);
+        return;
+    };
+    if (child.active_subsurface != value or self.exactRelationship(child, value.identity) == null) {
+        self.destroySubsurface(value);
+        return;
+    }
+    var transition = try self.prepareDesyncTransition(child, false);
+    defer transition.deinit(self.allocator);
+    self.destroySubsurface(value);
+    self.applyDesyncTransition(&transition);
+}
+
+fn setRelationshipPosition(
+    self: *WayringCompositor,
+    child: *Surface,
+    identity: AssociationIdentity,
+    position: Position,
+) !void {
+    const relationship = self.exactRelationship(child, identity) orelse return error.BadRelationship;
+    const parent = self.surfaceForId(identity.parent) orelse return error.BadRelationship;
+    for (parent.children.items) |*entry| if (std.meta.eql(entry.identity, identity)) {
+        relationship.position = position;
+        entry.position = position;
+        parent.topology_dirty = true;
+        return;
+    };
+    return error.BadRelationship;
+}
+
+fn restackSubsurface(self: *WayringCompositor, value: *Subsurface, child: *Surface, parent: *Surface, sibling_id: u32, above: bool) void {
+    const resource = &value.resource;
+    const client = self.clientForResource(&resource.runtime) orelse return;
+    const objects = self.findClient(client) orelse return;
+    const sibling_resource = client.lookup(sibling_id) orelse return self.badSubsurface(client, resource);
+    const sibling = adapterSurface(objects, sibling_resource) orelse return self.badSubsurface(client, resource);
+    if (sibling == child) return self.badSubsurface(client, resource);
+    var old: ?usize = null;
+    for (parent.children.items, 0..) |entry, index| if (std.meta.eql(entry.identity, value.identity)) {
+        old = index;
+        break;
+    };
+    const old_index = old orelse return self.badSubsurface(client, resource);
+    var sentinel = parent.parent_sentinel_index;
+    if (old_index < sentinel) sentinel -= 1;
+    var target: usize = undefined;
+    var inserted_below_parent = false;
+    if (sibling == parent) target = sentinel else {
+        const relationship = sibling.relationship orelse return self.badSubsurface(client, resource);
+        if (!std.meta.eql(relationship.identity.parent, parent.id)) return self.badSubsurface(client, resource);
+        const sibling_role = sibling.active_subsurface orelse return self.badSubsurface(client, resource);
+        if (!std.meta.eql(sibling_role.identity, relationship.identity)) return self.badSubsurface(client, resource);
+        const sibling_index = for (parent.children.items, 0..) |entry, index| {
+            if (std.meta.eql(entry.identity, relationship.identity)) {
+                var adjusted = index;
+                if (old_index < adjusted) adjusted -= 1;
+                break adjusted;
+            }
+        } else return self.badSubsurface(client, resource);
+        inserted_below_parent = sibling_index < sentinel;
+        target = if (above) sibling_index + 1 else sibling_index;
+    }
+    const entry = parent.children.orderedRemove(old_index);
+    parent.children.insertAssumeCapacity(target, entry);
+    if (sibling == parent) {
+        if (!above) sentinel += 1;
+    } else if (inserted_below_parent) sentinel += 1;
+    parent.parent_sentinel_index = sentinel;
+    parent.topology_dirty = true;
+}
+
+fn badSubsurface(self: *WayringCompositor, client: *server.Client, resource: *core.wl_subsurface.Resource) void {
+    _ = self;
+    client.postProtocolError(&resource.runtime, @intCast(core.wl_subsurface.@"error".bad_surface), "invalid placement reference");
 }
 
 fn handleCompositor(
@@ -707,7 +984,15 @@ fn handleSurface(
     self: *WayringCompositor,
 ) !void {
     switch (request) {
-        .destroy => self.destroySurface(@fieldParentPtr("resource", resource)),
+        .destroy => {
+            const surface: *Surface = @fieldParentPtr("resource", resource);
+            if (surface.active_subsurface != null) {
+                const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
+                client.postProtocolError(&resource.runtime, @intCast(core.wl_surface.@"error".defunct_role_object), "surface has a live role object");
+                return;
+            }
+            self.destroySurface(surface);
+        },
         .attach => |attach| try self.attachSurface(resource, attach.buffer, attach.x, attach.y),
         .damage => |damage| {
             if (damage.width > 0 and damage.height > 0) {
@@ -997,8 +1282,12 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
         var value_owned = true;
         errdefer if (value_owned) value.deinit(self.allocator);
         try value.ensureTotalCapacity(self.allocator, surface.children.items.len + 1);
+        for (surface.children.items[0..surface.parent_sentinel_index]) |child| value.appendAssumeCapacity(.{ .child = .{
+            .identity = child.identity,
+            .position = child.position,
+        } });
         value.appendAssumeCapacity(.parent);
-        for (surface.children.items) |child| value.appendAssumeCapacity(.{ .child = .{
+        for (surface.children.items[surface.parent_sentinel_index..]) |child| value.appendAssumeCapacity(.{ .child = .{
             .identity = child.identity,
             .position = child.position,
         } });
@@ -1221,11 +1510,15 @@ fn applyScratch(self: *WayringCompositor, scratch: *ApplyScratch) void {
             const start = scratch.stack_entries.items.len;
             for (topology.items) |entry| switch (entry) {
                 .parent => scratch.stack_entries.appendAssumeCapacity(.parent),
-                .child => |child| if (self.associationLive(surface.id, child.identity))
+                .child => |child| if (self.associationLive(surface.id, child.identity)) {
+                    if (self.surfaceForId(child.identity.child)) |live_child| {
+                        if (live_child.relationship) |*relationship| relationship.detached = false;
+                    }
                     scratch.stack_entries.appendAssumeCapacity(.{ .child = .{
                         .id = child.identity.child,
                         .position = child.position,
-                    } }),
+                    } });
+                },
             };
             const stack = scratch.stack_entries.items[start..];
             var parent_found = false;
@@ -1513,6 +1806,57 @@ fn clientForResource(self: *WayringCompositor, resource: *server.Resource) ?*ser
     return null;
 }
 
+fn destroySubcompositor(self: *WayringCompositor, value: *Subcompositor) void {
+    const client = self.clientForResource(&value.resource.runtime) orelse unreachable;
+    const objects = self.findClient(client) orelse unreachable;
+    removePointer(Subcompositor, &objects.subcompositors, value);
+    value.resource.destroy();
+    value.resource.deinit();
+    self.allocator.destroy(value);
+}
+
+fn notifyDetached(self: *WayringCompositor, child: *Surface, identity: AssociationIdentity) void {
+    const relationship = self.exactRelationship(child, identity) orelse return;
+    if (relationship.detached) return;
+    relationship.detached = true;
+    if (self.presentation_listener) |listener| listener.detached(listener.context, child.id);
+}
+
+/// Removes one exact association without touching a replacement that happens
+/// to reuse the same canonical child. Queued CUs hold only this identity, so a
+/// stale topology snapshot can never retain or recover the role resource.
+fn dissociate(self: *WayringCompositor, child: *Surface, identity: AssociationIdentity) bool {
+    _ = self.exactRelationship(child, identity) orelse return false;
+    self.discardSurfaceQueue(child);
+    if (self.surfaceForId(identity.parent)) |parent| {
+        for (parent.children.items, 0..) |entry, index| {
+            if (!std.meta.eql(entry.identity, identity)) continue;
+            _ = parent.children.orderedRemove(index);
+            if (index < parent.parent_sentinel_index) parent.parent_sentinel_index -= 1;
+            parent.topology_dirty = true;
+            break;
+        }
+    }
+    self.notifyDetached(child, identity);
+    child.relationship = null;
+    return true;
+}
+
+fn destroySubsurface(self: *WayringCompositor, value: *Subsurface) void {
+    const client = self.clientForResource(&value.resource.runtime) orelse unreachable;
+    const objects = self.findClient(client) orelse unreachable;
+    if (self.surfaceForId(value.identity.child)) |child| {
+        if (child.active_subsurface == value and self.exactRelationship(child, value.identity) != null) {
+            _ = self.dissociate(child, value.identity);
+            child.active_subsurface = null;
+        }
+    }
+    removePointer(Subsurface, &objects.subsurfaces, value);
+    value.resource.destroy();
+    value.resource.deinit();
+    self.allocator.destroy(value);
+}
+
 fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     const client = self.clientForResource(&surface.resource.runtime) orelse unreachable;
     const objects = self.findClient(client) orelse unreachable;
@@ -1522,15 +1866,15 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     if (surface.relationship) |relationship| if (self.surfaceForId(relationship.identity.parent)) |parent| {
         for (parent.children.items, 0..) |entry, index| if (std.meta.eql(entry.identity, relationship.identity)) {
             _ = parent.children.orderedRemove(index);
+            if (index < parent.parent_sentinel_index) parent.parent_sentinel_index -= 1;
             parent.topology_dirty = true;
             break;
         };
     };
     for (surface.children.items) |entry| {
         if (self.surfaceForId(entry.identity.child)) |child| {
-            self.discardSurfaceQueue(child);
             if (child.relationship) |relationship| {
-                if (std.meta.eql(relationship.identity, entry.identity)) child.relationship = null;
+                if (std.meta.eql(relationship.identity, entry.identity)) self.notifyDetached(child, entry.identity);
             }
         }
     }
@@ -1723,6 +2067,45 @@ fn bindShm(self: *WayringCompositor, client: *server.Client, shm_id: u32) !void 
     });
     const formats = try drain(client);
     defer std.testing.allocator.free(formats);
+}
+
+fn bindTestSubcompositor(self: *WayringCompositor, client: *server.Client, id: u32) !void {
+    const global = self.subcompositor_global orelse return error.TestGlobalNotPublished;
+    try send(client, 2, 0, &core.wl_registry.request_messages[0], &.{
+        .{ .uint = global.name() },
+        .{ .new_id = .{ .generic = .{ .interface = "wl_subcompositor", .version = 1, .id = id } } },
+    });
+}
+
+fn getSubsurface(client: *server.Client, manager_id: u32, id: u32, child_id: u32, parent_id: u32) !void {
+    try send(client, manager_id, 1, &core.wl_subcompositor.request_messages[1], &.{
+        .{ .new_id = .{ .typed = id } }, .{ .object = child_id }, .{ .object = parent_id },
+    });
+}
+
+fn setSubsurfacePosition(client: *server.Client, id: u32, x: i32, y: i32) !void {
+    try send(client, id, 1, &core.wl_subsurface.request_messages[1], &.{ .{ .int = x }, .{ .int = y } });
+}
+
+fn placeSubsurface(client: *server.Client, id: u32, sibling_id: u32, above: bool) !void {
+    const opcode: u16 = if (above) 2 else 3;
+    try send(client, id, opcode, &core.wl_subsurface.request_messages[opcode], &.{.{ .object = sibling_id }});
+}
+
+fn setSubsurfaceMode(client: *server.Client, id: u32, sync: bool) !void {
+    const opcode: u16 = if (sync) 4 else 5;
+    try send(client, id, opcode, &core.wl_subsurface.request_messages[opcode], &.{});
+}
+
+fn destroySubsurfaceResource(client: *server.Client, id: u32) !void {
+    try send(client, id, 0, &core.wl_subsurface.request_messages[0], &.{});
+}
+
+fn expectPendingChildren(parent: *const Surface, expected: []const SurfaceId, sentinel: usize) !void {
+    try std.testing.expectEqual(expected.len, parent.children.items.len);
+    try std.testing.expectEqual(sentinel, parent.parent_sentinel_index);
+    for (expected, parent.children.items) |id, placement|
+        try std.testing.expectEqual(id, placement.identity.child);
 }
 
 fn createSurfaceResource(client: *server.Client, compositor_id: u32, surface_id: u32) !void {
@@ -4890,6 +5273,876 @@ test "Wayring compositor advertises no wl_subcompositor global" {
         try std.testing.expect(!std.mem.eql(u8, global.interface().name, "wl_subcompositor"));
 }
 
+test "generated wl_subcompositor and wl_subsurface scanner descriptors are exact" {
+    try std.testing.expectEqualStrings("wl_subcompositor", core.wl_subcompositor.interface.name);
+    try std.testing.expectEqual(@as(u32, 1), core.wl_subcompositor.interface.version);
+    try std.testing.expectEqualStrings("wl_subsurface", core.wl_subsurface.interface.name);
+    try std.testing.expectEqual(@as(u32, 1), core.wl_subsurface.interface.version);
+    try std.testing.expectEqual(@as(usize, 2), core.wl_subcompositor.request_messages.len);
+    try std.testing.expectEqualStrings("destroy", core.wl_subcompositor.request_messages[0].name);
+    try std.testing.expect(core.wl_subcompositor.request_messages[0].destructor);
+    try std.testing.expectEqualStrings("get_subsurface", core.wl_subcompositor.request_messages[1].name);
+    try std.testing.expect(!core.wl_subcompositor.request_messages[1].destructor);
+    try std.testing.expectEqual(@as(usize, 3), core.wl_subcompositor.request_messages[1].arguments.len);
+    const get_arguments = core.wl_subcompositor.request_messages[1].arguments;
+    try std.testing.expectEqualStrings("id", get_arguments[0].name);
+    try std.testing.expectEqual(&core.wl_subsurface.interface, get_arguments[0].kind.new_id.?);
+    try std.testing.expectEqualStrings("surface", get_arguments[1].name);
+    try std.testing.expectEqual(&core.wl_surface.interface, get_arguments[1].kind.object.interface.?);
+    try std.testing.expectEqual(wire.Nullability.required, get_arguments[1].kind.object.nullability);
+    try std.testing.expectEqualStrings("parent", get_arguments[2].name);
+    try std.testing.expectEqual(&core.wl_surface.interface, get_arguments[2].kind.object.interface.?);
+    try std.testing.expectEqual(wire.Nullability.required, get_arguments[2].kind.object.nullability);
+    try std.testing.expectEqual(@as(i64, 0), core.wl_subcompositor.@"error".bad_surface);
+    try std.testing.expectEqual(@as(i64, 1), core.wl_subcompositor.@"error".bad_parent);
+    const names = [_][]const u8{ "destroy", "set_position", "place_above", "place_below", "set_sync", "set_desync" };
+    try std.testing.expectEqual(names.len, core.wl_subsurface.request_messages.len);
+    for (names, 0..) |name, opcode| {
+        try std.testing.expectEqualStrings(name, core.wl_subsurface.request_messages[opcode].name);
+        try std.testing.expectEqual(opcode == 0, core.wl_subsurface.request_messages[opcode].destructor);
+        try std.testing.expectEqual(@as(u32, 1), core.wl_subsurface.request_messages[opcode].since);
+    }
+    try std.testing.expectEqualStrings("x", core.wl_subsurface.request_messages[1].arguments[0].name);
+    try std.testing.expectEqual(wire.ArgumentKind.int, core.wl_subsurface.request_messages[1].arguments[0].kind);
+    try std.testing.expectEqualStrings("y", core.wl_subsurface.request_messages[1].arguments[1].name);
+    try std.testing.expectEqual(wire.ArgumentKind.int, core.wl_subsurface.request_messages[1].arguments[1].kind);
+    for (2..4) |opcode| {
+        const argument = core.wl_subsurface.request_messages[opcode].arguments[0];
+        try std.testing.expectEqualStrings("sibling", argument.name);
+        try std.testing.expectEqual(&core.wl_surface.interface, argument.kind.object.interface.?);
+        try std.testing.expectEqual(wire.Nullability.required, argument.kind.object.nullability);
+    }
+    try std.testing.expectEqual(@as(usize, 0), core.wl_subsurface.request_messages[4].arguments.len);
+    try std.testing.expectEqual(@as(usize, 0), core.wl_subsurface.request_messages[5].arguments.len);
+    try std.testing.expectEqual(@as(i64, 0), core.wl_subsurface.@"error".bad_surface);
+}
+
+test "scanner dispatch instantiates every wl_subcompositor and wl_subsurface handler" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    try compositor.publishTestSubcompositor();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    // Publishing precedes get_registry because registry globals are a snapshot.
+    try bindCompositor(client, 3);
+    try bindTestSubcompositor(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    try createSurfaceResource(client, 3, 6);
+    try getSubsurface(client, 4, 7, 5, 6);
+    const child = compositor.surfaceForId(compositor.surfaceId(client, 5).?).?;
+    try std.testing.expectEqual(Surface.Role.subsurface, child.role);
+    try std.testing.expect(child.active_subsurface != null);
+    try std.testing.expect(child.relationship.?.local_sync);
+    try std.testing.expectEqual(Position{}, child.relationship.?.position);
+    try std.testing.expectEqual(@as(u32, 1), child.active_subsurface.?.resource.version());
+    try std.testing.expectEqual(&child.active_subsurface.?.resource.runtime, client.lookup(7).?);
+    try std.testing.expectEqual(@as(usize, 1), compositor.findClient(client).?.subcompositors.items.len);
+    try std.testing.expectEqual(@as(u32, 1), compositor.findClient(client).?.subcompositors.items[0].resource.version());
+
+    try setSubsurfacePosition(client, 7, -12, 34);
+    try std.testing.expectEqual(Position{ .x = -12, .y = 34 }, child.relationship.?.position);
+    try placeSubsurface(client, 7, 6, true);
+    try placeSubsurface(client, 7, 6, false);
+    try setSubsurfaceMode(client, 7, false);
+    try std.testing.expect(!child.relationship.?.local_sync);
+    try setSubsurfaceMode(client, 7, true);
+    try std.testing.expect(child.relationship.?.local_sync);
+    const generation = child.relationship.?.identity.generation;
+    try destroySubsurfaceResource(client, 7);
+    try std.testing.expect(client.lookup(7) == null);
+    try std.testing.expectEqual(Surface.Role.subsurface, child.role);
+    try std.testing.expect(child.relationship == null);
+
+    try getSubsurface(client, 4, 8, 5, 6);
+    try std.testing.expect(child.relationship.?.identity.generation > generation);
+    try destroySubsurfaceResource(client, 8);
+    try send(client, 4, 0, &core.wl_subcompositor.request_messages[0], &.{});
+    try std.testing.expect(client.lookup(4) == null);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "scanner subsurface association and movement are parent double buffered" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    try compositor.publishTestSubcompositor();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 6);
+    try bindTestSubcompositor(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    try createSurfaceResource(client, 3, 6);
+    const preferences = try drain(client);
+    defer std.testing.allocator.free(preferences);
+    try std.testing.expectEqual(@as(usize, 48), preferences.len);
+    const parent_id = compositor.surfaceId(client, 5).?;
+    const child_id = compositor.surfaceId(client, 6).?;
+    const parent = compositor.surfaceForId(parent_id).?;
+    const child = compositor.surfaceForId(child_id).?;
+
+    try getSubsurface(client, 4, 7, 6, 5);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.detached_count);
+    try std.testing.expectEqual(Surface.Role.subsurface, child.role);
+    try std.testing.expect(child.active_subsurface != null);
+    try std.testing.expect(child.relationship.?.local_sync);
+    try std.testing.expectEqual(Position{}, child.relationship.?.position);
+    try expectPendingChildren(parent, &.{child_id}, 0);
+    try std.testing.expectEqual(@as(usize, 0), listener_state.committed_count);
+
+    try setSubsurfacePosition(client, 7, 19, -3);
+    try setSubsurfacePosition(client, 7, -8, 11);
+    try std.testing.expectEqual(Position{ .x = -8, .y = 11 }, child.relationship.?.position);
+    try std.testing.expectEqual(Position{ .x = -8, .y = 11 }, parent.children.items[0].position);
+    try std.testing.expectEqual(@as(usize, 0), listener_state.committed_count);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.last_batch_parent_count);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.last_parent_stack_lengths[0]);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.last_stack_child_count);
+    try std.testing.expectEqual(child_id, listener_state.last_stack_child_ids[0]);
+    try std.testing.expectEqual(Position{ .x = -8, .y = 11 }, listener_state.last_stack_child_positions[0]);
+    try std.testing.expect(!child.relationship.?.detached);
+
+    // wl_surface.offset remains ordinary consumed CU state, but never changes
+    // the parent-pending subsurface placement.
+    try setSurfaceOffset(client, 6, 71, -29);
+    try commitSurfaceResource(client, 6);
+    try std.testing.expectEqual(@as(i32, 0), child.pending_offset_x);
+    try std.testing.expectEqual(@as(i32, 0), child.pending_offset_y);
+    try std.testing.expectEqual(@as(i32, 0), child.current_offset_x);
+    try std.testing.expectEqual(@as(i32, 0), child.current_offset_y);
+    try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
+    try std.testing.expectEqual(Position{ .x = -8, .y = 11 }, parent.children.items[0].position);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(i32, 71), child.current_offset_x);
+    try std.testing.expectEqual(@as(i32, -29), child.current_offset_y);
+    try std.testing.expectEqual(Position{ .x = -8, .y = 11 }, listener_state.last_stack_child_positions[0]);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "scanner place requests implement parent sentinel and sibling stacking" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    try compositor.publishTestSubcompositor();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try bindTestSubcompositor(&compositor, client, 4);
+    for (5..9) |id| try createSurfaceResource(client, 3, @intCast(id));
+    try getSubsurface(client, 4, 9, 6, 5);
+    try getSubsurface(client, 4, 10, 7, 5);
+    try getSubsurface(client, 4, 11, 8, 5);
+    const parent = compositor.surfaceForId(compositor.surfaceId(client, 5).?).?;
+    const a = compositor.surfaceId(client, 6).?;
+    const b = compositor.surfaceId(client, 7).?;
+    const c = compositor.surfaceId(client, 8).?;
+    try expectPendingChildren(parent, &.{ a, b, c }, 0);
+
+    try placeSubsurface(client, 9, 5, false);
+    try expectPendingChildren(parent, &.{ a, b, c }, 1);
+    try placeSubsurface(client, 11, 5, true);
+    try expectPendingChildren(parent, &.{ a, c, b }, 1);
+    try placeSubsurface(client, 10, 8, false);
+    try expectPendingChildren(parent, &.{ a, b, c }, 1);
+    try placeSubsurface(client, 9, 7, true);
+    try expectPendingChildren(parent, &.{ b, a, c }, 0);
+    try placeSubsurface(client, 11, 5, false);
+    try expectPendingChildren(parent, &.{ c, b, a }, 1);
+    try placeSubsurface(client, 10, 8, false);
+    try expectPendingChildren(parent, &.{ b, c, a }, 2);
+
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(usize, 4), listener_state.last_parent_stack_lengths[0]);
+    try std.testing.expectEqualSlices(SurfaceId, &.{ b, c, a }, listener_state.last_stack_child_ids[0..3]);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "scanner get_subsurface validates roles parents and adapter ownership before mutation" {
+    const Failure = enum { other_role, active_object, self_parent, descendant_parent, child_impostor, parent_impostor };
+    const Case = struct {
+        fn run(failure: Failure) !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var registry = SurfaceRegistry.init(std.testing.allocator);
+            defer registry.deinit();
+            var listener_state: TestPresentationListener = .{ .registry = &registry };
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+            defer compositor.deinit();
+            listener_state.compositor = &compositor;
+            try compositor.publishTestSubcompositor();
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const client = managed.client();
+            var impostor: core.wl_surface.Resource = .init(std.testing.allocator, 8, 1, .client, client.ownerHooks());
+            var impostor_live = false;
+            defer {
+                compositor.destroyClientResources(client);
+                if (impostor_live) {
+                    impostor.destroy();
+                    impostor.deinit();
+                }
+                managed.destroy();
+            }
+
+            try bindCompositor(client, 3);
+            try bindTestSubcompositor(&compositor, client, 4);
+            for (5..8) |id| try createSurfaceResource(client, 3, @intCast(id));
+            try client.installClientInitial(8, &impostor.runtime);
+            impostor_live = true;
+            const objects = compositor.findClient(client).?;
+            const first = objects.surfaces.items[0];
+            switch (failure) {
+                .other_role => first.role = .other,
+                .active_object => try getSubsurface(client, 4, 9, 5, 6),
+                .descendant_parent => try getSubsurface(client, 4, 9, 6, 5),
+                .self_parent, .child_impostor, .parent_impostor => {},
+            }
+
+            const generations_before = compositor.next_relationship_generation;
+            const subsurfaces_before = objects.subsurfaces.items.len;
+            const detached_before = listener_state.detached_count;
+            var roles_before: [3]Surface.Role = undefined;
+            var relationships_before: [3]?Relationship = undefined;
+            var child_counts_before: [3]usize = undefined;
+            var sentinels_before: [3]usize = undefined;
+            for (objects.surfaces.items, 0..) |surface, index| {
+                roles_before[index] = surface.role;
+                relationships_before[index] = surface.relationship;
+                child_counts_before[index] = surface.children.items.len;
+                sentinels_before[index] = surface.parent_sentinel_index;
+            }
+
+            const arguments: struct { child: u32, parent: u32, code: i64 } = switch (failure) {
+                .other_role => .{ .child = 5, .parent = 6, .code = core.wl_subcompositor.@"error".bad_surface },
+                .active_object => .{ .child = 5, .parent = 7, .code = core.wl_subcompositor.@"error".bad_surface },
+                .self_parent => .{ .child = 5, .parent = 5, .code = core.wl_subcompositor.@"error".bad_parent },
+                .descendant_parent => .{ .child = 5, .parent = 6, .code = core.wl_subcompositor.@"error".bad_parent },
+                .child_impostor => .{ .child = 8, .parent = 6, .code = core.wl_subcompositor.@"error".bad_surface },
+                .parent_impostor => .{ .child = 5, .parent = 8, .code = core.wl_subcompositor.@"error".bad_parent },
+            };
+            const rejected_id: u32 = if (subsurfaces_before == 0) 9 else 10;
+            try getSubsurface(client, 4, rejected_id, arguments.child, arguments.parent);
+
+            const fatal = client.fatal().?;
+            try std.testing.expectEqual(server.Fatal.Kind.protocol, fatal.kind);
+            try std.testing.expectEqual(@as(?u32, @intCast(arguments.code)), fatal.protocol_code);
+            try std.testing.expectEqual(@as(u32, 4), fatal.object_id);
+            try std.testing.expect(client.lookup(rejected_id) == null);
+            try std.testing.expectEqual(generations_before, compositor.next_relationship_generation);
+            try std.testing.expectEqual(subsurfaces_before, objects.subsurfaces.items.len);
+            try std.testing.expectEqual(detached_before, listener_state.detached_count);
+            for (objects.surfaces.items, 0..) |surface, index| {
+                try std.testing.expectEqual(roles_before[index], surface.role);
+                try std.testing.expectEqual(relationships_before[index], surface.relationship);
+                try std.testing.expectEqual(child_counts_before[index], surface.children.items.len);
+                try std.testing.expectEqual(sentinels_before[index], surface.parent_sentinel_index);
+            }
+        }
+    };
+
+    inline for (std.meta.tags(Failure)) |failure| try Case.run(failure);
+}
+
+test "scanner object validation rejects unknown dead wrong-interface and foreign surfaces" {
+    const Failure = enum { unknown, dead, wrong_interface };
+    const Case = struct {
+        fn run(failure: Failure) !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var registry = SurfaceRegistry.init(std.testing.allocator);
+            defer registry.deinit();
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(std.testing.allocator, &host, &registry, null);
+            defer compositor.deinit();
+            try compositor.publishTestSubcompositor();
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const client = managed.client();
+            defer {
+                compositor.destroyClientResources(client);
+                managed.destroy();
+            }
+
+            try bindCompositor(client, 3);
+            try bindTestSubcompositor(&compositor, client, 4);
+            try createSurfaceResource(client, 3, 5);
+            try createSurfaceResource(client, 3, 6);
+            if (failure == .dead) try send(client, 6, 0, &core.wl_surface.request_messages[0], &.{});
+            const child: u32 = switch (failure) {
+                .unknown => 99,
+                .dead => 6,
+                .wrong_interface => 3,
+            };
+            try getSubsurface(client, 4, 7, child, 5);
+            const fatal = client.fatal().?;
+            try std.testing.expectEqual(server.Fatal.Kind.protocol, fatal.kind);
+            try std.testing.expect(fatal.protocol_code == null);
+            try std.testing.expectEqual(@as(u32, 4), fatal.object_id);
+            try std.testing.expect(client.lookup(7) == null);
+            try std.testing.expectEqual(@as(usize, 0), compositor.findClient(client).?.subsurfaces.items.len);
+            try std.testing.expect(compositor.surfaceForId(compositor.surfaceId(client, 5).?).?.relationship == null);
+        }
+    };
+    inline for (std.meta.tags(Failure)) |failure| try Case.run(failure);
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const first = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const second = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    defer {
+        compositor.destroyClientResources(second.client());
+        second.destroy();
+        compositor.destroyClientResources(first.client());
+        first.destroy();
+    }
+    try bindCompositor(first.client(), 3);
+    try createSurfaceResource(first.client(), 3, 4);
+    try bindCompositor(second.client(), 3);
+    try createSurfaceResource(second.client(), 3, 4);
+    const first_objects = compositor.findClient(first.client()).?;
+    const foreign = compositor.findClient(second.client()).?.surfaces.items[0];
+    try std.testing.expect(adapterSurface(first_objects, &foreign.resource.runtime) == null);
+}
+
+test "scanner restack rejects every non-sibling reference without changing order" {
+    const Failure = enum { self, unrelated, different_parent, impostor, unknown, wrong_interface };
+    const Case = struct {
+        fn run(failure: Failure) !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var registry = SurfaceRegistry.init(std.testing.allocator);
+            defer registry.deinit();
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(std.testing.allocator, &host, &registry, null);
+            defer compositor.deinit();
+            try compositor.publishTestSubcompositor();
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const client = managed.client();
+            var impostor: core.wl_surface.Resource = .init(std.testing.allocator, 13, 1, .client, client.ownerHooks());
+            var impostor_live = false;
+            defer {
+                compositor.destroyClientResources(client);
+                if (impostor_live) {
+                    impostor.destroy();
+                    impostor.deinit();
+                }
+                managed.destroy();
+            }
+
+            try bindCompositor(client, 3);
+            try bindTestSubcompositor(&compositor, client, 4);
+            for (5..10) |id| try createSurfaceResource(client, 3, @intCast(id));
+            try getSubsurface(client, 4, 10, 6, 5);
+            try getSubsurface(client, 4, 11, 7, 5);
+            try getSubsurface(client, 4, 12, 8, 9);
+            try client.installClientInitial(13, &impostor.runtime);
+            impostor_live = true;
+            const parent = compositor.surfaceForId(compositor.surfaceId(client, 5).?).?;
+            const a = compositor.surfaceId(client, 6).?;
+            const b = compositor.surfaceId(client, 7).?;
+            try expectPendingChildren(parent, &.{ a, b }, 0);
+            const reference: u32 = switch (failure) {
+                .self => 6,
+                .unrelated => 9,
+                .different_parent => 8,
+                .impostor => 13,
+                .unknown => 99,
+                .wrong_interface => 4,
+            };
+            try placeSubsurface(client, 10, reference, failure != .unrelated);
+            const fatal = client.fatal().?;
+            try std.testing.expectEqual(server.Fatal.Kind.protocol, fatal.kind);
+            if (failure == .unknown or failure == .wrong_interface) {
+                try std.testing.expect(fatal.protocol_code == null);
+            } else {
+                try std.testing.expectEqual(
+                    @as(?u32, @intCast(core.wl_subsurface.@"error".bad_surface)),
+                    fatal.protocol_code,
+                );
+            }
+            try expectPendingChildren(parent, &.{ a, b }, 0);
+        }
+    };
+    inline for (std.meta.tags(Failure)) |failure| try Case.run(failure);
+}
+
+test "scanner subsurface destroy discards queued work and permits permanent-role recreation" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    try compositor.publishTestSubcompositor();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try bindTestSubcompositor(&compositor, client, 4);
+    for (5..8) |id| try createSurfaceResource(client, 3, @intCast(id));
+    const child_id = compositor.surfaceId(client, 5).?;
+    const first_parent = compositor.surfaceForId(compositor.surfaceId(client, 6).?).?;
+    const second_parent = compositor.surfaceForId(compositor.surfaceId(client, 7).?).?;
+    const child = compositor.surfaceForId(child_id).?;
+    try getSubsurface(client, 4, 8, 5, 6);
+    const first_generation = child.relationship.?.identity.generation;
+    try commitSurfaceResource(client, 6);
+    try std.testing.expect(!child.relationship.?.detached);
+    try requestFrame(client, 5, 9);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
+    switch (child.frame_callbacks.items[0].state) {
+        .queued => {},
+        .pending, .committed => return error.TestExpectedQueuedCallback,
+    }
+
+    try destroySubsurfaceResource(client, 8);
+    try std.testing.expectEqual(@as(usize, 0), child.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 0), child.frame_callbacks.items.len);
+    try std.testing.expect(client.lookup(9) == null);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.detached_count);
+    try std.testing.expectEqual(Surface.Role.subsurface, child.role);
+    try std.testing.expect(child.active_subsurface == null);
+    try std.testing.expect(child.relationship == null);
+    try expectPendingChildren(first_parent, &.{}, 0);
+    const retired = try drain(client);
+    defer std.testing.allocator.free(retired);
+    try expectDeleteIds(retired, &.{ 9, 8 });
+
+    try getSubsurface(client, 4, 10, 5, 7);
+    try std.testing.expect(child.relationship.?.identity.generation > first_generation);
+    try std.testing.expectEqual(second_parent.id, child.relationship.?.identity.parent);
+    try std.testing.expect(child.relationship.?.local_sync);
+    try std.testing.expectEqual(Position{}, child.relationship.?.position);
+    try expectPendingChildren(second_parent, &.{child_id}, 0);
+    try send(client, 4, 0, &core.wl_subcompositor.request_messages[0], &.{});
+    try std.testing.expect(client.lookup(4) == null);
+    try setSubsurfacePosition(client, 10, -4, 6);
+    try destroySubsurfaceResource(client, 10);
+    try send(client, 5, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expect(!compositor.containsSurface(child_id));
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "wl_surface destroy preserves a live subsurface role object on defunct error" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    try compositor.publishTestSubcompositor();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try bindTestSubcompositor(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    try createSurfaceResource(client, 3, 6);
+    try getSubsurface(client, 4, 7, 5, 6);
+    const child_id = compositor.surfaceId(client, 5).?;
+    const child = compositor.surfaceForId(child_id).?;
+    const relationship = child.relationship.?;
+    try send(client, 5, 0, &core.wl_surface.request_messages[0], &.{});
+    const fatal = client.fatal().?;
+    try std.testing.expectEqual(server.Fatal.Kind.protocol, fatal.kind);
+    try std.testing.expectEqual(
+        @as(?u32, @intCast(core.wl_surface.@"error".defunct_role_object)),
+        fatal.protocol_code,
+    );
+    try std.testing.expectEqual(@as(u32, 5), fatal.object_id);
+    try std.testing.expect(compositor.containsSurface(child_id));
+    try std.testing.expectEqual(Surface.Role.subsurface, child.role);
+    try std.testing.expect(child.active_subsurface != null);
+    try std.testing.expectEqual(relationship, child.relationship.?);
+    try std.testing.expect(client.lookup(5) != null);
+    try std.testing.expect(client.lookup(7) != null);
+}
+
+test "destroying a parent unmaps children but leaves their role resources inert" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    try compositor.publishTestSubcompositor();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try bindTestSubcompositor(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    try createSurfaceResource(client, 3, 6);
+    try getSubsurface(client, 4, 7, 5, 6);
+    const child_id = compositor.surfaceId(client, 5).?;
+    const parent_id = compositor.surfaceId(client, 6).?;
+    const child = compositor.surfaceForId(child_id).?;
+    const identity = child.relationship.?.identity;
+    try commitSurfaceResource(client, 6);
+    try std.testing.expect(!child.relationship.?.detached);
+    try send(client, 6, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expect(!compositor.containsSurface(parent_id));
+    try std.testing.expect(compositor.containsSurface(child_id));
+    try std.testing.expectEqual(identity, child.relationship.?.identity);
+    try std.testing.expect(child.active_subsurface != null);
+    try std.testing.expect(child.relationship.?.detached);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.detached_count);
+
+    // With no live parent, non-destructor role requests have no state to
+    // modify. The role object remains live solely so lifecycle ordering and
+    // defunct_role_object stay exact until the client destroys it.
+    try setSubsurfacePosition(client, 7, 20, 30);
+    try setSubsurfaceMode(client, 7, false);
+    try std.testing.expectEqual(Position{}, child.relationship.?.position);
+    try std.testing.expect(child.relationship.?.local_sync);
+    try std.testing.expect(client.fatal() == null);
+    try destroySubsurfaceResource(client, 7);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.detached_count);
+    try std.testing.expect(child.relationship == null);
+    try send(client, 5, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expect(!compositor.containsSurface(child_id));
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "disconnect destroys subsurface records before surfaces without duplicate detach" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    try compositor.publishTestSubcompositor();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    var managed_live = true;
+    defer if (managed_live) {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    };
+    try bindCompositor(client, 3);
+    try bindTestSubcompositor(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    try createSurfaceResource(client, 3, 6);
+    try getSubsurface(client, 4, 7, 5, 6);
+    try commitSurfaceResource(client, 6);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.detached_count);
+    compositor.destroyClientResources(client);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.detached_count);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.removing_count);
+    try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 0), registry.len());
+    managed.destroy();
+    managed_live = false;
+}
+
+test "subcompositor binding OOM rolls back stable records lists and new ids" {
+    const Case = struct {
+        fn run(fail_offset: usize) !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var registry = SurfaceRegistry.init(std.testing.allocator);
+            defer registry.deinit();
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(failing.allocator(), &host, &registry, null);
+            defer compositor.deinit();
+            try compositor.publishTestSubcompositor();
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const client = managed.client();
+            defer {
+                compositor.destroyClientResources(client);
+                managed.destroy();
+            }
+            try bindCompositor(client, 3);
+            const objects = compositor.findClient(client).?;
+            const live_before = failing.allocated_bytes - failing.freed_bytes;
+            const bind_request = try encode(2, 0, &core.wl_registry.request_messages[0], &.{
+                .{ .uint = compositor.subcompositor_global.?.name() },
+                .{ .new_id = .{ .generic = .{ .interface = "wl_subcompositor", .version = 1, .id = 4 } } },
+            });
+            defer std.testing.allocator.free(bind_request);
+            try client.receive(bind_request, &.{});
+            failing.fail_index = failing.alloc_index + fail_offset;
+            try client.dispatch();
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+            try std.testing.expect(client.lookup(4) == null);
+            try std.testing.expectEqual(@as(usize, 0), objects.subcompositors.items.len);
+            try std.testing.expectEqual(@as(usize, 0), objects.subcompositors.capacity);
+            try std.testing.expectEqual(live_before, failing.allocated_bytes - failing.freed_bytes);
+        }
+    };
+    try Case.run(0);
+    try Case.run(1);
+}
+
+test "get_subsurface OOM preserves role topology ownership and reserved new id" {
+    const Case = struct {
+        fn run(fail_offset: usize) !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var registry = SurfaceRegistry.init(std.testing.allocator);
+            defer registry.deinit();
+            var listener_state: TestPresentationListener = .{ .registry = &registry };
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(failing.allocator(), &host, &registry, listener_state.listener());
+            defer compositor.deinit();
+            listener_state.compositor = &compositor;
+            try compositor.publishTestSubcompositor();
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const client = managed.client();
+            defer {
+                compositor.destroyClientResources(client);
+                managed.destroy();
+            }
+            try bindCompositor(client, 3);
+            try bindTestSubcompositor(&compositor, client, 4);
+            try createSurfaceResource(client, 3, 5);
+            try createSurfaceResource(client, 3, 6);
+            const objects = compositor.findClient(client).?;
+            const child = compositor.surfaceForId(compositor.surfaceId(client, 5).?).?;
+            const parent = compositor.surfaceForId(compositor.surfaceId(client, 6).?).?;
+            const generation_before = compositor.next_relationship_generation;
+            const live_before = failing.allocated_bytes - failing.freed_bytes;
+            const request = try encode(4, 1, &core.wl_subcompositor.request_messages[1], &.{
+                .{ .new_id = .{ .typed = 7 } }, .{ .object = 5 }, .{ .object = 6 },
+            });
+            defer std.testing.allocator.free(request);
+            try client.receive(request, &.{});
+            failing.fail_index = failing.alloc_index + fail_offset;
+            try client.dispatch();
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+            try std.testing.expect(client.lookup(7) == null);
+            try std.testing.expectEqual(Surface.Role.none, child.role);
+            try std.testing.expect(child.active_subsurface == null);
+            try std.testing.expect(child.relationship == null);
+            try std.testing.expectEqual(@as(usize, 0), parent.children.items.len);
+            try std.testing.expectEqual(@as(usize, 0), parent.children.capacity);
+            try std.testing.expectEqual(@as(usize, 0), objects.subsurfaces.items.len);
+            try std.testing.expectEqual(@as(usize, 0), objects.subsurfaces.capacity);
+            try std.testing.expectEqual(generation_before, compositor.next_relationship_generation);
+            try std.testing.expectEqual(@as(usize, 0), listener_state.detached_count);
+            try std.testing.expectEqual(live_before, failing.allocated_bytes - failing.freed_bytes);
+        }
+    };
+    try Case.run(0); // per-client subsurface pointer list
+    try Case.run(1); // parent pending children storage
+    try Case.run(2); // heap-stable Subsurface record
+}
+
+test "protocol set_desync scratch failures preserve mode claims queues and applied state" {
+    const Case = struct {
+        fn run(fault: CommitFault) !void {
+            var host: server.Server = .init(std.testing.allocator);
+            defer host.deinit();
+            var registry = SurfaceRegistry.init(std.testing.allocator);
+            defer registry.deinit();
+            var listener_state: TestPresentationListener = .{ .registry = &registry };
+            var compositor: WayringCompositor = undefined;
+            try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+            defer compositor.deinit();
+            listener_state.compositor = &compositor;
+            try compositor.publishTestSubcompositor();
+            const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+            const client = managed.client();
+            defer {
+                compositor.destroyClientResources(client);
+                managed.destroy();
+            }
+            try bindCompositor(client, 3);
+            try bindTestSubcompositor(&compositor, client, 4);
+            try createSurfaceResource(client, 3, 5);
+            try createSurfaceResource(client, 3, 6);
+            try getSubsurface(client, 4, 7, 5, 6);
+            const child = compositor.surfaceForId(compositor.surfaceId(client, 5).?).?;
+            try requestFrame(client, 5, 8);
+            try commitSurfaceResource(client, 5);
+            const token = child.content_updates.items[0].token;
+            const callbacks = child.content_updates.items[0].callback_count;
+            const detached_before = listener_state.detached_count;
+            compositor.commit_fault = fault;
+            try setSubsurfaceMode(client, 7, false);
+            try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+            try std.testing.expect(child.relationship.?.local_sync);
+            try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
+            try std.testing.expectEqual(token, child.content_updates.items[0].token);
+            try std.testing.expectEqual(UpdateKind.scu, child.content_updates.items[0].kind);
+            try std.testing.expect(child.content_updates.items[0].claimed_by == null);
+            try std.testing.expectEqual(callbacks, child.content_updates.items[0].callback_count);
+            try std.testing.expectEqual(@as(usize, 1), child.frame_callbacks.items.len);
+            try std.testing.expectEqual(detached_before, listener_state.detached_count);
+            try std.testing.expectEqual(@as(usize, 0), listener_state.committed_count);
+        }
+    };
+    try Case.run(.apply_scratch);
+    try Case.run(.batch_assembly);
+}
+
+test "destroying a synchronized ancestor role unlocks local-desync descendant SCUs" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    try compositor.publishTestSubcompositor();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+    try bindCompositor(client, 3);
+    try bindTestSubcompositor(&compositor, client, 4);
+    for (5..8) |id| try createSurfaceResource(client, 3, @intCast(id));
+    try getSubsurface(client, 4, 8, 6, 5);
+    try getSubsurface(client, 4, 9, 7, 6);
+    try setSubsurfaceMode(client, 9, false);
+    const parent = compositor.surfaceForId(compositor.surfaceId(client, 6).?).?;
+    const child = compositor.surfaceForId(compositor.surfaceId(client, 7).?).?;
+    try std.testing.expect(!child.relationship.?.local_sync);
+    try std.testing.expect(compositor.effectivelySynchronized(child));
+    try requestFrame(client, 7, 10);
+    try commitSurfaceResource(client, 7);
+    try std.testing.expectEqual(UpdateKind.scu, child.content_updates.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), listener_state.committed_count);
+
+    try destroySubsurfaceResource(client, 8);
+    try std.testing.expect(parent.relationship == null);
+    try std.testing.expect(parent.active_subsurface == null);
+    try std.testing.expect(!compositor.effectivelySynchronized(child));
+    try std.testing.expectEqual(@as(usize, 0), child.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
+    switch (child.frame_callbacks.items[0].state) {
+        .committed => {},
+        .pending, .queued => return error.TestExpectedCommittedCallback,
+    }
+
+    // Later child commits are ordinary DCUs rather than being blocked behind
+    // the former SCU forever.
+    try commitSurfaceResource(client, 7);
+    try std.testing.expectEqual(@as(usize, 0), child.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.committed_count);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "ancestor role destroy scratch OOM leaves resources topology and SCUs unchanged" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    try compositor.publishTestSubcompositor();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+    try bindCompositor(client, 3);
+    try bindTestSubcompositor(&compositor, client, 4);
+    for (5..8) |id| try createSurfaceResource(client, 3, @intCast(id));
+    try getSubsurface(client, 4, 8, 6, 5);
+    try getSubsurface(client, 4, 9, 7, 6);
+    try setSubsurfaceMode(client, 9, false);
+    const grandparent = compositor.surfaceForId(compositor.surfaceId(client, 5).?).?;
+    const parent = compositor.surfaceForId(compositor.surfaceId(client, 6).?).?;
+    const child = compositor.surfaceForId(compositor.surfaceId(client, 7).?).?;
+    try requestFrame(client, 7, 10);
+    try commitSurfaceResource(client, 7);
+    const parent_identity = parent.relationship.?.identity;
+    const child_token = child.content_updates.items[0].token;
+    const detached_before = listener_state.detached_count;
+    compositor.commit_fault = .apply_scratch;
+    try destroySubsurfaceResource(client, 8);
+
+    try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, client.fatal().?.kind);
+    try std.testing.expectEqual(&parent.active_subsurface.?.resource.runtime, client.lookup(8).?);
+    try std.testing.expectEqual(parent_identity, parent.relationship.?.identity);
+    try std.testing.expectEqual(@as(usize, 1), grandparent.children.items.len);
+    try std.testing.expectEqual(parent_identity, grandparent.children.items[0].identity);
+    try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
+    try std.testing.expectEqual(child_token, child.content_updates.items[0].token);
+    try std.testing.expectEqual(UpdateKind.scu, child.content_updates.items[0].kind);
+    try std.testing.expect(child.content_updates.items[0].claimed_by == null);
+    try std.testing.expect(!child.relationship.?.local_sync);
+    switch (child.frame_callbacks.items[0].state) {
+        .queued => {},
+        .pending, .committed => return error.TestExpectedQueuedCallback,
+    }
+    try std.testing.expectEqual(detached_before, listener_state.detached_count);
+    try std.testing.expectEqual(@as(usize, 0), listener_state.committed_count);
+}
+
 test "exact CU tails apply one nested batch without consuming a later child update" {
     var host: server.Server = .init(std.testing.allocator);
     defer host.deinit();
@@ -4900,6 +6153,7 @@ test "exact CU tails apply one nested batch without consuming a later child upda
     try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
     defer compositor.deinit();
     listener_state.compositor = &compositor;
+    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
@@ -4908,42 +6162,43 @@ test "exact CU tails apply one nested batch without consuming a later child upda
     }
 
     try bindCompositor(client, 3);
-    try createSurfaceResource(client, 3, 4);
+    try bindTestSubcompositor(&compositor, client, 4);
     try createSurfaceResource(client, 3, 5);
     try createSurfaceResource(client, 3, 6);
-    const root_id = compositor.surfaceId(client, 4).?;
-    const parent_id = compositor.surfaceId(client, 5).?;
-    const child_id = compositor.surfaceId(client, 6).?;
+    try createSurfaceResource(client, 3, 7);
+    const root_id = compositor.surfaceId(client, 5).?;
+    const parent_id = compositor.surfaceId(client, 6).?;
+    const child_id = compositor.surfaceId(client, 7).?;
     const root = compositor.surfaceForId(root_id).?;
     const parent = compositor.surfaceForId(parent_id).?;
     const child = compositor.surfaceForId(child_id).?;
-    _ = try compositor.testAssociate(parent_id, root_id);
-    _ = try compositor.testAssociate(child_id, parent_id);
-    try compositor.testSetPosition(parent_id, .{ .x = 10, .y = 4 });
-    try compositor.testSetPosition(child_id, .{ .x = 3, .y = -2 });
+    try getSubsurface(client, 4, 8, 6, 5);
+    try getSubsurface(client, 4, 9, 7, 6);
+    try setSubsurfacePosition(client, 8, 10, 4);
+    try setSubsurfacePosition(client, 9, 3, -2);
 
-    try commitSurfaceResource(client, 6);
+    try commitSurfaceResource(client, 7);
     try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
     try std.testing.expectEqual(UpdateKind.scu, child.content_updates.items[0].kind);
     const child_n = child.content_updates.items[0].token;
-    try commitSurfaceResource(client, 5);
+    try commitSurfaceResource(client, 6);
     try std.testing.expectEqual(@as(usize, 1), parent.content_updates.items.len);
     try std.testing.expectEqual(@as(usize, 1), parent.content_updates.items[0].claims.items.len);
     try std.testing.expectEqual(child_n, parent.content_updates.items[0].claims.items[0].token);
     try std.testing.expectEqual(parent.content_updates.items[0].token, child.content_updates.items[0].claimed_by.?);
 
     // A second parent CU cannot claim the already-owned tail.
-    try commitSurfaceResource(client, 5);
+    try commitSurfaceResource(client, 6);
     try std.testing.expectEqual(@as(usize, 2), parent.content_updates.items.len);
     try std.testing.expectEqual(@as(usize, 0), parent.content_updates.items[1].claims.items.len);
 
     // This later child CU is not reachable through the parent's exact N claim.
-    try commitSurfaceResource(client, 6);
+    try commitSurfaceResource(client, 7);
     try std.testing.expectEqual(@as(usize, 2), child.content_updates.items.len);
     const child_n_plus_one = child.content_updates.items[1].token;
     try std.testing.expect(child_n_plus_one.sequence > child_n.sequence);
     const commits_before_root = listener_state.committed_count;
-    try commitSurfaceResource(client, 4);
+    try commitSurfaceResource(client, 5);
 
     try std.testing.expectEqual(commits_before_root + 1, listener_state.committed_count);
     try std.testing.expectEqual(@as(usize, 3), listener_state.last_batch_surface_count);
@@ -4972,23 +6227,23 @@ test "exact CU tails apply one nested batch without consuming a later child upda
 
     // Desync under a synchronized ancestor does not flush, and set_sync never
     // flushes. Unlocking that ancestor reaches only local-desync descendants.
-    try compositor.testSetDesync(child_id);
+    try setSubsurfaceMode(client, 9, false);
     try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
-    try compositor.testSetSync(child_id);
+    try setSubsurfaceMode(client, 9, true);
     try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
-    try compositor.testSetDesync(child_id);
+    try setSubsurfaceMode(client, 9, false);
 
-    try createSurfaceResource(client, 3, 7);
-    const grandchild_id = compositor.surfaceId(client, 7).?;
+    try createSurfaceResource(client, 3, 10);
+    const grandchild_id = compositor.surfaceId(client, 10).?;
     const grandchild = compositor.surfaceForId(grandchild_id).?;
-    _ = try compositor.testAssociate(grandchild_id, child_id);
-    try commitSurfaceResource(client, 7);
+    try getSubsurface(client, 4, 11, 10, 7);
+    try commitSurfaceResource(client, 10);
     try std.testing.expectEqual(@as(usize, 1), grandchild.content_updates.items.len);
 
-    try compositor.testSetDesync(parent_id);
+    try setSubsurfaceMode(client, 8, false);
     try std.testing.expectEqual(@as(usize, 0), child.content_updates.items.len);
     try std.testing.expectEqual(@as(usize, 1), grandchild.content_updates.items.len);
-    try compositor.testSetDesync(grandchild_id);
+    try setSubsurfaceMode(client, 11, false);
     try std.testing.expectEqual(@as(usize, 0), grandchild.content_updates.items.len);
     try std.testing.expect(client.fatal() == null);
 }
@@ -5117,6 +6372,7 @@ test "stale association and canonical generations cannot alias replacement topol
     try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
     defer compositor.deinit();
     listener_state.compositor = &compositor;
+    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
@@ -5125,19 +6381,21 @@ test "stale association and canonical generations cannot alias replacement topol
     }
 
     try bindCompositor(client, 3);
-    try createSurfaceResource(client, 3, 4);
+    try bindTestSubcompositor(&compositor, client, 4);
     try createSurfaceResource(client, 3, 5);
     try createSurfaceResource(client, 3, 6);
-    const root_id = compositor.surfaceId(client, 4).?;
-    const parent_id = compositor.surfaceId(client, 5).?;
-    const old_child_id = compositor.surfaceId(client, 6).?;
-    _ = try compositor.testAssociate(parent_id, root_id);
-    const first_association = try compositor.testAssociate(old_child_id, parent_id);
-    try commitSurfaceResource(client, 5);
-    try compositor.testDissociate(old_child_id);
-    const second_association = try compositor.testAssociate(old_child_id, parent_id);
+    try createSurfaceResource(client, 3, 7);
+    const parent_id = compositor.surfaceId(client, 6).?;
+    const old_child_id = compositor.surfaceId(client, 7).?;
+    try getSubsurface(client, 4, 8, 6, 5);
+    try getSubsurface(client, 4, 9, 7, 6);
+    const first_association = compositor.surfaceForId(old_child_id).?.relationship.?.identity.generation;
+    try commitSurfaceResource(client, 6);
+    try destroySubsurfaceResource(client, 9);
+    try getSubsurface(client, 4, 10, 7, 6);
+    const second_association = compositor.surfaceForId(old_child_id).?.relationship.?.identity.generation;
     try std.testing.expect(second_association > first_association);
-    try commitSurfaceResource(client, 4);
+    try commitSurfaceResource(client, 5);
     try std.testing.expectEqual(@as(usize, 2), listener_state.last_batch_parent_count);
     try std.testing.expectEqual(@as(usize, 1), listener_state.last_parent_stack_lengths[0]);
     try std.testing.expectEqual(@as(usize, 1), listener_state.last_stack_child_count);
@@ -5145,14 +6403,15 @@ test "stale association and canonical generations cannot alias replacement topol
 
     // Queue another old-child topology, then replace the provider in the same
     // registry slot before its synchronized CU applies.
-    try commitSurfaceResource(client, 5);
-    try send(client, 6, 0, &core.wl_surface.request_messages[0], &.{});
-    try createSurfaceResource(client, 3, 7);
-    const replacement_id = compositor.surfaceId(client, 7).?;
+    try commitSurfaceResource(client, 6);
+    try destroySubsurfaceResource(client, 10);
+    try send(client, 7, 0, &core.wl_surface.request_messages[0], &.{});
+    try createSurfaceResource(client, 3, 11);
+    const replacement_id = compositor.surfaceId(client, 11).?;
     try std.testing.expectEqual(old_child_id.index, replacement_id.index);
     try std.testing.expect(old_child_id.generation != replacement_id.generation);
-    _ = try compositor.testAssociate(replacement_id, parent_id);
-    try commitSurfaceResource(client, 4);
+    try getSubsurface(client, 4, 12, 11, 6);
+    try commitSurfaceResource(client, 5);
     try std.testing.expectEqual(@as(usize, 1), listener_state.last_parent_stack_lengths[0]);
     try std.testing.expectEqual(@as(usize, 1), listener_state.last_stack_child_count);
     try std.testing.expectEqual(parent_id, listener_state.last_stack_child_ids[0]);
