@@ -12,6 +12,7 @@ const std = @import("std");
 const core = @import("wayring-core-protocol");
 const wayring = @import("wayring");
 const CopiedBufferSnapshot = @import("../CopiedBufferSnapshot.zig");
+const HeadlessSurfaceForest = @import("../HeadlessSurfaceForest.zig");
 const Region = @import("../region.zig");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const SurfaceFrameCompletion = @import("../SurfaceFrameCompletion.zig");
@@ -32,16 +33,23 @@ pub const SurfaceId = SurfaceRegistry.Id;
 /// value and must not invoke it after compositor deinit; removed or reused IDs
 /// are harmless no-ops.
 pub const FrameCompletion = SurfaceFrameCompletion;
+pub const Position = HeadlessSurfaceForest.Position;
+pub const AppliedSurfaceState = HeadlessSurfaceForest.AppliedSurfaceState;
+pub const AppliedStackEntry = HeadlessSurfaceForest.AppliedStackEntry;
+pub const AppliedParentState = HeadlessSurfaceForest.AppliedParentState;
+pub const AppliedBatch = HeadlessSurfaceForest.AppliedBatch;
 
-/// Presentation lifecycle copied by init. The context remains borrowed until
-/// compositor deinit; callbacks never receive Wayland resources or policy and
-/// must not reenter surface lifecycle. During creation rollback, `removing`
-/// can resolve the provider through SurfaceRegistry but the Wayring object has
-/// not been published in its per-client list.
+/// Final synchronous presentation-publication seam copied by init. The context
+/// remains borrowed until compositor deinit. Callbacks receive no Wayland
+/// resources or policy and must not reenter surface lifecycle. Applied batch
+/// slices are valid only for the callback. During creation rollback,
+/// `removing` can resolve the provider through SurfaceRegistry even when the
+/// Wayring object was not published in its per-client list.
 pub const PresentationListener = struct {
     context: *anyopaque,
     added: *const fn (*anyopaque, SurfaceId, FrameCompletion) error{OutOfMemory}!void,
-    committed: *const fn (*anyopaque, SurfaceId, ?render.Size, bool) void,
+    detached: *const fn (*anyopaque, SurfaceId) void,
+    applied: *const fn (*anyopaque, AppliedBatch) void,
     removing: *const fn (*anyopaque, SurfaceId) void,
 };
 
@@ -877,13 +885,17 @@ fn publishPreparedCommit(self: *WayringCompositor, surface: *Surface, prepared: 
     std.debug.assert(callbacks_to_commit == 0);
 
     std.debug.assert((surface.current != null) == (surface.current_logical_size != null));
-    if (self.presentation_listener) |listener|
-        listener.committed(
-            listener.context,
-            surface.id,
-            surface.current_logical_size,
-            prepared.pending_frame_callback_count != 0,
-        );
+    if (self.presentation_listener) |listener| {
+        const surfaces = [_]AppliedSurfaceState{.{
+            .id = surface.id,
+            .mapped_size = surface.current_logical_size,
+            .callbacks_committed = prepared.pending_frame_callback_count != 0,
+        }};
+        listener.applied(listener.context, .{
+            .surfaces = &surfaces,
+            .parents = &.{},
+        });
+    }
 }
 
 fn failCommitAt(self: *WayringCompositor, point: CommitFault) bool {
@@ -1357,7 +1369,8 @@ const TestPresentationListener = struct {
         return .{
             .context = self,
             .added = added,
-            .committed = committed,
+            .detached = detached,
+            .applied = applied,
             .removing = removing,
         };
     }
@@ -1377,13 +1390,16 @@ const TestPresentationListener = struct {
         if (self.fail_added) return error.OutOfMemory;
     }
 
-    fn committed(
-        context: *anyopaque,
-        id: SurfaceId,
-        size: ?render.Size,
-        callbacks_committed: bool,
-    ) void {
+    fn detached(_: *anyopaque, _: SurfaceId) void {}
+
+    fn applied(context: *anyopaque, batch: AppliedBatch) void {
         const self: *TestPresentationListener = @ptrCast(@alignCast(context));
+        std.debug.assert(batch.surfaces.len == 1);
+        std.debug.assert(batch.parents.len == 0);
+        const applied_surface = batch.surfaces[0];
+        const id = applied_surface.id;
+        const size = applied_surface.mapped_size;
+        const callbacks_committed = applied_surface.callbacks_committed;
         std.debug.assert(self.registry.contains(id));
         const state = self.registry.renderState(id);
         if (size) |mapped_size| {
@@ -4243,4 +4259,18 @@ test "null listener teardown leaves unrelated registry provider for compositor d
     try std.testing.expectEqual(@as(u32, synthetic.pixel), surface_registry.renderState(synthetic_id).?.buffer.pixels[0]);
     surface_registry.remove(synthetic_id);
     synthetic_live = false;
+}
+
+test "Wayring compositor advertises no wl_subcompositor global" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, null);
+    defer compositor.deinit();
+
+    var globals = host.iterator();
+    while (globals.next()) |global|
+        try std.testing.expect(!std.mem.eql(u8, global.interface().name, "wl_subcompositor"));
 }

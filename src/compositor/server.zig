@@ -3644,7 +3644,8 @@ pub fn wayringPresentationListener(self: *Self) ?WayringCompositor.PresentationL
     return .{
         .context = self,
         .added = wayringSurfaceAdded,
-        .committed = wayringSurfaceCommitted,
+        .detached = wayringSurfaceDetached,
+        .applied = wayringSurfaceApplied,
         .removing = wayringSurfaceRemoving,
     };
 }
@@ -3680,40 +3681,41 @@ fn commitHeadlessSurface(
     size: ?render.Size,
     callbacks_committed: bool,
 ) void {
-    std.debug.assert(self.surface_registry.contains(id));
-    if (size) |mapped| std.debug.assert(mapped.width > 0 and mapped.height > 0);
-    const index = self.headless_surface_forest.rootIndex(id) orelse unreachable;
-    if (self.headless_surface_forest.roots()[index].mapped_size) |old_size| {
-        self.damageHeadlessSurfaceBounds(.{
-            .x = 0,
-            .y = 0,
-            .width = old_size.width,
-            .height = old_size.height,
-        }, index);
-    }
-    self.headless_surface_forest.applyRoot(id, size, callbacks_committed);
-    if (size) |new_size| {
-        self.damageHeadlessSurfaceBounds(.{
-            .x = 0,
-            .y = 0,
-            .width = new_size.width,
-            .height = new_size.height,
-        }, index);
-    }
+    const surfaces = [_]WayringCompositor.AppliedSurfaceState{.{
+        .id = id,
+        .mapped_size = size,
+        .callbacks_committed = callbacks_committed,
+    }};
+    self.applyHeadlessBatch(.{ .surfaces = &surfaces, .parents = &.{} });
 }
 
 fn removeHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
     std.debug.assert(self.surface_registry.contains(id));
-    const index = self.headless_surface_forest.rootIndex(id) orelse unreachable;
-    if (self.headless_surface_forest.roots()[index].mapped_size) |old_size| {
-        self.damageHeadlessSurfaceBounds(.{
-            .x = 0,
-            .y = 0,
-            .width = old_size.width,
-            .height = old_size.height,
-        }, index);
+    self.damageHeadlessCompound(id);
+    self.headless_surface_forest.remove(id);
+}
+
+fn detachHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
+    std.debug.assert(self.surface_registry.contains(id));
+    self.damageHeadlessCompound(id);
+    self.headless_surface_forest.detach(id);
+}
+
+fn applyHeadlessBatch(self: *Self, batch: WayringCompositor.AppliedBatch) void {
+    self.damageHeadlessBatch(batch);
+    self.headless_surface_forest.apply(batch);
+    self.damageHeadlessBatch(batch);
+}
+
+fn damageHeadlessBatch(self: *Self, batch: WayringCompositor.AppliedBatch) void {
+    for (batch.surfaces) |surface| self.damageHeadlessCompound(surface.id);
+    for (batch.parents) |parent_state| {
+        self.damageHeadlessCompound(parent_state.id);
+        for (parent_state.stack) |entry| switch (entry) {
+            .parent => {},
+            .child => |child| self.damageHeadlessCompound(child.id),
+        };
     }
-    self.headless_surface_forest.removeRoot(id);
 }
 
 fn wayringSurfaceAdded(
@@ -3727,27 +3729,28 @@ fn wayringSurfaceAdded(
     try self.addHeadlessSurface(id, frame_completion);
 }
 
-fn wayringSurfaceCommitted(
-    context: *anyopaque,
-    id: SurfaceRegistry.Id,
-    size: ?render.Size,
-    callbacks_committed: bool,
-) void {
+fn wayringSurfaceDetached(context: *anyopaque, id: SurfaceRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    const render_state = self.surface_registry.renderState(id);
-    if (size) |mapped_size| {
-        std.debug.assert(render_state != null);
-        std.debug.assert(std.meta.eql(mapped_size, render_state.?.logical_size));
-    } else {
-        std.debug.assert(render_state == null);
+    self.detachHeadlessSurface(id);
+}
+
+fn wayringSurfaceApplied(context: *anyopaque, batch: WayringCompositor.AppliedBatch) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    for (batch.surfaces) |surface| {
+        const render_state = self.surface_registry.renderState(surface.id);
+        if (surface.mapped_size) |mapped_size| {
+            std.debug.assert(render_state != null);
+            std.debug.assert(std.meta.eql(mapped_size, render_state.?.logical_size));
+        } else {
+            std.debug.assert(render_state == null);
+        }
     }
-    self.commitHeadlessSurface(id, size, callbacks_committed);
+    self.applyHeadlessBatch(batch);
 }
 
 fn wayringSurfaceRemoving(context: *anyopaque, id: SurfaceRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    const index = self.headless_surface_forest.rootIndex(id) orelse unreachable;
-    if (self.headless_surface_forest.roots()[index].mapped_size) |mapped_size| {
+    if (self.headless_surface_forest.state(id).?.mapped_size) |mapped_size| {
         const render_state = self.surface_registry.renderState(id) orelse unreachable;
         std.debug.assert(std.meta.eql(mapped_size, render_state.logical_size));
     }
@@ -5037,7 +5040,7 @@ fn damageGlobalRect(
                     render_output,
                     output,
                     &surface_damage,
-                    0,
+                    null,
                 ) catch {
                     self.damageFullOutput(render_output);
                     continue;
@@ -5107,9 +5110,8 @@ fn damageGlobalRect(
 fn damageHeadlessSurfaceBounds(
     self: *Self,
     rectangle: render.Rect,
-    source_index: usize,
+    source_id: SurfaceRegistry.Id,
 ) void {
-    std.debug.assert(source_index < self.headless_surface_forest.len());
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| {
         const render_output = entry.value.*;
@@ -5135,7 +5137,7 @@ fn damageHeadlessSurfaceBounds(
             render_output,
             output,
             &damage,
-            source_index + 1,
+            source_id,
         ) catch {
             self.damageFullOutput(render_output);
             continue;
@@ -5165,30 +5167,51 @@ fn damageHeadlessSurfaceBounds(
     }
 }
 
+fn damageHeadlessCompound(self: *Self, id: SurfaceRegistry.Id) void {
+    switch (self.headless_surface_forest.compoundBounds(id)) {
+        .hidden => {},
+        .rect => |rectangle| self.damageHeadlessSurfaceBounds(rectangle, id),
+        .full_damage => {
+            var render_outputs = self.render_outputs.iterator();
+            while (render_outputs.next()) |entry| {
+                const output = entry.value.*;
+                if (!output.backend.isHeadless() or !output.backend.powered()) continue;
+                self.damageFullOutput(output);
+            }
+        },
+    }
+}
+
 fn expandHeadlessSurfaceBlurDamage(
     self: *Self,
     render_output: *const RenderOutput,
     output: *const Output,
     damage: *Region,
-    first_index: usize,
+    after_id: ?SurfaceRegistry.Id,
 ) (Region.Error || error{UnresolvedBlurSource})!bool {
-    const roots = self.headless_surface_forest.roots();
-    std.debug.assert(first_index <= roots.len);
     const blur = Scene.background_blur;
     var any_changed = false;
     var changed = true;
     while (changed) {
         changed = false;
-        for (roots[first_index..]) |entry| {
-            const mapped_size = entry.mapped_size orelse continue;
+        var reached_source = after_id == null;
+        var iterator = self.headless_surface_forest.renderIterator();
+        while (iterator.next()) |entry| {
+            if (!reached_source) {
+                if (std.meta.eql(entry.id, after_id.?)) reached_source = true;
+                continue;
+            }
+            const mapped_size = entry.mapped_size;
             const render_state = self.surface_registry.renderState(entry.id) orelse
                 return error.UnresolvedBlurSource;
-            std.debug.assert(std.meta.eql(mapped_size, render_state.logical_size));
+            if (!std.meta.eql(mapped_size, render_state.logical_size))
+                return error.UnresolvedBlurSource;
             if (renderStateFullyOpaque(render_state)) continue;
             const region = render_state.blur_region orelse continue;
             var rectangles = region.rectangleIterator();
             while (rectangles.next()) |rectangle| {
-                const local = surfaceEffectRect(rectangle, mapped_size) orelse continue;
+                const local = (surfaceEffectRect(rectangle, mapped_size) orelse continue)
+                    .translated(entry.position.x, entry.position.y);
                 const affected = backdrop_blur_damage.areaForOutput(
                     local,
                     output.logicalRect(),
@@ -5259,17 +5282,16 @@ fn rememberSampledSurfaces(self: *Self, output: *RenderOutput) void {
 /// frame. Taking the thunk clears demand before frontend code can run.
 fn completeSampledHeadlessFrames(self: *Self) void {
     var callback_timestamp_ms: ?u32 = null;
-    var index: usize = 0;
-    while (index < self.headless_surface_forest.len()) : (index += 1) {
-        const root = self.headless_surface_forest.roots()[index];
-        if (!root.frame_demand or !self.renderer.wasSampled(surfaceSampleTag(root.id))) continue;
-        const completion = self.headless_surface_forest.takeFrameCompletion(root.id) orelse unreachable;
+    var iterator = self.headless_surface_forest.nodeIterator();
+    while (iterator.next()) |node| {
+        if (!node.frame_demand or !self.renderer.wasSampled(surfaceSampleTag(node.id))) continue;
+        const completion = self.headless_surface_forest.takeFrameCompletion(node.id) orelse unreachable;
         const timestamp_ms = callback_timestamp_ms orelse timestamp: {
             const value = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io)).milliseconds();
             callback_timestamp_ms = value;
             break :timestamp value;
         };
-        completion.complete(completion.context, root.id, timestamp_ms);
+        completion.complete(completion.context, node.id, timestamp_ms);
     }
 }
 
@@ -9496,13 +9518,14 @@ fn renderLayerSurfaces(
 
 fn renderHeadlessSurfaces(self: *Self, frame: *const OutputFrame) Renderer.Error!void {
     if (!frame.render_output.backend.isHeadless()) return;
-    for (self.headless_surface_forest.roots()) |entry| {
-        const mapped_size = entry.mapped_size orelse continue;
+    var iterator = self.headless_surface_forest.renderIterator();
+    while (iterator.next()) |entry| {
+        const mapped_size = entry.mapped_size;
         const render_state = self.surface_registry.renderState(entry.id) orelse continue;
         std.debug.assert(std.meta.eql(mapped_size, render_state.logical_size));
         const surface_rect: render.Rect = .{
-            .x = 0,
-            .y = 0,
+            .x = entry.position.x,
+            .y = entry.position.y,
             .width = mapped_size.width,
             .height = mapped_size.height,
         };
@@ -9511,8 +9534,8 @@ fn renderHeadlessSurfaces(self: *Self, frame: *const OutputFrame) Renderer.Error
         const capture_id: ?u32 = if (renderStateBlurBounds(
             frame,
             render_state,
-            0,
-            0,
+            entry.position.x,
+            entry.position.y,
             null,
             null,
         )) |rect| capture: {
@@ -9531,15 +9554,19 @@ fn renderHeadlessSurfaces(self: *Self, frame: *const OutputFrame) Renderer.Error
         try self.renderSurfaceBackgroundEffect(
             frame,
             render_state,
-            0,
-            0,
+            entry.position.x,
+            entry.position.y,
             null,
             null,
             capture_id,
         );
         const command = [_]render.Command{.{ .image = imageFromRenderState(
             render_state,
-            .{ .position = .{}, .rounded_clip = null, .clip = null },
+            .{
+                .position = .{ .x = entry.position.x, .y = entry.position.y },
+                .rounded_clip = null,
+                .clip = null,
+            },
             surfaceSampleTag(entry.id),
         ) }};
         try self.renderCommands(frame, &command);
@@ -10920,9 +10947,8 @@ const TestFrameCompletion = struct {
         const self: *TestFrameCompletion = @ptrCast(@alignCast(context));
         std.debug.assert(self.count < self.ids.len);
         if (self.forest) |forest| {
-            const index = forest.rootIndex(id) orelse unreachable;
             self.demand_cleared_before_call = self.demand_cleared_before_call and
-                !forest.roots()[index].frame_demand;
+                !forest.state(id).?.frame_demand;
         }
         self.ids[self.count] = id;
         self.timestamps_ms[self.count] = timestamp_ms;
@@ -10936,6 +10962,252 @@ fn renderPendingTestOutput(server: *Self, output: *RenderOutput) Renderer.Error!
     output.render_scheduled = false;
     output.repaint_needed = false;
     try server.renderFrame(output);
+}
+
+test "applied nested topology paints exact order and completes only sampled child tags" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 3, .height = 1 } },
+    );
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+    var sampled_completion: TestFrameCompletion = .{ .forest = &server.headless_surface_forest };
+    var hidden_completion: TestFrameCompletion = .{ .forest = &server.headless_surface_forest };
+    var root: SyntheticSurfaceProvider = .{
+        .pixel = 0xffff_0000,
+        .logical_size = .{ .width = 3, .height = 1 },
+    };
+    var below: SyntheticSurfaceProvider = .{
+        .pixel = 0xff00_ff00,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    var above: SyntheticSurfaceProvider = .{
+        .pixel = 0xff00_00ff,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    var grandchild: SyntheticSurfaceProvider = .{
+        .pixel = 0xffff_ff00,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    var outside: SyntheticSurfaceProvider = .{
+        .pixel = 0xff00_ffff,
+        .logical_size = .{ .width = 2, .height = 1 },
+    };
+    const root_id = try server.surface_registry.add(root.provider());
+    const below_id = try server.surface_registry.add(below.provider());
+    const above_id = try server.surface_registry.add(above.provider());
+    const grandchild_id = try server.surface_registry.add(grandchild.provider());
+    const outside_id = try server.surface_registry.add(outside.provider());
+    try server.addHeadlessSurface(root_id, null);
+    try server.addHeadlessSurface(below_id, null);
+    try server.addHeadlessSurface(above_id, sampled_completion.frameCompletion());
+    try server.addHeadlessSurface(grandchild_id, sampled_completion.frameCompletion());
+    try server.addHeadlessSurface(outside_id, hidden_completion.frameCompletion());
+    server.commitHeadlessSurface(root_id, root.logical_size, false);
+    server.commitHeadlessSurface(below_id, below.logical_size, false);
+    server.commitHeadlessSurface(above_id, above.logical_size, true);
+    server.commitHeadlessSurface(grandchild_id, grandchild.logical_size, true);
+    server.commitHeadlessSurface(outside_id, outside.logical_size, true);
+
+    const root_stack = [_]WayringCompositor.AppliedStackEntry{
+        .{ .child = .{ .id = below_id, .position = .{} } },
+        .parent,
+        .{ .child = .{ .id = above_id, .position = .{ .x = 1 } } },
+        .{ .child = .{ .id = outside_id, .position = .{ .x = -2 } } },
+    };
+    const above_stack = [_]WayringCompositor.AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = grandchild_id, .position = .{ .x = -1 } } },
+    };
+    const parents = [_]WayringCompositor.AppliedParentState{
+        .{ .id = root_id, .stack = &root_stack },
+        .{ .id = above_id, .stack = &above_stack },
+    };
+    server.applyHeadlessBatch(.{ .surfaces = &.{}, .parents = &parents });
+    try renderPendingTestOutput(server, output);
+
+    const target = switch (output.backend.acquire().?) {
+        .pixels => |pixels| pixels,
+        else => return error.ExpectedCpuHeadlessTarget,
+    };
+    try std.testing.expectEqualSlices(u32, &.{ grandchild.pixel, above.pixel, root.pixel }, target.pixels);
+    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(below_id)));
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(root_id)));
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(above_id)));
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(grandchild_id)));
+    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(outside_id)));
+    try std.testing.expectEqual(@as(usize, 2), sampled_completion.count);
+    try std.testing.expectEqual(@as(usize, 0), hidden_completion.count);
+    try std.testing.expect(server.headless_surface_forest.state(outside_id).?.frame_demand);
+    try std.testing.expect(surfaceSampleTag(above_id) != surfaceSampleTag(grandchild_id));
+
+    // Recursive mapping hides descendants without consuming their demand.
+    server.commitHeadlessSurface(grandchild_id, grandchild.logical_size, true);
+    server.commitHeadlessSurface(root_id, null, false);
+    try renderPendingTestOutput(server, output);
+    try std.testing.expectEqual(@as(usize, 2), sampled_completion.count);
+    try std.testing.expect(server.headless_surface_forest.state(grandchild_id).?.frame_demand);
+    server.commitHeadlessSurface(root_id, root.logical_size, false);
+    try renderPendingTestOutput(server, output);
+    try std.testing.expectEqual(@as(usize, 3), sampled_completion.count);
+    try std.testing.expectEqual(grandchild_id, sampled_completion.ids[2]);
+
+    // A partially intersecting child becomes visible without clipping to its
+    // parent, and its previously hidden demand completes on the exact tag.
+    const moved_stack = [_]WayringCompositor.AppliedStackEntry{
+        .{ .child = .{ .id = below_id, .position = .{} } },
+        .parent,
+        .{ .child = .{ .id = above_id, .position = .{ .x = 1 } } },
+        .{ .child = .{ .id = outside_id, .position = .{ .x = -1 } } },
+    };
+    const moved_parents = [_]WayringCompositor.AppliedParentState{.{
+        .id = root_id,
+        .stack = &moved_stack,
+    }};
+    server.applyHeadlessBatch(.{ .surfaces = &.{}, .parents = &moved_parents });
+    try renderPendingTestOutput(server, output);
+    try std.testing.expectEqual(@as(usize, 1), hidden_completion.count);
+    try std.testing.expectEqual(outside_id, hidden_completion.ids[0]);
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(outside_id)));
+    const partial_target = switch (output.backend.acquire().?) {
+        .pixels => |pixels| pixels,
+        else => return error.ExpectedCpuHeadlessTarget,
+    };
+    try std.testing.expectEqual(outside.pixel, partial_target.pixels[0]);
+
+    // Reusing the provider slot for another child cannot alias the sampled
+    // tag or revive stale completion demand.
+    const stale_tag = surfaceSampleTag(outside_id);
+    server.removeHeadlessSurface(outside_id);
+    server.surface_registry.remove(outside_id);
+    var replacement: SyntheticSurfaceProvider = .{
+        .pixel = 0xffff_00ff,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const replacement_id = try server.surface_registry.add(replacement.provider());
+    try std.testing.expectEqual(outside_id.index, replacement_id.index);
+    try std.testing.expect(outside_id.generation != replacement_id.generation);
+    try server.addHeadlessSurface(replacement_id, null);
+    server.commitHeadlessSurface(replacement_id, replacement.logical_size, false);
+    const replacement_stack = [_]WayringCompositor.AppliedStackEntry{
+        .{ .child = .{ .id = below_id, .position = .{} } },
+        .parent,
+        .{ .child = .{ .id = above_id, .position = .{ .x = 1 } } },
+        .{ .child = .{ .id = replacement_id, .position = .{ .x = 2 } } },
+    };
+    const replacement_parents = [_]WayringCompositor.AppliedParentState{.{
+        .id = root_id,
+        .stack = &replacement_stack,
+    }};
+    server.applyHeadlessBatch(.{ .surfaces = &.{}, .parents = &replacement_parents });
+    try renderPendingTestOutput(server, output);
+    try std.testing.expect(!server.renderer.wasSampled(stale_tag));
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(replacement_id)));
+    try std.testing.expectEqual(@as(usize, 1), hidden_completion.count);
+
+    try std.testing.expectEqual(@as(?SurfaceRegistry.Id, null), server.scene.focusedSurface());
+    try std.testing.expectEqual(@as(?SurfaceRegistry.Id, null), server.scene.topWindowSurface());
+    try std.testing.expect(!server.scene.surfaceTracked(grandchild_id));
+    try std.testing.expectEqual(@as(?Seat.PointerFocus, null), server.pointerFocus(0, 0));
+    try std.testing.expect(!server.outputs.get(output.protocol_id).?.containsSurface(grandchild_id));
+
+    server.removeHeadlessSurface(root_id);
+    server.surface_registry.remove(root_id);
+    server.removeHeadlessSurface(below_id);
+    server.surface_registry.remove(below_id);
+    server.removeHeadlessSurface(above_id);
+    server.surface_registry.remove(above_id);
+    server.removeHeadlessSurface(grandchild_id);
+    server.surface_registry.remove(grandchild_id);
+    server.removeHeadlessSurface(replacement_id);
+    server.surface_registry.remove(replacement_id);
+}
+
+test "applied topology damages old and new compounds for movement stacking mapping detach and removal" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 8, .height = 1 } },
+    );
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+    var root: SyntheticSurfaceProvider = .{
+        .pixel = 0xffff_0000,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    var first: SyntheticSurfaceProvider = .{
+        .pixel = 0xff00_ff00,
+        .logical_size = .{ .width = 2, .height = 1 },
+    };
+    var second: SyntheticSurfaceProvider = .{
+        .pixel = 0xff00_00ff,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const root_id = try server.surface_registry.add(root.provider());
+    const first_id = try server.surface_registry.add(first.provider());
+    const second_id = try server.surface_registry.add(second.provider());
+    try server.addHeadlessSurface(root_id, null);
+    try server.addHeadlessSurface(first_id, null);
+    try server.addHeadlessSurface(second_id, null);
+    server.commitHeadlessSurface(root_id, root.logical_size, false);
+    server.commitHeadlessSurface(first_id, first.logical_size, false);
+    server.commitHeadlessSurface(second_id, second.logical_size, false);
+
+    const initial_stack = [_]WayringCompositor.AppliedStackEntry{
+        .{ .child = .{ .id = second_id, .position = .{ .x = 2 } } },
+        .parent,
+        .{ .child = .{ .id = first_id, .position = .{ .x = 1 } } },
+    };
+    const initial_parents = [_]WayringCompositor.AppliedParentState{.{
+        .id = root_id,
+        .stack = &initial_stack,
+    }};
+    server.applyHeadlessBatch(.{ .surfaces = &.{}, .parents = &initial_parents });
+    try renderPendingTestOutput(server, output);
+
+    resetTestOutputDamage(output);
+    const moved_stack = [_]WayringCompositor.AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = second_id, .position = .{ .x = 2 } } },
+        .{ .child = .{ .id = first_id, .position = .{ .x = 4 } } },
+    };
+    const moved_parents = [_]WayringCompositor.AppliedParentState{.{
+        .id = root_id,
+        .stack = &moved_stack,
+    }};
+    server.applyHeadlessBatch(.{ .surfaces = &.{}, .parents = &moved_parents });
+    try std.testing.expect(output.damage.coversRectangle(0, 0, 3, 1));
+    try std.testing.expect(output.damage.coversRectangle(4, 0, 2, 1));
+    try std.testing.expect(output.repaint_needed and output.render_scheduled);
+
+    resetTestOutputDamage(output);
+    server.commitHeadlessSurface(first_id, null, false);
+    try std.testing.expect(output.damage.coversRectangle(4, 0, 2, 1));
+    server.commitHeadlessSurface(first_id, first.logical_size, false);
+    try std.testing.expect(output.damage.coversRectangle(4, 0, 2, 1));
+
+    resetTestOutputDamage(output);
+    server.detachHeadlessSurface(first_id);
+    try std.testing.expect(output.damage.coversRectangle(4, 0, 2, 1));
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement.detached, server.headless_surface_forest.state(first_id).?.placement);
+
+    server.applyHeadlessBatch(.{ .surfaces = &.{}, .parents = &moved_parents });
+    resetTestOutputDamage(output);
+    server.removeHeadlessSurface(first_id);
+    try std.testing.expect(output.damage.coversRectangle(4, 0, 2, 1));
+    server.surface_registry.remove(first_id);
+
+    server.removeHeadlessSurface(root_id);
+    server.surface_registry.remove(root_id);
+    server.removeHeadlessSurface(second_id);
+    server.surface_registry.remove(second_id);
 }
 
 test "sampled accepted headless frame completes callback-only demand once" {
@@ -10963,12 +11235,12 @@ test "sampled accepted headless frame completes callback-only demand once" {
     server.commitHeadlessSurface(id, provider.logical_size, true);
     try std.testing.expect(output.repaint_needed);
     try std.testing.expect(output.render_scheduled);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.state(id).?.frame_demand);
 
     try std.testing.expectEqual(provider.pixel, try captureSinglePixel(server));
     try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(id)));
     try std.testing.expectEqual(@as(usize, 0), completion.count);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.state(id).?.frame_demand);
 
     try server.renderer.beginFrame(.{ .offscreen = .{
         .id = 1,
@@ -10981,7 +11253,7 @@ test "sampled accepted headless frame completes callback-only demand once" {
     ) }});
     try std.testing.expectError(error.InvalidTarget, server.renderer.finishFrame());
     try std.testing.expectEqual(@as(usize, 0), completion.count);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.state(id).?.frame_demand);
 
     var target_pixels: [1]u32 = undefined;
     try server.renderer.beginFrame(.{ .pixels = .{
@@ -11002,13 +11274,13 @@ test "sampled accepted headless frame completes callback-only demand once" {
     server.renderer.cancelFrame();
     try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(id)));
     try std.testing.expectEqual(@as(usize, 0), completion.count);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.state(id).?.frame_demand);
 
     try renderPendingTestOutput(server, output);
     try std.testing.expectEqual(@as(usize, 1), completion.count);
     try std.testing.expect(std.meta.eql(id, completion.ids[0]));
     try std.testing.expect(completion.demand_cleared_before_call);
-    try std.testing.expect(!server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(!server.headless_surface_forest.state(id).?.frame_demand);
 
     server.commitHeadlessSurface(id, provider.logical_size, false);
     try renderPendingTestOutput(server, output);
@@ -11017,13 +11289,13 @@ test "sampled accepted headless frame completes callback-only demand once" {
     server.commitHeadlessSurface(id, null, true);
     try renderPendingTestOutput(server, output);
     try std.testing.expectEqual(@as(usize, 1), completion.count);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.state(id).?.frame_demand);
 
     server.commitHeadlessSurface(id, provider.logical_size, false);
     try renderPendingTestOutput(server, output);
     try std.testing.expectEqual(@as(usize, 2), completion.count);
     try std.testing.expect(std.meta.eql(id, completion.ids[1]));
-    try std.testing.expect(!server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(!server.headless_surface_forest.state(id).?.frame_demand);
 
     server.removeHeadlessSurface(id);
     server.surface_registry.remove(id);
@@ -11058,8 +11330,8 @@ test "scale-only logical resize damages bounds samples and completes frame deman
     try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 1));
     try std.testing.expect(output.repaint_needed);
     try std.testing.expect(output.render_scheduled);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
-    try std.testing.expectEqual(provider.logical_size, server.headless_surface_forest.roots()[0].mapped_size.?);
+    try std.testing.expect(server.headless_surface_forest.state(id).?.frame_demand);
+    try std.testing.expectEqual(provider.logical_size, server.headless_surface_forest.state(id).?.mapped_size.?);
     const state = server.surface_registry.renderState(id).?;
     try std.testing.expectEqual(provider.logical_size, state.logical_size);
     try std.testing.expectEqual(@as(u64, 1), state.buffer.source_cache.?.version);
@@ -11069,7 +11341,7 @@ test "scale-only logical resize damages bounds samples and completes frame deman
     try std.testing.expectEqual(@as(usize, 1), completion.count);
     try std.testing.expect(std.meta.eql(id, completion.ids[0]));
     try std.testing.expect(completion.demand_cleared_before_call);
-    try std.testing.expect(!server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(!server.headless_surface_forest.state(id).?.frame_demand);
 
     const target = switch (output.backend.acquire().?) {
         .pixels => |pixels| pixels,
@@ -11115,7 +11387,7 @@ test "headless completion follows exact opaque pruning and partial visibility" {
     try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(lower_id)));
     try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(upper_id)));
     try std.testing.expectEqual(@as(usize, 0), completion.count);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.state(lower_id).?.frame_demand);
 
     upper.logical_size = .{ .width = 1, .height = 1 };
     upper.version += 1;
@@ -11281,10 +11553,10 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
     const second_id = try server.surface_registry.add(second.provider());
     try server.addHeadlessSurface(second_id, null);
     server.commitHeadlessSurface(second_id, second.logical_size, false);
-    try std.testing.expectEqualSlices(HeadlessSurfaceForest.Root, &.{
-        .{ .id = first_id, .mapped_size = null },
-        .{ .id = second_id, .mapped_size = second.logical_size },
-    }, server.headless_surface_forest.roots());
+    try std.testing.expectEqual(first_id, server.headless_surface_forest.rootAt(0).?.id);
+    try std.testing.expectEqual(@as(?render.Size, null), server.headless_surface_forest.rootAt(0).?.mapped_size);
+    try std.testing.expectEqual(second_id, server.headless_surface_forest.rootAt(1).?.id);
+    try std.testing.expectEqual(second.logical_size, server.headless_surface_forest.rootAt(1).?.mapped_size.?);
 
     resetTestOutputDamage(output);
     server.removeHeadlessSurface(first_id);
@@ -11298,10 +11570,10 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
     const replacement_id = try server.surface_registry.add(replacement.provider());
     try server.addHeadlessSurface(replacement_id, null);
     server.commitHeadlessSurface(replacement_id, replacement.logical_size, false);
-    try std.testing.expectEqualSlices(HeadlessSurfaceForest.Root, &.{
-        .{ .id = second_id, .mapped_size = second.logical_size },
-        .{ .id = replacement_id, .mapped_size = replacement.logical_size },
-    }, server.headless_surface_forest.roots());
+    try std.testing.expectEqual(second_id, server.headless_surface_forest.rootAt(0).?.id);
+    try std.testing.expectEqual(second.logical_size, server.headless_surface_forest.rootAt(0).?.mapped_size.?);
+    try std.testing.expectEqual(replacement_id, server.headless_surface_forest.rootAt(1).?.id);
+    try std.testing.expectEqual(replacement.logical_size, server.headless_surface_forest.rootAt(1).?.mapped_size.?);
 
     resetTestOutputDamage(output);
     server.removeHeadlessSurface(second_id);
@@ -11591,7 +11863,7 @@ test "opaque fullscreen suppresses headless surfaces and preserves direct scanou
     }
     server.renderer.cancelFrame();
     try std.testing.expectEqual(@as(usize, 0), completion.count);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.state(headless_id).?.frame_demand);
 
     var fullscreen: SyntheticSurfaceProvider = .{
         .pixel = 0xffab_cdef,
@@ -11629,7 +11901,7 @@ test "opaque fullscreen suppresses headless surfaces and preserves direct scanou
     }
     server.renderer.cancelFrame();
     try std.testing.expectEqual(@as(usize, 0), completion.count);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.state(headless_id).?.frame_demand);
 
     server.scene.removeWindow(fullscreen_scene);
     server.commitHeadlessSurface(headless_id, headless.logical_size, false);
@@ -11674,10 +11946,8 @@ test "Wayring listener rollback removes an unpublished headless entry" {
         .complete = Completion.complete,
     };
     try listener.added(listener.context, id, completion);
-    try std.testing.expectEqualSlices(HeadlessSurfaceForest.Root, &.{.{
-        .id = id,
-        .frame_completion = completion,
-    }}, server.headless_surface_forest.roots());
+    try std.testing.expectEqual(id, server.headless_surface_forest.rootAt(0).?.id);
+    try std.testing.expectEqual(completion, server.headless_surface_forest.rootAt(0).?.frame_completion.?);
     listener.removing(listener.context, id);
     try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
     server.surface_registry.remove(id);
@@ -12148,7 +12418,7 @@ fn expectWayringSnapshot(
     expected_transform: render.BufferTransform,
 ) !void {
     try std.testing.expectEqual(@as(usize, 1), server.headless_surface_forest.len());
-    const state = server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id).?;
+    const state = server.surface_registry.renderState(server.headless_surface_forest.rootAt(0).?.id).?;
     try std.testing.expectEqual(expected_logical_size, state.logical_size);
     try std.testing.expectEqual(expected_transform, state.transform);
     try std.testing.expectEqual(expected_version, state.buffer.source_cache.?.version);
@@ -12166,7 +12436,7 @@ fn expectWayringScaleSnapshot(
     expected_logical_size: render.Size,
 ) !void {
     try std.testing.expectEqual(@as(usize, 1), server.headless_surface_forest.len());
-    const state = server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id).?;
+    const state = server.surface_registry.renderState(server.headless_surface_forest.rootAt(0).?.id).?;
     try std.testing.expectEqual(render.Size{ .width = 4, .height = 2 }, state.buffer.size);
     try std.testing.expectEqual(expected_logical_size, state.logical_size);
     try std.testing.expectEqual(render.BufferTransform.normal, state.transform);
@@ -12318,7 +12588,7 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try std.testing.expectEqual(registry_baseline + 1, server.surface_registry.len());
     try std.testing.expectEqual(@as(usize, 1), compositor.surfaceCount());
     try std.testing.expectEqual(@as(usize, 0), compositor.regionCount());
-    const initial_state = server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id).?;
+    const initial_state = server.surface_registry.renderState(server.headless_surface_forest.rootAt(0).?.id).?;
     try std.testing.expect(initial_state.opaque_region.?.contains(0, 0));
     try std.testing.expect(!initial_state.opaque_region.?.contains(1, 0));
     try expectWayringSnapshot(
@@ -12364,7 +12634,7 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     );
     try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 1));
     try std.testing.expect(output.damage.coversRectangle(0, 0, 1, 2));
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.rootAt(0).?.frame_demand);
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringRotatedHeadlessPixels(server, .{ 0x0066_7788, 0x0099_aabb });
 
@@ -12398,7 +12668,7 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 1));
     try std.testing.expect(output.repaint_needed);
     try std.testing.expect(output.render_scheduled);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.rootAt(0).?.frame_demand);
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, .{ 0x00cc_0000, 0x0000_dd00 });
 
@@ -12415,7 +12685,7 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 1));
     try std.testing.expect(output.repaint_needed);
     try std.testing.expect(output.render_scheduled);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.rootAt(0).?.frame_demand);
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, .{ 0x00cc_0000, 0x0000_dd00 });
 
@@ -12433,10 +12703,10 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 1));
     try std.testing.expect(output.repaint_needed);
     try std.testing.expect(output.render_scheduled);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.rootAt(0).?.frame_demand);
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, .{ 0x00cc_0000, 0x0000_dd00 });
-    const attached_offset_state = server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id).?;
+    const attached_offset_state = server.surface_registry.renderState(server.headless_surface_forest.rootAt(0).?.id).?;
     const attached_offset_pointer = attached_offset_state.buffer.pixels.ptr;
     const attached_offset_cache = attached_offset_state.buffer.source_cache.?;
 
@@ -12450,14 +12720,14 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
     try std.testing.expectEqual(@as(u8, 4), client.release_count.load(.acquire));
     try std.testing.expectEqual(@as(u8, 5), client.frame_done_count.load(.acquire));
-    const offset_only_state = server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id).?;
+    const offset_only_state = server.surface_registry.renderState(server.headless_surface_forest.rootAt(0).?.id).?;
     try std.testing.expectEqual(attached_offset_pointer, offset_only_state.buffer.pixels.ptr);
     try std.testing.expectEqual(attached_offset_cache, offset_only_state.buffer.source_cache.?);
     try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, offset_only_state.logical_size);
     try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 1));
     try std.testing.expect(output.repaint_needed);
     try std.testing.expect(output.render_scheduled);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.rootAt(0).?.frame_demand);
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, .{ 0x00cc_0000, 0x0000_dd00 });
 
@@ -12470,15 +12740,15 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try waitForWayringClientStage(server, host, &client, .unmapped);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
     try std.testing.expectEqual(@as(u8, 6), client.frame_done_count.load(.acquire));
-    try std.testing.expect(server.surface_registry.renderState(server.headless_surface_forest.roots()[0].id) == null);
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.surface_registry.renderState(server.headless_surface_forest.rootAt(0).?.id) == null);
+    try std.testing.expect(server.headless_surface_forest.rootAt(0).?.frame_demand);
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, null);
 
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .unmapped_no_done);
     try std.testing.expectEqual(@as(u8, 6), client.frame_done_count.load(.acquire));
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.rootAt(0).?.frame_demand);
 
     previous_frames = output.frame_statistics.frames_presented;
     try signalWayringCommand(command_fd);
@@ -12503,7 +12773,7 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try waitForWayringClientStage(server, host, &client, .outstanding_callback);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
     try std.testing.expectEqual(@as(u8, 7), client.frame_done_count.load(.acquire));
-    try std.testing.expect(server.headless_surface_forest.roots()[0].frame_demand);
+    try std.testing.expect(server.headless_surface_forest.rootAt(0).?.frame_demand);
 
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .disconnected);
