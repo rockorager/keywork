@@ -12331,6 +12331,393 @@ const WayringHeadlessClient = struct {
     }
 };
 
+// Staged real libwayland-client peer for the subsurface E2E below. Listener-
+// owned values are published by the stage release, and the server thread reads
+// them only after the matching acquire.
+const WayringSubsurfaceClient = struct {
+    const Stage = enum(u8) {
+        starting,
+        queued,
+        applied,
+        first_done,
+        child_desync_locked,
+        ancestor_unlocked,
+        second_done,
+        occluded,
+        occluded_no_done,
+        restacked,
+        restacked_done,
+        hidden,
+        hidden_no_done,
+        remapped,
+        remapped_done,
+        off_output,
+        off_output_no_done,
+        on_output,
+        on_output_done,
+        frame_pending,
+        frame_not_done,
+        frame_done,
+        multi_pending,
+        multi_first_done,
+        multi_second_unchanged,
+        queued_detached,
+        detached_no_done,
+        recreated,
+        parent_destroyed,
+        disconnected,
+        failed,
+    };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*wayland.client.wl.Compositor = null,
+    shm: ?*wayland.client.wl.Shm = null,
+    subcompositor: ?*wayland.client.wl.Subcompositor = null,
+    compositor_globals: u8 = 0,
+    subcompositor_globals: u8 = 0,
+    compositor_version: u32 = 0,
+    subcompositor_version: u32 = 0,
+    release_count: std.atomic.Value(u8) = .init(0),
+    done_count: std.atomic.Value(u8) = .init(0),
+    last_done_timestamp_ms: std.atomic.Value(u32) = .init(0),
+
+    fn run(self: *WayringSubsurfaceClient) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *WayringSubsurfaceClient) !void {
+        const path = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}/{s}", .{
+            self.runtime_directory, self.display_name,
+        }, 0);
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+        const display = try wayland.client.wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*WayringSubsurfaceClient, registryEvent, self);
+        try expectClientRoundtrip(display);
+        if (self.compositor_globals != 1 or self.subcompositor_globals != 1 or
+            self.compositor_version != 6 or self.subcompositor_version != 1)
+            return error.UnexpectedGlobalCount;
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        const shm = self.shm orelse return error.ShmMissing;
+        const manager = self.subcompositor orelse return error.SubcompositorMissing;
+        var manager_live = true;
+        defer if (manager_live) manager.destroy();
+
+        const root = try compositor.createSurface();
+        var root_live = true;
+        defer if (root_live) root.destroy();
+        const parent = try compositor.createSurface();
+        var parent_live = true;
+        defer if (parent_live) parent.destroy();
+        const child = try compositor.createSurface();
+        var child_live = true;
+        defer if (child_live) child.destroy();
+        const sibling = try compositor.createSurface();
+        var sibling_live = true;
+        defer if (sibling_live) sibling.destroy();
+        const parent_role = try manager.getSubsurface(parent, root);
+        var parent_role_live = true;
+        defer if (parent_role_live) parent_role.destroy();
+        var child_role = try manager.getSubsurface(child, parent);
+        var child_role_live = true;
+        defer if (child_role_live) child_role.destroy();
+        const sibling_role = try manager.getSubsurface(sibling, root);
+        var sibling_role_live = true;
+        defer if (sibling_role_live) sibling_role.destroy();
+        parent_role.setPosition(1, 0);
+        child_role.setPosition(1, 0);
+        sibling_role.setPosition(1, 0);
+
+        const shm_fd = try std.posix.memfd_create("keywork-wayring-subsurface", std.os.linux.MFD.CLOEXEC);
+        defer _ = std.os.linux.close(shm_fd);
+        const pixels = [_]u32{
+            0x00ff_0000,
+            0x00ff_0000,
+            0x0000_ff00,
+            0x0000_00ff,
+            0x0000_ffff,
+            0x00ff_ff00,
+        };
+        if (std.os.linux.errno(std.os.linux.ftruncate(shm_fd, @sizeOf(@TypeOf(pixels)))) != .SUCCESS)
+            return error.ShmResizeFailed;
+        if (std.c.pwrite(shm_fd, @ptrCast(&pixels), @sizeOf(@TypeOf(pixels)), 0) != @sizeOf(@TypeOf(pixels)))
+            return error.ShmWriteFailed;
+        const pool = try shm.createPool(shm_fd, @sizeOf(@TypeOf(pixels)));
+        defer pool.destroy();
+        const buffers = [_]*wayland.client.wl.Buffer{
+            try pool.createBuffer(0, 2, 1, 2 * @sizeOf(u32), .xrgb8888),
+            try pool.createBuffer(2 * @sizeOf(u32), 1, 1, @sizeOf(u32), .xrgb8888),
+            try pool.createBuffer(3 * @sizeOf(u32), 1, 1, @sizeOf(u32), .xrgb8888),
+            try pool.createBuffer(4 * @sizeOf(u32), 1, 1, @sizeOf(u32), .xrgb8888),
+            try pool.createBuffer(5 * @sizeOf(u32), 1, 1, @sizeOf(u32), .xrgb8888),
+        };
+        for (buffers) |buffer| buffer.setListener(*WayringSubsurfaceClient, bufferEvent, self);
+        defer for (buffers) |buffer| buffer.destroy();
+
+        root.attach(buffers[0], 0, 0);
+        child.attach(buffers[2], 0, 0);
+        try self.requestFrame(child);
+        child.commit();
+        parent.attach(buffers[1], 0, 0);
+        parent.commit(); // claims the first child cached state
+        parent.commit(); // cannot claim the already-owned child tail twice
+        child.attach(buffers[3], 0, 0);
+        try self.requestFrame(child);
+        child.commit();
+        sibling.attach(buffers[4], 0, 0);
+        sibling.commit();
+        try expectClientRoundtrip(display);
+        if (self.release_count.load(.acquire) != 4 or self.done_count.load(.acquire) != 0)
+            return error.UnexpectedQueuedState;
+        try self.pause(.queued);
+
+        root.commit();
+        try expectClientRoundtrip(display);
+        if (self.release_count.load(.acquire) != 5 or self.done_count.load(.acquire) != 0)
+            return error.UnexpectedAppliedState;
+        try self.pause(.applied);
+        try expectClientRoundtrip(display);
+        try self.expectDone(1);
+        try self.pause(.first_done);
+
+        child_role.setDesync();
+        try expectClientRoundtrip(display);
+        try self.expectDone(1);
+        try self.pause(.child_desync_locked);
+
+        parent_role.setDesync();
+        try expectClientRoundtrip(display);
+        try self.expectDone(1);
+        try self.pause(.ancestor_unlocked);
+        try expectClientRoundtrip(display);
+        try self.expectDone(2);
+        try self.pause(.second_done);
+
+        child_role.setPosition(0, 0);
+        parent.commit();
+        try self.requestFrame(child);
+        child.commit();
+        try expectClientRoundtrip(display);
+        try self.expectDone(2);
+        try self.pause(.occluded);
+        try expectClientRoundtrip(display);
+        try self.expectDone(2);
+        try self.pause(.occluded_no_done);
+
+        sibling_role.placeBelow(root);
+        parent_role.placeAbove(sibling);
+        parent_role.placeAbove(root);
+        root.commit();
+        try expectClientRoundtrip(display);
+        try self.expectDone(2);
+        try self.pause(.restacked);
+        try expectClientRoundtrip(display);
+        try self.expectDone(3);
+        try self.pause(.restacked_done);
+
+        try self.requestFrame(child);
+        child.commit();
+        parent.attach(null, 0, 0);
+        parent.commit();
+        try expectClientRoundtrip(display);
+        try self.expectDone(3);
+        try self.pause(.hidden);
+        try expectClientRoundtrip(display);
+        try self.expectDone(3);
+        try self.pause(.hidden_no_done);
+
+        parent.attach(buffers[1], 0, 0);
+        parent.commit();
+        try expectClientRoundtrip(display);
+        if (self.release_count.load(.acquire) != 6) return error.UnexpectedBufferRelease;
+        try self.expectDone(3);
+        try self.pause(.remapped);
+        try expectClientRoundtrip(display);
+        try self.expectDone(4);
+        try self.pause(.remapped_done);
+
+        child_role.setPosition(20, 0);
+        parent.commit();
+        try self.requestFrame(child);
+        child.commit();
+        try expectClientRoundtrip(display);
+        try self.expectDone(4);
+        try self.pause(.off_output);
+        try expectClientRoundtrip(display);
+        try self.expectDone(4);
+        try self.pause(.off_output_no_done);
+
+        child_role.setPosition(-1, 0);
+        parent.commit();
+        try expectClientRoundtrip(display);
+        try self.expectDone(4);
+        try self.pause(.on_output);
+        try expectClientRoundtrip(display);
+        try self.expectDone(5);
+        try self.pause(.on_output_done);
+
+        try self.requestFrame(child);
+        child.commit();
+        try expectClientRoundtrip(display);
+        try self.expectDone(5);
+        try self.pause(.frame_pending);
+        try expectClientRoundtrip(display);
+        try self.expectDone(5);
+        try self.pause(.frame_not_done);
+        try expectClientRoundtrip(display);
+        try self.expectDone(6);
+        try self.pause(.frame_done);
+
+        try self.requestFrame(child);
+        child.commit();
+        try expectClientRoundtrip(display);
+        try self.expectDone(6);
+        try self.pause(.multi_pending);
+        try expectClientRoundtrip(display);
+        try self.expectDone(7);
+        try self.pause(.multi_first_done);
+        try expectClientRoundtrip(display);
+        try self.expectDone(7);
+        try self.pause(.multi_second_unchanged);
+
+        child_role.setSync();
+        try self.requestFrame(child);
+        child.commit();
+        child_role.destroy();
+        child_role_live = false;
+        try expectClientRoundtrip(display);
+        try self.expectDone(7);
+        try self.pause(.queued_detached);
+        try expectClientRoundtrip(display);
+        try self.expectDone(7);
+        try self.pause(.detached_no_done);
+
+        child_role = try manager.getSubsurface(child, sibling);
+        child_role_live = true;
+        child_role.setPosition(-1, 0);
+        sibling.commit();
+        root.commit();
+        try expectClientRoundtrip(display);
+        try self.expectDone(7);
+        try self.pause(.recreated);
+
+        manager.destroy();
+        manager_live = false;
+        sibling_role.destroy();
+        sibling_role_live = false;
+        sibling.destroy();
+        sibling_live = false;
+        try expectClientRoundtrip(display);
+        try self.pause(.parent_destroyed);
+
+        // With its parent gone, the role is inert until destroyed. The direct
+        // scanner fault matrix owns deterministic OOM and partial-construction
+        // injection; this real fixture owns queued teardown and disconnect.
+        child_role.setPosition(9, -3);
+        child_role.destroy();
+        child_role_live = false;
+        child.destroy();
+        child_live = false;
+        parent_role.destroy();
+        parent_role_live = false;
+        parent.destroy();
+        parent_live = false;
+        root.destroy();
+        root_live = false;
+        try expectClientRoundtrip(display);
+    }
+
+    fn pause(self: *WayringSubsurfaceClient, stage: Stage) !void {
+        self.stage.store(@intFromEnum(stage), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+
+    fn expectDone(self: *WayringSubsurfaceClient, expected: u8) !void {
+        if (self.done_count.load(.acquire) != expected) return error.UnexpectedFrameDone;
+    }
+
+    fn requestFrame(self: *WayringSubsurfaceClient, surface: *wayland.client.wl.Surface) !void {
+        const callback = try surface.frame();
+        callback.setListener(*WayringSubsurfaceClient, frameEvent, self);
+    }
+
+    fn registryEvent(registry: *wayland.client.wl.Registry, event: wayland.client.wl.Registry.Event, self: *WayringSubsurfaceClient) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor")) {
+                    self.compositor_globals += 1;
+                    self.compositor_version = global.version;
+                    if (self.compositor == null and global.version >= 6)
+                        self.compositor = registry.bind(global.name, wayland.client.wl.Compositor, 6) catch null;
+                } else if (std.mem.eql(u8, interface, "wl_shm") and self.shm == null) {
+                    self.shm = registry.bind(global.name, wayland.client.wl.Shm, 1) catch null;
+                } else if (std.mem.eql(u8, interface, "wl_subcompositor")) {
+                    self.subcompositor_globals += 1;
+                    self.subcompositor_version = global.version;
+                    if (self.subcompositor == null and global.version >= 1)
+                        self.subcompositor = registry.bind(global.name, wayland.client.wl.Subcompositor, 1) catch null;
+                }
+            },
+            .global_remove => {},
+        }
+    }
+
+    fn bufferEvent(_: *wayland.client.wl.Buffer, event: wayland.client.wl.Buffer.Event, self: *WayringSubsurfaceClient) void {
+        switch (event) {
+            .release => _ = self.release_count.fetchAdd(1, .acq_rel),
+        }
+    }
+
+    fn frameEvent(callback: *wayland.client.wl.Callback, event: wayland.client.wl.Callback.Event, self: *WayringSubsurfaceClient) void {
+        switch (event) {
+            .done => |done| {
+                self.last_done_timestamp_ms.store(done.callback_data, .release);
+                _ = self.done_count.fetchAdd(1, .acq_rel);
+                callback.destroy();
+            },
+        }
+    }
+
+    fn closeWake(self: *WayringSubsurfaceClient, shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(if (shutdown_requested) -2 else -1, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+
+    fn shutdown(self: *WayringSubsurfaceClient) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
 fn connectWayringTestSocket(path: [:0]const u8) !std.posix.fd_t {
     const linux = std.os.linux;
     var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
@@ -12398,6 +12785,32 @@ fn waitForWayringClientStage(
         if (host.failure()) |err| return err;
     }
     return error.WayringClientTimedOut;
+}
+
+fn waitForWayringSubsurfaceStage(
+    server: *Self,
+    host: anytype,
+    client: *WayringSubsurfaceClient,
+    expected: WayringSubsurfaceClient.Stage,
+) !void {
+    for (0..1_000) |_| {
+        const stage: WayringSubsurfaceClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure.?;
+        try server.eventLoop().dispatch(1);
+        if (host.failure()) |err| return err;
+    }
+    return error.WayringClientTimedOut;
+}
+
+fn wayringSurfaceWithPixel(server: *Self, pixel: u32) ?SurfaceRegistry.Id {
+    var iterator = server.headless_surface_forest.nodeIterator();
+    while (iterator.next()) |node| {
+        const state = server.surface_registry.renderState(node.id) orelse continue;
+        if (state.buffer.pixels.len == 1 and state.buffer.pixels[0] == (pixel | 0xff00_0000))
+            return node.id;
+    }
+    return null;
 }
 
 fn waitForWayringDisconnect(server: *Self, host: anytype, compositor: *WayringCompositor) !void {
@@ -12469,6 +12882,14 @@ fn expectWayringHeadlessExactPixels(server: *Self, expected_pixels: [8]u32) !voi
     try std.testing.expectEqualSlices(u32, &normalized, target.pixels);
 }
 
+fn expectWayringOutputPixels(server: *Self, expected_pixels: []const u32) !void {
+    const target = switch (server.primaryRenderOutput().backend.acquire().?) {
+        .pixels => |pixels| pixels,
+        else => return error.ExpectedCpuHeadlessTarget,
+    };
+    try std.testing.expectEqualSlices(u32, expected_pixels, target.pixels);
+}
+
 fn expectWayringRotatedHeadlessPixels(server: *Self, expected_surface: [2]u32) !void {
     const target = switch (server.primaryRenderOutput().backend.acquire().?) {
         .pixels => |pixels| pixels,
@@ -12482,6 +12903,15 @@ fn expectWayringRotatedHeadlessPixels(server: *Self, expected_surface: [2]u32) !
 
 fn renderPendingWayringFrame(server: *Self, host: anytype, previous_frames: u64) !void {
     const output = server.primaryRenderOutput();
+    try renderPendingWayringOutput(server, host, output, previous_frames);
+}
+
+fn renderPendingWayringOutput(
+    server: *Self,
+    host: anytype,
+    output: *RenderOutput,
+    previous_frames: u64,
+) !void {
     try std.testing.expect(output.repaint_needed);
     try std.testing.expect(output.render_scheduled);
     try output.timer.?.timerUpdate(1);
@@ -12491,6 +12921,40 @@ fn renderPendingWayringFrame(server: *Self, host: anytype, previous_frames: u64)
         if (output.frame_statistics.frames_presented > previous_frames) return;
     }
     return error.WayringFrameTimedOut;
+}
+
+fn rejectWayringFrames(server: *Self, output: *RenderOutput, child_id: SurfaceRegistry.Id) !void {
+    try server.renderer.beginFrame(.{ .offscreen = .{
+        .id = 1,
+        .size = .{ .width = 1, .height = 1 },
+    } }, .{}, .{}, null, .{});
+    try server.renderer.append(&.{.{ .image = imageFromRenderState(
+        server.surface_registry.renderState(child_id).?,
+        .{ .position = .{}, .rounded_clip = null, .clip = null },
+        surfaceSampleTag(child_id),
+    ) }});
+    try std.testing.expectError(error.InvalidTarget, server.renderer.finishFrame());
+    try std.testing.expect(server.headless_surface_forest.state(child_id).?.frame_demand);
+
+    var target_pixels: [12]u32 = undefined;
+    try server.renderer.beginFrame(.{ .pixels = .{
+        .size = .{ .width = 6, .height = 2 },
+        .stride_pixels = 6,
+        .pixels = &target_pixels,
+    } }, .{}, .{}, null, .{});
+    var capture_id: u32 = 1;
+    const frame: OutputFrame = .{
+        .render_output = output,
+        .output = server.outputs.get(output.protocol_id).?,
+        .visible_rect = .{ .x = 0, .y = 0, .width = 6, .height = 2 },
+        .track_visibility = false,
+        .next_backdrop_capture_id = &capture_id,
+    };
+    try server.renderCommands(&frame, &.{.{ .clear = render.Color.rgba(0, 0, 0, 0) }});
+    _ = try server.renderDesktopContents(&frame, false, false);
+    server.renderer.cancelFrame();
+    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(child_id)));
+    try std.testing.expect(server.headless_surface_forest.state(child_id).?.frame_demand);
 }
 
 test "Wayring wl_compositor v6 preferences offset state and sampled headless content end to end" {
@@ -12804,6 +13268,338 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
     server.destroy();
     server_live = false;
+}
+
+test "Wayring wl_subcompositor v1 nested synchronized state is accepted end to end" {
+    const WayringHost = @import("wayland/WayringHost.zig");
+    const wayring = @import("wayring");
+    const linux = std.os.linux;
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/tmp/keywork-wayring-subsurface-{d}-{x}",
+        .{ linux.getpid(), @intFromPtr(&marker) },
+        0,
+    );
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS)
+        return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{
+            .size = .{ .width = 6, .height = 2 },
+            .refresh_millihertz = 1,
+        },
+    );
+    defer server.destroy();
+    const second_output_id = try server.addRenderOutput(std.testing.io, .{
+        .kind = .headless,
+        .size = .{ .width = 6, .height = 2 },
+        .name = "HEADLESS-WAYRING-SECOND",
+        .description = "Keywork Wayring completion test output",
+        .model = "headless",
+        .refresh_millihertz = 1,
+    });
+    defer std.debug.assert(server.removeRenderOutput(second_output_id));
+    const output = server.primaryRenderOutput();
+    const second_output = server.render_outputs.get(second_output_id).?.*;
+    const registry_baseline = server.surface_registry.len();
+    try std.testing.expectEqual(@as(usize, 0), registry_baseline);
+    var protocol_server: wayring.server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(
+        std.testing.allocator,
+        &protocol_server,
+        server.surfaceRegistry(),
+        server.wayringPresentationListener(),
+    );
+    defer compositor.deinit();
+    const Lifecycle = struct {
+        fn destroy(context: *anyopaque, peer: *wayring.server.Client) void {
+            const owner: *WayringCompositor = @ptrCast(@alignCast(context));
+            owner.destroyClientResources(peer);
+        }
+    };
+    const host = try WayringHost.create(
+        std.testing.allocator,
+        server.eventLoop(),
+        &protocol_server,
+        runtime_directory,
+        .{ .context = &compositor, .destroy_resources = Lifecycle.destroy },
+    );
+    defer host.destroy() catch {};
+    const raw_command_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_command_fd) != .SUCCESS) return error.EventFdFailed;
+    const command_fd: std.posix.fd_t = @intCast(raw_command_fd);
+    defer _ = linux.close(command_fd);
+    var client: WayringSubsurfaceClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = command_fd,
+    };
+    const thread = try std.Thread.spawn(.{}, WayringSubsurfaceClient.run, .{&client});
+    var joined = false;
+    defer if (!joined) {
+        client.shutdown();
+        thread.join();
+    };
+
+    try waitForWayringSubsurfaceStage(server, host, &client, .queued);
+    try std.testing.expectEqual(@as(u8, 1), client.compositor_globals);
+    try std.testing.expectEqual(@as(u32, 6), client.compositor_version);
+    try std.testing.expectEqual(@as(u8, 1), client.subcompositor_globals);
+    try std.testing.expectEqual(@as(u32, 1), client.subcompositor_version);
+    try std.testing.expectEqual(@as(u8, 4), client.release_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), client.done_count.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 4), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 4), server.headless_surface_forest.len());
+    try std.testing.expectEqual(@as(usize, 1), server.headless_surface_forest.rootLen());
+    var nodes = server.headless_surface_forest.nodeIterator();
+    while (nodes.next()) |node|
+        try std.testing.expect(server.surface_registry.renderState(node.id) == null);
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .applied);
+    try std.testing.expectEqual(@as(u8, 5), client.release_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), client.done_count.load(.acquire));
+    const root_id = server.headless_surface_forest.rootAt(0).?.id;
+    const parent_id = wayringSurfaceWithPixel(server, 0x0000_ff00).?;
+    const child_id = wayringSurfaceWithPixel(server, 0x0000_00ff).?;
+    const sibling_id = wayringSurfaceWithPixel(server, 0x00ff_ff00).?;
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{ 0xffff_0000, 0xffff_0000 },
+        server.surface_registry.renderState(root_id).?.buffer.pixels,
+    );
+    try std.testing.expectEqual(@as(usize, 1), server.headless_surface_forest.rootLen());
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement.root, server.headless_surface_forest.state(root_id).?.placement);
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement{ .child = .{
+        .parent = root_id,
+        .position = .{ .x = 1 },
+    } }, server.headless_surface_forest.state(parent_id).?.placement);
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement{ .child = .{
+        .parent = parent_id,
+        .position = .{ .x = 1 },
+    } }, server.headless_surface_forest.state(child_id).?.placement);
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement{ .child = .{
+        .parent = root_id,
+        .position = .{ .x = 1 },
+    } }, server.headless_surface_forest.state(sibling_id).?.placement);
+    try std.testing.expectEqual(@as(u64, 1), server.surface_registry.renderState(child_id).?.buffer.source_cache.?.version);
+    try std.testing.expectEqual(
+        @as(u32, 0xff00_00ff),
+        server.surface_registry.renderState(child_id).?.buffer.pixels[0],
+    );
+    try std.testing.expect(server.headless_surface_forest.state(child_id).?.frame_demand);
+    var previous_frames = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(child_id)));
+    var expected: [12]u32 = @splat(renderColor(server.palette.desktop_background).argb8888());
+    expected[0] = 0xffff_0000;
+    expected[1] = 0xffff_ff00;
+    expected[2] = 0xff00_00ff;
+    try expectWayringOutputPixels(server, &expected);
+    try std.testing.expectEqual(@as(u8, 0), client.done_count.load(.acquire));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .first_done);
+    try std.testing.expectEqual(@as(u8, 1), client.done_count.load(.acquire));
+    try std.testing.expect(!server.headless_surface_forest.state(child_id).?.frame_demand);
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .child_desync_locked);
+    try std.testing.expectEqual(@as(u64, 1), server.surface_registry.renderState(child_id).?.buffer.source_cache.?.version);
+    try std.testing.expectEqual(@as(u8, 1), client.done_count.load(.acquire));
+    try std.testing.expect(!server.headless_surface_forest.state(child_id).?.frame_demand);
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .ancestor_unlocked);
+    try std.testing.expectEqual(@as(u64, 2), server.surface_registry.renderState(child_id).?.buffer.source_cache.?.version);
+    try std.testing.expectEqual(
+        @as(u32, 0xff00_ffff),
+        server.surface_registry.renderState(child_id).?.buffer.pixels[0],
+    );
+    try std.testing.expect(server.headless_surface_forest.state(child_id).?.frame_demand);
+    previous_frames = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(child_id)));
+    expected[2] = 0xff00_ffff;
+    try expectWayringOutputPixels(server, &expected);
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .second_done);
+    try std.testing.expectEqual(@as(u8, 2), client.done_count.load(.acquire));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .occluded);
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement{ .child = .{
+        .parent = parent_id,
+        .position = .{},
+    } }, server.headless_surface_forest.state(child_id).?.placement);
+    previous_frames = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(child_id)));
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(sibling_id)));
+    try std.testing.expect(server.headless_surface_forest.state(child_id).?.frame_demand);
+    expected[1] = 0xffff_ff00;
+    expected[2] = renderColor(server.palette.desktop_background).argb8888();
+    try expectWayringOutputPixels(server, &expected);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .occluded_no_done);
+    try std.testing.expectEqual(@as(u8, 2), client.done_count.load(.acquire));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .restacked);
+    previous_frames = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(child_id)));
+    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(sibling_id)));
+    expected[1] = 0xff00_ffff;
+    try expectWayringOutputPixels(server, &expected);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .restacked_done);
+    try std.testing.expectEqual(@as(u8, 3), client.done_count.load(.acquire));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .hidden);
+    try std.testing.expect(server.surface_registry.renderState(parent_id) == null);
+    try std.testing.expect(server.headless_surface_forest.state(child_id).?.frame_demand);
+    previous_frames = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(child_id)));
+    expected[1] = 0xffff_0000;
+    try expectWayringOutputPixels(server, &expected);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .hidden_no_done);
+    try std.testing.expectEqual(@as(u8, 3), client.done_count.load(.acquire));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .remapped);
+    try std.testing.expectEqual(@as(u8, 6), client.release_count.load(.acquire));
+    try std.testing.expect(server.surface_registry.renderState(parent_id) != null);
+    previous_frames = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(child_id)));
+    expected[1] = 0xff00_ffff;
+    try expectWayringOutputPixels(server, &expected);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .remapped_done);
+    try std.testing.expectEqual(@as(u8, 4), client.done_count.load(.acquire));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .off_output);
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement{ .child = .{
+        .parent = parent_id,
+        .position = .{ .x = 20 },
+    } }, server.headless_surface_forest.state(child_id).?.placement);
+    previous_frames = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(child_id)));
+    expected[1] = 0xff00_ff00;
+    try expectWayringOutputPixels(server, &expected);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .off_output_no_done);
+    try std.testing.expectEqual(@as(u8, 4), client.done_count.load(.acquire));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .on_output);
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement{ .child = .{
+        .parent = parent_id,
+        .position = .{ .x = -1 },
+    } }, server.headless_surface_forest.state(child_id).?.placement);
+    previous_frames = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(child_id)));
+    expected[0] = 0xff00_ffff;
+    expected[1] = 0xff00_ff00;
+    try expectWayringOutputPixels(server, &expected);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .on_output_done);
+    try std.testing.expectEqual(@as(u8, 5), client.done_count.load(.acquire));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .frame_pending);
+    try std.testing.expect(server.headless_surface_forest.state(child_id).?.frame_demand);
+    try rejectWayringFrames(server, output, child_id);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .frame_not_done);
+    try std.testing.expectEqual(@as(u8, 5), client.done_count.load(.acquire));
+    try std.testing.expect(server.headless_surface_forest.state(child_id).?.frame_demand);
+    previous_frames = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .frame_done);
+    try std.testing.expectEqual(@as(u8, 6), client.done_count.load(.acquire));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .multi_pending);
+    try std.testing.expect(server.headless_surface_forest.state(child_id).?.frame_demand);
+    const previous_second_frames = second_output.frame_statistics.frames_presented;
+    try renderPendingWayringOutput(server, host, second_output, previous_second_frames);
+    try std.testing.expect(!server.headless_surface_forest.state(child_id).?.frame_demand);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .multi_first_done);
+    try std.testing.expectEqual(@as(u8, 7), client.done_count.load(.acquire));
+    const first_output_timestamp = client.last_done_timestamp_ms.load(.acquire);
+    previous_frames = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .multi_second_unchanged);
+    try std.testing.expectEqual(@as(u8, 7), client.done_count.load(.acquire));
+    try std.testing.expectEqual(first_output_timestamp, client.last_done_timestamp_ms.load(.acquire));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .queued_detached);
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement.detached, server.headless_surface_forest.state(child_id).?.placement);
+    try std.testing.expect(!server.headless_surface_forest.state(child_id).?.frame_demand);
+    previous_frames = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try std.testing.expect(!server.renderer.wasSampled(surfaceSampleTag(child_id)));
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .detached_no_done);
+    try std.testing.expectEqual(@as(u8, 7), client.done_count.load(.acquire));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .recreated);
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement{ .child = .{
+        .parent = sibling_id,
+        .position = .{ .x = -1 },
+    } }, server.headless_surface_forest.state(child_id).?.placement);
+    try std.testing.expect(!std.meta.eql(
+        server.headless_surface_forest.state(child_id).?.placement,
+        HeadlessSurfaceForest.Placement{ .child = .{ .parent = parent_id, .position = .{ .x = -1 } } },
+    ));
+    try std.testing.expectEqual(@as(?SurfaceRegistry.Id, null), server.scene.focusedSurface());
+    try std.testing.expect(!server.scene.surfaceTracked(child_id));
+    try std.testing.expectEqual(@as(?Seat.PointerFocus, null), server.pointerFocus(0, 0));
+    try std.testing.expect(!server.outputs.get(output.protocol_id).?.containsSurface(child_id));
+    try std.testing.expect(!server.outputs.get(second_output.protocol_id).?.containsSurface(child_id));
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .parent_destroyed);
+    try std.testing.expect(!server.surface_registry.contains(sibling_id));
+    try std.testing.expect(server.surface_registry.contains(child_id));
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement.detached, server.headless_surface_forest.state(child_id).?.placement);
+    try std.testing.expectEqual(@as(usize, 3), compositor.surfaceCount());
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSubsurfaceStage(server, host, &client, .disconnected);
+    thread.join();
+    joined = true;
+    try waitForWayringDisconnect(server, host, &compositor);
+    try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
+    try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
+    try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
+    try std.testing.expect(wayringPresentationEnabled(.headless));
+    try std.testing.expect(!wayringPresentationEnabled(.drm));
+    try std.testing.expect(!wayringPresentationEnabled(.nested));
 }
 
 test "server creates and destroys protocol globals" {

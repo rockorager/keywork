@@ -1,6 +1,5 @@
 //! Scanner-backed Wayring ownership slice for wl_compositor, wl_surface,
-//! wl_subcompositor/wl_subsurface, and wl_shm. Subcompositor publication is
-//! test-only until the production-advertisement wave.
+//! wl_subcompositor/wl_subsurface, and wl_shm.
 //!
 //! Surfaces use the compositor-wide registry for identity and borrowed render
 //! state. Wayring object ownership remains isolated per client; presentation
@@ -323,7 +322,7 @@ protocol_server: *server.Server,
 surface_registry: *SurfaceRegistry,
 presentation_listener: ?PresentationListener,
 global: *const server.Server.Global,
-subcompositor_global: if (builtin.is_test) ?*const server.Server.Global else void,
+subcompositor_global: *const server.Server.Global,
 shm: Shm,
 clients: std.ArrayList(*ClientObjects) = .empty,
 owned_provider_count: usize = 0,
@@ -346,8 +345,8 @@ pub fn init(
         .surface_registry = surface_registry,
         .presentation_listener = presentation_listener,
         .global = undefined,
+        .subcompositor_global = undefined,
         .shm = .init(allocator),
-        .subcompositor_global = if (builtin.is_test) null else {},
         .completing_frame_callbacks = false,
         .commit_fault = if (builtin.is_test) null else {},
     };
@@ -360,21 +359,28 @@ pub fn init(
     );
     errdefer protocol_server.removeGlobal(self.global) catch {};
     _ = try self.shm.publish(protocol_server, 1);
+    errdefer self.shm.deinit();
+    self.subcompositor_global = try self.protocol_server.addGlobal(
+        core.wl_subcompositor,
+        1,
+        WayringCompositor,
+        self,
+        bindSubcompositor,
+    );
 }
 
 pub fn deinit(self: *WayringCompositor) void {
     std.debug.assert(self.clients.items.len == 0);
     std.debug.assert(self.owned_provider_count == 0);
+    self.protocol_server.removeGlobal(self.subcompositor_global) catch |err| switch (err) {
+        error.AlreadyRemoved => {},
+        error.ForeignGlobal => unreachable,
+    };
+    self.shm.deinit();
     self.protocol_server.removeGlobal(self.global) catch |err| switch (err) {
         error.AlreadyRemoved => {},
         error.ForeignGlobal => unreachable,
     };
-    if (builtin.is_test) if (self.subcompositor_global) |global|
-        self.protocol_server.removeGlobal(global) catch |err| switch (err) {
-            error.AlreadyRemoved => {},
-            error.ForeignGlobal => unreachable,
-        };
-    self.shm.deinit();
     self.clients.deinit(self.allocator);
     self.* = undefined;
 }
@@ -411,18 +417,6 @@ pub fn surfaceCount(self: *const WayringCompositor) usize {
     var count: usize = 0;
     for (self.clients.items) |objects| count += objects.surfaces.items.len;
     return count;
-}
-
-fn publishTestSubcompositor(self: *WayringCompositor) !void {
-    if (comptime !builtin.is_test) unreachable;
-    std.debug.assert(self.subcompositor_global == null);
-    self.subcompositor_global = try self.protocol_server.addGlobal(
-        core.wl_subcompositor,
-        1,
-        WayringCompositor,
-        self,
-        bindSubcompositor,
-    );
 }
 
 pub fn regionCount(self: *const WayringCompositor) usize {
@@ -2070,9 +2064,8 @@ fn bindShm(self: *WayringCompositor, client: *server.Client, shm_id: u32) !void 
 }
 
 fn bindTestSubcompositor(self: *WayringCompositor, client: *server.Client, id: u32) !void {
-    const global = self.subcompositor_global orelse return error.TestGlobalNotPublished;
     try send(client, 2, 0, &core.wl_registry.request_messages[0], &.{
-        .{ .uint = global.name() },
+        .{ .uint = self.subcompositor_global.name() },
         .{ .new_id = .{ .generic = .{ .interface = "wl_subcompositor", .version = 1, .id = id } } },
     });
 }
@@ -5259,18 +5252,88 @@ test "null listener teardown leaves unrelated registry provider for compositor d
     synthetic_live = false;
 }
 
-test "Wayring compositor advertises no wl_subcompositor global" {
+test "production globals publish v6 compositor v1 shm then v1 subcompositor and unpublish in reverse" {
     var host: server.Server = .init(std.testing.allocator);
     defer host.deinit();
     var surface_registry = SurfaceRegistry.init(std.testing.allocator);
     defer surface_registry.deinit();
     var compositor: WayringCompositor = undefined;
     try compositor.init(std.testing.allocator, &host, &surface_registry, null);
-    defer compositor.deinit();
+    const compositor_global = compositor.global;
+    const shm_global = compositor.shm.global.?;
+    const subcompositor_global = compositor.subcompositor_global;
 
+    const expected = [_]struct { name: []const u8, version: u32 }{
+        .{ .name = "wl_compositor", .version = 6 },
+        .{ .name = "wl_shm", .version = 1 },
+        .{ .name = "wl_subcompositor", .version = 1 },
+    };
     var globals = host.iterator();
-    while (globals.next()) |global|
-        try std.testing.expect(!std.mem.eql(u8, global.interface().name, "wl_subcompositor"));
+    for (expected) |entry| {
+        const global = globals.next().?;
+        try std.testing.expectEqualStrings(entry.name, global.interface().name);
+        try std.testing.expectEqual(entry.version, global.version());
+    }
+    try std.testing.expect(globals.next() == null);
+
+    const RemovalLog = struct {
+        items: [3]*const server.Server.Global = undefined,
+        count: usize = 0,
+
+        fn notify(
+            self: *@This(),
+            publication: server.Server.Publication,
+            global: *const server.Server.Global,
+        ) void {
+            if (publication != .removed) return;
+            std.debug.assert(self.count < self.items.len);
+            self.items[self.count] = global;
+            self.count += 1;
+        }
+    };
+    var removal_log: RemovalLog = .{};
+    _ = try host.addPublicationObserver(RemovalLog, &removal_log, RemovalLog.notify);
+    compositor.deinit();
+    try std.testing.expectEqual(@as(usize, 3), removal_log.count);
+    try std.testing.expectEqual(subcompositor_global, removal_log.items[0]);
+    try std.testing.expectEqual(shm_global, removal_log.items[1]);
+    try std.testing.expectEqual(compositor_global, removal_log.items[2]);
+}
+
+test "global publication OOM rolls back every previously published global" {
+    var measuring = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var measuring_host: server.Server = .init(measuring.allocator());
+    var measuring_registry = SurfaceRegistry.init(std.testing.allocator);
+    var measuring_compositor: WayringCompositor = undefined;
+    try measuring_compositor.init(
+        std.testing.allocator,
+        &measuring_host,
+        &measuring_registry,
+        null,
+    );
+    const allocation_count = measuring.alloc_index;
+    measuring_compositor.deinit();
+    measuring_registry.deinit();
+    measuring_host.deinit();
+    try std.testing.expectEqual(measuring.allocated_bytes, measuring.freed_bytes);
+
+    for (0..allocation_count) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        failing.fail_index = fail_index;
+        var host: server.Server = .init(failing.allocator());
+        var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+        var compositor: WayringCompositor = undefined;
+        try std.testing.expectError(
+            error.OutOfMemory,
+            compositor.init(std.testing.allocator, &host, &surface_registry, null),
+        );
+        try std.testing.expect(failing.has_induced_failure);
+        var globals = host.iterator();
+        try std.testing.expect(globals.next() == null);
+        surface_registry.deinit();
+        host.deinit();
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 test "generated wl_subcompositor and wl_subsurface scanner descriptors are exact" {
@@ -5325,7 +5388,6 @@ test "scanner dispatch instantiates every wl_subcompositor and wl_subsurface han
     var compositor: WayringCompositor = undefined;
     try compositor.init(std.testing.allocator, &host, &registry, null);
     defer compositor.deinit();
-    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
@@ -5381,7 +5443,6 @@ test "scanner subsurface association and movement are parent double buffered" {
     try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
     defer compositor.deinit();
     listener_state.compositor = &compositor;
-    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
@@ -5451,7 +5512,6 @@ test "scanner place requests implement parent sentinel and sibling stacking" {
     try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
     defer compositor.deinit();
     listener_state.compositor = &compositor;
-    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
@@ -5503,7 +5563,6 @@ test "scanner get_subsurface validates roles parents and adapter ownership befor
             try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
             defer compositor.deinit();
             listener_state.compositor = &compositor;
-            try compositor.publishTestSubcompositor();
             const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
             const client = managed.client();
             var impostor: core.wl_surface.Resource = .init(std.testing.allocator, 8, 1, .client, client.ownerHooks());
@@ -5587,7 +5646,6 @@ test "scanner object validation rejects unknown dead wrong-interface and foreign
             var compositor: WayringCompositor = undefined;
             try compositor.init(std.testing.allocator, &host, &registry, null);
             defer compositor.deinit();
-            try compositor.publishTestSubcompositor();
             const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
             const client = managed.client();
             defer {
@@ -5652,7 +5710,6 @@ test "scanner restack rejects every non-sibling reference without changing order
             var compositor: WayringCompositor = undefined;
             try compositor.init(std.testing.allocator, &host, &registry, null);
             defer compositor.deinit();
-            try compositor.publishTestSubcompositor();
             const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
             const client = managed.client();
             var impostor: core.wl_surface.Resource = .init(std.testing.allocator, 13, 1, .client, client.ownerHooks());
@@ -5713,7 +5770,6 @@ test "scanner subsurface destroy discards queued work and permits permanent-role
     try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
     defer compositor.deinit();
     listener_state.compositor = &compositor;
-    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
@@ -5776,7 +5832,6 @@ test "wl_surface destroy preserves a live subsurface role object on defunct erro
     var compositor: WayringCompositor = undefined;
     try compositor.init(std.testing.allocator, &host, &registry, null);
     defer compositor.deinit();
-    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
@@ -5818,7 +5873,6 @@ test "destroying a parent unmaps children but leaves their role resources inert"
     try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
     defer compositor.deinit();
     listener_state.compositor = &compositor;
-    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
@@ -5871,7 +5925,6 @@ test "disconnect destroys subsurface records before surfaces without duplicate d
     try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
     defer compositor.deinit();
     listener_state.compositor = &compositor;
-    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     var managed_live = true;
@@ -5906,7 +5959,6 @@ test "subcompositor binding OOM rolls back stable records lists and new ids" {
             var compositor: WayringCompositor = undefined;
             try compositor.init(failing.allocator(), &host, &registry, null);
             defer compositor.deinit();
-            try compositor.publishTestSubcompositor();
             const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
             const client = managed.client();
             defer {
@@ -5917,7 +5969,7 @@ test "subcompositor binding OOM rolls back stable records lists and new ids" {
             const objects = compositor.findClient(client).?;
             const live_before = failing.allocated_bytes - failing.freed_bytes;
             const bind_request = try encode(2, 0, &core.wl_registry.request_messages[0], &.{
-                .{ .uint = compositor.subcompositor_global.?.name() },
+                .{ .uint = compositor.subcompositor_global.name() },
                 .{ .new_id = .{ .generic = .{ .interface = "wl_subcompositor", .version = 1, .id = 4 } } },
             });
             defer std.testing.allocator.free(bind_request);
@@ -5949,7 +6001,6 @@ test "get_subsurface OOM preserves role topology ownership and reserved new id" 
             try compositor.init(failing.allocator(), &host, &registry, listener_state.listener());
             defer compositor.deinit();
             listener_state.compositor = &compositor;
-            try compositor.publishTestSubcompositor();
             const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
             const client = managed.client();
             defer {
@@ -6004,7 +6055,6 @@ test "protocol set_desync scratch failures preserve mode claims queues and appli
             try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
             defer compositor.deinit();
             listener_state.compositor = &compositor;
-            try compositor.publishTestSubcompositor();
             const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
             const client = managed.client();
             defer {
@@ -6050,7 +6100,6 @@ test "destroying a synchronized ancestor role unlocks local-desync descendant SC
     try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
     defer compositor.deinit();
     listener_state.compositor = &compositor;
-    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
@@ -6101,7 +6150,6 @@ test "ancestor role destroy scratch OOM leaves resources topology and SCUs uncha
     try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
     defer compositor.deinit();
     listener_state.compositor = &compositor;
-    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
@@ -6153,7 +6201,6 @@ test "exact CU tails apply one nested batch without consuming a later child upda
     try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
     defer compositor.deinit();
     listener_state.compositor = &compositor;
-    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
@@ -6372,7 +6419,6 @@ test "stale association and canonical generations cannot alias replacement topol
     try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
     defer compositor.deinit();
     listener_state.compositor = &compositor;
-    try compositor.publishTestSubcompositor();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     defer {
