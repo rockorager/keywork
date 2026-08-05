@@ -80,6 +80,21 @@ pub fn contains(self: *const WayringClients, client: ClientRegistry.Id) bool {
     return false;
 }
 
+/// Allocation-free reverse lookup for terminalizing one generated client
+/// after a canonical operation identified it only by neutral ID.
+pub fn rawClient(
+    self: *const WayringClients,
+    client_id: ClientRegistry.Id,
+) ?*wayring.server.Client {
+    std.debug.assert(self.initialized);
+    if (self.registry.domainOf(client_id) != .wayring_server) return null;
+    var iterator = self.clients.valueIterator();
+    while (iterator.next()) |state| {
+        if (std.meta.eql(state.*.id, client_id)) return state.*.client;
+    }
+    return null;
+}
+
 /// Requires every generated application resource for `client` to be gone.
 /// The raw lookup is removed before the neutral registry notifies listeners,
 /// matching MatureClients: listeners observe both a dead ID and absent raw
@@ -102,8 +117,10 @@ test "raw address reuse receives a new generated-server generation" {
 
     const stale = try clients.register(raw);
     try std.testing.expectEqual(ClientRegistry.SerialDomain.wayring_server, registry.domainOf(stale).?);
+    try std.testing.expect(clients.rawClient(stale) == raw);
     clients.unregister(raw);
     try std.testing.expect(clients.id(raw) == null);
+    try std.testing.expect(clients.rawClient(stale) == null);
     try std.testing.expect(!registry.contains(stale));
 
     const current = try clients.register(raw);
@@ -111,6 +128,7 @@ test "raw address reuse receives a new generated-server generation" {
     try std.testing.expect(stale.generation != current.generation);
     try std.testing.expect(!registry.contains(stale));
     try std.testing.expect(!clients.contains(stale));
+    try std.testing.expect(clients.rawClient(current) == raw);
     try std.testing.expect(clients.contains(current));
     clients.unregister(raw);
 }
