@@ -678,7 +678,6 @@ test "completion read failure and stalled destroy are undrainable without repeat
 test "existing event loop drives scanner-backed Wayring client lifecycle" {
     const WayringCompositor = @import("WayringCompositor.zig");
     const SurfaceRegistry = @import("../SurfaceRegistry.zig");
-    const render = @import("../render/types.zig");
     var marker: u8 = 0;
     const runtime_directory = try std.fmt.allocPrintSentinel(
         std.testing.allocator,
@@ -706,7 +705,8 @@ test "existing event loop drives scanner-backed Wayring client lifecycle" {
             return .{
                 .context = self,
                 .added = added,
-                .committed = committed,
+                .detached = detached,
+                .applied = applied,
                 .removing = removing,
             };
         }
@@ -722,13 +722,14 @@ test "existing event loop drives scanner-backed Wayring client lifecycle" {
             self.added_count += 1;
         }
 
-        fn committed(
-            context: *anyopaque,
-            id: SurfaceRegistry.Id,
-            size: ?render.Size,
-            _: bool,
-        ) void {
+        fn detached(_: *anyopaque, _: SurfaceRegistry.Id) void {}
+
+        fn applied(context: *anyopaque, batch: WayringCompositor.AppliedBatch) void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(batch.surfaces.len == 1);
+            std.debug.assert(batch.parents.len == 0);
+            const id = batch.surfaces[0].id;
+            const size = batch.surfaces[0].mapped_size;
             std.debug.assert(self.registry.contains(id));
             std.debug.assert(size != null and self.registry.renderState(id) != null);
             self.committed_count += 1;
