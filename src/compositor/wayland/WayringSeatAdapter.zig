@@ -1,8 +1,9 @@
-//! Unpublished generated wl_seat/wl_keyboard/wl_pointer/wl_touch adapter.
+//! Generated wl_seat/wl_keyboard/wl_pointer/wl_touch adapter.
 //!
-//! The seat is deliberately available only through `bind`: production does
-//! not install a global. Canonical seat policy calls the resource-free sink;
-//! this type owns only protocol resources and per-resource generations.
+//! Production publication is explicit so assembly can place the global after
+//! the core globals and before optional outputs. Canonical seat policy calls
+//! the resource-free sink; this type owns only its global, protocol resources,
+//! and per-resource generations.
 
 const WayringSeatAdapter = @This();
 
@@ -22,6 +23,7 @@ clients: *WayringClients,
 compositor: *WayringCompositor,
 request_sink: SeatDelivery.RequestSink,
 seat_name: [:0]const u8,
+global: ?*const wayring.server.Server.Global = null,
 snapshot: SeatDelivery.CapabilitySnapshot = .{},
 seats: std.ArrayList(*SeatResource) = .empty,
 keyboards: std.ArrayList(*KeyboardResource) = .empty,
@@ -90,6 +92,7 @@ pub fn init(
 }
 
 pub fn deinit(self: *WayringSeatAdapter) void {
+    std.debug.assert(self.global == null);
     std.debug.assert(self.seats.items.len == 0 and self.keyboards.items.len == 0 and
         self.pointers.items.len == 0 and self.touches.items.len == 0 and
         self.terminal_clients.items.len == 0);
@@ -99,6 +102,40 @@ pub fn deinit(self: *WayringSeatAdapter) void {
     self.touches.deinit(self.allocator);
     self.terminal_clients.deinit(self.allocator);
     self.* = undefined;
+}
+
+/// Publishes exactly one generated seat at the scanner interface version.
+/// The canonical sink must already be installed so a client can never bind an
+/// adapter with a stale default capability snapshot.
+pub fn publish(self: *WayringSeatAdapter) !void {
+    std.debug.assert(self.global == null);
+    self.global = try self.protocol_server.addGlobal(
+        core.wl_seat,
+        core.wl_seat.interface.version,
+        WayringSeatAdapter,
+        self,
+        bindGlobal,
+    );
+}
+
+/// Removes publication before adapter teardown. Existing client resources
+/// must already have been retired by the host lifecycle.
+pub fn unpublish(self: *WayringSeatAdapter) void {
+    const global = self.global orelse unreachable;
+    self.protocol_server.removeGlobal(global) catch |err| switch (err) {
+        error.AlreadyRemoved => {},
+        error.ForeignGlobal => unreachable,
+    };
+    self.global = null;
+}
+
+fn bindGlobal(
+    client: *wayring.server.Client,
+    id: u32,
+    version: u32,
+    self: *WayringSeatAdapter,
+) !void {
+    try self.bind(client, id, version);
 }
 
 /// Registers the canonical pre-fatal retirement hook for one accepted raw
@@ -130,7 +167,7 @@ pub fn clearCursorListener(self: *WayringSeatAdapter) void {
     self.compositor.clearCursorListener(self);
 }
 
-/// Direct typed bind seam. This intentionally is not registered as a global.
+/// Direct typed bind seam shared by production publication and fault fixtures.
 pub fn bind(self: *WayringSeatAdapter, client: *wayring.server.Client, id: u32, version: u32) !void {
     if (version == 0 or version > core.wl_seat.interface.version) return error.InvalidVersion;
     errdefer self.retireClient(client);
@@ -1455,7 +1492,7 @@ fn countPublished(server: *const wayring.server.Server, name: []const u8) usize 
     return count;
 }
 
-test "scanner seat bind negotiates exactly stays unpublished and releases resources" {
+test "production seat publication follows core globals and negotiates and releases exactly" {
     var setup: AdapterTestSetup = undefined;
     try setup.init();
     defer setup.deinit();
@@ -1466,14 +1503,24 @@ test "scanner seat bind negotiates exactly stays unpublished and releases resour
     _ = snapshot.keyboard.setAvailable(true);
     _ = snapshot.touch.setAvailable(true);
     capabilities(&setup.adapter, snapshot);
-    const seat_global = try setup.protocol_server.addGlobal(
-        core.wl_seat,
-        core.wl_seat.interface.version,
-        WayringSeatAdapter,
-        &setup.adapter,
-        testSeatBind,
-    );
-    defer setup.protocol_server.removeGlobal(seat_global) catch {};
+    try setup.adapter.publish();
+    var published = true;
+    defer if (published) setup.adapter.unpublish();
+    const seat_global = setup.adapter.global.?;
+    try std.testing.expectEqual(@as(usize, 1), countPublished(&setup.protocol_server, "wl_seat"));
+    const expected_globals = [_]struct { name: []const u8, version: u32 }{
+        .{ .name = "wl_compositor", .version = 6 },
+        .{ .name = "wl_shm", .version = 1 },
+        .{ .name = "wl_subcompositor", .version = 1 },
+        .{ .name = "wl_seat", .version = core.wl_seat.interface.version },
+    };
+    var globals = setup.protocol_server.iterator();
+    for (expected_globals) |expected| {
+        const global = globals.next().?;
+        try std.testing.expectEqualStrings(expected.name, global.interface().name);
+        try std.testing.expectEqual(expected.version, global.version());
+    }
+    try std.testing.expect(globals.next() == null);
 
     const managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
     const client = managed.client();
@@ -1522,10 +1569,61 @@ test "scanner seat bind negotiates exactly stays unpublished and releases resour
     try std.testing.expectEqual(@as(usize, 0), setup.adapter.seats.items.len);
     try std.testing.expect(client.lookup(3) == null);
 
-    setup.protocol_server.removeGlobal(seat_global) catch unreachable;
+    setup.adapter.unpublish();
+    published = false;
     try std.testing.expectEqual(@as(usize, 0), countPublished(&setup.protocol_server, "wl_seat"));
     setup.destroyClient(managed);
     client_live = false;
+}
+
+test "seat publication failure leaves no seat or stale bind context and outer rollback is exact" {
+    var protocol_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var client_registry = ClientRegistry.init(std.testing.allocator);
+    defer client_registry.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var protocol_server: wayring.server.Server = .init(protocol_allocator.allocator());
+    var protocol_server_live = true;
+    defer if (protocol_server_live) protocol_server.deinit();
+    var clients: WayringClients = undefined;
+    clients.init(std.testing.allocator, &client_registry);
+    defer clients.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(
+        std.testing.allocator,
+        &protocol_server,
+        &surface_registry,
+        null,
+    );
+    var compositor_live = true;
+    defer if (compositor_live) compositor.deinit();
+    var probe: TestRequestProbe = .{};
+    var adapter: WayringSeatAdapter = .init(
+        std.testing.allocator,
+        &protocol_server,
+        &clients,
+        &compositor,
+        probe.sink(),
+        "test-seat",
+    );
+    var adapter_live = true;
+    defer if (adapter_live) adapter.deinit();
+
+    protocol_allocator.fail_index = protocol_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, adapter.publish());
+    try std.testing.expect(protocol_allocator.has_induced_failure);
+    try std.testing.expect(adapter.global == null);
+    try std.testing.expectEqual(@as(usize, 0), countPublished(&protocol_server, "wl_seat"));
+
+    compositor.deinit();
+    compositor_live = false;
+    var globals = protocol_server.iterator();
+    try std.testing.expect(globals.next() == null);
+    adapter.deinit();
+    adapter_live = false;
+    protocol_server.deinit();
+    protocol_server_live = false;
+    try std.testing.expectEqual(protocol_allocator.allocated_bytes, protocol_allocator.freed_bytes);
 }
 
 test "scanner keyboard repeat_info begins at protocol version four" {

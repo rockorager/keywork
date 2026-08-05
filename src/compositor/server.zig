@@ -88,8 +88,10 @@ const HeadlessSurfaceForest = @import("HeadlessSurfaceForest.zig");
 const SurfaceFrameCompletion = @import("SurfaceFrameCompletion.zig");
 const Surface = @import("wayland/surface.zig");
 const MatureClients = @import("wayland/MatureClients.zig");
+const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
+const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const Viewporter = @import("wayland/viewporter.zig");
 const InputManager = @import("input_manager.zig");
 const BuiltinKeybindings = @import("builtin_keybindings.zig");
@@ -3686,8 +3688,7 @@ pub fn surfaceRegistry(self: *Self) *SurfaceRegistry {
 }
 
 /// Installs the single resource-free generated frontend query/delivery sink.
-/// Wave 2 uses only ownership and input-region queries; event callbacks remain
-/// intentionally inert in the generated adapter.
+/// Canonical seat policy and state remain owned by `Seat`.
 pub fn setGeneratedSeatDeliverySink(self: *Self, sink: SeatDelivery.Sink) void {
     self.seat.setDeliverySink(sink);
 }
@@ -14210,6 +14211,395 @@ const WayringSubsurfaceClient = struct {
     }
 };
 
+const WayringSeatClient = struct {
+    const client_wl = wayland.client.wl;
+    const Stage = enum(u8) {
+        starting,
+        ready,
+        cursor_ready,
+        cursor_and_late_touch_ready,
+        resources_released,
+        registry_ready,
+        disconnected,
+        failed,
+    };
+    const PointerTag = enum { enter, leave, motion, button, frame };
+    const KeyboardTag = enum { keymap, enter, leave, key, modifiers, repeat_info };
+    const TouchTag = enum { down, up, motion, frame, cancel, shape, orientation };
+    const TouchLog = struct {
+        tags: [16]TouchTag = undefined,
+        ids: [16]?i32 = @splat(null),
+        x: [16]?f64 = @splat(null),
+        y: [16]?f64 = @splat(null),
+        count: usize = 0,
+
+        fn append(self: *TouchLog, tag: TouchTag, id: ?i32, x: ?f64, y: ?f64) void {
+            if (self.count == self.tags.len) return;
+            self.tags[self.count] = tag;
+            self.ids[self.count] = id;
+            self.x[self.count] = x;
+            self.y[self.count] = y;
+            self.count += 1;
+        }
+    };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    registry_only: bool = false,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    shm: ?*client_wl.Shm = null,
+    output: ?*client_wl.Output = null,
+    seat: ?*client_wl.Seat = null,
+    global_count: usize = 0,
+    globals_exact: bool = true,
+    seat_name_valid: bool = false,
+    seat_capabilities_valid: bool = false,
+    seat_event_count: usize = 0,
+    pointer_tags: [16]PointerTag = undefined,
+    pointer_count: usize = 0,
+    pointer_enter_serial: u32 = 0,
+    pointer_motion_x: f64 = 0,
+    pointer_motion_y: f64 = 0,
+    keyboard_tags: [16]KeyboardTag = undefined,
+    keyboard_count: usize = 0,
+    keymap_valid: bool = false,
+    repeat_valid: bool = false,
+    keyboard_enter_keys: [8]u32 = @splat(0),
+    keyboard_enter_key_count: usize = 0,
+    keyboard_enter_count: usize = 0,
+    keyboard_key_states: [4]client_wl.Keyboard.KeyState = undefined,
+    keyboard_key_count: usize = 0,
+    explicit_modifiers_seen: bool = false,
+    touch: TouchLog = .{},
+    late_touch: TouchLog = .{},
+
+    fn run(self: *WayringSeatClient) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *WayringSeatClient) !void {
+        const path = try std.fmt.allocPrintSentinel(
+            std.heap.page_allocator,
+            "{s}/{s}",
+            .{ self.runtime_directory, self.display_name },
+            0,
+        );
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*WayringSeatClient, registryEvent, self);
+        try expectClientRoundtrip(display);
+        if (!self.globals_exact or self.global_count != expected_globals.len)
+            return error.UnexpectedRegistrySnapshot;
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        const shm = self.shm orelse return error.ShmMissing;
+        const output = self.output orelse return error.OutputMissing;
+        var output_live = true;
+        defer if (output_live) output.release();
+        const seat = self.seat orelse return error.SeatMissing;
+        var seat_live = true;
+        defer if (seat_live) seat.release();
+        try expectClientRoundtrip(display);
+        if (!self.seat_name_valid or !self.seat_capabilities_valid or
+            self.seat_event_count != 2 or seat.getVersion() != client_wl.Seat.generated_version)
+            return error.UnexpectedSeatSnapshot;
+
+        if (self.registry_only) {
+            output.release();
+            output_live = false;
+            seat.release();
+            seat_live = false;
+            try expectClientRoundtrip(display);
+            try self.pause(.registry_ready);
+            return;
+        }
+
+        const surface = try compositor.createSurface();
+        defer surface.destroy();
+        surface.setListener(*WayringSeatClient, surfaceEvent, self);
+        const cursor_surface = try compositor.createSurface();
+        defer cursor_surface.destroy();
+        cursor_surface.setListener(*WayringSeatClient, surfaceEvent, self);
+        const shm_fd = try std.posix.memfd_create("keywork-wayring-seat", std.os.linux.MFD.CLOEXEC);
+        defer _ = std.os.linux.close(shm_fd);
+        const pixels: [4]u32 = @splat(0x00aa_bbcc);
+        if (std.os.linux.errno(std.os.linux.ftruncate(shm_fd, @sizeOf(@TypeOf(pixels)))) != .SUCCESS)
+            return error.ShmResizeFailed;
+        if (std.c.pwrite(shm_fd, @ptrCast(&pixels), @sizeOf(@TypeOf(pixels)), 0) != @sizeOf(@TypeOf(pixels)))
+            return error.ShmWriteFailed;
+        const pool = try shm.createPool(shm_fd, @sizeOf(@TypeOf(pixels)));
+        defer pool.destroy();
+        const buffer = try pool.createBuffer(0, 2, 2, 2 * @sizeOf(u32), .xrgb8888);
+        defer buffer.destroy();
+        buffer.setListener(*WayringSeatClient, bufferEvent, self);
+        surface.attach(buffer, 0, 0);
+        surface.damageBuffer(0, 0, 2, 2);
+        surface.commit();
+
+        const pointer = try seat.getPointer();
+        var pointer_live = true;
+        defer if (pointer_live) pointer.release();
+        pointer.setListener(*WayringSeatClient, pointerEvent, self);
+        const keyboard = try seat.getKeyboard();
+        var keyboard_live = true;
+        defer if (keyboard_live) keyboard.release();
+        keyboard.setListener(*WayringSeatClient, keyboardEvent, self);
+        const touch = try seat.getTouch();
+        var touch_live = true;
+        defer if (touch_live) touch.release();
+        touch.setListener(*TouchLog, touchEvent, &self.touch);
+        try expectClientRoundtrip(display);
+        if (!self.keymap_valid or !self.repeat_valid) return error.UnexpectedKeyboardInitial;
+        try self.pause(.ready);
+
+        try expectClientRoundtrip(display);
+        if (self.pointer_enter_serial == 0) return error.PointerEnterMissing;
+        pointer.setCursor(self.pointer_enter_serial, cursor_surface, 1, 1);
+        try expectClientRoundtrip(display);
+        try self.pause(.cursor_ready);
+        const late_touch = try seat.getTouch();
+        var late_touch_live = true;
+        defer if (late_touch_live) late_touch.release();
+        late_touch.setListener(*TouchLog, touchEvent, &self.late_touch);
+        try expectClientRoundtrip(display);
+        try self.pause(.cursor_and_late_touch_ready);
+
+        try expectClientRoundtrip(display);
+        try self.validateDelivery();
+        late_touch.release();
+        late_touch_live = false;
+        touch.release();
+        touch_live = false;
+        keyboard.release();
+        keyboard_live = false;
+        pointer.release();
+        pointer_live = false;
+        seat.release();
+        seat_live = false;
+        output.release();
+        output_live = false;
+        try expectClientRoundtrip(display);
+        try self.pause(.resources_released);
+    }
+
+    fn validateDelivery(self: *const WayringSeatClient) !void {
+        try std.testing.expectEqualSlices(PointerTag, &.{
+            .enter,
+            .motion,
+            .button,
+            .frame,
+            .button,
+            .frame,
+            .leave,
+            .frame,
+            .enter,
+            .frame,
+        }, self.pointer_tags[0..self.pointer_count]);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.75), self.pointer_motion_x, 0.01);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.75), self.pointer_motion_y, 0.01);
+        try std.testing.expectEqualSlices(KeyboardTag, &.{
+            .keymap,
+            .repeat_info,
+            .enter,
+            .modifiers,
+            .modifiers,
+            .key,
+            .key,
+            .leave,
+            .enter,
+            .modifiers,
+        }, self.keyboard_tags[0..self.keyboard_count]);
+        try std.testing.expectEqualSlices(u32, &.{30}, self.keyboard_enter_keys[0..self.keyboard_enter_key_count]);
+        try std.testing.expectEqual(@as(usize, 2), self.keyboard_key_count);
+        try std.testing.expectEqual(client_wl.Keyboard.KeyState.repeated, self.keyboard_key_states[0]);
+        try std.testing.expectEqual(client_wl.Keyboard.KeyState.released, self.keyboard_key_states[1]);
+        try std.testing.expect(self.explicit_modifiers_seen);
+        try std.testing.expectEqualSlices(TouchTag, &.{
+            .down,
+            .shape,
+            .orientation,
+            .motion,
+            .frame,
+            .up,
+            .frame,
+            .down,
+            .cancel,
+        }, self.touch.tags[0..self.touch.count]);
+        try std.testing.expectEqualSlices(TouchTag, &.{ .down, .cancel }, self.late_touch.tags[0..self.late_touch.count]);
+        try std.testing.expectEqual(@as(?i32, 7), self.touch.ids[0]);
+        try std.testing.expectEqual(@as(?i32, 8), self.late_touch.ids[0]);
+    }
+
+    const expected_globals = [_]struct { name: []const u8, version: u32 }{
+        .{ .name = "wl_compositor", .version = 6 },
+        .{ .name = "wl_shm", .version = 1 },
+        .{ .name = "wl_subcompositor", .version = 1 },
+        .{ .name = "wl_seat", .version = 11 },
+        .{ .name = "wl_output", .version = 4 },
+    };
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *WayringSeatClient) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                const index = self.global_count;
+                self.global_count += 1;
+                if (index >= expected_globals.len or
+                    !std.mem.eql(u8, interface, expected_globals[index].name) or
+                    global.version != expected_globals[index].version)
+                {
+                    self.globals_exact = false;
+                }
+                if (std.mem.eql(u8, interface, "wl_compositor") and self.compositor == null)
+                    self.compositor = registry.bind(global.name, client_wl.Compositor, 6) catch null
+                else if (std.mem.eql(u8, interface, "wl_shm") and self.shm == null)
+                    self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null
+                else if (std.mem.eql(u8, interface, "wl_output") and self.output == null) {
+                    self.output = registry.bind(global.name, client_wl.Output, 4) catch null;
+                    if (self.output) |output| output.setListener(*WayringSeatClient, outputEvent, self);
+                } else if (std.mem.eql(u8, interface, "wl_seat") and self.seat == null) {
+                    self.seat = registry.bind(global.name, client_wl.Seat, global.version) catch null;
+                    if (self.seat) |seat| seat.setListener(*WayringSeatClient, seatEvent, self);
+                }
+            },
+            .global_remove => {},
+        }
+    }
+
+    fn seatEvent(_: *client_wl.Seat, event: client_wl.Seat.Event, self: *WayringSeatClient) void {
+        self.seat_event_count += 1;
+        switch (event) {
+            .name => |name| self.seat_name_valid = self.seat_event_count == 1 and
+                std.mem.eql(u8, std.mem.span(name.name), "default"),
+            .capabilities => |capabilities| self.seat_capabilities_valid = self.seat_event_count == 2 and
+                capabilities.capabilities.pointer and capabilities.capabilities.keyboard and
+                capabilities.capabilities.touch,
+        }
+    }
+
+    fn pointerEvent(_: *client_wl.Pointer, event: client_wl.Pointer.Event, self: *WayringSeatClient) void {
+        if (self.pointer_count == self.pointer_tags.len) return;
+        const tag: ?PointerTag = switch (event) {
+            .enter => |enter| value: {
+                self.pointer_enter_serial = enter.serial;
+                break :value .enter;
+            },
+            .leave => .leave,
+            .motion => |motion| value: {
+                self.pointer_motion_x = motion.surface_x.toDouble();
+                self.pointer_motion_y = motion.surface_y.toDouble();
+                break :value .motion;
+            },
+            .button => .button,
+            .frame => .frame,
+            else => null,
+        };
+        if (tag) |value| {
+            self.pointer_tags[self.pointer_count] = value;
+            self.pointer_count += 1;
+        }
+    }
+
+    fn keyboardEvent(_: *client_wl.Keyboard, event: client_wl.Keyboard.Event, self: *WayringSeatClient) void {
+        if (self.keyboard_count == self.keyboard_tags.len) return;
+        const tag: KeyboardTag = switch (event) {
+            .keymap => |keymap| value: {
+                self.keymap_valid = keymap.format == .xkb_v1 and keymap.size == 8;
+                _ = std.os.linux.close(keymap.fd);
+                break :value .keymap;
+            },
+            .enter => |enter| value: {
+                if (self.keyboard_enter_count == 0) {
+                    const keys = enter.keys.slice(u32);
+                    self.keyboard_enter_key_count = @min(keys.len, self.keyboard_enter_keys.len);
+                    @memcpy(self.keyboard_enter_keys[0..self.keyboard_enter_key_count], keys[0..self.keyboard_enter_key_count]);
+                }
+                self.keyboard_enter_count += 1;
+                break :value .enter;
+            },
+            .leave => .leave,
+            .key => |key| value: {
+                if (self.keyboard_key_count < self.keyboard_key_states.len) {
+                    self.keyboard_key_states[self.keyboard_key_count] = key.state;
+                    self.keyboard_key_count += 1;
+                }
+                break :value .key;
+            },
+            .modifiers => |modifiers| value: {
+                if (modifiers.mods_depressed == 1 and modifiers.mods_latched == 2 and
+                    modifiers.mods_locked == 4 and modifiers.group == 3)
+                    self.explicit_modifiers_seen = true;
+                break :value .modifiers;
+            },
+            .repeat_info => |repeat| value: {
+                self.repeat_valid = repeat.rate == 0 and repeat.delay == 500;
+                break :value .repeat_info;
+            },
+        };
+        self.keyboard_tags[self.keyboard_count] = tag;
+        self.keyboard_count += 1;
+    }
+
+    fn touchEvent(_: *client_wl.Touch, event: client_wl.Touch.Event, log_value: *TouchLog) void {
+        switch (event) {
+            .down => |down| log_value.append(.down, down.id, down.x.toDouble(), down.y.toDouble()),
+            .up => |up| log_value.append(.up, up.id, null, null),
+            .motion => |motion| log_value.append(.motion, motion.id, motion.x.toDouble(), motion.y.toDouble()),
+            .frame => log_value.append(.frame, null, null, null),
+            .cancel => log_value.append(.cancel, null, null, null),
+            .shape => |shape| log_value.append(.shape, shape.id, shape.major.toDouble(), shape.minor.toDouble()),
+            .orientation => |orientation| log_value.append(.orientation, orientation.id, orientation.orientation.toDouble(), null),
+        }
+    }
+
+    fn surfaceEvent(_: *client_wl.Surface, _: client_wl.Surface.Event, _: *WayringSeatClient) void {}
+    fn outputEvent(_: *client_wl.Output, _: client_wl.Output.Event, _: *WayringSeatClient) void {}
+    fn bufferEvent(_: *client_wl.Buffer, _: client_wl.Buffer.Event, _: *WayringSeatClient) void {}
+
+    fn pause(self: *WayringSeatClient, stage_value: Stage) !void {
+        self.stage.store(@intFromEnum(stage_value), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+
+    fn closeWake(self: *WayringSeatClient, shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(-2, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+
+    fn shutdown(self: *WayringSeatClient) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
 fn connectWayringTestSocket(path: [:0]const u8) !std.posix.fd_t {
     const linux = std.os.linux;
     var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
@@ -14289,6 +14679,22 @@ fn waitForWayringSubsurfaceStage(
         const stage: WayringSubsurfaceClient.Stage = @enumFromInt(client.stage.load(.acquire));
         if (stage == expected) return;
         if (stage == .failed) return client.failure.?;
+        try server.eventLoop().dispatch(1);
+        if (host.failure()) |err| return err;
+    }
+    return error.WayringClientTimedOut;
+}
+
+fn waitForWayringSeatStage(
+    server: *Self,
+    host: anytype,
+    client: *WayringSeatClient,
+    expected: WayringSeatClient.Stage,
+) !void {
+    for (0..1_000) |_| {
+        const stage_value: WayringSeatClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage_value == expected) return;
+        if (stage_value == .failed) return client.failure.?;
         try server.eventLoop().dispatch(1);
         if (host.failure()) |err| return err;
     }
@@ -15343,4 +15749,280 @@ test "fullscreen selection is isolated to each output" {
         .width = 640,
         .height = 480,
     }).?.id);
+}
+
+test "production Wayring seat global accepts canonical input through the real host" {
+    const WayringHost = @import("wayland/WayringHost.zig");
+    const wayring = @import("wayring");
+    const linux = std.os.linux;
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/tmp/keywork-wayring-seat-{d}-{x}",
+        .{ linux.getpid(), @intFromPtr(&marker) },
+        0,
+    );
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS)
+        return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{
+            .size = .{ .width = 4, .height = 4 },
+            .refresh_millihertz = 1,
+        },
+    );
+    var server_live = true;
+    defer if (server_live) server.destroy();
+    const output = server.primaryRenderOutput();
+    const registry_baseline = server.surface_registry.len();
+    try std.testing.expectEqual(@as(usize, 0), registry_baseline);
+
+    const keymap_fd = try std.posix.memfd_create("keywork-wayring-keymap", linux.MFD.CLOEXEC);
+    const keymap = "keymap\x00\x00";
+    if (linux.errno(linux.ftruncate(keymap_fd, keymap.len)) != .SUCCESS)
+        return error.KeymapResizeFailed;
+    if (std.c.pwrite(keymap_fd, keymap.ptr, keymap.len, 0) != keymap.len)
+        return error.KeymapWriteFailed;
+    server.seat.setKeymap(.xkb_v1, keymap_fd, keymap.len);
+    server.seat.setRepeatInfo(0, 500);
+    server.seat.setKeyboardAvailable(true);
+    server.seat.setPointerAvailable(true);
+    server.seat.setTouchAvailable(true);
+
+    var protocol_server: wayring.server.Server = .init(std.testing.allocator);
+    var protocol_server_live = true;
+    defer if (protocol_server_live) protocol_server.deinit();
+    var clients: WayringClients = undefined;
+    clients.init(std.testing.allocator, server.clientRegistry());
+    var clients_live = true;
+    defer if (clients_live) clients.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(
+        std.testing.allocator,
+        &protocol_server,
+        server.surfaceRegistry(),
+        server.wayringPresentationListener(),
+    );
+    var compositor_live = true;
+    defer if (compositor_live) compositor.deinit();
+    var seat_adapter: WayringSeatAdapter = .init(
+        std.testing.allocator,
+        &protocol_server,
+        &clients,
+        &compositor,
+        server.generatedSeatRequestSink(),
+        server.generatedSeatName(),
+    );
+    var seat_adapter_live = true;
+    var seat_published = false;
+    var seat_sink_installed = false;
+    var cursor_listener_installed = false;
+    defer if (seat_adapter_live) {
+        if (seat_published) seat_adapter.unpublish();
+        if (seat_sink_installed) server.clearGeneratedSeatDeliverySink(&seat_adapter);
+        if (cursor_listener_installed) seat_adapter.clearCursorListener();
+        seat_adapter.deinit();
+    };
+    seat_adapter.installCursorListener();
+    cursor_listener_installed = true;
+    server.setGeneratedSeatDeliverySink(seat_adapter.sink());
+    seat_sink_installed = true;
+    try seat_adapter.publish();
+    seat_published = true;
+    var wayring_outputs: WayringOutput = undefined;
+    try wayring_outputs.init(
+        std.testing.allocator,
+        &protocol_server,
+        server.wayringOutputLayout().?,
+        &compositor,
+    );
+    var outputs_live = true;
+    defer if (outputs_live) wayring_outputs.deinit();
+
+    const Lifecycle = struct {
+        clients: *WayringClients,
+        outputs: *WayringOutput,
+        compositor: *WayringCompositor,
+        seat: *WayringSeatAdapter,
+        ids: [2]ClientRegistry.Id = undefined,
+        accepted_count: usize = 0,
+
+        fn accepted(context: *anyopaque, client: *wayring.server.Client) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const client_id = try self.clients.register(client);
+            errdefer self.clients.unregister(client);
+            try self.seat.trackClient(client);
+            std.debug.assert(self.accepted_count < self.ids.len);
+            self.ids[self.accepted_count] = client_id;
+            self.accepted_count += 1;
+        }
+
+        fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.seat.destroyClientResources(client);
+            self.outputs.destroyClientResources(client);
+            self.compositor.destroyClientResources(client);
+            if (self.clients.id(client) != null) self.clients.unregister(client);
+        }
+    };
+    var lifecycle: Lifecycle = .{
+        .clients = &clients,
+        .outputs = &wayring_outputs,
+        .compositor = &compositor,
+        .seat = &seat_adapter,
+    };
+    const host = try WayringHost.create(
+        std.testing.allocator,
+        server.eventLoop(),
+        &protocol_server,
+        runtime_directory,
+        .{
+            .context = &lifecycle,
+            .accepted = Lifecycle.accepted,
+            .destroy_resources = Lifecycle.destroy,
+        },
+    );
+    var host_live = true;
+    defer if (host_live) host.destroy() catch {};
+
+    const raw_command_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_command_fd) != .SUCCESS) return error.EventFdFailed;
+    const command_fd: std.posix.fd_t = @intCast(raw_command_fd);
+    defer _ = linux.close(command_fd);
+    var client: WayringSeatClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = command_fd,
+    };
+    const thread = try std.Thread.spawn(.{}, WayringSeatClient.run, .{&client});
+    var joined = false;
+    defer if (!joined) {
+        client.shutdown();
+        thread.join();
+    };
+
+    try waitForWayringSeatStage(server, host, &client, .ready);
+    try std.testing.expectEqual(@as(usize, 1), lifecycle.accepted_count);
+    try std.testing.expectEqual(@as(usize, 1), server.client_registry.len());
+    try std.testing.expectEqual(@as(usize, 2), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 2), server.headless_surface_forest.len());
+    const root = server.headless_surface_forest.rootAt(0).?.id;
+
+    keyboardEnter(output, &.{30});
+    pointerMotion(output, 1, 0.25, 0.25);
+    pointerMotion(output, 2, 0.75, 0.75);
+    pointerButton(output, 3, linux_button_left, .pressed);
+    pointerFrame(output);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSeatStage(server, host, &client, .cursor_ready);
+    switch (server.seat.cursorInfo() orelse return error.GeneratedCursorMissing) {
+        .generated => |cursor| {
+            try std.testing.expectEqual(@as(i32, -1), cursor.x);
+            try std.testing.expectEqual(@as(i32, -1), cursor.y);
+        },
+        .surface, .shape => return error.UnexpectedCursorOwner,
+    }
+
+    touchDown(output, 4, 7, 0.5, 0.5);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSeatStage(server, host, &client, .cursor_and_late_touch_ready);
+
+    keyboardModifiers(output, 1, 2, 4, 3);
+    keyboardKey(output, 5, 30, .repeated);
+    keyboardKey(output, 6, 30, .released);
+    pointerButton(output, 7, linux_button_left, .released);
+    pointerFrame(output);
+    pointerMotion(output, 8, 3, 3);
+    pointerFrame(output);
+    pointerMotion(output, 9, 0.25, 0.25);
+    pointerFrame(output);
+    server.applyMatureKeyboardFocus(null);
+    try std.testing.expect(server.focusGeneratedSurface(root));
+    touchShape(output, 7, 2, 1);
+    touchOrientation(output, 7, 0.5);
+    touchMotion(output, 10, 7, 0.75, 0.75);
+    touchFrame(output);
+    touchUp(output, 11, 7);
+    touchFrame(output);
+    touchDown(output, 12, 8, 0.5, 0.5);
+    touchCancel(output);
+    touchFrame(output);
+    try signalWayringCommand(command_fd);
+    try waitForWayringSeatStage(server, host, &client, .resources_released);
+    try std.testing.expectEqual(@as(usize, 1), server.client_registry.len());
+    try std.testing.expectEqual(@as(usize, 2), compositor.surfaceCount());
+    try std.testing.expectEqual(FocusArbiter.Frontend.generated, server.focus_arbiter.target().?.frontend);
+    try std.testing.expect(server.seat.pointerFocus().?.generated != null);
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSeatStage(server, host, &client, .disconnected);
+    thread.join();
+    joined = true;
+    try waitForWayringDisconnect(server, host, &compositor);
+    try std.testing.expectEqual(@as(usize, 0), server.client_registry.len());
+    try std.testing.expect(server.focus_arbiter.target() == null);
+    try std.testing.expect(server.seat.pointerFocus() == null);
+    if (server.seat.cursorInfo()) |cursor| switch (cursor) {
+        .generated => return error.StaleGeneratedCursor,
+        .surface, .shape => {},
+    };
+    try std.testing.expect(!server.seat.touchSequenceActive());
+
+    const raw_reconnect_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_reconnect_fd) != .SUCCESS) return error.EventFdFailed;
+    const reconnect_fd: std.posix.fd_t = @intCast(raw_reconnect_fd);
+    defer _ = linux.close(reconnect_fd);
+    var reconnect: WayringSeatClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = reconnect_fd,
+        .registry_only = true,
+    };
+    const reconnect_thread = try std.Thread.spawn(.{}, WayringSeatClient.run, .{&reconnect});
+    var reconnect_joined = false;
+    defer if (!reconnect_joined) {
+        reconnect.shutdown();
+        reconnect_thread.join();
+    };
+    try waitForWayringSeatStage(server, host, &reconnect, .registry_ready);
+    try std.testing.expectEqual(@as(usize, 2), lifecycle.accepted_count);
+    try std.testing.expectEqual(lifecycle.ids[0].index, lifecycle.ids[1].index);
+    try std.testing.expect(lifecycle.ids[0].generation != lifecycle.ids[1].generation);
+    try std.testing.expectEqual(@as(usize, 1), server.client_registry.len());
+    try signalWayringCommand(reconnect_fd);
+    try waitForWayringSeatStage(server, host, &reconnect, .disconnected);
+    reconnect_thread.join();
+    reconnect_joined = true;
+    try waitForWayringDisconnect(server, host, &compositor);
+    try std.testing.expect(host.failure() == null);
+    try std.testing.expectEqual(@as(usize, 0), server.client_registry.len());
+
+    try host.destroy();
+    host_live = false;
+    wayring_outputs.deinit();
+    outputs_live = false;
+    seat_adapter.unpublish();
+    seat_published = false;
+    server.clearGeneratedSeatDeliverySink(&seat_adapter);
+    seat_sink_installed = false;
+    seat_adapter.clearCursorListener();
+    cursor_listener_installed = false;
+    seat_adapter.deinit();
+    seat_adapter_live = false;
+    clients.deinit();
+    clients_live = false;
+    compositor.deinit();
+    compositor_live = false;
+    protocol_server.deinit();
+    protocol_server_live = false;
+    try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
+    server.destroy();
+    server_live = false;
 }
