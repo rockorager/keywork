@@ -285,11 +285,14 @@ pub const Sink = struct {
     keyboard: *const fn (*anyopaque, ClientRegistry.Id, SurfaceRegistry.Id, KeyboardEvent) void,
     pointer: *const fn (*anyopaque, ClientRegistry.Id, SurfaceRegistry.Id, PointerEvent) void,
     touch: *const fn (*anyopaque, ClientRegistry.Id, TouchEvent) void,
+    touch_frame: *const fn (*anyopaque) void = unavailableTouchFrame,
 };
 
 fn unavailableCursorRole(_: *anyopaque, _: ClientRegistry.Id, _: SurfaceRegistry.Id) CursorRoleResult {
     return .not_live;
 }
+
+fn unavailableTouchFrame(_: *anyopaque) void {}
 
 capabilities: CapabilitySnapshot = .{},
 sink: ?Sink = null,
@@ -421,6 +424,15 @@ pub fn deliverTouch(
     self.beginNotify();
     defer self.endNotify();
     sink.touch(sink.context, client, event);
+}
+
+/// Ends the current canonical touch frame after resource-specific pending
+/// state has already been recorded by synchronous touch event delivery.
+pub fn deliverTouchFrame(self: *SeatDelivery) void {
+    const sink = self.sink orelse return;
+    self.beginNotify();
+    defer self.endNotify();
+    sink.touch_frame(sink.context);
 }
 
 pub fn resourceInSequence(generation: ResourceGeneration, max_generation: ResourceGeneration) bool {

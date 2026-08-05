@@ -114,12 +114,14 @@ const TouchPoint = struct {
         offset_x: f64,
         offset_y: f64,
         max_resource_generation: SeatDelivery.ResourceGeneration,
+        generated_root: ?SurfaceRegistry.Id = null,
     };
 };
 
 const TouchCancellation = struct {
     client: ClientRegistry.Id,
     max_resource_generation: SeatDelivery.ResourceGeneration,
+    generated: bool,
 };
 
 const TouchResource = struct {
@@ -507,6 +509,33 @@ pub fn touchSequenceActive(self: *const Self) bool {
     return self.touch_points.items.len != 0;
 }
 
+/// Cancels each generated client stream with a contact in externally invalidated
+/// presentation topology. Contact ownership and cancellation fanout remain in
+/// this canonical seat; the caller supplies only the compositor topology test.
+pub fn cancelGeneratedTouchesMatching(
+    self: *Self,
+    context: *anyopaque,
+    matches: *const fn (*anyopaque, SurfaceRegistry.Id, SurfaceRegistry.Id) bool,
+) void {
+    var index: usize = 0;
+    while (index < self.touch_points.items.len) {
+        const point = self.touch_points.items[index];
+        const target = point.target orelse {
+            index += 1;
+            continue;
+        };
+        const root = target.generated_root orelse {
+            index += 1;
+            continue;
+        };
+        if (!matches(context, target.surface_id, root)) {
+            index += 1;
+            continue;
+        }
+        self.touchCancelPoint(point.id);
+    }
+}
+
 pub fn ownsResource(self: *Self, resource: *wl.Seat) bool {
     return resource.getUserData() == @as(?*anyopaque, @ptrCast(self));
 }
@@ -761,6 +790,7 @@ pub fn activationSurfaceFocused(self: *const Self, surface_id: Surface.Id) bool 
     }
     for (self.touch_points.items) |point| {
         const target = point.target orelse continue;
+        if (target.generated_root != null) continue;
         if (std.meta.eql(target.surface_id, surface_id)) return true;
     }
     return false;
@@ -1767,12 +1797,29 @@ pub fn touchDown(
     try self.touch_points.ensureUnusedCapacity(self.allocator, 1);
 
     const target: ?TouchPoint.Target = if (focus) |candidate| target: {
+        if (candidate.generated) |generated| {
+            if (!self.surface_registry.contains(candidate.surface_id) or
+                self.clients.domainOf(generated.client) != .wayring_server) break :target null;
+            const owner = self.delivery.ownerForSurface(candidate.surface_id) orelse break :target null;
+            if (!std.meta.eql(owner, generated.client) or
+                !self.delivery.surfaceAcceptsInput(candidate.surface_id, candidate.x, candidate.y))
+                break :target null;
+            const destination = self.delivery.touchTarget(candidate.surface_id) orelse break :target null;
+            if (!std.meta.eql(destination.client, generated.client)) break :target null;
+            break :target .{
+                .surface_id = candidate.surface_id,
+                .client = generated.client,
+                .offset_x = x - candidate.x,
+                .offset_y = y - candidate.y,
+                .max_resource_generation = destination.max_resource_generation,
+                .generated_root = generated.root,
+            };
+        }
         const surface = Surface.resourceFor(self.surface_store, candidate.surface_id) orelse
             break :target null;
         const client = self.matureClient(surface.getClient()) orelse break :target null;
-        const max_resource_generation = self.latestTouchResourceGeneration(
-            client,
-        ) orelse break :target null;
+        const max_resource_generation = self.latestTouchResourceGeneration(client) orelse
+            break :target null;
         break :target .{
             .surface_id = candidate.surface_id,
             .client = client,
@@ -1784,6 +1831,27 @@ pub fn touchDown(
     self.touch_points.appendAssumeCapacity(.{ .id = id, .target = target });
 
     const destination = target orelse return;
+    if (destination.generated_root != null) {
+        if (!self.generatedTouchTargetLive(destination)) return;
+        const serial = self.delivery.issueSerial(destination.client) orelse {
+            self.retireGeneratedClient(destination.client);
+            return;
+        };
+        if (!self.authority.recordAction(destination.client, serial)) {
+            self.retireGeneratedClient(destination.client);
+            return;
+        }
+        self.delivery.deliverTouch(destination.client, .{ .down = .{
+            .serial = serial,
+            .time = time,
+            .surface = destination.surface_id,
+            .id = id,
+            .x = pointerFixed(x - destination.offset_x),
+            .y = pointerFixed(y - destination.offset_y),
+            .max_resource_generation = destination.max_resource_generation,
+        } });
+        return;
+    }
     const surface = Surface.resourceFor(self.surface_store, destination.surface_id) orelse return;
     const surface_client = self.matureClient(surface.getClient()) orelse return;
     if (!std.meta.eql(surface_client, destination.client)) return;
@@ -1819,20 +1887,43 @@ pub fn touchUp(self: *Self, time: u32, id: i32) void {
             _ = self.touch_points.orderedRemove(index);
             return;
         }
-        const serial = MatureSerials.issue(self.display);
-        if (!self.recordSelectionForClient(target.client, serial)) {
-            _ = self.touch_points.orderedRemove(index);
-            return;
-        }
-        for (self.touch_resources.items) |*entry| {
-            if (!self.touchResourceActive(entry.*)) continue;
-            const resource = entry.resource;
-            if (SeatDelivery.resourceInSequence(
-                entry.generation,
-                target.max_resource_generation,
-            ) and self.touchResourceMatchesClient(entry.*, target.client)) {
-                markTouchFrame(entry);
-                resource.sendUp(serial.value, time, id);
+        if (target.generated_root != null) {
+            if (!self.generatedTouchTargetLive(target)) {
+                self.touchCancelPoint(id);
+                return;
+            }
+            const serial = self.delivery.issueSerial(target.client) orelse {
+                self.retireGeneratedClient(target.client);
+                _ = self.touch_points.orderedRemove(index);
+                return;
+            };
+            if (!self.recordSelectionForClient(target.client, serial)) {
+                self.retireGeneratedClient(target.client);
+                _ = self.touch_points.orderedRemove(index);
+                return;
+            }
+            self.delivery.deliverTouch(target.client, .{ .up = .{
+                .serial = serial,
+                .time = time,
+                .id = id,
+                .max_resource_generation = target.max_resource_generation,
+            } });
+        } else {
+            const serial = MatureSerials.issue(self.display);
+            if (!self.recordSelectionForClient(target.client, serial)) {
+                _ = self.touch_points.orderedRemove(index);
+                return;
+            }
+            for (self.touch_resources.items) |*entry| {
+                if (!self.touchResourceActive(entry.*)) continue;
+                const resource = entry.resource;
+                if (SeatDelivery.resourceInSequence(
+                    entry.generation,
+                    target.max_resource_generation,
+                ) and self.touchResourceMatchesClient(entry.*, target.client)) {
+                    markTouchFrame(entry);
+                    resource.sendUp(serial.value, time, id);
+                }
             }
         }
     }
@@ -1849,6 +1940,20 @@ pub fn touchMotion(
     if (!self.delivery.capability(.touch).available) return;
     const point = self.touchPoint(id) orelse return;
     const target = point.target orelse return;
+    if (target.generated_root != null) {
+        if (!self.generatedTouchTargetLive(target)) {
+            self.touchCancelPoint(id);
+            return;
+        }
+        self.delivery.deliverTouch(target.client, .{ .motion = .{
+            .time = time,
+            .id = id,
+            .x = pointerFixed(x - target.offset_x),
+            .y = pointerFixed(y - target.offset_y),
+            .max_resource_generation = target.max_resource_generation,
+        } });
+        return;
+    }
     for (self.touch_resources.items) |*entry| {
         if (!self.touchResourceActive(entry.*)) continue;
         const resource = entry.resource;
@@ -1871,6 +1976,7 @@ pub fn touchFrame(self: *Self) void {
     for (self.touch_resources.items) |*entry| {
         if (takeTouchFrame(entry)) entry.resource.sendFrame();
     }
+    self.delivery.deliverTouchFrame();
 }
 
 pub fn touchCancel(self: *Self) void {
@@ -1887,6 +1993,29 @@ pub fn touchCancel(self: *Self) void {
             break;
         }
     }
+    for (self.touch_points.items, 0..) |point, index| {
+        const target = point.target orelse continue;
+        if (target.generated_root == null) continue;
+        for (self.touch_points.items[0..index]) |earlier| {
+            const earlier_target = earlier.target orelse continue;
+            if (earlier_target.generated_root != null and
+                std.meta.eql(earlier_target.client, target.client)) break;
+        } else {
+            var max_resource_generation = target.max_resource_generation;
+            for (self.touch_points.items[index + 1 ..]) |later| {
+                const later_target = later.target orelse continue;
+                if (later_target.generated_root != null and
+                    std.meta.eql(later_target.client, target.client))
+                    max_resource_generation = @max(
+                        max_resource_generation,
+                        later_target.max_resource_generation,
+                    );
+            }
+            self.delivery.deliverTouch(target.client, .{ .cancel = .{
+                .max_resource_generation = max_resource_generation,
+            } });
+        }
+    }
     self.touch_points.clearRetainingCapacity();
     for (self.touch_resources.items) |*entry| entry.frame_pending = false;
 }
@@ -1896,6 +2025,12 @@ pub fn touchCancel(self: *Self) void {
 /// physical device reports up or cancel.
 pub fn touchCancelPoint(self: *Self, id: i32) void {
     const cancellation = cancelTouchPointState(&self.touch_points, id) orelse return;
+    if (cancellation.generated) {
+        self.delivery.deliverTouch(cancellation.client, .{ .cancel = .{
+            .max_resource_generation = cancellation.max_resource_generation,
+        } });
+        return;
+    }
     for (self.touch_resources.items) |*entry| {
         if (!self.touchResourceActive(entry.*) or
             entry.generation > cancellation.max_resource_generation or
@@ -1913,6 +2048,19 @@ pub fn touchShape(self: *Self, id: i32, major: f64, minor: f64) void {
     if (!self.delivery.capability(.touch).available) return;
     const point = self.touchPoint(id) orelse return;
     const target = point.target orelse return;
+    if (target.generated_root != null) {
+        if (!self.generatedTouchTargetLive(target)) {
+            self.touchCancelPoint(id);
+            return;
+        }
+        self.delivery.deliverTouch(target.client, .{ .shape = .{
+            .id = id,
+            .major = pointerFixed(major),
+            .minor = pointerFixed(minor),
+            .max_resource_generation = target.max_resource_generation,
+        } });
+        return;
+    }
     if (!self.hasTouchResourceVersion(
         target.client,
         wl.Touch.shape_since_version,
@@ -1935,6 +2083,18 @@ pub fn touchOrientation(self: *Self, id: i32, orientation: f64) void {
     if (!self.delivery.capability(.touch).available) return;
     const point = self.touchPoint(id) orelse return;
     const target = point.target orelse return;
+    if (target.generated_root != null) {
+        if (!self.generatedTouchTargetLive(target)) {
+            self.touchCancelPoint(id);
+            return;
+        }
+        self.delivery.deliverTouch(target.client, .{ .orientation = .{
+            .id = id,
+            .orientation = pointerFixed(orientation),
+            .max_resource_generation = target.max_resource_generation,
+        } });
+        return;
+    }
     if (!self.hasTouchResourceVersion(
         target.client,
         wl.Touch.orientation_since_version,
@@ -2241,6 +2401,14 @@ fn touchTargetClientLive(
     return clients.contains(target.client);
 }
 
+fn generatedTouchTargetLive(self: *const Self, target: TouchPoint.Target) bool {
+    if (target.generated_root == null or
+        self.clients.domainOf(target.client) != .wayring_server or
+        !self.surface_registry.contains(target.surface_id)) return false;
+    const owner = self.delivery.ownerForSurface(target.surface_id) orelse return false;
+    return std.meta.eql(owner, target.client);
+}
+
 fn cancelTouchPointState(
     points: *std.ArrayList(TouchPoint),
     id: i32,
@@ -2260,6 +2428,7 @@ fn cancelTouchPointState(
     return .{
         .client = client,
         .max_resource_generation = max_resource_generation,
+        .generated = cancelled.target.?.generated_root != null,
     };
 }
 
@@ -2904,6 +3073,10 @@ pub fn retireGeneratedClient(self: *Self, client: ClientRegistry.Id) void {
     }
     if (self.drag_cursor_client) |controller| {
         if (std.meta.eql(controller, client)) self.drag_cursor_client = null;
+    }
+    for (self.touch_points.items) |*point| {
+        const target = point.target orelse continue;
+        if (std.meta.eql(target.client, client)) point.target = null;
     }
 }
 
