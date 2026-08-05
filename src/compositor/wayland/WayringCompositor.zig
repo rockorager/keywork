@@ -53,8 +53,17 @@ pub const PresentationListener = struct {
     removing: *const fn (*anyopaque, SurfaceId) void,
 };
 
+const UpdateToken = struct {
+    surface: SurfaceId,
+    sequence: u64,
+};
+
 const FrameCallback = struct {
-    const State = enum { pending, committed };
+    const State = union(enum) {
+        pending,
+        queued: UpdateToken,
+        committed,
+    };
 
     resource: core.wl_callback.Resource,
     state: State,
@@ -86,6 +95,85 @@ const Surface = struct {
     current_logical_size: ?render.Size = null,
     source_cache_id: u64,
     next_source_version: u64 = 1,
+    /// Content-update serials never wrap: aliasing an old dependency is worse
+    /// than terminalizing the (already impractically long-lived) client.
+    next_content_sequence: ?u64 = 1,
+    content_updates: std.ArrayList(ContentUpdate) = .empty,
+    relationship: ?Relationship = null,
+    children: std.ArrayList(ChildPlacement) = .empty,
+    topology_dirty: bool = false,
+};
+
+const AssociationIdentity = struct {
+    child: SurfaceId,
+    parent: SurfaceId,
+    generation: u64,
+};
+
+const Relationship = struct {
+    identity: AssociationIdentity,
+    local_sync: bool = true,
+    position: Position = .{},
+};
+
+const ChildPlacement = struct {
+    identity: AssociationIdentity,
+    position: Position = .{},
+};
+
+const TopologyEntry = union(enum) {
+    parent,
+    child: struct {
+        identity: AssociationIdentity,
+        position: Position,
+    },
+};
+
+const UpdateKind = enum { scu, dcu };
+const Claim = struct {
+    token: UpdateToken,
+    association: AssociationIdentity,
+};
+
+const ContentUpdate = struct {
+    token: UpdateToken,
+    prepared: PreparedCommit,
+    callback_count: usize,
+    kind: UpdateKind,
+    claims: std.ArrayList(Claim) = .empty,
+    claimed_by: ?UpdateToken = null,
+    topology: ?std.ArrayList(TopologyEntry) = null,
+
+    fn deinit(self: *ContentUpdate, allocator: std.mem.Allocator) void {
+        self.prepared.deinit();
+        self.claims.deinit(allocator);
+        if (self.topology) |*topology| topology.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const ApplyScratch = struct {
+    const Visit = struct {
+        token: UpdateToken,
+        exit: bool,
+    };
+
+    visits: std.ArrayList(Visit) = .empty,
+    active: std.ArrayList(UpdateToken) = .empty,
+    plan: std.ArrayList(UpdateToken) = .empty,
+    surfaces: std.ArrayList(AppliedSurfaceState) = .empty,
+    parents: std.ArrayList(AppliedParentState) = .empty,
+    stack_entries: std.ArrayList(AppliedStackEntry) = .empty,
+
+    fn deinit(self: *ApplyScratch, allocator: std.mem.Allocator) void {
+        self.stack_entries.deinit(allocator);
+        self.parents.deinit(allocator);
+        self.surfaces.deinit(allocator);
+        self.plan.deinit(allocator);
+        self.active.deinit(allocator);
+        self.visits.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 const InputRegion = struct {
@@ -128,6 +216,7 @@ const PreparedCommit = struct {
     pending_frame_callback_count: usize,
     attachment_changed: bool,
     publishes_snapshot: bool = false,
+    physical_size: ?render.Size = null,
     logical_size: ?render.Size,
     scale: i32,
     transform: render.BufferTransform,
@@ -190,8 +279,14 @@ const ClientObjects = struct {
 };
 
 const CommitFault = enum {
+    queue_storage,
     candidate_allocation,
+    prepared_owned,
     region_copy,
+    claims,
+    topology_snapshot,
+    apply_scratch,
+    batch_assembly,
     access,
     copy,
     access_end,
@@ -206,6 +301,7 @@ global: *const server.Server.Global,
 shm: Shm,
 clients: std.ArrayList(*ClientObjects) = .empty,
 owned_provider_count: usize = 0,
+next_relationship_generation: ?u64 = 1,
 completing_frame_callbacks: bool = false,
 commit_fault: if (builtin.is_test) ?CommitFault else void,
 
@@ -305,6 +401,121 @@ pub fn currentBuffer(self: *WayringCompositor, id: SurfaceId) ?*CopiedBufferSnap
     return if (surface.current) |*current| current else null;
 }
 
+// Private resource-free controls exercise CU relationships until Wave 4C
+// supplies the real wl_subsurface producer. They create no protocol state.
+fn testAssociate(self: *WayringCompositor, child_id: SurfaceId, parent_id: SurfaceId) !u64 {
+    const child = self.surfaceForId(child_id) orelse return error.UnknownSurface;
+    const parent = self.surfaceForId(parent_id) orelse return error.UnknownSurface;
+    if (child.relationship != null or std.meta.eql(child_id, parent_id)) return error.BadRelationship;
+    var cursor = parent;
+    var depth: usize = 0;
+    while (true) {
+        if (std.meta.eql(cursor.id, child_id)) return error.RelationshipCycle;
+        const relationship = cursor.relationship orelse break;
+        depth += 1;
+        if (depth >= self.surfaceCount()) return error.RelationshipCycle;
+        cursor = self.surfaceForId(relationship.identity.parent) orelse return error.BadRelationship;
+    }
+    const generation = self.next_relationship_generation orelse return error.GenerationExhausted;
+    try parent.children.ensureUnusedCapacity(self.allocator, 1);
+    const identity: AssociationIdentity = .{
+        .child = child_id,
+        .parent = parent_id,
+        .generation = generation,
+    };
+    self.next_relationship_generation = std.math.add(u64, generation, 1) catch null;
+    child.relationship = .{ .identity = identity };
+    parent.children.appendAssumeCapacity(.{ .identity = identity });
+    parent.topology_dirty = true;
+    return generation;
+}
+
+fn testSetPosition(self: *WayringCompositor, child_id: SurfaceId, position: Position) !void {
+    const child = self.surfaceForId(child_id) orelse return error.UnknownSurface;
+    var relationship = child.relationship orelse return error.BadRelationship;
+    const parent = self.surfaceForId(relationship.identity.parent) orelse return error.BadRelationship;
+    relationship.position = position;
+    child.relationship = relationship;
+    for (parent.children.items) |*entry| if (std.meta.eql(entry.identity, relationship.identity)) {
+        entry.position = position;
+        parent.topology_dirty = true;
+        return;
+    };
+    unreachable;
+}
+
+fn testSetSync(self: *WayringCompositor, child_id: SurfaceId) !void {
+    const child = self.surfaceForId(child_id) orelse return error.UnknownSurface;
+    if (child.relationship) |*relationship| relationship.local_sync = true else return error.BadRelationship;
+}
+
+fn testSetDesync(self: *WayringCompositor, child_id: SurfaceId) !void {
+    const child = self.surfaceForId(child_id) orelse return error.UnknownSurface;
+    const relationship = child.relationship orelse return error.BadRelationship;
+    if (!relationship.local_sync) return;
+    const parent = self.surfaceForId(relationship.identity.parent) orelse return error.BadRelationship;
+    if (self.effectivelySynchronized(parent)) {
+        child.relationship.?.local_sync = false;
+        return;
+    }
+
+    var affected: std.ArrayList(SurfaceId) = .empty;
+    defer affected.deinit(self.allocator);
+    var roots: std.ArrayList(UpdateToken) = .empty;
+    defer roots.deinit(self.allocator);
+    try affected.ensureTotalCapacity(self.allocator, self.surfaceCount());
+    try roots.ensureTotalCapacity(self.allocator, self.surfaceCount());
+    affected.appendAssumeCapacity(child.id);
+    var index: usize = 0;
+    while (index < affected.items.len) : (index += 1) {
+        const surface = self.surfaceForId(affected.items[index]) orelse continue;
+        if (surface.content_updates.items.len != 0)
+            roots.appendAssumeCapacity(surface.content_updates.items[surface.content_updates.items.len - 1].token);
+        for (surface.children.items) |entry| {
+            const descendant = self.surfaceForId(entry.identity.child) orelse continue;
+            const descendant_relationship = descendant.relationship orelse continue;
+            if (!std.meta.eql(descendant_relationship.identity, entry.identity) or descendant_relationship.local_sync)
+                continue;
+            affected.appendAssumeCapacity(descendant.id);
+        }
+    }
+
+    var scratch: ?ApplyScratch = if (roots.items.len == 0)
+        null
+    else
+        try self.prepareApplyScratch(roots.items, null);
+    defer if (scratch) |*value| value.deinit(self.allocator);
+
+    // With no fifo, commit-timing, or explicit-sync constraints in Wave 4B,
+    // every converted queue is immediately eligible as a whole. Adding any
+    // such constraint invalidates this simplification and requires selecting
+    // candidates after constraint evaluation instead.
+    child.relationship.?.local_sync = false;
+    for (affected.items) |id| {
+        const surface = self.surfaceForId(id) orelse continue;
+        for (surface.content_updates.items) |*update| {
+            update.kind = .dcu;
+            self.unlinkIncomingClaim(update);
+        }
+    }
+    if (scratch) |*value| self.applyScratch(value);
+}
+
+fn testDissociate(self: *WayringCompositor, child_id: SurfaceId) !void {
+    const child = self.surfaceForId(child_id) orelse return error.UnknownSurface;
+    const relationship = child.relationship orelse return error.BadRelationship;
+    const parent = self.surfaceForId(relationship.identity.parent) orelse return error.BadRelationship;
+    self.discardSurfaceQueue(child);
+    for (parent.children.items, 0..) |entry, index| {
+        if (!std.meta.eql(entry.identity, relationship.identity)) continue;
+        _ = parent.children.orderedRemove(index);
+        break;
+    }
+    parent.topology_dirty = true;
+    child.relationship = null;
+    if (self.presentation_listener) |listener| listener.detached(listener.context, child.id);
+}
+
 /// Completes every callback committed for the canonical surface ID. Event
 /// enqueue failure terminalizes the client but never escapes this entrypoint;
 /// each one-shot callback is retired regardless. Pending callbacks are left
@@ -322,7 +533,10 @@ pub fn completeFrame(self: *WayringCompositor, id: SurfaceId, timestamp_ms: u32)
     const client = self.clientForResource(&surface.resource.runtime) orelse return;
     while (surface.frame_callbacks.items.len > 0) {
         const callback = surface.frame_callbacks.items[0];
-        if (callback.state == .pending) break;
+        switch (callback.state) {
+            .pending, .queued => break,
+            .committed => {},
+        }
         core.wl_callback.@"send:done"(&callback.resource, timestamp_ms) catch |err| switch (err) {
             error.OutOfMemory, error.WriteFailed => client.postOutOfMemory(&callback.resource.runtime, "queueing wl_callback.done"),
             error.OutputSealed, error.ClientFatal => {},
@@ -724,6 +938,15 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     // state remains unchanged, matching the existing terminal policy.
     defer if (!published and had_pending_attachment) clearPendingAttachment(surface);
 
+    const sequence = surface.next_content_sequence orelse {
+        const client = self.clientForResource(&surface.resource.runtime) orelse return error.UntrackedClient;
+        client.postImplementationError(&surface.resource.runtime, "wl_surface content-update sequence exhausted");
+        return;
+    };
+    const token: UpdateToken = .{ .surface = surface.id, .sequence = sequence };
+    // Classification is frozen at the commit request, before preparation.
+    const kind: UpdateKind = if (self.effectivelySynchronized(surface)) .scu else .dcu;
+
     var prepared = self.prepareCommit(surface) catch |err| {
         const client = self.clientForResource(&surface.resource.runtime) orelse return error.UntrackedClient;
         switch (err) {
@@ -740,17 +963,349 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
         }
         return;
     };
-    defer prepared.deinit();
-    self.publishPreparedCommit(surface, &prepared);
+    var candidate: ContentUpdate = .{
+        .token = token,
+        .prepared = prepared,
+        .callback_count = prepared.pending_frame_callback_count,
+        .kind = kind,
+    };
+    prepared = undefined;
+    var candidate_owned = true;
+    defer if (candidate_owned) candidate.deinit(self.allocator);
+
+    if (self.failCommitAt(.queue_storage)) return error.OutOfMemory;
+    try surface.content_updates.ensureUnusedCapacity(self.allocator, 1);
+    if (self.failCommitAt(.claims)) return error.OutOfMemory;
+    try candidate.claims.ensureTotalCapacity(self.allocator, surface.children.items.len);
+    for (surface.children.items) |child_entry| {
+        const child = self.surfaceForId(child_entry.identity.child) orelse continue;
+        if (child.content_updates.items.len == 0) continue;
+        const tail = &child.content_updates.items[child.content_updates.items.len - 1];
+        const association = child.relationship orelse continue;
+        if (tail.kind == .scu and tail.claimed_by == null and
+            std.meta.eql(association.identity, child_entry.identity))
+        {
+            candidate.claims.appendAssumeCapacity(.{
+                .token = tail.token,
+                .association = association.identity,
+            });
+        }
+    }
+    if (self.failCommitAt(.topology_snapshot)) return error.OutOfMemory;
+    if (surface.topology_dirty or surface.children.items.len != 0) {
+        var value: std.ArrayList(TopologyEntry) = .empty;
+        var value_owned = true;
+        errdefer if (value_owned) value.deinit(self.allocator);
+        try value.ensureTotalCapacity(self.allocator, surface.children.items.len + 1);
+        value.appendAssumeCapacity(.parent);
+        for (surface.children.items) |child| value.appendAssumeCapacity(.{ .child = .{
+            .identity = child.identity,
+            .position = child.position,
+        } });
+        candidate.topology = value;
+        value_owned = false;
+    }
+
+    var scratch: ?ApplyScratch = null;
+    defer if (scratch) |*value| value.deinit(self.allocator);
+    if (kind == .dcu and !hasQueuedScu(surface))
+        scratch = try self.prepareApplyScratch(&.{token}, &candidate);
+
+    // Release enqueue is the final fallible operation. Queue, callbacks,
+    // pending state, claims, and applied state are untouched before it.
+    if (surface.pending_attachment) |*pending| if (pending.resource) |buffer_resource| {
+        if (self.failCommitAt(.release_enqueue)) return error.OutOfMemory;
+        try self.shm.sendRelease(buffer_resource);
+    };
+
+    surface.next_content_sequence = std.math.add(u64, sequence, 1) catch null;
+    var callbacks_to_queue = candidate.callback_count;
+    for (surface.frame_callbacks.items) |callback| switch (callback.state) {
+        .pending => if (callbacks_to_queue != 0) {
+            callback.state = .{ .queued = token };
+            callbacks_to_queue -= 1;
+        },
+        .queued, .committed => {},
+    };
+    std.debug.assert(callbacks_to_queue == 0);
+    const publishes_snapshot = candidate.prepared.publishes_snapshot;
+    surface.content_updates.appendAssumeCapacity(candidate);
+    candidate_owned = false;
+    const stored = &surface.content_updates.items[surface.content_updates.items.len - 1];
+    for (stored.claims.items) |claim| {
+        const claimed = self.updateForToken(claim.token) orelse unreachable;
+        std.debug.assert(claimed.claimed_by == null);
+        claimed.claimed_by = token;
+    }
+
+    surface.pending_damage.clear();
+    surface.pending_opaque_dirty = false;
+    surface.pending_input_dirty = false;
+    clearPendingAttachment(surface);
+    clearPendingOffset(surface);
+    surface.topology_dirty = false;
+    if (publishes_snapshot) surface.next_source_version +%= 1;
     published = true;
+    if (scratch) |*value| self.applyScratch(value);
+    if (surface.relationship == null) std.debug.assert(surface.content_updates.items.len == 0);
+}
+
+fn projectedPhysicalSize(self: *WayringCompositor, surface: *const Surface) ?render.Size {
+    _ = self;
+    var index = surface.content_updates.items.len;
+    while (index > 0) {
+        index -= 1;
+        const prepared = &surface.content_updates.items[index].prepared;
+        if (!prepared.attachment_changed) continue;
+        return prepared.physical_size;
+    }
+    return if (surface.current) |*current| current.size else null;
+}
+
+fn updateForToken(self: *WayringCompositor, token: UpdateToken) ?*ContentUpdate {
+    const surface = self.surfaceForId(token.surface) orelse return null;
+    for (surface.content_updates.items) |*update|
+        if (std.meta.eql(update.token, token)) return update;
+    return null;
+}
+
+fn updateForPlan(
+    self: *WayringCompositor,
+    token: UpdateToken,
+    proposed: ?*const ContentUpdate,
+) ?*const ContentUpdate {
+    if (proposed) |candidate| if (std.meta.eql(candidate.token, token)) return candidate;
+    return self.updateForToken(token);
+}
+
+fn effectivelySynchronized(self: *WayringCompositor, surface: *const Surface) bool {
+    var cursor = surface;
+    var remaining = self.surfaceCount() + 1;
+    while (cursor.relationship) |relationship| {
+        if (remaining == 0) return true;
+        remaining -= 1;
+        if (relationship.local_sync) return true;
+        cursor = self.surfaceForId(relationship.identity.parent) orelse return false;
+    }
+    return false;
+}
+
+fn tokenIn(items: []const UpdateToken, token: UpdateToken) bool {
+    for (items) |candidate| if (std.meta.eql(candidate, token)) return true;
+    return false;
+}
+
+fn hasQueuedScu(surface: *const Surface) bool {
+    for (surface.content_updates.items) |update| if (update.kind == .scu) return true;
+    return false;
+}
+
+fn predecessorToken(
+    self: *WayringCompositor,
+    token: UpdateToken,
+    proposed: ?*const ContentUpdate,
+) ?UpdateToken {
+    const surface = self.surfaceForId(token.surface) orelse return null;
+    if (proposed) |candidate| if (std.meta.eql(candidate.token, token)) {
+        return if (surface.content_updates.items.len == 0)
+            null
+        else
+            surface.content_updates.items[surface.content_updates.items.len - 1].token;
+    };
+    for (surface.content_updates.items, 0..) |update, index| {
+        if (!std.meta.eql(update.token, token)) continue;
+        return if (index == 0) null else surface.content_updates.items[index - 1].token;
+    }
+    return null;
+}
+
+/// Prebuilds a bounded, nonrecursive post-order plan and every borrowed batch
+/// buffer. The optional candidate has not entered its queue yet, allowing CU
+/// cycles and allocation failures to be rejected before buffer release.
+fn prepareApplyScratch(
+    self: *WayringCompositor,
+    roots: []const UpdateToken,
+    proposed: ?*const ContentUpdate,
+) !ApplyScratch {
+    var total: usize = 0;
+    var topology_entries: usize = 0;
+    for (self.clients.items) |objects| {
+        for (objects.surfaces.items) |surface| {
+            total = try std.math.add(usize, total, surface.content_updates.items.len);
+            for (surface.content_updates.items) |update| {
+                if (update.topology) |topology|
+                    topology_entries = try std.math.add(usize, topology_entries, topology.items.len);
+            }
+        }
+    }
+    if (proposed) |candidate| {
+        total = try std.math.add(usize, total, 1);
+        if (candidate.topology) |topology|
+            topology_entries = try std.math.add(usize, topology_entries, topology.items.len);
+    }
+    const visit_capacity = try std.math.mul(usize, total, 4);
+
+    var scratch: ApplyScratch = .{};
+    errdefer scratch.deinit(self.allocator);
+    if (self.failCommitAt(.apply_scratch)) return error.OutOfMemory;
+    try scratch.visits.ensureTotalCapacity(self.allocator, visit_capacity);
+    try scratch.active.ensureTotalCapacity(self.allocator, total);
+    try scratch.plan.ensureTotalCapacity(self.allocator, total);
+    if (self.failCommitAt(.batch_assembly)) return error.OutOfMemory;
+    try scratch.surfaces.ensureTotalCapacity(self.allocator, self.surfaceCount());
+    try scratch.parents.ensureTotalCapacity(self.allocator, self.surfaceCount());
+    try scratch.stack_entries.ensureTotalCapacity(self.allocator, topology_entries);
+
+    for (roots) |root| {
+        scratch.visits.appendAssumeCapacity(.{ .token = root, .exit = false });
+        while (scratch.visits.pop()) |visit| {
+            if (visit.exit) {
+                std.debug.assert(scratch.active.items.len != 0);
+                std.debug.assert(std.meta.eql(scratch.active.items[scratch.active.items.len - 1], visit.token));
+                _ = scratch.active.pop();
+                if (!tokenIn(scratch.plan.items, visit.token)) scratch.plan.appendAssumeCapacity(visit.token);
+                continue;
+            }
+            if (tokenIn(scratch.plan.items, visit.token)) continue;
+            if (tokenIn(scratch.active.items, visit.token)) return error.InvalidDependencyCycle;
+            const update = self.updateForPlan(visit.token, proposed) orelse return error.InvalidDependencyToken;
+            scratch.active.appendAssumeCapacity(visit.token);
+            scratch.visits.appendAssumeCapacity(.{ .token = visit.token, .exit = true });
+            var claim_index = update.claims.items.len;
+            while (claim_index > 0) {
+                claim_index -= 1;
+                scratch.visits.appendAssumeCapacity(.{
+                    .token = update.claims.items[claim_index].token,
+                    .exit = false,
+                });
+            }
+            if (self.predecessorToken(visit.token, proposed)) |predecessor|
+                scratch.visits.appendAssumeCapacity(.{ .token = predecessor, .exit = false });
+        }
+    }
+    std.debug.assert(scratch.active.items.len == 0);
+    return scratch;
+}
+
+fn associationLive(
+    self: *WayringCompositor,
+    parent: SurfaceId,
+    identity: AssociationIdentity,
+) bool {
+    if (!std.meta.eql(parent, identity.parent)) return false;
+    const child = self.surfaceForId(identity.child) orelse return false;
+    const relationship = child.relationship orelse return false;
+    return std.meta.eql(relationship.identity, identity);
+}
+
+fn applyScratch(self: *WayringCompositor, scratch: *ApplyScratch) void {
+    for (scratch.plan.items) |token| {
+        const update = self.updateForToken(token) orelse unreachable;
+        const surface = self.surfaceForId(token.surface) orelse unreachable;
+        self.publishPreparedCommit(surface, &update.prepared, token, false);
+
+        var state_found = false;
+        for (scratch.surfaces.items) |*state| if (std.meta.eql(state.id, surface.id)) {
+            state.mapped_size = surface.current_logical_size;
+            state.callbacks_committed = state.callbacks_committed or update.callback_count != 0;
+            state_found = true;
+            break;
+        };
+        if (!state_found) scratch.surfaces.appendAssumeCapacity(.{
+            .id = surface.id,
+            .mapped_size = surface.current_logical_size,
+            .callbacks_committed = update.callback_count != 0,
+        });
+
+        if (update.topology) |topology| {
+            const start = scratch.stack_entries.items.len;
+            for (topology.items) |entry| switch (entry) {
+                .parent => scratch.stack_entries.appendAssumeCapacity(.parent),
+                .child => |child| if (self.associationLive(surface.id, child.identity))
+                    scratch.stack_entries.appendAssumeCapacity(.{ .child = .{
+                        .id = child.identity.child,
+                        .position = child.position,
+                    } }),
+            };
+            const stack = scratch.stack_entries.items[start..];
+            var parent_found = false;
+            for (scratch.parents.items) |*parent_state| if (std.meta.eql(parent_state.id, surface.id)) {
+                parent_state.stack = stack;
+                parent_found = true;
+                break;
+            };
+            if (!parent_found) scratch.parents.appendAssumeCapacity(.{ .id = surface.id, .stack = stack });
+        }
+    }
+
+    for (scratch.plan.items) |token| self.clearOwnedClaims(self.updateForToken(token) orelse unreachable);
+    if (self.presentation_listener) |listener| listener.applied(listener.context, .{
+        .surfaces = scratch.surfaces.items,
+        .parents = scratch.parents.items,
+    });
+
+    for (self.clients.items) |objects| for (objects.surfaces.items) |surface| {
+        while (surface.content_updates.items.len != 0 and
+            tokenIn(scratch.plan.items, surface.content_updates.items[0].token))
+        {
+            var update = surface.content_updates.orderedRemove(0);
+            update.deinit(self.allocator);
+        }
+    };
+}
+
+fn clearOwnedClaims(self: *WayringCompositor, update: *ContentUpdate) void {
+    for (update.claims.items) |claim| {
+        const claimed = self.updateForToken(claim.token) orelse continue;
+        if (claimed.claimed_by) |owner| {
+            if (std.meta.eql(owner, update.token)) claimed.claimed_by = null;
+        }
+    }
+}
+
+fn unlinkIncomingClaim(self: *WayringCompositor, update: *ContentUpdate) void {
+    const owner_token = update.claimed_by orelse return;
+    update.claimed_by = null;
+    const owner = self.updateForToken(owner_token) orelse return;
+    for (owner.claims.items, 0..) |claim, index| {
+        if (!std.meta.eql(claim.token, update.token)) continue;
+        _ = owner.claims.orderedRemove(index);
+        return;
+    }
+}
+
+fn discardUpdateAt(self: *WayringCompositor, surface: *Surface, index: usize) void {
+    const token = surface.content_updates.items[index].token;
+    self.unlinkIncomingClaim(&surface.content_updates.items[index]);
+    self.clearOwnedClaims(&surface.content_updates.items[index]);
+    var callback_index: usize = 0;
+    while (callback_index < surface.frame_callbacks.items.len) {
+        const discard = switch (surface.frame_callbacks.items[callback_index].state) {
+            .queued => |queued| std.meta.eql(queued, token),
+            .pending, .committed => false,
+        };
+        if (discard) {
+            destroyFrameCallback(self, surface, callback_index);
+        } else {
+            callback_index += 1;
+        }
+    }
+    var update = surface.content_updates.orderedRemove(index);
+    update.deinit(self.allocator);
+}
+
+fn discardSurfaceQueue(self: *WayringCompositor, surface: *Surface) void {
+    while (surface.content_updates.items.len != 0) self.discardUpdateAt(surface, 0);
 }
 
 fn prepareCommit(self: *WayringCompositor, surface: *Surface) !PreparedCommit {
     var prepared = PreparedCommit.init(surface);
     errdefer prepared.deinit();
+    prepared.physical_size = self.projectedPhysicalSize(surface);
 
     if (self.failCommitAt(.candidate_allocation)) return error.OutOfMemory;
     try prepared.damage.copyFrom(&surface.pending_damage);
+    if (self.failCommitAt(.prepared_owned)) return error.OutOfMemory;
     if (surface.pending_opaque_dirty) {
         var opaque_region = Region.init();
         var opaque_region_owned = true;
@@ -773,10 +1328,11 @@ fn prepareCommit(self: *WayringCompositor, surface: *Surface) !PreparedCommit {
         if (surface.pending_attachment) |*pending| {
             try self.preparePendingBuffer(surface, pending, &prepared);
         } else {
+            prepared.physical_size = null;
             prepared.logical_size = null;
         }
-    } else if (surface.current) |*current| {
-        prepared.logical_size = try logicalSize(current.size, prepared.scale, prepared.transform);
+    } else if (prepared.physical_size) |physical_size| {
+        prepared.logical_size = try logicalSize(physical_size, prepared.scale, prepared.transform);
     } else {
         prepared.logical_size = null;
     }
@@ -800,6 +1356,7 @@ fn preparePendingBuffer(
         .width = @intCast(geometry.width),
         .height = @intCast(geometry.height),
     };
+    prepared.physical_size = physical_size;
     prepared.logical_size = try logicalSize(physical_size, prepared.scale, prepared.transform);
     const source_cache: render.SourceCache = .{
         .id = surface.source_cache_id,
@@ -832,10 +1389,6 @@ fn preparePendingBuffer(
         return err;
     };
     access_live = false;
-    if (pending.resource) |buffer_resource| {
-        if (self.failCommitAt(.release_enqueue)) return error.OutOfMemory;
-        try self.shm.sendRelease(buffer_resource);
-    }
 }
 
 fn logicalSize(
@@ -854,10 +1407,18 @@ fn logicalSize(
     };
 }
 
-fn publishPreparedCommit(self: *WayringCompositor, surface: *Surface, prepared: *PreparedCommit) void {
+fn publishPreparedCommit(
+    self: *WayringCompositor,
+    surface: *Surface,
+    prepared: *PreparedCommit,
+    token: UpdateToken,
+    notify_listener: bool,
+) void {
+    // Wayland 1.26 applies the buffer before every other CU field so all
+    // coordinates and regions are interpreted against the new content.
+    if (prepared.attachment_changed) std.mem.swap(?CopiedBufferSnapshot, &surface.current, &prepared.buffer);
     if (prepared.opaque_region) |*opaque_region| std.mem.swap(Region, &surface.current_opaque, opaque_region);
     if (prepared.input) |*input| std.mem.swap(InputRegion, &surface.current_input, input);
-    if (prepared.attachment_changed) std.mem.swap(?CopiedBufferSnapshot, &surface.current, &prepared.buffer);
     surface.current_logical_size = prepared.logical_size;
     surface.current_scale = prepared.scale;
     surface.current_transform = prepared.transform;
@@ -868,34 +1429,25 @@ fn publishPreparedCommit(self: *WayringCompositor, surface: *Surface, prepared: 
     // roleless root policy intentionally keeps rendering at the global origin;
     // future roles can consume the exact applied value without leaking it into
     // SurfaceRegistry or Scene prematurely.
-    surface.pending_damage.clear();
-    surface.pending_opaque_dirty = false;
-    surface.pending_input_dirty = false;
-    clearPendingAttachment(surface);
-    clearPendingOffset(surface);
-    if (prepared.publishes_snapshot) surface.next_source_version +%= 1;
-
     var callbacks_to_commit = prepared.pending_frame_callback_count;
-    for (surface.frame_callbacks.items) |callback| {
-        if (callback.state == .committed) continue;
-        if (callbacks_to_commit == 0) break;
-        callback.state = .committed;
-        callbacks_to_commit -= 1;
-    }
+    for (surface.frame_callbacks.items) |callback| switch (callback.state) {
+        .queued => |queued| if (std.meta.eql(queued, token)) {
+            callback.state = .committed;
+            callbacks_to_commit -= 1;
+        },
+        .pending, .committed => {},
+    };
     std.debug.assert(callbacks_to_commit == 0);
 
     std.debug.assert((surface.current != null) == (surface.current_logical_size != null));
-    if (self.presentation_listener) |listener| {
+    if (notify_listener) if (self.presentation_listener) |listener| {
         const surfaces = [_]AppliedSurfaceState{.{
             .id = surface.id,
             .mapped_size = surface.current_logical_size,
             .callbacks_committed = prepared.pending_frame_callback_count != 0,
         }};
-        listener.applied(listener.context, .{
-            .surfaces = &surfaces,
-            .parents = &.{},
-        });
-    }
+        listener.applied(listener.context, .{ .surfaces = &surfaces, .parents = &.{} });
+    };
 }
 
 fn failCommitAt(self: *WayringCompositor, point: CommitFault) bool {
@@ -922,7 +1474,7 @@ fn pendingFrameCallbackCount(surface: *const Surface) usize {
     var count: usize = 0;
     var saw_pending = false;
     for (surface.frame_callbacks.items) |callback| switch (callback.state) {
-        .committed => std.debug.assert(!saw_pending),
+        .committed, .queued => std.debug.assert(!saw_pending),
         .pending => {
             saw_pending = true;
             count += 1;
@@ -966,6 +1518,23 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     const objects = self.findClient(client) orelse unreachable;
     std.debug.assert(!surface.destroying);
     surface.destroying = true;
+    self.discardSurfaceQueue(surface);
+    if (surface.relationship) |relationship| if (self.surfaceForId(relationship.identity.parent)) |parent| {
+        for (parent.children.items, 0..) |entry, index| if (std.meta.eql(entry.identity, relationship.identity)) {
+            _ = parent.children.orderedRemove(index);
+            parent.topology_dirty = true;
+            break;
+        };
+    };
+    for (surface.children.items) |entry| {
+        if (self.surfaceForId(entry.identity.child)) |child| {
+            self.discardSurfaceQueue(child);
+            if (child.relationship) |relationship| {
+                if (std.meta.eql(relationship.identity, entry.identity)) child.relationship = null;
+            }
+        }
+    }
+    surface.children.deinit(self.allocator);
     if (self.presentation_listener) |listener|
         listener.removing(listener.context, surface.id);
     self.surface_registry.remove(surface.id);
@@ -975,6 +1544,7 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     while (surface.frame_callbacks.items.len > 0)
         destroyFrameCallback(self, surface, 0);
     surface.frame_callbacks.deinit(self.allocator);
+    surface.content_updates.deinit(self.allocator);
     clearPendingAttachment(surface);
     if (surface.current) |*current| current.deinit();
     surface.current_input.deinit();
@@ -1353,6 +1923,7 @@ const TestPresentationListener = struct {
     events: [16]Event = undefined,
     event_count: usize = 0,
     added_count: usize = 0,
+    detached_count: usize = 0,
     committed_count: usize = 0,
     removing_count: usize = 0,
     last_id: ?SurfaceId = null,
@@ -1364,6 +1935,15 @@ const TestPresentationListener = struct {
     last_callbacks_committed: bool = false,
     callbacks_committed_count: usize = 0,
     removing_had_render_state: bool = false,
+    last_batch_surface_count: usize = 0,
+    last_batch_parent_count: usize = 0,
+    last_batch_surface_ids: [32]SurfaceId = undefined,
+    last_batch_callbacks: [32]bool = undefined,
+    last_batch_parent_ids: [16]SurfaceId = undefined,
+    last_parent_stack_lengths: [16]usize = undefined,
+    last_stack_child_ids: [32]SurfaceId = undefined,
+    last_stack_child_positions: [32]Position = undefined,
+    last_stack_child_count: usize = 0,
 
     fn listener(self: *TestPresentationListener) PresentationListener {
         return .{
@@ -1390,36 +1970,61 @@ const TestPresentationListener = struct {
         if (self.fail_added) return error.OutOfMemory;
     }
 
-    fn detached(_: *anyopaque, _: SurfaceId) void {}
+    fn detached(context: *anyopaque, id: SurfaceId) void {
+        const self: *TestPresentationListener = @ptrCast(@alignCast(context));
+        std.debug.assert(self.registry.contains(id));
+        self.detached_count += 1;
+    }
 
     fn applied(context: *anyopaque, batch: AppliedBatch) void {
         const self: *TestPresentationListener = @ptrCast(@alignCast(context));
-        std.debug.assert(batch.surfaces.len == 1);
-        std.debug.assert(batch.parents.len == 0);
-        const applied_surface = batch.surfaces[0];
-        const id = applied_surface.id;
-        const size = applied_surface.mapped_size;
-        const callbacks_committed = applied_surface.callbacks_committed;
-        std.debug.assert(self.registry.contains(id));
-        const state = self.registry.renderState(id);
-        if (size) |mapped_size| {
-            std.debug.assert(state != null);
-            std.debug.assert(std.meta.eql(mapped_size, state.?.logical_size));
-            self.last_source_cache = state.?.buffer.source_cache;
-            self.last_pixel_pointer = state.?.buffer.pixels.ptr;
-            self.last_first_pixel = state.?.buffer.pixels[0];
-        } else {
-            std.debug.assert(state == null);
-            self.last_source_cache = null;
-            self.last_pixel_pointer = null;
-            self.last_first_pixel = null;
+        std.debug.assert(batch.surfaces.len <= self.last_batch_surface_ids.len);
+        std.debug.assert(batch.parents.len <= self.last_batch_parent_ids.len);
+        self.last_batch_surface_count = batch.surfaces.len;
+        self.last_batch_parent_count = batch.parents.len;
+        self.last_stack_child_count = 0;
+        for (batch.surfaces, 0..) |applied_surface, index| {
+            const id = applied_surface.id;
+            self.last_batch_surface_ids[index] = id;
+            self.last_batch_callbacks[index] = applied_surface.callbacks_committed;
+            const size = applied_surface.mapped_size;
+            const callbacks_committed = applied_surface.callbacks_committed;
+            std.debug.assert(self.registry.contains(id));
+            const state = self.registry.renderState(id);
+            if (size) |mapped_size| {
+                std.debug.assert(state != null);
+                std.debug.assert(std.meta.eql(mapped_size, state.?.logical_size));
+                self.last_source_cache = state.?.buffer.source_cache;
+                self.last_pixel_pointer = state.?.buffer.pixels.ptr;
+                self.last_first_pixel = state.?.buffer.pixels[0];
+            } else {
+                std.debug.assert(state == null);
+                self.last_source_cache = null;
+                self.last_pixel_pointer = null;
+                self.last_first_pixel = null;
+            }
+            self.last_id = id;
+            self.last_size = size;
+            self.last_callbacks_committed = callbacks_committed;
+            if (callbacks_committed) self.callbacks_committed_count += 1;
+        }
+        for (batch.parents, 0..) |parent, parent_index| {
+            self.last_batch_parent_ids[parent_index] = parent.id;
+            self.last_parent_stack_lengths[parent_index] = parent.stack.len;
+            var sentinel_count: usize = 0;
+            for (parent.stack) |entry| switch (entry) {
+                .parent => sentinel_count += 1,
+                .child => |child| {
+                    std.debug.assert(self.last_stack_child_count < self.last_stack_child_ids.len);
+                    self.last_stack_child_ids[self.last_stack_child_count] = child.id;
+                    self.last_stack_child_positions[self.last_stack_child_count] = child.position;
+                    self.last_stack_child_count += 1;
+                },
+            };
+            std.debug.assert(sentinel_count == 1);
         }
         self.record(.committed);
         self.committed_count += 1;
-        self.last_id = id;
-        self.last_size = size;
-        self.last_callbacks_committed = callbacks_committed;
-        if (callbacks_committed) self.callbacks_committed_count += 1;
     }
 
     fn removing(context: *anyopaque, id: SurfaceId) void {
@@ -2386,7 +2991,10 @@ test "prepared callback boundary leaves later requests pending and preserves ord
     var prepared = try compositor.prepareCommit(surface);
     defer prepared.deinit();
     try requestFrame(client, 4, 7);
-    compositor.publishPreparedCommit(surface, &prepared);
+    const token: UpdateToken = .{ .surface = id, .sequence = 1 };
+    surface.frame_callbacks.items[0].state = .{ .queued = token };
+    surface.frame_callbacks.items[1].state = .{ .queued = token };
+    compositor.publishPreparedCommit(surface, &prepared, token, true);
 
     try std.testing.expectEqual(FrameCallback.State.committed, surface.frame_callbacks.items[0].state);
     try std.testing.expectEqual(FrameCallback.State.committed, surface.frame_callbacks.items[1].state);
@@ -3931,7 +4539,7 @@ test "prepared commit failures preserve all published surface state and reclaim 
 
             const expected_fatal: server.Fatal.Kind = switch (fault) {
                 .access, .access_end => .implementation,
-                .candidate_allocation, .region_copy, .copy, .release_enqueue => .out_of_memory,
+                else => .out_of_memory,
             };
             try std.testing.expectEqual(expected_fatal, client.fatal().?.kind);
             try std.testing.expect(surface.pending_attachment == null);
@@ -3952,6 +4560,7 @@ test "prepared commit failures preserve all published surface state and reclaim 
             try std.testing.expectEqual(old_version, surface.next_source_version);
             try std.testing.expectEqual(old_listener_count, listener_state.committed_count);
             try std.testing.expectEqual(old_callbacks_committed_count, listener_state.callbacks_committed_count);
+            try std.testing.expectEqual(@as(usize, 0), surface.content_updates.items.len);
             try std.testing.expectEqual(@as(usize, 1), surface.frame_callbacks.items.len);
             try std.testing.expectEqual(FrameCallback.State.pending, surface.frame_callbacks.items[0].state);
             try std.testing.expectEqual(&surface.frame_callbacks.items[0].resource.runtime, client.lookup(11).?);
@@ -3976,8 +4585,14 @@ test "prepared commit failures preserve all published surface state and reclaim 
     };
 
     for ([_]CommitFault{
-        .region_copy,
+        .queue_storage,
         .candidate_allocation,
+        .prepared_owned,
+        .region_copy,
+        .claims,
+        .topology_snapshot,
+        .apply_scratch,
+        .batch_assembly,
         .access,
         .copy,
         .access_end,
@@ -4273,4 +4888,314 @@ test "Wayring compositor advertises no wl_subcompositor global" {
     var globals = host.iterator();
     while (globals.next()) |global|
         try std.testing.expect(!std.mem.eql(u8, global.interface().name, "wl_subcompositor"));
+}
+
+test "exact CU tails apply one nested batch without consuming a later child update" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try createSurfaceResource(client, 3, 4);
+    try createSurfaceResource(client, 3, 5);
+    try createSurfaceResource(client, 3, 6);
+    const root_id = compositor.surfaceId(client, 4).?;
+    const parent_id = compositor.surfaceId(client, 5).?;
+    const child_id = compositor.surfaceId(client, 6).?;
+    const root = compositor.surfaceForId(root_id).?;
+    const parent = compositor.surfaceForId(parent_id).?;
+    const child = compositor.surfaceForId(child_id).?;
+    _ = try compositor.testAssociate(parent_id, root_id);
+    _ = try compositor.testAssociate(child_id, parent_id);
+    try compositor.testSetPosition(parent_id, .{ .x = 10, .y = 4 });
+    try compositor.testSetPosition(child_id, .{ .x = 3, .y = -2 });
+
+    try commitSurfaceResource(client, 6);
+    try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
+    try std.testing.expectEqual(UpdateKind.scu, child.content_updates.items[0].kind);
+    const child_n = child.content_updates.items[0].token;
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(usize, 1), parent.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 1), parent.content_updates.items[0].claims.items.len);
+    try std.testing.expectEqual(child_n, parent.content_updates.items[0].claims.items[0].token);
+    try std.testing.expectEqual(parent.content_updates.items[0].token, child.content_updates.items[0].claimed_by.?);
+
+    // A second parent CU cannot claim the already-owned tail.
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(usize, 2), parent.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 0), parent.content_updates.items[1].claims.items.len);
+
+    // This later child CU is not reachable through the parent's exact N claim.
+    try commitSurfaceResource(client, 6);
+    try std.testing.expectEqual(@as(usize, 2), child.content_updates.items.len);
+    const child_n_plus_one = child.content_updates.items[1].token;
+    try std.testing.expect(child_n_plus_one.sequence > child_n.sequence);
+    const commits_before_root = listener_state.committed_count;
+    try commitSurfaceResource(client, 4);
+
+    try std.testing.expectEqual(commits_before_root + 1, listener_state.committed_count);
+    try std.testing.expectEqual(@as(usize, 3), listener_state.last_batch_surface_count);
+    try std.testing.expectEqualSlices(
+        SurfaceId,
+        &.{ child_id, parent_id, root_id },
+        listener_state.last_batch_surface_ids[0..3],
+    );
+    try std.testing.expectEqual(@as(usize, 2), listener_state.last_batch_parent_count);
+    try std.testing.expectEqualSlices(
+        SurfaceId,
+        &.{ parent_id, root_id },
+        listener_state.last_batch_parent_ids[0..2],
+    );
+    try std.testing.expectEqualSlices(
+        SurfaceId,
+        &.{ child_id, parent_id },
+        listener_state.last_stack_child_ids[0..2],
+    );
+    try std.testing.expectEqual(Position{ .x = 3, .y = -2 }, listener_state.last_stack_child_positions[0]);
+    try std.testing.expectEqual(Position{ .x = 10, .y = 4 }, listener_state.last_stack_child_positions[1]);
+    try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
+    try std.testing.expectEqual(child_n_plus_one, child.content_updates.items[0].token);
+    try std.testing.expectEqual(@as(usize, 0), parent.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 0), root.content_updates.items.len);
+
+    // Desync under a synchronized ancestor does not flush, and set_sync never
+    // flushes. Unlocking that ancestor reaches only local-desync descendants.
+    try compositor.testSetDesync(child_id);
+    try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
+    try compositor.testSetSync(child_id);
+    try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
+    try compositor.testSetDesync(child_id);
+
+    try createSurfaceResource(client, 3, 7);
+    const grandchild_id = compositor.surfaceId(client, 7).?;
+    const grandchild = compositor.surfaceForId(grandchild_id).?;
+    _ = try compositor.testAssociate(grandchild_id, child_id);
+    try commitSurfaceResource(client, 7);
+    try std.testing.expectEqual(@as(usize, 1), grandchild.content_updates.items.len);
+
+    try compositor.testSetDesync(parent_id);
+    try std.testing.expectEqual(@as(usize, 0), child.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 1), grandchild.content_updates.items.len);
+    try compositor.testSetDesync(grandchild_id);
+    try std.testing.expectEqual(@as(usize, 0), grandchild.content_updates.items.len);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "queued CU projection and callbacks follow exact update application" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 6);
+    try bindShm(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    try createSurfaceResource(client, 3, 6);
+    const preferences = try drain(client);
+    defer std.testing.allocator.free(preferences);
+    try std.testing.expectEqual(@as(usize, 48), preferences.len);
+    const root_id = compositor.surfaceId(client, 5).?;
+    const child_id = compositor.surfaceId(client, 6).?;
+    const root = compositor.surfaceForId(root_id).?;
+    const child = compositor.surfaceForId(child_id).?;
+    _ = try compositor.testAssociate(child_id, root_id);
+
+    const pixels: [8]u32 = .{
+        0xff01_0203, 0xff04_0506, 0xff07_0809, 0xff0a_0b0c,
+        0xff10_2030, 0xff40_5060, 0xff70_8090, 0xffa0_b0c0,
+    };
+    const fd = try memfdWithPixels(&pixels);
+    defer _ = std.c.close(fd);
+    try createShmPool(client, 4, 7, fd, @sizeOf(@TypeOf(pixels)));
+    try createShmBuffer(client, 7, 8, 0, .{ .width = 4, .height = 2 }, 4 * @sizeOf(u32), .argb8888);
+
+    try requestFrame(client, 6, 9);
+    try attachBuffer(client, 6, 8);
+    try commitSurfaceResource(client, 6);
+    try requestFrame(client, 6, 10);
+    try setBufferScale(client, 6, 2);
+    try commitSurfaceResource(client, 6);
+    try setBufferTransform(client, 6, @intCast(core.wl_output.transform.@"90"));
+    try commitSurfaceResource(client, 6);
+
+    try std.testing.expectEqual(@as(usize, 3), child.content_updates.items.len);
+    try std.testing.expectEqual(render.Size{ .width = 4, .height = 2 }, child.content_updates.items[0].prepared.physical_size.?);
+    try std.testing.expectEqual(render.Size{ .width = 4, .height = 2 }, child.content_updates.items[0].prepared.logical_size.?);
+    try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, child.content_updates.items[1].prepared.logical_size.?);
+    try std.testing.expectEqual(render.Size{ .width = 1, .height = 2 }, child.content_updates.items[2].prepared.logical_size.?);
+    try std.testing.expectEqual(@as(u64, 1), child.content_updates.items[0].prepared.buffer.?.source_cache.version);
+    try std.testing.expectEqual(@as(u64, 2), child.next_source_version);
+    try std.testing.expect(child.content_updates.items[1].prepared.buffer == null);
+    try std.testing.expect(child.content_updates.items[2].prepared.buffer == null);
+    try std.testing.expectEqual(UpdateKind.scu, child.content_updates.items[2].kind);
+
+    const released = try drain(client);
+    defer std.testing.allocator.free(released);
+    try std.testing.expectEqual(@as(usize, 8), released.len);
+    listener_state.frame_completion.?.complete(listener_state.frame_completion.?.context, child_id, 40);
+    const queued_not_done = try drain(client);
+    defer std.testing.allocator.free(queued_not_done);
+    try std.testing.expectEqual(@as(usize, 0), queued_not_done.len);
+
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(usize, 0), child.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 0), root.content_updates.items.len);
+    const state = registry.renderState(child_id).?;
+    try std.testing.expectEqual(render.Size{ .width = 1, .height = 2 }, state.logical_size);
+    try std.testing.expectEqual(render.BufferTransform.rotate_90, state.transform);
+    try std.testing.expectEqual(@as(u64, 1), state.buffer.source_cache.?.version);
+    try std.testing.expectEqualSlices(u32, &pixels, state.buffer.pixels);
+    try std.testing.expectEqualSlices(SurfaceId, &.{ child_id, root_id }, listener_state.last_batch_surface_ids[0..2]);
+    try std.testing.expect(listener_state.last_batch_callbacks[0]);
+    listener_state.frame_completion.?.complete(listener_state.frame_completion.?.context, child_id, 41);
+    const callback_done = try drain(client);
+    defer std.testing.allocator.free(callback_done);
+    try std.testing.expectEqual(@as(usize, 48), callback_done.len);
+    try expectCallbackDoneAndDelete(callback_done, 0, 9, 41);
+    try expectCallbackDoneAndDelete(callback_done, 24, 10, 41);
+
+    // A null attachment projects through the next state-only SCU, and its
+    // callback remains committed demand even though the final content is null.
+    try requestFrame(client, 6, 11);
+    try attachBuffer(client, 6, null);
+    try commitSurfaceResource(client, 6);
+    try setBufferScale(client, 6, 1);
+    try commitSurfaceResource(client, 6);
+    try std.testing.expectEqual(@as(usize, 2), child.content_updates.items.len);
+    try std.testing.expect(child.content_updates.items[0].prepared.physical_size == null);
+    try std.testing.expect(child.content_updates.items[0].prepared.logical_size == null);
+    try std.testing.expect(child.content_updates.items[1].prepared.physical_size == null);
+    try std.testing.expect(child.content_updates.items[1].prepared.logical_size == null);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expect(registry.renderState(child_id) == null);
+    try std.testing.expect(listener_state.last_batch_callbacks[0]);
+    listener_state.frame_completion.?.complete(listener_state.frame_completion.?.context, child_id, 42);
+    const hidden_done = try drain(client);
+    defer std.testing.allocator.free(hidden_done);
+    try expectCallbackDoneAndDelete(hidden_done, 0, 11, 42);
+
+    // Discarding a queued CU retires its exact callback without wl_callback.done.
+    try requestFrame(client, 6, 12);
+    try commitSurfaceResource(client, 6);
+    try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
+    try send(client, 6, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expect(client.lookup(12) == null);
+    try std.testing.expect(!compositor.containsSurface(child_id));
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "stale association and canonical generations cannot alias replacement topology" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try createSurfaceResource(client, 3, 4);
+    try createSurfaceResource(client, 3, 5);
+    try createSurfaceResource(client, 3, 6);
+    const root_id = compositor.surfaceId(client, 4).?;
+    const parent_id = compositor.surfaceId(client, 5).?;
+    const old_child_id = compositor.surfaceId(client, 6).?;
+    _ = try compositor.testAssociate(parent_id, root_id);
+    const first_association = try compositor.testAssociate(old_child_id, parent_id);
+    try commitSurfaceResource(client, 5);
+    try compositor.testDissociate(old_child_id);
+    const second_association = try compositor.testAssociate(old_child_id, parent_id);
+    try std.testing.expect(second_association > first_association);
+    try commitSurfaceResource(client, 4);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.last_batch_parent_count);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.last_parent_stack_lengths[0]);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.last_stack_child_count);
+    try std.testing.expectEqual(parent_id, listener_state.last_stack_child_ids[0]);
+
+    // Queue another old-child topology, then replace the provider in the same
+    // registry slot before its synchronized CU applies.
+    try commitSurfaceResource(client, 5);
+    try send(client, 6, 0, &core.wl_surface.request_messages[0], &.{});
+    try createSurfaceResource(client, 3, 7);
+    const replacement_id = compositor.surfaceId(client, 7).?;
+    try std.testing.expectEqual(old_child_id.index, replacement_id.index);
+    try std.testing.expect(old_child_id.generation != replacement_id.generation);
+    _ = try compositor.testAssociate(replacement_id, parent_id);
+    try commitSurfaceResource(client, 4);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.last_parent_stack_lengths[0]);
+    try std.testing.expectEqual(@as(usize, 1), listener_state.last_stack_child_count);
+    try std.testing.expectEqual(parent_id, listener_state.last_stack_child_ids[0]);
+    try std.testing.expect(!std.meta.eql(replacement_id, listener_state.last_stack_child_ids[0]));
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "hostile-depth CU traversal is iterative and relationship cycles are rejected" {
+    const depth = 128;
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    var ids: [depth]SurfaceId = undefined;
+    for (0..depth) |index| {
+        const object_id: u32 = @intCast(4 + index);
+        try createSurfaceResource(client, 3, object_id);
+        ids[index] = compositor.surfaceId(client, object_id).?;
+    }
+    for (1..depth) |index| _ = try compositor.testAssociate(ids[index], ids[index - 1]);
+    try std.testing.expectError(error.RelationshipCycle, compositor.testAssociate(ids[0], ids[depth - 1]));
+    try std.testing.expect(compositor.surfaceForId(ids[0]).?.relationship == null);
+
+    var index: usize = depth;
+    while (index > 1) {
+        index -= 1;
+        try commitSurfaceResource(client, @intCast(4 + index));
+    }
+    try commitSurfaceResource(client, 4);
+    for (ids) |id| try std.testing.expectEqual(
+        @as(usize, 0),
+        compositor.surfaceForId(id).?.content_updates.items.len,
+    );
+    try std.testing.expect(client.fatal() == null);
 }
