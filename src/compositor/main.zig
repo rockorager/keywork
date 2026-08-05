@@ -634,6 +634,7 @@ test {
     _ = @import("ClientRegistry.zig");
     _ = @import("wayland/MatureClients.zig");
     _ = @import("SeatAuthority.zig");
+    _ = @import("SeatDelivery.zig");
     _ = @import("wayland/transient_seat.zig");
     _ = @import("wayland/output.zig");
     _ = @import("wayland/output_layout.zig");

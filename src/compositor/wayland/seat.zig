@@ -9,6 +9,7 @@ const PressedKeyState = @import("PressedKeyState.zig");
 const Surface = @import("surface.zig");
 const ClientRegistry = @import("../ClientRegistry.zig");
 const SeatAuthority = @import("../SeatAuthority.zig");
+const SeatDelivery = @import("../SeatDelivery.zig");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const MatureClients = @import("MatureClients.zig");
 const MatureSerials = @import("mature_serials.zig");
@@ -26,6 +27,7 @@ clients: *ClientRegistry,
 mature_clients: *MatureClients,
 surface_registry: *SurfaceRegistry,
 authority: SeatAuthority,
+delivery: SeatDelivery,
 seat_resources: std.ArrayList(*wl.Seat),
 seat_resource_listener: ?SeatResourceListener,
 keyboard_resources: std.ArrayList(KeyboardResource),
@@ -33,18 +35,10 @@ pointer_resources: std.ArrayList(PointerResource),
 touch_resources: std.ArrayList(TouchResource),
 next_pointer_resource_generation: u64,
 next_touch_resource_generation: u64,
-// Input objects created before a capability is re-added must remain inert.
-keyboard_capability_generation: u64,
-pointer_capability_generation: u64,
-touch_capability_generation: u64,
-keyboard_ever_available: bool,
-pointer_ever_available: bool,
-touch_ever_available: bool,
 keyboard_available: bool,
 virtual_keyboard_count: usize,
 pointer_available: bool,
 virtual_pointer_count: usize,
-touch_available: bool,
 keymap: ?Keymap,
 repeat_info: RepeatInfo,
 keyboard_grab: ?KeyboardGrab,
@@ -55,7 +49,6 @@ focus: ?Surface.Id,
 pointer_focus: ?PointerFocus,
 pointer_position: ?PointerPosition,
 touch_points: std.ArrayList(TouchPoint),
-touch_frame_resources: std.ArrayList(*wl.Touch),
 active_cursor: ?ActiveCursor,
 compositor_cursor: ?CursorImage,
 default_cursor: ?CursorImage,
@@ -73,17 +66,8 @@ const Keymap = struct {
     size: u32,
 };
 
-const RepeatInfo = struct {
-    rate: i32 = 0,
-    delay: i32 = 0,
-};
-
-const Modifiers = struct {
-    depressed: u32 = 0,
-    latched: u32 = 0,
-    locked: u32 = 0,
-    group: u32 = 0,
-};
+const RepeatInfo = SeatDelivery.RepeatInfo;
+const Modifiers = SeatDelivery.Modifiers;
 
 const ModifierState = struct {
     current: Modifiers = .{},
@@ -125,22 +109,23 @@ const TouchPoint = struct {
 
     const Target = struct {
         surface_id: Surface.Id,
-        client: *wl.Client,
+        client: ClientRegistry.Id,
         offset_x: f64,
         offset_y: f64,
-        max_resource_generation: u64,
+        max_resource_generation: SeatDelivery.ResourceGeneration,
     };
 };
 
 const TouchCancellation = struct {
-    client: *wl.Client,
-    max_resource_generation: u64,
+    client: ClientRegistry.Id,
+    max_resource_generation: SeatDelivery.ResourceGeneration,
 };
 
 const TouchResource = struct {
     resource: *wl.Touch,
     generation: u64,
     capability_generation: u64,
+    frame_pending: bool,
 };
 
 const KeyboardResource = struct {
@@ -283,6 +268,7 @@ pub fn init(
         .mature_clients = mature_clients,
         .surface_registry = surface_registry,
         .authority = SeatAuthority.init(allocator, clients, surface_registry),
+        .delivery = .init(),
         .seat_resources = .empty,
         .seat_resource_listener = null,
         .keyboard_resources = .empty,
@@ -290,17 +276,10 @@ pub fn init(
         .touch_resources = .empty,
         .next_pointer_resource_generation = 0,
         .next_touch_resource_generation = 0,
-        .keyboard_capability_generation = 0,
-        .pointer_capability_generation = 0,
-        .touch_capability_generation = 0,
-        .keyboard_ever_available = false,
-        .pointer_ever_available = false,
-        .touch_ever_available = false,
         .keyboard_available = false,
         .virtual_keyboard_count = 0,
         .pointer_available = false,
         .virtual_pointer_count = 0,
-        .touch_available = false,
         .keymap = null,
         .repeat_info = .{},
         .keyboard_grab = null,
@@ -311,7 +290,6 @@ pub fn init(
         .pointer_focus = null,
         .pointer_position = null,
         .touch_points = .empty,
-        .touch_frame_resources = .empty,
         .active_cursor = null,
         .compositor_cursor = null,
         .default_cursor = null,
@@ -328,7 +306,6 @@ pub fn init(
     errdefer self.pointer_resources.deinit(allocator);
     errdefer self.touch_resources.deinit(allocator);
     errdefer self.touch_points.deinit(allocator);
-    errdefer self.touch_frame_resources.deinit(allocator);
     errdefer self.pressed_keys.deinit();
     errdefer self.grabbed_keys.deinit(allocator);
     errdefer self.keyboard_focus_listeners.deinit(allocator);
@@ -355,12 +332,12 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.drag_cursor_client == null);
     self.clients.removeDisconnectListener(self);
     self.authority.deinit();
+    self.delivery.deinit();
     self.global.destroy();
     if (self.keymap) |keymap| keymap.file.close(self.io);
     self.keyboard_focus_listeners.deinit(self.allocator);
     self.grabbed_keys.deinit(self.allocator);
     self.pressed_keys.deinit();
-    self.touch_frame_resources.deinit(self.allocator);
     self.touch_points.deinit(self.allocator);
     self.touch_resources.deinit(self.allocator);
     self.pointer_resources.deinit(self.allocator);
@@ -393,6 +370,30 @@ pub fn discardAuthorityGrants(self: *Self) void {
 
 pub fn name(self: *const Self) [:0]const u8 {
     return self.name_value;
+}
+
+/// Installs the single resource-free generated frontend delivery sink. The
+/// sink receives current capability and keyboard configuration synchronously.
+pub fn setDeliverySink(self: *Self, sink: SeatDelivery.Sink) void {
+    self.delivery.setSink(sink);
+    self.delivery.notifyKeyboardState(.{ .keymap = self.deliveryKeymapSnapshot() });
+    self.delivery.notifyKeyboardState(.{ .repeat_info = self.repeat_info });
+}
+
+pub fn clearDeliverySink(self: *Self, context: *anyopaque) void {
+    self.delivery.clearSink(context);
+}
+
+/// Returns canonical resource-free state. Borrowed slices and file descriptors
+/// follow SeatDelivery.Snapshot's synchronous lifetime contract.
+pub fn deliverySnapshot(self: *const Self) SeatDelivery.Snapshot {
+    return .{
+        .capabilities = self.delivery.capabilitySnapshot(),
+        .keymap = self.deliveryKeymapSnapshot(),
+        .repeat_info = self.repeat_info,
+        .modifiers = self.modifier_state.current,
+        .pressed_keys = self.pressed_keys.keys(),
+    };
 }
 
 pub fn ownsResource(self: *Self, resource: *wl.Seat) bool {
@@ -571,6 +572,34 @@ pub fn selectionOrder(self: *const Self, client: *wl.Client, serial: u32) ?SeatA
     return self.authority.selectionOrder(client_id, MatureSerials.fromWire(serial));
 }
 
+/// Records the authority purpose produced by keyboard enter or key release.
+/// Frontend adapters receive no mutable access to the underlying authority.
+pub fn recordSelectionForClient(
+    self: *Self,
+    client: ClientRegistry.Id,
+    serial: ClientRegistry.Serial,
+) bool {
+    return self.authority.recordSelection(client, serial);
+}
+
+/// Records the authority purpose produced by pointer enter.
+pub fn recordPointerEnterForClient(
+    self: *Self,
+    client: ClientRegistry.Id,
+    serial: ClientRegistry.Serial,
+) bool {
+    return self.authority.recordPointerEnter(client, serial);
+}
+
+/// Validates pointer-enter authority without exposing its retained grants.
+pub fn acceptsPointerEnterForClient(
+    self: *const Self,
+    client: ClientRegistry.Id,
+    serial: ClientRegistry.Serial,
+) bool {
+    return self.authority.acceptsPointerEnter(client, serial);
+}
+
 pub fn nextSelectionOrder(self: *Self) SeatAuthority.Order {
     return self.authority.nextOrder();
 }
@@ -658,13 +687,13 @@ fn recordAction(self: *Self, client: *wl.Client, serial: ClientRegistry.Serial) 
 
 fn recordSelection(self: *Self, client: *wl.Client, serial: ClientRegistry.Serial) void {
     const id = self.matureClient(client) orelse unreachable;
-    const recorded = self.authority.recordSelection(id, serial);
+    const recorded = self.recordSelectionForClient(id, serial);
     std.debug.assert(recorded);
 }
 
 fn recordPointerEnter(self: *Self, client: *wl.Client, serial: ClientRegistry.Serial) void {
     const id = self.matureClient(client) orelse unreachable;
-    const recorded = self.authority.recordPointerEnter(id, serial);
+    const recorded = self.recordPointerEnterForClient(id, serial);
     std.debug.assert(recorded);
 }
 
@@ -681,6 +710,10 @@ fn clientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
     }
     if (self.drag_cursor_client) |controller| {
         if (std.meta.eql(controller, client)) self.drag_cursor_client = null;
+    }
+    for (self.touch_points.items) |*point| {
+        const target = point.target orelse continue;
+        if (std.meta.eql(target.client, client)) point.target = null;
     }
     if (clear_active_shape) self.clearCursor();
 }
@@ -817,28 +850,18 @@ pub fn setKeyboardAvailable(self: *Self, available: bool) void {
     const old_capability = self.hasKeyboardCapability();
     if (!available and self.virtual_keyboard_count == 0) self.parentKeyboardLeave();
     self.keyboard_available = available;
-    const new_capability = self.hasKeyboardCapability();
-    if (!old_capability and new_capability) {
-        beginCapabilityGeneration(
-            &self.keyboard_capability_generation,
-            &self.keyboard_ever_available,
-        );
-    }
-    if (old_capability != new_capability) self.broadcastCapabilities();
+    const changed = self.delivery.setCapability(.keyboard, self.keyboardCapabilityAvailable());
+    std.debug.assert(changed == (old_capability != self.hasKeyboardCapability()));
+    if (changed) self.broadcastCapabilities();
 }
 
 pub fn addVirtualKeyboard(self: *Self) void {
     const old_capability = self.hasKeyboardCapability();
     self.virtual_keyboard_count = std.math.add(usize, self.virtual_keyboard_count, 1) catch
         unreachable;
-    const new_capability = self.hasKeyboardCapability();
-    if (!old_capability and new_capability) {
-        beginCapabilityGeneration(
-            &self.keyboard_capability_generation,
-            &self.keyboard_ever_available,
-        );
-    }
-    if (old_capability == new_capability) return;
+    const changed = self.delivery.setCapability(.keyboard, self.keyboardCapabilityAvailable());
+    std.debug.assert(changed == (old_capability != self.hasKeyboardCapability()));
+    if (!changed) return;
     self.broadcastCapabilities();
     if (self.parent_focused) {
         self.notifyKeyboardFocus();
@@ -852,8 +875,9 @@ pub fn removeVirtualKeyboard(self: *Self) void {
     if (old_capability and !self.keyboard_available and
         self.virtual_keyboard_count == 1 and self.parent_focused) self.sendLeave();
     self.virtual_keyboard_count -= 1;
-    const new_capability = self.hasKeyboardCapability();
-    if (old_capability == new_capability) return;
+    const changed = self.delivery.setCapability(.keyboard, self.keyboardCapabilityAvailable());
+    std.debug.assert(changed == (old_capability != self.hasKeyboardCapability()));
+    if (!changed) return;
     self.broadcastCapabilities();
     self.notifyKeyboardFocus();
 }
@@ -862,18 +886,14 @@ pub fn setPointerAvailable(self: *Self, available: bool) void {
     if (self.pointer_available == available) return;
     const old_capability = self.hasPointerCapability();
     self.pointer_available = available;
-    const new_capability = self.hasPointerCapability();
+    const new_capability = self.pointerCapabilityAvailable();
+    const changed = self.delivery.setCapability(.pointer, new_capability);
+    std.debug.assert(changed == (old_capability != new_capability));
     if (old_capability and !new_capability) {
         self.pointerLeave();
         self.authority.clearPointerPresses();
     }
-    if (!old_capability and new_capability) {
-        beginCapabilityGeneration(
-            &self.pointer_capability_generation,
-            &self.pointer_ever_available,
-        );
-    }
-    if (old_capability != new_capability) self.broadcastCapabilities();
+    if (changed) self.broadcastCapabilities();
 }
 
 pub fn addVirtualPointer(self: *Self) void {
@@ -881,10 +901,7 @@ pub fn addVirtualPointer(self: *Self) void {
     self.virtual_pointer_count = std.math.add(usize, self.virtual_pointer_count, 1) catch
         unreachable;
     if (old_capability) return;
-    beginCapabilityGeneration(
-        &self.pointer_capability_generation,
-        &self.pointer_ever_available,
-    );
+    std.debug.assert(self.delivery.setCapability(.pointer, true));
     self.broadcastCapabilities();
 }
 
@@ -892,7 +909,9 @@ pub fn removeVirtualPointer(self: *Self) void {
     std.debug.assert(self.virtual_pointer_count > 0);
     const old_capability = self.hasPointerCapability();
     self.virtual_pointer_count -= 1;
-    if (old_capability == self.hasPointerCapability()) return;
+    const new_capability = self.pointerCapabilityAvailable();
+    if (old_capability == new_capability) return;
+    std.debug.assert(self.delivery.setCapability(.pointer, new_capability));
     self.pointerLeave();
     self.authority.clearPointerPresses();
     self.broadcastCapabilities();
@@ -903,15 +922,9 @@ pub fn hasVirtualPointers(self: *const Self) bool {
 }
 
 pub fn setTouchAvailable(self: *Self, available: bool) void {
-    if (self.touch_available == available) return;
+    if (self.delivery.capability(.touch).available == available) return;
     if (!available) self.touchCancel();
-    self.touch_available = available;
-    if (available) {
-        beginCapabilityGeneration(
-            &self.touch_capability_generation,
-            &self.touch_ever_available,
-        );
-    }
+    std.debug.assert(self.delivery.setCapability(.touch, available));
     self.broadcastCapabilities();
 }
 
@@ -929,19 +942,15 @@ pub fn setKeymap(
         .file = .{ .handle = fd, .flags = .{ .nonblocking = false } },
         .size = size,
     };
-    const new_capability = self.hasKeyboardCapability();
-    if (!old_capability and new_capability) {
-        beginCapabilityGeneration(
-            &self.keyboard_capability_generation,
-            &self.keyboard_ever_available,
-        );
-    }
-    if (old_capability != new_capability) self.broadcastCapabilities();
+    const changed = self.delivery.setCapability(.keyboard, self.keyboardCapabilityAvailable());
+    std.debug.assert(changed == (old_capability != self.hasKeyboardCapability()));
+    if (changed) self.broadcastCapabilities();
     for (self.keyboard_resources.items) |entry| {
         if (!self.keyboardResourceActive(entry)) continue;
         self.sendKeymap(entry.resource);
         self.sendRepeatInfo(entry.resource);
     }
+    self.delivery.notifyKeyboardState(.{ .keymap = self.deliveryKeymapSnapshot() });
     if (self.keyboard_grab) |grab| {
         if (grab.surface == null) grab.keymap(grab.context, format, fd, size);
     }
@@ -957,6 +966,7 @@ pub fn setRepeatInfo(self: *Self, rate: i32, delay: i32) void {
     for (self.keyboard_resources.items) |entry| {
         if (self.keyboardResourceActive(entry)) self.sendRepeatInfo(entry.resource);
     }
+    self.delivery.notifyKeyboardState(.{ .repeat_info = self.repeat_info });
     if (self.keyboard_grab) |grab| {
         if (grab.surface == null) grab.repeat_info(grab.context, rate, delay);
     }
@@ -1083,7 +1093,12 @@ fn keyWithGrab(
                 if (!self.keyboardResourceActive(entry)) continue;
                 const resource = entry.resource;
                 if (resource.getClient() != surface.getClient()) continue;
-                if (state == .repeated and resource.getVersion() < 10) continue;
+                if (!keyboardKeyEventEligible(
+                    state,
+                    self.pressed_keys.contains(key_code),
+                    self.repeat_info.rate,
+                    resource.getVersion(),
+                )) continue;
                 resource.sendKey(serial.value, time, key_code, state);
             }
             return;
@@ -1108,7 +1123,12 @@ fn keyWithGrab(
         if (!self.keyboardResourceActive(entry)) continue;
         const resource = entry.resource;
         if (resource.getClient() != surface.getClient()) continue;
-        if (state == .repeated and resource.getVersion() < 10) continue;
+        if (!keyboardKeyEventEligible(
+            state,
+            self.pressed_keys.contains(key_code),
+            self.repeat_info.rate,
+            resource.getVersion(),
+        )) continue;
         resource.sendKey(serial.value, time, key_code, state);
     }
 }
@@ -1413,18 +1433,19 @@ pub fn touchDown(
     y: f64,
     focus: ?PointerFocus,
 ) error{OutOfMemory}!void {
-    if (!self.touch_available or self.findTouchPoint(id) != null) return;
+    if (!self.delivery.capability(.touch).available or self.findTouchPoint(id) != null) return;
     try self.touch_points.ensureUnusedCapacity(self.allocator, 1);
 
     const target: ?TouchPoint.Target = if (focus) |candidate| target: {
         const surface = Surface.resourceFor(self.surface_store, candidate.surface_id) orelse
             break :target null;
+        const client = self.matureClient(surface.getClient()) orelse break :target null;
         const max_resource_generation = self.latestTouchResourceGeneration(
-            surface.getClient(),
+            client,
         ) orelse break :target null;
         break :target .{
             .surface_id = candidate.surface_id,
-            .client = surface.getClient(),
+            .client = client,
             .offset_x = x - candidate.x,
             .offset_y = y - candidate.y,
             .max_resource_generation = max_resource_generation,
@@ -1434,15 +1455,19 @@ pub fn touchDown(
 
     const destination = target orelse return;
     const surface = Surface.resourceFor(self.surface_store, destination.surface_id) orelse return;
+    const surface_client = self.matureClient(surface.getClient()) orelse return;
+    if (!std.meta.eql(surface_client, destination.client)) return;
     const serial = MatureSerials.issue(self.display);
-    self.recordAction(destination.client, serial);
-    for (self.touch_resources.items) |entry| {
-        if (!self.touchResourceActive(entry)) continue;
+    const recorded = self.authority.recordAction(destination.client, serial);
+    std.debug.assert(recorded);
+    for (self.touch_resources.items) |*entry| {
+        if (!self.touchResourceActive(entry.*)) continue;
         const resource = entry.resource;
-        if (touchResourceInSequence(entry.generation, destination.max_resource_generation) and
-            resource.getClient() == destination.client)
-        {
-            try self.markTouchFrame(resource);
+        if (SeatDelivery.resourceInSequence(
+            entry.generation,
+            destination.max_resource_generation,
+        ) and self.touchResourceMatchesClient(entry.*, destination.client)) {
+            markTouchFrame(entry);
             resource.sendDown(
                 serial.value,
                 time,
@@ -1455,20 +1480,28 @@ pub fn touchDown(
     }
 }
 
-pub fn touchUp(self: *Self, time: u32, id: i32) error{OutOfMemory}!void {
-    if (!self.touch_available) return;
+pub fn touchUp(self: *Self, time: u32, id: i32) void {
+    if (!self.delivery.capability(.touch).available) return;
     const index = self.findTouchPoint(id) orelse return;
     const point = self.touch_points.items[index];
     if (point.target) |target| {
+        if (!touchTargetClientLive(self.clients, target)) {
+            _ = self.touch_points.orderedRemove(index);
+            return;
+        }
         const serial = MatureSerials.issue(self.display);
-        self.recordSelection(target.client, serial);
-        for (self.touch_resources.items) |entry| {
-            if (!self.touchResourceActive(entry)) continue;
+        if (!self.recordSelectionForClient(target.client, serial)) {
+            _ = self.touch_points.orderedRemove(index);
+            return;
+        }
+        for (self.touch_resources.items) |*entry| {
+            if (!self.touchResourceActive(entry.*)) continue;
             const resource = entry.resource;
-            if (touchResourceInSequence(entry.generation, target.max_resource_generation) and
-                resource.getClient() == target.client)
-            {
-                try self.markTouchFrame(resource);
+            if (SeatDelivery.resourceInSequence(
+                entry.generation,
+                target.max_resource_generation,
+            ) and self.touchResourceMatchesClient(entry.*, target.client)) {
+                markTouchFrame(entry);
                 resource.sendUp(serial.value, time, id);
             }
         }
@@ -1482,17 +1515,18 @@ pub fn touchMotion(
     id: i32,
     x: f64,
     y: f64,
-) error{OutOfMemory}!void {
-    if (!self.touch_available) return;
+) void {
+    if (!self.delivery.capability(.touch).available) return;
     const point = self.touchPoint(id) orelse return;
     const target = point.target orelse return;
-    for (self.touch_resources.items) |entry| {
-        if (!self.touchResourceActive(entry)) continue;
+    for (self.touch_resources.items) |*entry| {
+        if (!self.touchResourceActive(entry.*)) continue;
         const resource = entry.resource;
-        if (touchResourceInSequence(entry.generation, target.max_resource_generation) and
-            resource.getClient() == target.client)
-        {
-            try self.markTouchFrame(resource);
+        if (SeatDelivery.resourceInSequence(
+            entry.generation,
+            target.max_resource_generation,
+        ) and self.touchResourceMatchesClient(entry.*, target.client)) {
+            markTouchFrame(entry);
             resource.sendMotion(
                 time,
                 id,
@@ -1504,23 +1538,27 @@ pub fn touchMotion(
 }
 
 pub fn touchFrame(self: *Self) void {
-    for (self.touch_frame_resources.items) |resource| resource.sendFrame();
-    self.touch_frame_resources.clearRetainingCapacity();
+    for (self.touch_resources.items) |*entry| {
+        if (takeTouchFrame(entry)) entry.resource.sendFrame();
+    }
 }
 
 pub fn touchCancel(self: *Self) void {
-    for (self.touch_resources.items) |entry| {
-        if (!self.touchResourceActive(entry)) continue;
+    for (self.touch_resources.items) |*entry| {
+        if (!self.touchResourceActive(entry.*)) continue;
         for (self.touch_points.items) |point| {
             const target = point.target orelse continue;
-            if (!touchResourceInSequence(entry.generation, target.max_resource_generation)) continue;
-            if (entry.resource.getClient() != target.client) continue;
+            if (!SeatDelivery.resourceInSequence(
+                entry.generation,
+                target.max_resource_generation,
+            )) continue;
+            if (!self.touchResourceMatchesClient(entry.*, target.client)) continue;
             entry.resource.sendCancel();
             break;
         }
     }
     self.touch_points.clearRetainingCapacity();
-    self.touch_frame_resources.clearRetainingCapacity();
+    for (self.touch_resources.items) |*entry| entry.frame_pending = false;
 }
 
 /// Cancels the client-visible stream containing `id` and forgets that point.
@@ -1528,24 +1566,21 @@ pub fn touchCancel(self: *Self) void {
 /// physical device reports up or cancel.
 pub fn touchCancelPoint(self: *Self, id: i32) void {
     const cancellation = cancelTouchPointState(&self.touch_points, id) orelse return;
-    for (self.touch_resources.items) |entry| {
-        if (!self.touchResourceActive(entry) or
+    for (self.touch_resources.items) |*entry| {
+        if (!self.touchResourceActive(entry.*) or
             entry.generation > cancellation.max_resource_generation or
-            entry.resource.getClient() != cancellation.client) continue;
+            !self.touchResourceMatchesClient(entry.*, cancellation.client)) continue;
         entry.resource.sendCancel();
     }
-    var index: usize = 0;
-    while (index < self.touch_frame_resources.items.len) {
-        if (self.touch_frame_resources.items[index].getClient() == cancellation.client) {
-            _ = self.touch_frame_resources.orderedRemove(index);
-        } else {
-            index += 1;
+    for (self.touch_resources.items) |*entry| {
+        if (self.touchResourceMatchesClient(entry.*, cancellation.client)) {
+            entry.frame_pending = false;
         }
     }
 }
 
-pub fn touchShape(self: *Self, id: i32, major: f64, minor: f64) error{OutOfMemory}!void {
-    if (!self.touch_available) return;
+pub fn touchShape(self: *Self, id: i32, major: f64, minor: f64) void {
+    if (!self.delivery.capability(.touch).available) return;
     const point = self.touchPoint(id) orelse return;
     const target = point.target orelse return;
     if (!self.hasTouchResourceVersion(
@@ -1553,21 +1588,21 @@ pub fn touchShape(self: *Self, id: i32, major: f64, minor: f64) error{OutOfMemor
         wl.Touch.shape_since_version,
         target.max_resource_generation,
     )) return;
-    for (self.touch_resources.items) |entry| {
-        if (!self.touchResourceActive(entry)) continue;
+    for (self.touch_resources.items) |*entry| {
+        if (!self.touchResourceActive(entry.*)) continue;
         const resource = entry.resource;
-        if (touchResourceInSequence(entry.generation, target.max_resource_generation) and
-            resource.getClient() == target.client and
+        if (SeatDelivery.resourceInSequence(entry.generation, target.max_resource_generation) and
+            self.touchResourceMatchesClient(entry.*, target.client) and
             resource.getVersion() >= wl.Touch.shape_since_version)
         {
-            try self.markTouchFrame(resource);
+            markTouchFrame(entry);
             resource.sendShape(id, fixed(major), fixed(minor));
         }
     }
 }
 
-pub fn touchOrientation(self: *Self, id: i32, orientation: f64) error{OutOfMemory}!void {
-    if (!self.touch_available) return;
+pub fn touchOrientation(self: *Self, id: i32, orientation: f64) void {
+    if (!self.delivery.capability(.touch).available) return;
     const point = self.touchPoint(id) orelse return;
     const target = point.target orelse return;
     if (!self.hasTouchResourceVersion(
@@ -1575,14 +1610,14 @@ pub fn touchOrientation(self: *Self, id: i32, orientation: f64) error{OutOfMemor
         wl.Touch.orientation_since_version,
         target.max_resource_generation,
     )) return;
-    for (self.touch_resources.items) |entry| {
-        if (!self.touchResourceActive(entry)) continue;
+    for (self.touch_resources.items) |*entry| {
+        if (!self.touchResourceActive(entry.*)) continue;
         const resource = entry.resource;
-        if (touchResourceInSequence(entry.generation, target.max_resource_generation) and
-            resource.getClient() == target.client and
+        if (SeatDelivery.resourceInSequence(entry.generation, target.max_resource_generation) and
+            self.touchResourceMatchesClient(entry.*, target.client) and
             resource.getVersion() >= wl.Touch.orientation_since_version)
         {
-            try self.markTouchFrame(resource);
+            markTouchFrame(entry);
             resource.sendOrientation(id, fixed(orientation));
         }
     }
@@ -1607,15 +1642,15 @@ fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
 fn handleRequest(resource: *wl.Seat, request: wl.Seat.Request, self: *Self) void {
     switch (request) {
         .release => resource.destroy(),
-        .get_keyboard => |get| if (self.keyboard_ever_available)
+        .get_keyboard => |get| if (self.delivery.capability(.keyboard).ever_available)
             self.createKeyboard(resource, get.id)
         else
             resource.postError(.missing_capability, "seat has never had a keyboard capability"),
-        .get_pointer => |get| if (self.pointer_ever_available)
+        .get_pointer => |get| if (self.delivery.capability(.pointer).ever_available)
             self.createPointer(resource, get.id)
         else
             resource.postError(.missing_capability, "seat has never had a pointer capability"),
-        .get_touch => |get| if (self.touch_ever_available)
+        .get_touch => |get| if (self.delivery.capability(.touch).ever_available)
             self.createTouch(resource, get.id)
         else
             resource.postError(.missing_capability, "seat has never had a touch capability"),
@@ -1652,7 +1687,7 @@ fn createKeyboard(self: *Self, seat: *wl.Seat, id: u32) void {
     };
     const entry: KeyboardResource = .{
         .resource = resource,
-        .capability_generation = self.keyboard_capability_generation,
+        .capability_generation = self.delivery.capability(.keyboard).generation,
     };
     self.keyboard_resources.append(self.allocator, entry) catch {
         resource.postNoMemory();
@@ -1682,7 +1717,7 @@ fn createPointer(self: *Self, seat: *wl.Seat, id: u32) void {
     const entry: PointerResource = .{
         .resource = resource,
         .generation = generation,
-        .capability_generation = self.pointer_capability_generation,
+        .capability_generation = self.delivery.capability(.pointer).generation,
         .enter_serial = null,
     };
     self.pointer_resources.append(self.allocator, entry) catch {
@@ -1713,7 +1748,8 @@ fn createTouch(self: *Self, seat: *wl.Seat, id: u32) void {
     self.touch_resources.append(self.allocator, .{
         .resource = resource,
         .generation = generation,
-        .capability_generation = self.touch_capability_generation,
+        .capability_generation = self.delivery.capability(.touch).generation,
+        .frame_pending = false,
     }) catch {
         resource.postNoMemory();
         resource.destroy();
@@ -1770,26 +1806,22 @@ fn handleTouchRequest(resource: *wl.Touch, request: wl.Touch.Request, _: *Self) 
 }
 
 fn handleTouchDestroy(resource: *wl.Touch, self: *Self) void {
-    const client = resource.getClient();
-    for (self.touch_frame_resources.items, 0..) |candidate, index| {
-        if (candidate != resource) continue;
-        _ = self.touch_frame_resources.orderedRemove(index);
-        break;
-    }
+    const raw_client = resource.getClient();
+    const client = self.matureClient(raw_client);
     for (self.touch_resources.items, 0..) |candidate, index| {
         if (candidate.resource != resource) continue;
         _ = self.touch_resources.orderedRemove(index);
         var client_has_resource = false;
         for (self.touch_resources.items) |remaining| {
-            if (remaining.resource.getClient() == client) {
+            if (remaining.resource.getClient() == raw_client) {
                 client_has_resource = true;
                 break;
             }
         }
-        if (!client_has_resource) {
+        if (!client_has_resource and client != null) {
             for (self.touch_points.items) |*point| {
                 const target = point.target orelse continue;
-                if (target.client == client) point.target = null;
+                if (std.meta.eql(target.client, client.?)) point.target = null;
             }
         }
         self.notifySeatResourceCount();
@@ -1814,28 +1846,28 @@ fn keyboardDeliverySurface(self: *Self) ?*wl.Surface {
     );
 }
 
-fn hasKeyboardCapability(self: *const Self) bool {
+fn keyboardCapabilityAvailable(self: *const Self) bool {
     return (self.keyboard_available or self.virtual_keyboard_count > 0) and self.keymap != null;
 }
 
-fn hasPointerCapability(self: *const Self) bool {
+fn pointerCapabilityAvailable(self: *const Self) bool {
     return self.pointer_available or self.virtual_pointer_count > 0;
 }
 
+fn hasKeyboardCapability(self: *const Self) bool {
+    return self.delivery.capability(.keyboard).available;
+}
+
+fn hasPointerCapability(self: *const Self) bool {
+    return self.delivery.capability(.pointer).available;
+}
+
 fn keyboardResourceActive(self: *const Self, entry: KeyboardResource) bool {
-    return capabilityResourceActive(
-        self.hasKeyboardCapability(),
-        self.keyboard_capability_generation,
-        entry.capability_generation,
-    );
+    return self.delivery.capability(.keyboard).resourceActive(entry.capability_generation);
 }
 
 fn pointerResourceActive(self: *const Self, entry: PointerResource) bool {
-    return capabilityResourceActive(
-        self.hasPointerCapability(),
-        self.pointer_capability_generation,
-        entry.capability_generation,
-    );
+    return self.delivery.capability(.pointer).resourceActive(entry.capability_generation);
 }
 
 fn pointerResourceIsActive(self: *const Self, resource: *wl.Pointer) bool {
@@ -1844,20 +1876,7 @@ fn pointerResourceIsActive(self: *const Self, resource: *wl.Pointer) bool {
 }
 
 fn touchResourceActive(self: *const Self, entry: TouchResource) bool {
-    return capabilityResourceActive(
-        self.touch_available,
-        self.touch_capability_generation,
-        entry.capability_generation,
-    );
-}
-
-fn beginCapabilityGeneration(generation: *u64, ever_available: *bool) void {
-    generation.* = std.math.add(u64, generation.*, 1) catch unreachable;
-    ever_available.* = true;
-}
-
-fn capabilityResourceActive(available: bool, current: u64, resource: u64) bool {
-    return available and resource == current;
+    return self.delivery.capability(.touch).resourceActive(entry.capability_generation);
 }
 
 fn findTouchPoint(self: *const Self, id: i32) ?usize {
@@ -1869,6 +1888,13 @@ fn findTouchPoint(self: *const Self, id: i32) ?usize {
 
 fn touchPoint(self: *const Self, id: i32) ?*const TouchPoint {
     return &self.touch_points.items[self.findTouchPoint(id) orelse return null];
+}
+
+fn touchTargetClientLive(
+    clients: *const ClientRegistry,
+    target: TouchPoint.Target,
+) bool {
+    return clients.contains(target.client);
 }
 
 fn cancelTouchPointState(
@@ -1883,7 +1909,7 @@ fn cancelTouchPointState(
     var max_resource_generation = cancelled.target.?.max_resource_generation;
     for (points.items) |*point| {
         const target = point.target orelse continue;
-        if (target.client != client) continue;
+        if (!std.meta.eql(target.client, client)) continue;
         max_resource_generation = @max(max_resource_generation, target.max_resource_generation);
         point.target = null;
     }
@@ -1893,51 +1919,73 @@ fn cancelTouchPointState(
     };
 }
 
-fn latestTouchResourceGeneration(self: *const Self, client: *wl.Client) ?u64 {
+fn latestTouchResourceGeneration(
+    self: *const Self,
+    client: ClientRegistry.Id,
+) ?SeatDelivery.ResourceGeneration {
     var latest: ?u64 = null;
     for (self.touch_resources.items) |entry| {
         if (!self.touchResourceActive(entry)) continue;
-        if (entry.resource.getClient() == client) latest = entry.generation;
+        if (self.touchResourceMatchesClient(entry, client)) latest = entry.generation;
     }
     return latest;
 }
 
 fn hasTouchResourceVersion(
     self: *const Self,
-    client: *wl.Client,
+    client: ClientRegistry.Id,
     version: u32,
-    max_generation: u64,
+    max_generation: SeatDelivery.ResourceGeneration,
 ) bool {
     for (self.touch_resources.items) |entry| {
         if (self.touchResourceActive(entry) and
-            touchResourceInSequence(entry.generation, max_generation) and
-            entry.resource.getClient() == client and
+            SeatDelivery.resourceInSequence(entry.generation, max_generation) and
+            self.touchResourceMatchesClient(entry, client) and
             entry.resource.getVersion() >= version) return true;
     }
     return false;
 }
 
-fn markTouchFrame(self: *Self, resource: *wl.Touch) error{OutOfMemory}!void {
-    for (self.touch_frame_resources.items) |pending| {
-        if (pending == resource) return;
-    }
-    try self.touch_frame_resources.append(self.allocator, resource);
+fn touchResourceMatchesClient(
+    self: *const Self,
+    entry: TouchResource,
+    client: ClientRegistry.Id,
+) bool {
+    const resource_client = self.matureClient(entry.resource.getClient()) orelse return false;
+    return std.meta.eql(resource_client, client);
 }
 
-fn touchResourceInSequence(generation: u64, max_generation: u64) bool {
-    return generation <= max_generation;
+fn markTouchFrame(entry: *TouchResource) void {
+    entry.frame_pending = true;
+}
+
+fn takeTouchFrame(entry: *TouchResource) bool {
+    if (!entry.frame_pending) return false;
+    entry.frame_pending = false;
+    return true;
 }
 
 fn capabilities(self: *const Self) wl.Seat.Capability {
+    const snapshot = self.delivery.capabilitySnapshot();
     return .{
-        .keyboard = self.hasKeyboardCapability(),
-        .pointer = self.hasPointerCapability(),
-        .touch = self.touch_available,
+        .keyboard = snapshot.keyboard.available,
+        .pointer = snapshot.pointer.available,
+        .touch = snapshot.touch.available,
     };
 }
 
 fn broadcastCapabilities(self: *Self) void {
     for (self.seat_resources.items) |resource| resource.sendCapabilities(self.capabilities());
+    self.delivery.notifyCapabilities();
+}
+
+fn deliveryKeymapSnapshot(self: *const Self) ?SeatDelivery.KeymapSnapshot {
+    const keymap = self.keymap orelse return null;
+    return .{
+        .format = @intCast(@intFromEnum(keymap.format)),
+        .fd = keymap.file.handle,
+        .size = keymap.size,
+    };
 }
 
 fn sendKeymap(self: *Self, resource: *wl.Keyboard) void {
@@ -1949,6 +1997,16 @@ fn sendRepeatInfo(self: *const Self, resource: *wl.Keyboard) void {
     if (resource.getVersion() >= wl.Keyboard.repeat_info_since_version) {
         resource.sendRepeatInfo(self.repeat_info.rate, self.repeat_info.delay);
     }
+}
+
+fn keyboardKeyEventEligible(
+    state: wl.Keyboard.KeyState,
+    key_down: bool,
+    repeat_rate: i32,
+    resource_version: u32,
+) bool {
+    if (state != .repeated) return true;
+    return key_down and repeat_rate == 0 and resource_version >= 10;
 }
 
 fn sendEnter(self: *Self) void {
@@ -2398,29 +2456,14 @@ test "virtual modifier teardown restores only the superseded physical state" {
     try std.testing.expectEqual(physical, state.current);
 }
 
-test "seat capability generations invalidate existing input resources" {
-    var generation: u64 = 0;
-    var ever_available = false;
-
-    beginCapabilityGeneration(&generation, &ever_available);
-    try std.testing.expect(ever_available);
-    try std.testing.expect(capabilityResourceActive(true, generation, generation));
-    try std.testing.expect(!capabilityResourceActive(false, generation, generation));
-
-    const previous = generation;
-    beginCapabilityGeneration(&generation, &ever_available);
-    try std.testing.expect(!capabilityResourceActive(true, generation, previous));
-    try std.testing.expect(capabilityResourceActive(true, generation, generation));
-}
-
 test "touch resources bound after down do not join the contact sequence" {
-    try std.testing.expect(touchResourceInSequence(4, 4));
-    try std.testing.expect(!touchResourceInSequence(5, 4));
+    try std.testing.expect(SeatDelivery.resourceInSequence(4, 4));
+    try std.testing.expect(!SeatDelivery.resourceInSequence(5, 4));
 }
 
 test "touch point cancellation preserves unrelated client streams" {
-    const client_a: *wl.Client = @ptrFromInt(0x1000);
-    const client_b: *wl.Client = @ptrFromInt(0x2000);
+    const client_a: ClientRegistry.Id = .{ .index = 1, .generation = 2 };
+    const client_b: ClientRegistry.Id = .{ .index = 3, .generation = 4 };
     var points: std.ArrayList(TouchPoint) = .empty;
     defer points.deinit(std.testing.allocator);
     try points.appendSlice(std.testing.allocator, &.{
@@ -2431,18 +2474,92 @@ test "touch point cancellation preserves unrelated client streams" {
     });
 
     const cancellation = cancelTouchPointState(&points, 1).?;
-    try std.testing.expectEqual(client_a, cancellation.client);
+    try std.testing.expect(std.meta.eql(client_a, cancellation.client));
     try std.testing.expectEqual(@as(u64, 4), cancellation.max_resource_generation);
     try std.testing.expectEqual(@as(usize, 3), points.items.len);
     try std.testing.expectEqual(@as(i32, 2), points.items[0].id);
     try std.testing.expect(points.items[0].target == null);
-    try std.testing.expectEqual(client_b, points.items[1].target.?.client);
+    try std.testing.expect(std.meta.eql(client_b, points.items[1].target.?.client));
     try std.testing.expect(points.items[2].target == null);
 
     try std.testing.expect(cancelTouchPointState(&points, 4) == null);
     try std.testing.expectEqual(@as(usize, 2), points.items.len);
     try std.testing.expect(cancelTouchPointState(&points, 99) == null);
     try std.testing.expectEqual(@as(usize, 2), points.items.len);
+}
+
+test "stale client identity rejects a retained touch target after slot reuse" {
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    const stale = try clients.register(.mature_display);
+    const target: TouchPoint.Target = .{
+        .surface_id = .{ .index = 1, .generation = 1 },
+        .client = stale,
+        .offset_x = 0,
+        .offset_y = 0,
+        .max_resource_generation = 2,
+    };
+    try std.testing.expect(touchTargetClientLive(&clients, target));
+    clients.unregister(stale);
+    const current = try clients.register(.mature_display);
+    try std.testing.expectEqual(stale.index, current.index);
+    try std.testing.expect(stale.generation != current.generation);
+    try std.testing.expect(!touchTargetClientLive(&clients, target));
+    clients.unregister(current);
+}
+
+test "touch frame pending coalesces sequencing without allocation" {
+    var resource: TouchResource = .{
+        .resource = undefined,
+        .generation = 1,
+        .capability_generation = 1,
+        .frame_pending = false,
+    };
+
+    try std.testing.expect(!takeTouchFrame(&resource));
+    markTouchFrame(&resource);
+    markTouchFrame(&resource);
+    try std.testing.expect(takeTouchFrame(&resource));
+    try std.testing.expect(!takeTouchFrame(&resource));
+    markTouchFrame(&resource);
+    resource.frame_pending = false;
+    try std.testing.expect(!takeTouchFrame(&resource));
+}
+
+test "neutral authority forwarding preserves grant purpose and rejects stale clients" {
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    var seat: Self = undefined;
+    seat.authority = SeatAuthority.init(std.testing.allocator, &clients, &surfaces);
+    defer seat.authority.deinit();
+
+    const client = try clients.register(.mature_display);
+    const selection: ClientRegistry.Serial = .{ .domain = .mature_display, .value = 7 };
+    const enter: ClientRegistry.Serial = .{ .domain = .mature_display, .value = 8 };
+    try std.testing.expect(seat.recordSelectionForClient(client, selection));
+    try std.testing.expect(!seat.acceptsPointerEnterForClient(client, selection));
+    try std.testing.expect(seat.recordPointerEnterForClient(client, enter));
+    try std.testing.expect(seat.acceptsPointerEnterForClient(client, enter));
+    try std.testing.expect(!seat.recordSelectionForClient(client, .{
+        .domain = .wayring_server,
+        .value = 9,
+    }));
+
+    clients.unregister(client);
+    _ = seat.authority.clientDisconnected(client);
+    try std.testing.expect(!seat.recordPointerEnterForClient(client, enter));
+}
+
+test "v10 repeated key event gate requires down key zero rate and recipient version" {
+    try std.testing.expect(keyboardKeyEventEligible(.pressed, false, 10, 1));
+    try std.testing.expect(keyboardKeyEventEligible(.released, false, 10, 1));
+    try std.testing.expect(keyboardKeyEventEligible(.repeated, true, 0, 10));
+    try std.testing.expect(keyboardKeyEventEligible(.repeated, true, 0, 11));
+    try std.testing.expect(!keyboardKeyEventEligible(.repeated, false, 0, 10));
+    try std.testing.expect(!keyboardKeyEventEligible(.repeated, true, 1, 10));
+    try std.testing.expect(!keyboardKeyEventEligible(.repeated, true, 0, 9));
 }
 
 test "implicit pointer grab freezes focus to the pressed surface" {
