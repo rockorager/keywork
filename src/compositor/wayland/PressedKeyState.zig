@@ -83,7 +83,7 @@ pub fn update(
             self.remove(index);
             return true;
         },
-        .repeated => return true,
+        .repeated => return self.contains(key_code),
         else => return false,
     }
 }
@@ -115,6 +115,12 @@ pub fn clearPhysical(self: *PressedKeyState) void {
 
 pub fn contains(self: *const PressedKeyState, key_code: u32) bool {
     return self.find(key_code) != null;
+}
+
+/// Returns a non-owning view invalidated by the next mutation or `deinit`.
+pub fn keys(self: *const PressedKeyState) []const u32 {
+    self.assertValid();
+    return self.key_codes.items;
 }
 
 /// Returns a non-owning view invalidated by the next mutation or `deinit`.
@@ -168,6 +174,17 @@ test "pressed key transitions aggregate physical and virtual sources" {
     try std.testing.expectEqual(@as(usize, 0), state.key_codes.items.len);
 }
 
+test "repeat requires a logically pressed key and does not mutate ownership" {
+    var state: PressedKeyState = .init(std.testing.allocator);
+    defer state.deinit();
+
+    try std.testing.expect(!try state.update(30, .repeated, .physical));
+    try std.testing.expect(try state.update(30, .pressed, .virtual));
+    try std.testing.expect(try state.update(30, .repeated, .physical));
+    try std.testing.expect(try state.update(30, .released, .virtual));
+    try std.testing.expect(!try state.update(30, .repeated, .virtual));
+}
+
 test "physical key replacement preserves virtual ownership" {
     var state: PressedKeyState = .init(std.testing.allocator);
     defer state.deinit();
@@ -180,4 +197,18 @@ test "physical key replacement preserves virtual ownership" {
     try std.testing.expectEqualSlices(u32, &.{40}, state.key_codes.items);
     try std.testing.expect(try state.update(40, .released, .virtual));
     try std.testing.expectEqual(@as(usize, 0), state.key_codes.items.len);
+}
+
+test "borrowed pressed-key view preserves aggregate order without allocation" {
+    var state: PressedKeyState = .init(std.testing.allocator);
+    defer state.deinit();
+
+    try std.testing.expect(try state.update(40, .pressed, .physical));
+    try std.testing.expect(try state.update(41, .pressed, .virtual));
+    const borrowed = state.keys();
+    try std.testing.expectEqualSlices(u32, &.{ 40, 41 }, borrowed);
+    try std.testing.expectEqual(@intFromPtr(state.key_codes.items.ptr), @intFromPtr(borrowed.ptr));
+
+    try std.testing.expect(!try state.update(40, .pressed, .virtual));
+    try std.testing.expectEqualSlices(u32, &.{ 40, 41 }, state.keys());
 }

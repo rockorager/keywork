@@ -6218,7 +6218,7 @@ fn routeTouchUp(self: *Self, device_id: NativeInput.DeviceId, time: u32, native_
         if (touch.device_id != device_id or touch.native_id != native_id) continue;
         self.idle_notify.notifyActivity(touch.seat);
         _ = self.routed_touches.orderedRemove(index);
-        touch.seat.touchUp(time, touch.protocol_id) catch self.terminate();
+        touch.seat.touchUp(time, touch.protocol_id);
         return;
     }
 }
@@ -6236,7 +6236,7 @@ fn routeTouchMotion(
         if (touch.device_id != device_id or touch.native_id != native_id) continue;
         self.idle_notify.notifyActivity(touch.seat);
         const point = output.globalPoint(x, y);
-        touch.seat.touchMotion(time, touch.protocol_id, point.x, point.y) catch self.terminate();
+        touch.seat.touchMotion(time, touch.protocol_id, point.x, point.y);
         return;
     }
 }
@@ -7027,10 +7027,7 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
 fn touchUp(context: *anyopaque, time: u32, id: i32) void {
     const self = serverForOutput(context);
     self.idle_notify.notifyActivity(&self.seat);
-    self.seat.touchUp(time, id) catch {
-        log.err("failed to finish touch point", .{});
-        self.terminate();
-    };
+    self.seat.touchUp(time, id);
 }
 
 fn touchMotion(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
@@ -7038,10 +7035,7 @@ fn touchMotion(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     const self = output.server;
     self.idle_notify.notifyActivity(&self.seat);
     const point = output.globalPoint(x, y);
-    self.seat.touchMotion(time, id, point.x, point.y) catch {
-        log.err("failed to update touch point", .{});
-        self.terminate();
-    };
+    self.seat.touchMotion(time, id, point.x, point.y);
 }
 
 fn touchFrame(context: *anyopaque) void {
@@ -7056,18 +7050,12 @@ fn touchCancel(context: *anyopaque) void {
 
 fn touchShape(context: *anyopaque, id: i32, major: f64, minor: f64) void {
     const self = serverForOutput(context);
-    self.seat.touchShape(id, major, minor) catch {
-        log.err("failed to update touch shape", .{});
-        self.terminate();
-    };
+    self.seat.touchShape(id, major, minor);
 }
 
 fn touchOrientation(context: *anyopaque, id: i32, orientation: f64) void {
     const self = serverForOutput(context);
-    self.seat.touchOrientation(id, orientation) catch {
-        log.err("failed to update touch orientation", .{});
-        self.terminate();
-    };
+    self.seat.touchOrientation(id, orientation);
 }
 
 fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
