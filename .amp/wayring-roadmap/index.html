@@ -97,7 +97,7 @@
   <header>
     <h1>Keywork → Wayring</h1>
     <p class="lede">Working roadmap for replacing the compositor's libwayland server path with scanner-generated Wayring, without weakening component boundaries.</p>
-    <p class="meta">Current migration implementation: <code>86d59176</code> on <code>wayring</code> · Updated 2026-08-05 · Phase 3 architecture is dependency-ordered; P3-A begins by splitting canonical output membership from frontend delivery.</p>
+    <p class="meta">Current migration implementation: <code>5c43a04e</code> on <code>wayring</code> · Updated 2026-08-05 · P3-A output delivery is integrated; P3-B1 now designs frontend-neutral client and serial-domain authority.</p>
   </header>
 
   <section class="summary" aria-label="Migration summary">
@@ -142,14 +142,15 @@
   </section>
 
   <section class="phase">
-    <div class="bar"><span style="width:8%"></span></div>
+    <div class="bar"><span style="width:16%"></span></div>
     <div class="phase-head">
       <div><h2>Phase 3 — Broader protocol parity and cutover readiness</h2><p class="detail">Migrate dependency-ordered protocol families while preserving one owner for output, input, windows, selection, and security policy.</p></div>
       <span class="status active">In progress</span>
     </div>
     <div class="wave"><span class="wave-label">Architecture inventory</span><div><h3>Remaining server protocol families</h3><p class="detail">Verified current globals, consumers, generated-contract readiness, ownership dependencies, session profiles, and explicit cutover criteria.</p></div><span class="status done">Complete</span></div>
-    <div class="wave"><span class="wave-label">P3-A</span><div><h3>Output delivery split</h3><p class="detail">Keep <code>Output</code>/<code>OutputLayout</code> authoritative, record canonical membership independently of mature resources, and add honest headless Wayring <code>wl_output</code> v4 plus enter/leave.</p></div><span class="status active">In progress</span></div>
-    <div class="wave"><span class="wave-label">P3-B1/B2</span><div><h3>Input authority and core seat</h3><p class="detail">First neutralize client/serial-domain authorization without behavior change, then publish one Wayring seat with pointer, keyboard, touch, and cursor roles.</p></div><span class="status proposed">Planned</span></div>
+    <div class="wave"><span class="wave-label">P3-A</span><div><h3>Output delivery split</h3><p class="detail">Canonical completed-frame membership now drives mature delivery and headless generated <code>wl_output</code> v4 enter/leave, with hotplug grace, same-client routing, and real-client acceptance.</p></div><span class="status done">Integrated</span></div>
+    <div class="wave"><span class="wave-label">P3-B1</span><div><h3>Input authority refactor</h3><p class="detail">Design and then implement frontend-neutral client identity and issuing-domain serial authorization while preserving mature seat behavior and all current globals.</p></div><span class="status active">Designing</span></div>
+    <div class="wave"><span class="wave-label">P3-B2</span><div><h3>Wayring core seat</h3><p class="detail">Publish one generated seat with pointer, keyboard, touch, capability generations, keymap/repeat state, focus ordering, and cursor-surface role.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">P3-C</span><div><h3>Atomic XDG window roles</h3><p class="detail">Integrate wm-base, surface, toplevel, popup, and positioner into real window policy for the first meaningful scale-1 SHM runtime milestone.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">P3-D</span><div><h3>Scale and interaction ergonomics</h3><p class="detail">Viewporter plus fractional scale, decoration, cursor-shape with SHM fallback, and activation on shared output/seat/XDG owners.</p></div><span class="status proposed">Planned</span></div>
     <div class="wave"><span class="wave-label">P3-E1–E3</span><div><h3>Selection, drag, and text input</h3><p class="detail">Core data-device/DnD, primary and privileged data-control, then text-input/input-method as coherent shared-state families.</p></div><span class="status proposed">Planned</span></div>
