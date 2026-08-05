@@ -4,7 +4,7 @@
 //! node properties as an asynchronous Lua event stream. Route-aware volume
 //! and mute methods write hardware device routes when available, falling back
 //! to node properties for virtual devices. The PipeWire loop is nested into
-//! Keywork's epoll loop. Realtime scheduling, and its PipeWire helper thread,
+//! Keywork's completion loop. Realtime scheduling, and its PipeWire helper thread,
 //! are disabled unless explicitly requested by the application.
 
 const std = @import("std");

@@ -54,8 +54,15 @@ test {
     _ = @import("backend/memory.zig");
     _ = @import("backend/wayland/input.zig");
     _ = @import("backend/wayland/shm.zig");
+    _ = @import("backend/wayland/vulkan/DmaBufTargetSet.zig");
     _ = @import("backend/wayland/vulkan/renderer.zig");
     _ = @import("backend/wayland/window.zig");
+    _ = @import("backend/wayring/Backend.zig");
+    _ = @import("backend/wayring/Client.zig");
+    _ = @import("backend/wayring/Input.zig");
+    _ = @import("backend/wayring/ShmWindow.zig");
+    _ = @import("backend/wayring/VulkanWindow.zig");
+    _ = @import("backend/wayring/Window.zig");
     _ = @import("graphics/raster.zig");
     _ = @import("graphics/RasterImage.zig");
     _ = @import("graphics/SharedPixelBuffer.zig");

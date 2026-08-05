@@ -4,6 +4,7 @@ const std = @import("std");
 const keywork = @import("keywork-ui");
 const TextRenderer = @import("../../../graphics/text.zig");
 const DmaBufImage = @import("../../../graphics/DmaBufImage.zig");
+pub const DmaBufTargets = @import("DmaBufTargetSet.zig");
 const wayland = @import("wayland");
 const vk = @import("vulkan");
 
@@ -76,6 +77,15 @@ const SwapchainResources = struct {
     render_finished_semaphores: []vk.Semaphore,
     present_fences: []vk.Fence,
     present_fence_pending: []bool,
+};
+
+/// Attachment state needed to record one UI frame. WSI acquisition and
+/// presentation deliberately remain outside this target description.
+const RenderTarget = DmaBufTargets.RenderTarget;
+
+const ForeignRelease = struct {
+    targets: *const DmaBufTargets,
+    target_index: usize,
 };
 
 const GpuBuffer = struct {
@@ -271,6 +281,7 @@ pub const Renderer = struct {
     device: vk.Device,
     queue_family_index: u32,
     queue: vk.Queue,
+    dmabuf_export: bool,
     dmabuf_import: bool,
     swapchain_maintenance: bool,
     swapchain: vk.SwapchainKHR,
@@ -313,6 +324,18 @@ pub const Renderer = struct {
     retired_swapchains: std.ArrayList(SwapchainResources),
 
     pub fn init(allocator: std.mem.Allocator, display: *wl.Display, surface: *wl.Surface) !Self {
+        return initInternal(allocator, display, surface);
+    }
+
+    /// Initializes the renderer without Vulkan WSI. Frames are exported
+    /// through `DmaBufTargets` and presented by the Wayring protocol path.
+    pub fn initDmaBuf(allocator: std.mem.Allocator) !Self {
+        return initInternal(allocator, null, null);
+    }
+
+    fn initInternal(allocator: std.mem.Allocator, display: ?*wl.Display, surface: ?*wl.Surface) !Self {
+        std.debug.assert((display == null) == (surface == null));
+        const uses_wsi = display != null;
         var text_renderer_instance = try TextRenderer.init(allocator);
         errdefer text_renderer_instance.deinit();
 
@@ -324,7 +347,7 @@ pub const Renderer = struct {
         const instance_api_version = @min(loader_api_version, vk.API_VERSION_1_1.toU32());
         const instance_extension_properties = try vkb.enumerateInstanceExtensionPropertiesAlloc(null, allocator);
         defer allocator.free(instance_extension_properties);
-        const surface_maintenance =
+        const surface_maintenance = uses_wsi and
             hasExtension(instance_extension_properties, vk.extensions.khr_get_surface_capabilities_2.name) and
             hasExtension(instance_extension_properties, vk.extensions.ext_surface_maintenance_1.name);
         const instance_extensions = [_][*:0]const u8{
@@ -333,7 +356,12 @@ pub const Renderer = struct {
             vk.extensions.khr_get_surface_capabilities_2.name,
             vk.extensions.ext_surface_maintenance_1.name,
         };
-        const instance_extension_count: u32 = if (surface_maintenance) instance_extensions.len else 2;
+        const instance_extension_count: u32 = if (!uses_wsi)
+            0
+        else if (surface_maintenance)
+            instance_extensions.len
+        else
+            2;
         const app_info: vk.ApplicationInfo = .{
             .p_application_name = "Keywork",
             .application_version = vk.makeApiVersion(0, 0, 0, 0).toU32(),
@@ -349,13 +377,21 @@ pub const Renderer = struct {
 
         const vki = vk.InstanceWrapper.load(instance, vkb.dispatch.vkGetInstanceProcAddr.?);
         errdefer vki.destroyInstance(instance, null);
-        const surface_khr = try vki.createWaylandSurfaceKHR(instance, &.{
-            .display = @ptrCast(display),
-            .surface = @ptrCast(surface),
-        }, null);
-        errdefer vki.destroySurfaceKHR(instance, surface_khr, null);
+        const surface_khr: vk.SurfaceKHR = if (uses_wsi)
+            try vki.createWaylandSurfaceKHR(instance, &.{
+                .display = @ptrCast(display.?),
+                .surface = @ptrCast(surface.?),
+            }, null)
+        else
+            .null_handle;
+        errdefer if (surface_khr != .null_handle) vki.destroySurfaceKHR(instance, surface_khr, null);
 
-        const selection = try selectPhysicalDevice(allocator, vki, instance, surface_khr);
+        const selection = try selectPhysicalDevice(
+            allocator,
+            vki,
+            instance,
+            if (uses_wsi) surface_khr else null,
+        );
         const memory_properties = vki.getPhysicalDeviceMemoryProperties(selection.physical_device);
         const physical_device_properties = vki.getPhysicalDeviceProperties(selection.physical_device);
         const device_limits = physical_device_properties.limits;
@@ -372,18 +408,20 @@ pub const Renderer = struct {
             vki.getPhysicalDeviceFeatures2(selection.physical_device, &features);
         }
         const swapchain_maintenance = has_maintenance_extension and maintenance_features.swapchain_maintenance_1 == .true;
-        const dmabuf_extension_names = [_][*:0]const u8{
+        const dmabuf_export_extension_names = [_][*:0]const u8{
             vk.extensions.khr_external_memory_fd.name,
-            vk.extensions.khr_external_semaphore_fd.name,
             vk.extensions.khr_image_format_list.name,
             vk.extensions.ext_external_memory_dma_buf.name,
             vk.extensions.ext_image_drm_format_modifier.name,
             vk.extensions.ext_queue_family_foreign.name,
         };
-        var dmabuf_import = can_query_extended_features;
-        for (dmabuf_extension_names) |name| {
-            dmabuf_import = dmabuf_import and hasExtension(extension_properties, std.mem.span(name));
+        var dmabuf_export = can_query_extended_features;
+        for (dmabuf_export_extension_names) |name| {
+            dmabuf_export = dmabuf_export and hasExtension(extension_properties, std.mem.span(name));
         }
+        var dmabuf_import = dmabuf_export and
+            hasExtension(extension_properties, vk.extensions.khr_external_semaphore_fd.name);
+        if (!uses_wsi and !dmabuf_export) return error.DmaBufExportUnavailable;
         if (dmabuf_import) {
             const external_semaphore_info: vk.PhysicalDeviceExternalSemaphoreInfo = .{
                 .handle_type = .{ .sync_fd_bit = true },
@@ -405,16 +443,22 @@ pub const Renderer = struct {
         };
         var device_extension_names: [8][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
-        device_extension_names[device_extension_count] = vk.extensions.khr_swapchain.name;
-        device_extension_count += 1;
+        if (uses_wsi) {
+            device_extension_names[device_extension_count] = vk.extensions.khr_swapchain.name;
+            device_extension_count += 1;
+        }
         if (swapchain_maintenance) {
             device_extension_names[device_extension_count] = vk.extensions.ext_swapchain_maintenance_1.name;
             device_extension_count += 1;
         }
-        if (dmabuf_import) for (dmabuf_extension_names) |name| {
+        if (dmabuf_export) for (dmabuf_export_extension_names) |name| {
             device_extension_names[device_extension_count] = name;
             device_extension_count += 1;
         };
+        if (dmabuf_import) {
+            device_extension_names[device_extension_count] = vk.extensions.khr_external_semaphore_fd.name;
+            device_extension_count += 1;
+        }
         const queue_priority: f32 = 1.0;
         const queue_create_info: vk.DeviceQueueCreateInfo = .{
             .queue_family_index = selection.queue_family_index,
@@ -483,6 +527,7 @@ pub const Renderer = struct {
             .device = device,
             .queue_family_index = selection.queue_family_index,
             .queue = queue,
+            .dmabuf_export = dmabuf_export,
             .dmabuf_import = dmabuf_import,
             .swapchain_maintenance = swapchain_maintenance,
             .swapchain = .null_handle,
@@ -548,7 +593,7 @@ pub const Renderer = struct {
         while (imported_values.next()) |imported| self.destroyImportedDmaBuf(imported.*);
         self.imported_dmabufs.deinit(self.allocator);
         self.vkd.destroyDevice(self.device, null);
-        self.vki.destroySurfaceKHR(self.instance, self.surface_khr, null);
+        if (self.surface_khr != .null_handle) self.vki.destroySurfaceKHR(self.instance, self.surface_khr, null);
         self.vki.destroyInstance(self.instance, null);
         self.text_renderer.deinit();
     }
@@ -698,6 +743,73 @@ pub const Renderer = struct {
         return true;
     }
 
+    pub fn dmaBufModifiers(self: *Self, allocator: std.mem.Allocator) ![]u64 {
+        if (!self.dmabuf_export) return error.DmaBufExportUnavailable;
+        return DmaBufTargets.queryModifiers(allocator, self.vki, self.physical_device);
+    }
+
+    pub fn createDmaBufTargets(self: *Self, width: u32, height: u32, modifier: u64) !DmaBufTargets {
+        if (!self.dmabuf_export) return error.DmaBufExportUnavailable;
+        return DmaBufTargets.init(
+            self.allocator,
+            self.vkd,
+            self.device,
+            self.memory_properties,
+            .{ .width = width, .height = height },
+            modifier,
+        );
+    }
+
+    /// Records, submits, and host-waits one exported target before it may be
+    /// attached to a Wayland surface. Compositor-to-client synchronization is
+    /// handled separately by `wl_buffer.release` and the DMA-BUF reservation.
+    pub fn renderDmaBuf(
+        self: *Self,
+        targets: *const DmaBufTargets,
+        target_index: usize,
+        display_list: []const keywork.PaintCommand,
+        scale: f32,
+    ) !void {
+        if (!self.dmabuf_export) return error.DmaBufExportUnavailable;
+        if (target_index >= targets.len()) return error.InvalidTarget;
+
+        try self.retireSignaledExternalUploads();
+        self.reapImportedDmaBufs();
+        self.loadFrameViews();
+        defer self.storeFrameViews();
+        _ = try self.vkd.waitForFences(self.device, &.{self.in_flight}, .true, std.math.maxInt(u64));
+        const frame = &self.frames[self.frame_index];
+        self.retireExternalFrame(frame);
+        var submitted = false;
+        errdefer if (!submitted) self.retireExternalFrame(frame);
+
+        const target = targets.renderTarget(target_index);
+        try self.ensureTextResources();
+        try self.ensureTextPipeline(target.format, target.render_pass);
+        try self.recordFrame(display_list, scale, frame, target, .{
+            .targets = targets,
+            .target_index = target_index,
+        });
+
+        const target_fence = targets.fence(target_index);
+        _ = try self.vkd.waitForFences(self.device, &.{target_fence}, .true, std.math.maxInt(u64));
+        try self.vkd.resetFences(self.device, &.{target_fence});
+        const signal_count: u32 = if (frame.external_uploads.items.len == 0) 0 else 1;
+        try self.vkd.queueSubmit(self.queue, &.{.{
+            .command_buffer_count = 1,
+            .p_command_buffers = @ptrCast(&self.command_buffer),
+            .signal_semaphore_count = signal_count,
+            .p_signal_semaphores = @ptrCast(&frame.external_release),
+        }}, target_fence);
+        submitted = true;
+        _ = try self.vkd.waitForFences(self.device, &.{target_fence}, .true, std.math.maxInt(u64));
+        self.finishExternalSources(frame);
+
+        self.storeFrameViews();
+        self.frame_index = (self.frame_index + 1) % frames_in_flight;
+        self.loadFrameViews();
+    }
+
     pub fn measureText(self: *Self, scale: f32, value: []const u8, style: keywork.ResolvedTextStyle) !keywork.Size {
         return self.text_renderer.measure(scale, value, style);
     }
@@ -765,7 +877,7 @@ pub const Renderer = struct {
         }
         try self.createRenderTargets();
         try self.ensureTextResources();
-        try self.ensureTextPipeline();
+        try self.ensureTextPipeline(self.swapchain_format, self.render_pass);
         self.swapchain_dirty = false;
         try self.reapRetiredSwapchains();
         log.info("Vulkan swapchain {d}x{d} images={d}", .{ extent.width, extent.height, self.swapchain_images.len });
@@ -1035,14 +1147,14 @@ pub const Renderer = struct {
         }}, null);
     }
 
-    fn ensureTextPipeline(self: *Self) !void {
-        if (self.text_pipeline != .null_handle and self.text_pipeline_format == self.swapchain_format) return;
+    fn ensureTextPipeline(self: *Self, format_value: vk.Format, render_pass: vk.RenderPass) !void {
+        if (self.text_pipeline != .null_handle and self.text_pipeline_format == format_value) return;
         if (self.text_pipeline != .null_handle) {
             self.vkd.destroyPipeline(self.device, self.text_pipeline, null);
             self.text_pipeline = .null_handle;
         }
-        try self.createTextPipeline();
-        self.text_pipeline_format = self.swapchain_format;
+        try self.createTextPipeline(render_pass);
+        self.text_pipeline_format = format_value;
     }
 
     fn resetAtlasPacking(self: *Self) void {
@@ -1132,7 +1244,7 @@ pub const Renderer = struct {
         self.text_vertices.clearRetainingCapacity();
     }
 
-    fn createTextPipeline(self: *Self) !void {
+    fn createTextPipeline(self: *Self, render_pass: vk.RenderPass) !void {
         const vert_module = try self.createShaderModule(@embedFile("../shaders/text.vert.spv"));
         defer self.vkd.destroyShaderModule(self.device, vert_module, null);
         const frag_module = try self.createShaderModule(@embedFile("../shaders/text.frag.spv"));
@@ -1224,7 +1336,7 @@ pub const Renderer = struct {
             .p_color_blend_state = &color_blend,
             .p_dynamic_state = &dynamic_state,
             .layout = self.text_pipeline_layout,
-            .render_pass = self.render_pass,
+            .render_pass = render_pass,
             .subpass = 0,
             .base_pipeline_handle = .null_handle,
             .base_pipeline_index = -1,
@@ -1252,49 +1364,12 @@ pub const Renderer = struct {
         };
         const suboptimal = acquired.result == .suboptimal_khr;
         const image_index = acquired.image_index;
-        var repacked_at_atlas_limit = false;
-        while (true) {
-            const atlas_layout_before = self.atlas.layout;
-            try self.vkd.resetCommandPool(self.device, self.command_pool, .{});
-            try self.vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
-
-            self.prepareQuads(display_list, scale) catch |err| switch (err) {
-                error.GlyphAtlasFull => {
-                    self.retireExternalFrame(frame);
-                    if (!try self.recoverAtlasCapacity(atlas_layout_before, &repacked_at_atlas_limit)) return err;
-                    continue;
-                },
-                error.GlyphUploadTooLarge, error.ImageUploadTooLarge => {
-                    self.retireExternalFrame(frame);
-                    try self.growStaging(atlas_layout_before);
-                    continue;
-                },
-                else => {
-                    // This command buffer is abandoned, so its recorded
-                    // transition never changed the real image layout.
-                    self.atlas.layout = atlas_layout_before;
-                    return err;
-                },
-            };
-            break;
-        }
-
-        const clear_value: vk.ClearValue = .{ .color = colorClearValue(self.swapchain_format, keywork.colors.transparent) };
-        self.vkd.cmdBeginRenderPass(self.command_buffer, &.{
-            .render_pass = self.render_pass,
+        try self.recordFrame(display_list, scale, frame, .{
             .framebuffer = self.framebuffers[image_index],
-            .render_area = .{
-                .offset = .{ .x = 0, .y = 0 },
-                .extent = self.swapchain_extent,
-            },
-            .clear_value_count = 1,
-            .p_clear_values = @ptrCast(&clear_value),
-        }, .@"inline");
-
-        self.drawQuads();
-
-        self.vkd.cmdEndRenderPass(self.command_buffer);
-        try self.vkd.endCommandBuffer(self.command_buffer);
+            .render_pass = self.render_pass,
+            .format = self.swapchain_format,
+            .extent = self.swapchain_extent,
+        }, null);
 
         const wait_stage: vk.PipelineStageFlags = .{ .color_attachment_output_bit = true };
         const signal_semaphores = [_]vk.Semaphore{
@@ -1347,6 +1422,66 @@ pub const Renderer = struct {
         self.loadFrameViews();
         if (suboptimal or present_result == .suboptimal_khr) return .stale;
         return .presented;
+    }
+
+    fn recordFrame(
+        self: *Self,
+        display_list: []const keywork.PaintCommand,
+        scale: f32,
+        frame: *FrameResources,
+        target: RenderTarget,
+        foreign_release: ?ForeignRelease,
+    ) !void {
+        var repacked_at_atlas_limit = false;
+        while (true) {
+            const atlas_layout_before = self.atlas.layout;
+            try self.vkd.resetCommandPool(self.device, self.command_pool, .{});
+            try self.vkd.beginCommandBuffer(self.command_buffer, &.{ .flags = .{ .one_time_submit_bit = true } });
+
+            self.prepareQuads(display_list, scale) catch |err| switch (err) {
+                error.GlyphAtlasFull => {
+                    self.retireExternalFrame(frame);
+                    if (!try self.recoverAtlasCapacity(atlas_layout_before, &repacked_at_atlas_limit)) return err;
+                    continue;
+                },
+                error.GlyphUploadTooLarge, error.ImageUploadTooLarge => {
+                    self.retireExternalFrame(frame);
+                    try self.growStaging(atlas_layout_before);
+                    continue;
+                },
+                else => {
+                    // This command buffer is abandoned, so its recorded
+                    // transition never changed the real image layout.
+                    self.atlas.layout = atlas_layout_before;
+                    return err;
+                },
+            };
+            break;
+        }
+
+        const clear_value: vk.ClearValue = .{ .color = colorClearValue(target.format, keywork.colors.transparent) };
+        self.vkd.cmdBeginRenderPass(self.command_buffer, &.{
+            .render_pass = target.render_pass,
+            .framebuffer = target.framebuffer,
+            .render_area = .{
+                .offset = .{ .x = 0, .y = 0 },
+                .extent = target.extent,
+            },
+            .clear_value_count = 1,
+            .p_clear_values = @ptrCast(&clear_value),
+        }, .@"inline");
+
+        self.drawQuads(target.extent);
+
+        self.vkd.cmdEndRenderPass(self.command_buffer);
+        if (foreign_release) |release| {
+            release.targets.recordForeignRelease(
+                self.command_buffer,
+                release.target_index,
+                self.queue_family_index,
+            );
+        }
+        try self.vkd.endCommandBuffer(self.command_buffer);
     }
 
     /// The single command/sync/upload fields act as views of the active
@@ -1947,25 +2082,25 @@ pub const Renderer = struct {
         try self.writeBuffer(self.vertex_buffer, 0, bytes);
     }
 
-    fn drawQuads(self: *Self) void {
+    fn drawQuads(self: *Self, extent: vk.Extent2D) void {
         if (self.text_vertices.items.len == 0) return;
 
         const push: PushConstants = .{ .viewport = .{
-            @floatFromInt(self.swapchain_extent.width),
-            @floatFromInt(self.swapchain_extent.height),
+            @floatFromInt(extent.width),
+            @floatFromInt(extent.height),
         } };
         self.vkd.cmdBindPipeline(self.command_buffer, .graphics, self.text_pipeline);
         self.vkd.cmdSetViewport(self.command_buffer, 0, &.{.{
             .x = 0,
             .y = 0,
-            .width = @floatFromInt(self.swapchain_extent.width),
-            .height = @floatFromInt(self.swapchain_extent.height),
+            .width = @floatFromInt(extent.width),
+            .height = @floatFromInt(extent.height),
             .min_depth = 0,
             .max_depth = 1,
         }});
         self.vkd.cmdSetScissor(self.command_buffer, 0, &.{.{
             .offset = .{ .x = 0, .y = 0 },
-            .extent = self.swapchain_extent,
+            .extent = extent,
         }});
         self.vkd.cmdBindDescriptorSets(self.command_buffer, .graphics, self.text_pipeline_layout, 0, &.{self.text_descriptor_set}, null);
         self.vkd.cmdPushConstants(self.command_buffer, self.text_pipeline_layout, .{ .vertex_bit = true }, 0, @sizeOf(PushConstants), &push);
@@ -2167,7 +2302,12 @@ const DeviceSelection = struct {
     queue_family_index: u32,
 };
 
-fn selectPhysicalDevice(allocator: std.mem.Allocator, vki: vk.InstanceWrapper, instance: vk.Instance, surface: vk.SurfaceKHR) !DeviceSelection {
+fn selectPhysicalDevice(
+    allocator: std.mem.Allocator,
+    vki: vk.InstanceWrapper,
+    instance: vk.Instance,
+    surface: ?vk.SurfaceKHR,
+) !DeviceSelection {
     const devices = try vki.enumeratePhysicalDevicesAlloc(instance, allocator);
     defer allocator.free(devices);
     for (devices) |physical_device| {
@@ -2175,8 +2315,15 @@ fn selectPhysicalDevice(allocator: std.mem.Allocator, vki: vk.InstanceWrapper, i
         defer allocator.free(families);
         for (families, 0..) |family, index| {
             if (!family.queue_flags.graphics_bit) continue;
-            const supported = try vki.getPhysicalDeviceSurfaceSupportKHR(physical_device, @intCast(index), surface);
-            if (supported == .true) return .{ .physical_device = physical_device, .queue_family_index = @intCast(index) };
+            if (surface) |surface_khr| {
+                const supported = try vki.getPhysicalDeviceSurfaceSupportKHR(
+                    physical_device,
+                    @intCast(index),
+                    surface_khr,
+                );
+                if (supported != .true) continue;
+            }
+            return .{ .physical_device = physical_device, .queue_family_index = @intCast(index) };
         }
     }
     return error.NoSuitableVulkanDevice;

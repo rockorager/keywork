@@ -11,6 +11,7 @@ const Renderer = @import("render/Renderer.zig");
 const render = @import("render/types.zig");
 const Server = @import("server.zig");
 const Systemd = @import("systemd.zig");
+const NativeServer = @import("wayring/NativeServer.zig");
 
 pub const std_options: std.Options = .{
     // Compile every level in; Logging applies the selected level at runtime.
@@ -27,6 +28,7 @@ const usage =
     \\  --config PATH             use an explicit configuration file
     \\  --output KIND             select drm, nested, or headless output
     \\  --renderer KIND           select cpu or vulkan rendering
+    \\  --wayland-backend KIND    select legacy or wayring protocol server
     \\  --headless-size WIDTHxHEIGHT
     \\  --headless-scale SCALE
     \\  --headless-refresh HZ
@@ -37,12 +39,16 @@ const usage =
     \\
 ;
 
+const WaylandBackend = enum { legacy, wayring };
+
 const StartupOptions = struct {
     help: bool = false,
     version: bool = false,
     config_path: ?[]const u8 = null,
     output: ?OutputBackend.Kind = null,
     renderer: ?Renderer.Kind = null,
+    wayland_backend: WaylandBackend = .legacy,
+    wayland_backend_set: bool = false,
     headless_size: ?render.Size = null,
     headless_scale: ?render.Scale = null,
     headless_refresh_millihertz: ?i32 = null,
@@ -105,6 +111,7 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
     defer if (session_lock) |file| file.close(init.io);
+    if (options.wayland_backend == .wayring) return runNative(init, options);
     var systemd: Systemd = .init(init.io, init.environ_map, native_session);
     try systemd.prepare();
     var launcher: Launcher = .init(init.gpa, init.io, init.environ_map);
@@ -200,6 +207,33 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
+fn runNative(init: std.process.Init, options: StartupOptions) !void {
+    const runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR") orelse
+        return error.MissingRuntimeDirectory;
+    const output_kind: NativeServer.OutputKind = switch (options.outputKind()) {
+        .headless => .headless,
+        .drm => .drm,
+        .nested => unreachable,
+    };
+    const native = try NativeServer.create(init.gpa, init.io, .{
+        .runtime_directory = runtime_directory,
+        .output_size = options.headless_size orelse .{ .width = 1280, .height = 720 },
+        .scale = options.headless_scale orelse .{},
+        .refresh_millihertz = options.headless_refresh_millihertz orelse 60_000,
+        .renderer_kind = options.rendererKind(),
+        .output_kind = output_kind,
+        .drm_device_path = options.drm_device,
+    });
+    defer native.destroy();
+    try init.environ_map.put("WAYLAND_DISPLAY", native.displayName());
+
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(init.io, &buffer);
+    try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{native.displayName()});
+    try writer.interface.flush();
+    try native.run();
+}
+
 fn parseArguments(arguments: anytype) !StartupOptions {
     var options: StartupOptions = .{};
     while (arguments.next()) |argument| {
@@ -222,6 +256,12 @@ fn parseArguments(arguments: anytype) !StartupOptions {
             const value = arguments.next() orelse return error.MissingArgument;
             options.renderer = std.meta.stringToEnum(Renderer.Kind, value) orelse
                 return error.InvalidRenderer;
+        } else if (std.mem.eql(u8, argument, "--wayland-backend")) {
+            if (options.wayland_backend_set) return error.DuplicateArgument;
+            const value = arguments.next() orelse return error.MissingArgument;
+            options.wayland_backend = std.meta.stringToEnum(WaylandBackend, value) orelse
+                return error.InvalidWaylandBackend;
+            options.wayland_backend_set = true;
         } else if (std.mem.eql(u8, argument, "--headless-size")) {
             if (options.headless_size != null) return error.DuplicateArgument;
             const value = arguments.next() orelse return error.MissingArgument;
@@ -263,6 +303,10 @@ fn parseArguments(arguments: anytype) !StartupOptions {
     }
     if (output != .drm and options.drm_device != null) {
         return error.DrmDeviceRequiresDrmOutput;
+    }
+    if (options.wayland_backend == .wayring) {
+        if (output == .nested) return error.WayringDoesNotSupportNestedOutput;
+        if (options.config_path != null) return error.WayringDoesNotLoadConfiguration;
     }
     return options;
 }
@@ -369,6 +413,7 @@ test "startup options replace environment backend controls" {
     const default_options = try parseArguments(&defaults);
     try std.testing.expectEqual(OutputBackend.Kind.drm, default_options.outputKind());
     try std.testing.expectEqual(Renderer.Kind.vulkan, default_options.rendererKind());
+    try std.testing.expectEqual(WaylandBackend.legacy, default_options.wayland_backend);
 
     var configured: TestArguments = .{ .values = &.{
         "--config",
@@ -398,6 +443,17 @@ test "startup options replace environment backend controls" {
     var drm: TestArguments = .{ .values = &.{ "--drm-device", "/dev/dri/card1" } };
     const drm_options = try parseArguments(&drm);
     try std.testing.expectEqualStrings("/dev/dri/card1", drm_options.drm_device.?);
+
+    var wayring: TestArguments = .{ .values = &.{
+        "--wayland-backend",
+        "wayring",
+        "--output",
+        "headless",
+        "--renderer",
+        "cpu",
+    } };
+    const wayring_options = try parseArguments(&wayring);
+    try std.testing.expectEqual(WaylandBackend.wayring, wayring_options.wayland_backend);
 
     var help: TestArguments = .{ .values = &.{ "--help", "--headless-size", "1920x1080" } };
     try std.testing.expect((try parseArguments(&help)).help);
@@ -435,6 +491,35 @@ test "startup options reject duplicates and backend-specific misuse" {
         error.DrmDeviceRequiresDrmOutput,
         parseArguments(&misplaced_drm),
     );
+
+    var wayring_drm: TestArguments = .{ .values = &.{
+        "--wayland-backend",
+        "wayring",
+    } };
+    const wayring_drm_options = try parseArguments(&wayring_drm);
+    try std.testing.expectEqual(OutputBackend.Kind.drm, wayring_drm_options.outputKind());
+
+    var wayring_nested: TestArguments = .{ .values = &.{
+        "--wayland-backend",
+        "wayring",
+        "--output",
+        "nested",
+    } };
+    try std.testing.expectError(
+        error.WayringDoesNotSupportNestedOutput,
+        parseArguments(&wayring_nested),
+    );
+
+    var wayring_vulkan: TestArguments = .{ .values = &.{
+        "--wayland-backend",
+        "wayring",
+        "--output",
+        "headless",
+        "--renderer",
+        "vulkan",
+    } };
+    const wayring_vulkan_options = try parseArguments(&wayring_vulkan);
+    try std.testing.expectEqual(Renderer.Kind.vulkan, wayring_vulkan_options.rendererKind());
 }
 
 test "headless output configuration parses size, scale, and refresh" {
@@ -467,6 +552,16 @@ test "cursor size defaults when missing or empty" {
 }
 
 test {
+    _ = @import("wayring/NativeServer.zig");
+    _ = @import("wayring/AsyncShmCopy.zig");
+    _ = @import("wayring/XdgShell.zig");
+    _ = @import("wayring/CompositorGlobal.zig");
+    _ = @import("wayring/TextInputGlobal.zig");
+    _ = @import("wayring/InputMethodGlobal.zig");
+    _ = @import("wayring/SurfaceTree.zig");
+    _ = @import("wayring/SubcompositorGlobal.zig");
+    _ = @import("wayring/ShmGlobal.zig");
+    _ = @import("wayring/shm.zig");
     _ = @import("render/types.zig");
     _ = @import("render/backdrop_cache_key.zig");
     _ = @import("render/blur_geometry.zig");
@@ -526,7 +621,7 @@ test {
     _ = @import("window_manager/workspace.zig");
     _ = @import("wayland/compositor.zig");
     _ = @import("wayland/surface.zig");
-    _ = @import("wayland/surface_geometry.zig");
+    _ = @import("surface_geometry.zig");
     _ = @import("wayland/region.zig");
     _ = @import("wayland/subcompositor.zig");
     _ = @import("wayland/seat.zig");
@@ -593,7 +688,7 @@ test {
     _ = @import("wayland/xdg_output.zig");
     _ = @import("wayland/viewporter.zig");
     _ = @import("wayland/gtk_shell.zig");
-    _ = @import("wayland/xdg_popup_placement.zig");
+    _ = @import("xdg_popup_placement.zig");
     _ = @import("wayland/xdg_shell.zig");
     _ = @import("wayland/layer_shell.zig");
     _ = @import("control.zig");

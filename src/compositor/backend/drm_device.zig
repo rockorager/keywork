@@ -3,7 +3,7 @@
 const Self = @This();
 
 const std = @import("std");
-const wayland = @import("wayland");
+const FdWatch = @import("FdWatch.zig");
 const DrmOutput = @import("drm.zig");
 const Gbm = @import("gbm.zig");
 const Session = @import("session.zig");
@@ -16,18 +16,19 @@ const c = @cImport({
     @cInclude("xf86drm.h");
     @cInclude("xf86drmMode.h");
 });
-const wl = wayland.server.wl;
 const log = std.log.scoped(.drm);
 
 allocator: std.mem.Allocator,
 io: std.Io,
 session: *Session,
 session_listener: Session.Listener,
-event_loop: *wl.EventLoop,
-event_source: ?*wl.EventSource,
+event_loop: FdWatch.Loop,
+event_watch: FdWatch,
+event_watch_initialized: bool,
 udev: ?*c.struct_udev,
 udev_monitor: ?*c.struct_udev_monitor,
-hotplug_source: ?*wl.EventSource,
+hotplug_watch: FdWatch,
+hotplug_watch_initialized: bool,
 device_path: ?[:0]u8,
 device: ?Session.Device,
 device_number: ?c.dev_t,
@@ -65,7 +66,7 @@ fn ignoreEvent(_: *anyopaque) void {}
 fn ignoreOutputEvent(_: *anyopaque, _: *DrmOutput) void {}
 fn ignoreLeaseRevoked(_: *anyopaque, _: u32) void {}
 
-pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: *wl.EventLoop, session: *Session, device_path: ?[]const u8) !void {
+pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: FdWatch.Loop, session: *Session, device_path: ?[]const u8) !void {
     const path = if (device_path) |value| try allocator.dupeSentinel(u8, value, 0) else null;
     self.* = .{
         .allocator = allocator,
@@ -73,10 +74,12 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, io: std.Io, event_loop: *
         .session = session,
         .session_listener = .{ .context = self, .activated = handleSessionActivated, .deactivated = handleSessionDeactivated, .failed = handleSessionFailed },
         .event_loop = event_loop,
-        .event_source = null,
+        .event_watch = undefined,
+        .event_watch_initialized = false,
         .udev = null,
         .udev_monitor = null,
-        .hotplug_source = null,
+        .hotplug_watch = undefined,
+        .hotplug_watch_initialized = false,
         .device_path = path,
         .device = null,
         .device_number = null,
@@ -355,16 +358,17 @@ fn activate(self: *Self) !void {
         };
         if (!found) try self.removeAt(index, device.fd);
     }
-    self.event_source = try self.event_loop.addFd(*Self, device.fd, .{ .readable = true }, handleDrmEvent, self);
+    try self.event_watch.init(self.event_loop, device.fd, self, handleDrmEvent);
+    self.event_watch_initialized = true;
     if (self.initialized) if (self.listener) |listener| listener.activated(listener.context);
 }
 
 fn deactivate(self: *Self) void {
     if (self.device != null) if (self.listener) |listener| listener.deactivating(listener.context);
     for (self.active_outputs.items) |output| output.notifyDeactivated();
-    if (self.event_source) |source| {
-        source.remove();
-        self.event_source = null;
+    if (self.event_watch_initialized) {
+        self.event_watch.deinit();
+        self.event_watch_initialized = false;
     }
     const device = self.device orelse return;
     for (self.active_outputs.items) |output| output.deactivate(device.fd);
@@ -552,17 +556,18 @@ fn initHotplugMonitor(self: *Self) !void {
     if (c.udev_monitor_filter_add_match_subsystem_devtype(monitor, "drm", null) != 0 or c.udev_monitor_enable_receiving(monitor) != 0) return error.UdevMonitorFailed;
     const fd = c.udev_monitor_get_fd(monitor);
     if (fd < 0) return error.UdevMonitorFailed;
-    self.hotplug_source = try self.event_loop.addFd(*Self, fd, .{ .readable = true }, handleHotplugEvent, self);
+    try self.hotplug_watch.init(self.event_loop, fd, self, handleHotplugEvent);
+    self.hotplug_watch_initialized = true;
     errdefer {
-        self.hotplug_source.?.remove();
-        self.hotplug_source = null;
+        self.hotplug_watch.deinit();
+        self.hotplug_watch_initialized = false;
     }
 }
 
 fn deinitHotplugMonitor(self: *Self) void {
-    if (self.hotplug_source) |source| {
-        source.remove();
-        self.hotplug_source = null;
+    if (self.hotplug_watch_initialized) {
+        self.hotplug_watch.deinit();
+        self.hotplug_watch_initialized = false;
     }
     if (self.udev_monitor) |monitor| {
         _ = c.udev_monitor_unref(monitor);
@@ -600,24 +605,24 @@ fn handleSessionFailed(context: *anyopaque) void {
     self.fail(error.SessionFailed);
 }
 
-fn handleDrmEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
-    if (mask.hangup or mask.@"error") self.fail(error.DeviceDisconnected) else if (mask.readable) if (self.device) |device| {
+fn handleDrmEvent(context: *anyopaque, events: FdWatch.Events) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (events.hangup or events.error_occurred) self.fail(error.DeviceDisconnected) else if (events.readable) if (self.device) |device| {
         DrmOutput.dispatchEvents(device.fd) catch |err| self.fail(err);
         self.collectRetiredOutputs();
     };
-    return 0;
 }
 
-fn handleHotplugEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
-    if (mask.hangup or mask.@"error") {
+fn handleHotplugEvent(context: *anyopaque, events: FdWatch.Events) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (events.hangup or events.error_occurred) {
         self.fail(error.UdevMonitorFailed);
-        return 0;
+        return;
     }
-    if (!mask.readable) return 0;
-    const device = c.udev_monitor_receive_device(self.udev_monitor.?) orelse return 0;
+    if (!events.readable) return;
+    const device = c.udev_monitor_receive_device(self.udev_monitor.?) orelse return;
     defer _ = c.udev_device_unref(device);
     self.handleDeviceEvent(device) catch |err| self.fail(err);
-    return 0;
 }
 
 fn handleDeviceEvent(self: *Self, device: *c.struct_udev_device) !void {

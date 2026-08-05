@@ -14,13 +14,38 @@ all checked-in Wayland XML live outside `src/`.
 
 ### Loop (`src/loop/`)
 
-Owns the `keywork-loop` Zig module: a concrete Linux reactor built on epoll,
-eventfd, timerfd, and inotify. It owns source dispatch and lifetime safety, but
-not application lifecycle or protocol-specific policy.
+Owns the `keywork-loop` Zig module: concrete Linux reactors and their operation
+lifetime safety. `EventLoop` owns the process's completion-native `IoUringLoop`;
+Wayring transport and ordinary runtime fd sources share that ring and its
+submit/wait/drain turns. Monotonic timers share an indexed heap backed by one
+io_uring timeout; realtime timers share a second heap and one timerfd read for
+clock-change semantics. Inotify and library-owned poll descriptors remain
+Linux event producers, but io_uring is the only outer wait mechanism. The
+component owns source and completion dispatch, but not application lifecycle
+or protocol-specific policy.
 
 The loop must not depend on the runtime, UI, Lua, compositor, systemd, or
 Wayland libraries. Consumer-owned adapters may integrate those systems through
 the loop's generic callback and phase contracts.
+
+### Wayring (`src/wayring/`)
+
+Owns the `wayring` Zig module: a sans-I/O Wayland wire and connection engine.
+It owns framing, argument validation, ordered byte and file-descriptor queues,
+object metadata, and send acknowledgement semantics. It receives bytes and
+owned descriptors from a transport and exposes drainable messages; it never
+waits on sockets or invokes application callbacks while parsing input.
+Its host-side scanner consumes repository-managed protocol XML and emits native
+Wayring descriptors without generating or linking libwayland ABI wrappers.
+The `wayring-server` module builds policy-neutral client, global, resource, and
+request-dispatch state on that engine. It remains sans-I/O: transports feed its
+clients and drain their output, while compositor-owned handlers implement
+protocol behavior.
+
+The core must not depend on the loop, runtime, compositor, Vulkan, or
+libwayland. Concrete transport adapters may depend on both `wayring` and
+`keywork-loop`; product-specific protocol policy remains with the runtime,
+stream client, or compositor that consumes generated bindings.
 
 ### UI (`src/ui/`)
 
@@ -46,6 +71,11 @@ runtime's typed callback contract; the server itself remains language-neutral.
 The native runtime depends on the UI and loop modules. It must compile and link
 without LuaJIT and must not acquire shell or compositor policy. Native Zig
 applications and language adapters consume the same public runtime contract.
+Its primary Wayring backend owns protocol policy and supports both Vulkan
+DMA-BUF and CPU `wl_shm` presentation while using `wayring-uring` for
+transport. The libwayland CPU and Vulkan backends remain explicit
+compatibility fallbacks. The sans-I/O engine remains independent of runtime
+and renderer ownership.
 
 ### Lua host (`src/lua/`)
 
@@ -200,9 +230,12 @@ Current source module roots are:
 | Module | Root | Direct module dependencies |
 | --- | --- | --- |
 | `keywork-loop` | `src/loop/event_loop.zig` | none |
+| `wayring` | `src/wayring/root.zig` | none |
+| `wayring-uring` | `src/wayring/IoUringTransport.zig` | `wayring`, `keywork-loop` |
+| `wayring-core` | `src/wayring/core_protocol.zig` | `wayring` |
 | `keywork-ui` | `src/ui/root.zig` | `uucode`, `linebreak`, `z2d` |
 | `keywork-ui-engine` | `src/ui/engine/root.zig` | `keywork-ui`, `uucode` |
-| `keywork-runtime` | `src/runtime/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine`, `varlink` |
+| `keywork-runtime` | `src/runtime/root.zig` | `keywork-loop`, `wayring`, `wayring-uring`, `wayring-protocols`, `keywork-ui`, `keywork-ui-engine`, `varlink` |
 | `keywork-application-control` | `src/runtime/app/control_protocol.zig` | none |
 | `keywork-lua` | `src/lua/root.zig` | public native modules |
 | `linebreak` | `src/ui/linebreak/root.zig` | `uucode` |

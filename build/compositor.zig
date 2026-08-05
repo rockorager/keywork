@@ -13,6 +13,12 @@ pub fn add(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     build_options: *std.Build.Step.Options,
+    keywork_loop: *std.Build.Module,
+    wayring: *std.Build.Module,
+    wayring_core: *std.Build.Module,
+    wayring_server: *std.Build.Module,
+    wayring_server_uring: *std.Build.Module,
+    wayring_protocols: *std.Build.Module,
     varlink: *std.Build.Module,
     control: *std.Build.Module,
     wayland_libraries: static_wayland.Output,
@@ -167,8 +173,14 @@ pub fn add(
     });
     compositor.addOptions("build-options", build_options);
     compositor.addImport("keywork-control", control);
+    compositor.addImport("keywork-loop", keywork_loop);
     compositor.addImport("varlink", varlink);
     compositor.addImport("wayland", wayland);
+    compositor.addImport("wayring", wayring);
+    compositor.addImport("wayring-core", wayring_core);
+    compositor.addImport("wayring-protocols", wayring_protocols);
+    compositor.addImport("wayring-server", wayring_server);
+    compositor.addImport("wayring-server-uring", wayring_server_uring);
     compositor.addImport("vulkan", vulkan);
     compositor.addAnonymousImport("default-config", .{
         .root_source_file = b.path("src/compositor/resources/keywork.conf"),

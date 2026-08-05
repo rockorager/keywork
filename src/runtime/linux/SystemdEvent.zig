@@ -1,7 +1,7 @@
-//! Embeds one sd-event dispatcher in Keywork's epoll event loop.
+//! Embeds one sd-event dispatcher in Keywork's completion event loop.
 //!
 //! sd-bus and sd-varlink sources attach to `event`. Keywork remains the
-//! outer loop: it watches sd-event's epoll descriptor and performs every
+//! outer loop: io_uring watches sd-event's descriptor and performs every
 //! prepare/wait/dispatch transition without starting a nested blocking loop.
 
 const SystemdEvent = @This();
@@ -16,6 +16,7 @@ const dispatch_budget = 64;
 event: *systemd.sd_event,
 source_handle: ?event_loop.EventLoop.SourceHandle = null,
 bound_loop: ?*event_loop.EventLoop = null,
+dirty: bool = false,
 
 pub fn create(allocator: std.mem.Allocator) !*SystemdEvent {
     const self = try allocator.create(SystemdEvent);
@@ -62,7 +63,14 @@ pub fn sdEvent(self: *SystemdEvent) *systemd.sd_event {
     return self.event;
 }
 
-/// Drives pending work and leaves sd-event armed for its next outer epoll
+/// Marks userspace-only sd-event state changed while the nested dispatcher is
+/// armed. Calls originate on the outer loop thread, so its next prepare phase
+/// observes this flag without a separate eventfd wakeup.
+pub fn notify(self: *SystemdEvent) void {
+    self.dirty = true;
+}
+
+/// Drives pending work and leaves sd-event armed for its next outer poll
 /// wait. A dispatch budget prevents a busy IPC peer from starving a Keywork
 /// turn; prepare() will continue the drain before the following blocking wait.
 fn prepare(self: *SystemdEvent) !bool {
@@ -83,10 +91,11 @@ fn prepare(self: *SystemdEvent) !bool {
                 if (result == 0) return dispatched;
             },
             systemd.SD_EVENT_ARMED => {
-                // Sources can enqueue userspace work while Keywork dispatches
-                // an unrelated outer-loop callback. Poll sd-event with a zero
-                // timeout before the outer epoll blocks again; its nested fd
-                // need not become readable for that newly queued work.
+                // Kernel-backed sources make sd-event's descriptor readable.
+                // Only explicitly marked userspace-only work needs an inner
+                // zero-time check before the outer ring blocks again.
+                if (!self.dirty) return dispatched;
+                self.dirty = false;
                 const result = try checkResult(systemd.sd_event_wait(self.event, 0));
                 if (result == 0) continue;
             },
@@ -102,6 +111,7 @@ fn ready(self: *SystemdEvent) !void {
     defer _ = systemd.sd_event_unref(self.event);
 
     if (systemd.sd_event_get_state(self.event) == systemd.SD_EVENT_ARMED) {
+        self.dirty = false;
         _ = try checkResult(systemd.sd_event_wait(self.event, 0));
     }
     _ = try self.prepare();
@@ -126,7 +136,7 @@ fn checkResult(result: c_int) !c_int {
     return result;
 }
 
-test "prepare dispatches pending sd-event work before epoll blocks" {
+test "prepare dispatches pending sd-event work before io_uring blocks" {
     const Context = struct {
         loop: *event_loop.EventLoop,
         fired: bool = false,
@@ -166,6 +176,7 @@ test "pre-poll dispatches userspace work queued while sd-event is armed" {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             try std.testing.expectEqual(systemd.SD_EVENT_ARMED, systemd.sd_event_get_state(self.bridge.event));
             try check(systemd.sd_event_add_defer(self.bridge.event, &self.source, dispatch, self));
+            self.bridge.notify();
         }
 
         fn dispatch(_: ?*systemd.sd_event_source, userdata: ?*anyopaque) callconv(.c) c_int {

@@ -72,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
         .app_id = "dev.keywork.NativeExample",
         .width = 640,
         .height = 480,
-        .backend = .wayland_shm,
+        .backend = .wayring_shm,
         .log_writer = &stdout_writer.interface,
     });
 }

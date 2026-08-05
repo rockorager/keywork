@@ -13,7 +13,7 @@ const Subcompositor = @import("subcompositor.zig");
 const OutputLayout = @import("output_layout.zig");
 const GtkShell = @import("gtk_shell.zig");
 const XdgPositioner = @import("XdgPositioner.zig");
-const popup_placement = @import("xdg_popup_placement.zig");
+const popup_placement = @import("../xdg_popup_placement.zig");
 
 const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
@@ -1283,7 +1283,7 @@ fn popupPlacement(
     }
     return popup_placement.place(
         rules,
-        parent.position,
+        .{ .x = parent.position.x, .y = parent.position.y },
         self.popupOutputBounds(parent.position, parent.geometry.size),
     );
 }
@@ -1904,7 +1904,10 @@ const XdgSurfaceResource = struct {
                 const pending = configure.popup orelse unreachable;
                 state.configured = true;
                 popup.rules = pending.rules;
-                self.shell.scene.setPopupPosition(scene_id, pending.placement.position);
+                self.shell.scene.setPopupPosition(scene_id, .{
+                    .x = pending.placement.position.x,
+                    .y = pending.placement.position.y,
+                });
                 state.last_acked_configure = null;
             }
             self.shell.scene.setPopupContentGeometry(
@@ -2643,20 +2646,20 @@ test "popup configure acknowledgements retain the matched placement" {
     try std.testing.expect(state.acknowledgeConfigure(11));
     try std.testing.expectEqual(@as(u32, 11), state.last_acked_configure.?.serial);
     try std.testing.expectEqual(
-        Scene.Position{ .x = 10, .y = 20 },
+        popup_placement.Position{ .x = 10, .y = 20 },
         state.last_acked_configure.?.popup.?.placement.position,
     );
     try std.testing.expectEqual(@as(usize, 1), state.configures.items.len);
     try std.testing.expectEqual(@as(u32, 12), state.configures.items[0].serial);
     try std.testing.expectEqual(
-        Scene.Position{ .x = 30, .y = 40 },
+        popup_placement.Position{ .x = 30, .y = 40 },
         state.configures.items[0].popup.?.placement.position,
     );
 
     try std.testing.expect(state.acknowledgeConfigure(12));
     try std.testing.expectEqual(@as(u32, 12), state.last_acked_configure.?.serial);
     try std.testing.expectEqual(
-        Scene.Position{ .x = 30, .y = 40 },
+        popup_placement.Position{ .x = 30, .y = 40 },
         state.last_acked_configure.?.popup.?.placement.position,
     );
     try std.testing.expectEqual(@as(usize, 0), state.configures.items.len);

@@ -1,11 +1,12 @@
 //! Pure xdg-positioner popup placement and constraint adjustment policy.
 
 const std = @import("std");
-const wayland = @import("wayland");
-const render = @import("../render/types.zig");
-const Scene = @import("../scene.zig");
+const render = @import("render/types.zig");
 
-const xdg = wayland.server.xdg;
+pub const Position = struct {
+    x: i32 = 0,
+    y: i32 = 0,
+};
 
 pub const Size = struct {
     width: i32,
@@ -19,13 +20,47 @@ pub const AnchorRect = struct {
     height: i32,
 };
 
+pub const Anchor = enum(u32) {
+    none = 0,
+    top = 1,
+    bottom = 2,
+    left = 3,
+    right = 4,
+    top_left = 5,
+    bottom_left = 6,
+    top_right = 7,
+    bottom_right = 8,
+};
+
+pub const Gravity = enum(u32) {
+    none = 0,
+    top = 1,
+    bottom = 2,
+    left = 3,
+    right = 4,
+    top_left = 5,
+    bottom_left = 6,
+    top_right = 7,
+    bottom_right = 8,
+};
+
+pub const ConstraintAdjustment = packed struct(u32) {
+    slide_x: bool = false,
+    slide_y: bool = false,
+    flip_x: bool = false,
+    flip_y: bool = false,
+    resize_x: bool = false,
+    resize_y: bool = false,
+    _padding: u26 = 0,
+};
+
 pub const Rules = struct {
     size: ?Size = null,
     anchor_rect: ?AnchorRect = null,
-    anchor: xdg.Positioner.Anchor = .none,
-    gravity: xdg.Positioner.Gravity = .none,
-    adjustment: xdg.Positioner.ConstraintAdjustment = .{},
-    offset: Scene.Position = .{},
+    anchor: Anchor = .none,
+    gravity: Gravity = .none,
+    adjustment: ConstraintAdjustment = .{},
+    offset: Position = .{},
     reactive: bool = false,
     parent_size: ?Size = null,
     parent_configure: ?u32 = null,
@@ -39,14 +74,14 @@ pub const Rules = struct {
 };
 
 pub const Placement = struct {
-    position: Scene.Position,
+    position: Position,
     dimensions: Size,
 };
 
 /// Places a popup from complete positioner rules and applies output constraints.
 pub fn place(
     rules: Rules,
-    parent_position: Scene.Position,
+    parent_position: Position,
     output_bounds: render.Rect,
 ) Placement {
     std.debug.assert(rules.complete());
@@ -147,10 +182,10 @@ fn popupPosition(rules: Rules, flip_x: bool, flip_y: bool) Position64 {
 }
 
 fn flipAnchor(
-    anchor: xdg.Positioner.Anchor,
+    anchor: Anchor,
     flip_x: bool,
     flip_y: bool,
-) xdg.Positioner.Anchor {
+) Anchor {
     var result = anchor;
     if (flip_x) result = switch (result) {
         .left => .right,
@@ -174,10 +209,10 @@ fn flipAnchor(
 }
 
 fn flipGravity(
-    gravity: xdg.Positioner.Gravity,
+    gravity: Gravity,
     flip_x: bool,
     flip_y: bool,
-) xdg.Positioner.Gravity {
+) Gravity {
     var result = gravity;
     if (flip_x) result = switch (result) {
         .left => .right,
@@ -221,7 +256,7 @@ test "xdg positioner derives popup geometry from anchor and gravity" {
         .offset = .{ .x = 3, .y = 4 },
     }, .{ .x = 100, .y = 50 }, .{ .x = 0, .y = 0, .width = 1280, .height = 720 });
 
-    try std.testing.expectEqual(Scene.Position{ .x = 13, .y = 64 }, placement.position);
+    try std.testing.expectEqual(Position{ .x = 13, .y = 64 }, placement.position);
     try std.testing.expectEqual(Size{ .width = 120, .height = 80 }, placement.dimensions);
 }
 
@@ -234,7 +269,7 @@ test "xdg positioner flips before sliding constrained popups" {
         .adjustment = .{ .flip_x = true, .slide_y = true },
     }, .{ .x = 2430, .y = 450 }, .{ .x = 1280, .y = -200, .width = 1280, .height = 720 });
 
-    try std.testing.expectEqual(Scene.Position{ .x = -120, .y = -30 }, placement.position);
+    try std.testing.expectEqual(Position{ .x = -120, .y = -30 }, placement.position);
     try std.testing.expectEqual(Size{ .width = 200, .height = 100 }, placement.dimensions);
 }
 
@@ -247,6 +282,6 @@ test "xdg positioner resizes a popup to the output boundary" {
         .adjustment = .{ .resize_x = true, .resize_y = true },
     }, .{}, .{ .x = 0, .y = 0, .width = 320, .height = 200 });
 
-    try std.testing.expectEqual(Scene.Position{}, placement.position);
+    try std.testing.expectEqual(Position{}, placement.position);
     try std.testing.expectEqual(Size{ .width = 320, .height = 200 }, placement.dimensions);
 }

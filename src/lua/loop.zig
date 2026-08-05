@@ -100,7 +100,7 @@ pub const FdWatch = struct {
     fd: i32,
     events: u32,
     reader_ref: c_int = -1,
-    /// Readiness reported while no reader was parked. Level-triggered epoll
+    /// Readiness reported while no reader was parked. Level-triggered polling
     /// re-reports the same readiness every wakeup, so it coalesces into one
     /// mask instead of queueing.
     pending: u32 = 0,

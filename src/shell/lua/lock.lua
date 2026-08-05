@@ -60,7 +60,7 @@ end
 
 return kw.app({
     app_id = "dev.rockorager.keywork.Lock",
-    backend = "cpu",
+    backend = "wayring",
     session_lock = true,
     start = function()
         if not report_ready then

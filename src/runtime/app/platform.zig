@@ -82,17 +82,17 @@ pub fn WaylandPlatform(comptime Backend: type) type {
 
         fn clipboardRead(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8 {
             const backend: *Backend = @ptrCast(@alignCast(ptr));
-            const clipboard = backend.clipboard orelse return null;
-            return clipboard.read(allocator);
+            const clipboard = if (backend.clipboard) |*value| value else return null;
+            return clipboard.*.read(allocator);
         }
 
         fn clipboardWrite(ptr: *anyopaque, text: []const u8) anyerror!void {
             const backend: *Backend = @ptrCast(@alignCast(ptr));
-            const clipboard = backend.clipboard orelse return error.ClipboardUnavailable;
+            const clipboard = if (backend.clipboard) |*value| value else return error.ClipboardUnavailable;
             // Compositors validate the selection claim against a recent
             // input serial, so writing before any user input fails.
             const serial = backend.input.last_input_serial orelse return error.NoInputSerial;
-            try clipboard.write(text, serial);
+            try clipboard.*.write(text, serial);
         }
 
         fn activationToken(ptr: *anyopaque, allocator: std.mem.Allocator, app_id: ?[*:0]const u8) anyerror!?[]u8 {
@@ -140,6 +140,71 @@ pub fn WaylandPlatform(comptime Backend: type) type {
             if (backend.input.last_button_press_serial == null) return error.NoRecentPress;
             const target = backend.input.last_button_press_target orelse return error.NoRecentPress;
             return @fieldParentPtr("input_target", target);
+        }
+    };
+}
+
+/// Platform services currently implemented by the native Wayring backend.
+/// Unsupported window-management services remain explicit until their
+/// protocols are migrated rather than falling back through libwayland.
+pub fn WayringPlatform(comptime Backend: type) type {
+    return struct {
+        const vtable: Platform.VTable = .{
+            .clipboard_read = clipboardRead,
+            .clipboard_write = clipboardWrite,
+            .activation_token = activationToken,
+            .start_move = startMove,
+            .start_resize = startResize,
+            .unlock_session = unlockSession,
+            .session_locked = sessionLocked,
+        };
+
+        pub fn platform(backend: *Backend) Platform {
+            return .{ .ptr = backend, .vtable = &vtable };
+        }
+
+        fn clipboardRead(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8 {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            return backend.clipboardRead(allocator);
+        }
+
+        fn clipboardWrite(ptr: *anyopaque, text: []const u8) anyerror!void {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            try backend.clipboardWrite(text);
+        }
+
+        fn activationToken(ptr: *anyopaque, allocator: std.mem.Allocator, app_id: ?[*:0]const u8) anyerror!?[]u8 {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            return backend.activationToken(allocator, app_id);
+        }
+
+        fn startMove(ptr: *anyopaque) anyerror!void {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            try backend.startMove();
+        }
+
+        fn startResize(ptr: *anyopaque, edge: ResizeEdge) anyerror!void {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            try backend.startResize(switch (edge) {
+                .top => .top,
+                .bottom => .bottom,
+                .left => .left,
+                .right => .right,
+                .top_left => .top_left,
+                .top_right => .top_right,
+                .bottom_left => .bottom_left,
+                .bottom_right => .bottom_right,
+            });
+        }
+
+        fn unlockSession(ptr: *anyopaque) anyerror!void {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            try backend.unlockSession();
+        }
+
+        fn sessionLocked(ptr: *anyopaque) bool {
+            const backend: *Backend = @ptrCast(@alignCast(ptr));
+            return backend.sessionLocked();
         }
     };
 }

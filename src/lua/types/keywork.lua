@@ -2,7 +2,7 @@
 
 ---@alias keywork.Color integer
 ---@alias keywork.ColorRef keywork.Color|string
----@alias keywork.Backend 'cpu'|'vulkan'|'log'
+---@alias keywork.Backend 'wayring'|'wayring-cpu'|'cpu'|'vulkan'|'log'
 ---@alias keywork.ColorScheme 'light'|'dark'|'no-preference'
 ---@alias keywork.ResolvedColorScheme 'light'|'dark'
 ---@alias keywork.Alignment 'start'|'center'|'end'

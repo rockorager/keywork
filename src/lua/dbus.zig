@@ -162,7 +162,10 @@ const OwnedName = struct {
     fn release(self: *OwnedName) void {
         if (self.released) return;
         self.released = true;
-        if (!self.bus.closed) _ = systemd.sd_bus_release_name(self.bus.connection, self.name.ptr);
+        if (!self.bus.closed) {
+            _ = systemd.sd_bus_release_name(self.bus.connection, self.name.ptr);
+            self.bus.notify();
+        }
         lua_handle.invalidate(self.bus.host.luaState(), self.handle_ref);
         self.handle_ref = -1;
     }
@@ -295,6 +298,7 @@ pub const Bus = struct {
     host: Host,
     kind: Kind,
     connection: *systemd.sd_bus,
+    bridge: *SystemdEvent,
     subscriptions: std.ArrayList(*Subscription) = .empty,
     pending_calls: std.ArrayList(*Call) = .empty,
     pending_replies: std.ArrayList(*PendingReply) = .empty,
@@ -330,6 +334,7 @@ pub const Bus = struct {
             .host = host,
             .kind = kind,
             .connection = connection.?,
+            .bridge = try host.systemdEvent(),
         };
         return self;
     }
@@ -341,9 +346,13 @@ pub const Bus = struct {
 
     pub fn register(self: *Bus) !void {
         if (self.registered or self.closed) return;
-        const bridge = try self.host.systemdEvent();
-        try checkDbus(systemd.sd_bus_attach_event(self.connection, bridge.sdEvent(), 0));
+        try checkDbus(systemd.sd_bus_attach_event(self.connection, self.bridge.sdEvent(), 0));
+        self.notify();
         self.registered = true;
+    }
+
+    fn notify(self: *Bus) void {
+        self.bridge.notify();
     }
 
     pub fn unregister(self: *Bus) void {
@@ -446,6 +455,7 @@ pub const Bus = struct {
             dbusSubscriptionCallback,
             subscription,
         ));
+        self.notify();
 
         try self.subscriptions.append(self.host.allocator(), subscription);
         return subscription;
@@ -480,7 +490,10 @@ pub const Bus = struct {
                 return;
             }
         }
-        if (!self.closed) _ = systemd.sd_bus_release_name(self.connection, tryZTemp(name).ptr);
+        if (!self.closed) {
+            _ = systemd.sd_bus_release_name(self.connection, tryZTemp(name).ptr);
+            self.notify();
+        }
     }
 
     fn exportObject(self: *Bus, lua_state: *c.lua_State, path_index: c_int, spec_index: c_int) !*ExportedObject {
@@ -537,6 +550,7 @@ pub const Bus = struct {
             @as(u64, @intCast(timeout_ms)) * std.time.us_per_ms,
         );
         if (call_result < 0) return error.DBusCallFailed;
+        self.notify();
         // The ref transfers only once nothing can fail, so the errdefer
         // above and the call's deinit never unref twice.
         call_state.ref = thread_ref;
@@ -561,6 +575,7 @@ pub const Bus = struct {
         defer _ = systemd.sd_bus_message_unref(message);
         try appendDbusLuaArgs(lua_state, options_index, message.?);
         try checkDbus(systemd.sd_bus_send(self.connection, message, null));
+        self.notify();
     }
 
     fn handleMethodCall(self: *Bus, message: *systemd.sd_bus_message) !bool {
@@ -681,6 +696,7 @@ pub const Bus = struct {
             try appendLuaValueToDbusIter(lua_state, index, reply.?);
         }
         try checkDbus(systemd.sd_bus_send(self.connection, reply, null));
+        self.notify();
     }
 
     fn replyString(self: *Bus, message: *systemd.sd_bus_message, value: []const u8) !void {
@@ -691,6 +707,7 @@ pub const Bus = struct {
         defer self.host.allocator().free(value_z);
         try appendDbusBasic(reply.?, systemd.SD_BUS_TYPE_STRING, value_z.ptr);
         try checkDbus(systemd.sd_bus_send(self.connection, reply, null));
+        self.notify();
     }
 
     fn replyError(self: *Bus, message: *systemd.sd_bus_message, name: []const u8, text: []const u8) !void {
@@ -708,6 +725,7 @@ pub const Bus = struct {
         try checkDbus(systemd.sd_bus_message_new_method_error(message, &error_message, &dbus_error));
         defer _ = systemd.sd_bus_message_unref(error_message);
         try checkDbus(systemd.sd_bus_send(self.connection, error_message, null));
+        self.notify();
     }
 
     fn replyPropertyGet(self: *Bus, object: *ExportedObject, message: *systemd.sd_bus_message, interface: []const u8, property: []const u8) !void {
@@ -724,6 +742,7 @@ pub const Bus = struct {
         try appendLuaValueWithSignature(lua_state, -1, signature, reply.?);
         try closeDbusContainer(reply.?);
         try checkDbus(systemd.sd_bus_send(self.connection, reply, null));
+        self.notify();
     }
 
     /// Handles org.freedesktop.DBus.Properties.Set: unwraps the variant
@@ -809,6 +828,7 @@ pub const Bus = struct {
         }
         try closeDbusContainer(reply.?);
         try checkDbus(systemd.sd_bus_send(self.connection, reply, null));
+        self.notify();
     }
 };
 

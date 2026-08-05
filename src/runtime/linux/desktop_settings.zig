@@ -321,6 +321,7 @@ const PortalClient = struct {
     fn installSignalFilter(self: *PortalClient, _: *Client) !void {
         std.debug.assert(!self.attached);
         try checkSystemd(systemd.sd_bus_attach_event(self.bus, self.bridge.sdEvent(), 0));
+        self.bridge.notify();
         self.attached = true;
     }
 
@@ -348,6 +349,7 @@ const PortalClient = struct {
             self,
             std.time.us_per_s,
         ));
+        self.bridge.notify();
     }
 
     fn finishColorSchemeRead(self: *PortalClient) ?ColorScheme {

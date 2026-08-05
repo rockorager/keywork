@@ -303,6 +303,12 @@ pub fn Backend(comptime RendererAdapter: type) type {
             pub fn configureGeneration(self: *const Window) u64 {
                 return self.protocol.configureGeneration();
             }
+            pub fn isClosed(self: *const Window) bool {
+                return self.protocol.closed;
+            }
+            pub fn setLayerContentRect(self: *Window, width: u31, height: u31, rect: keywork.Rect) !void {
+                try self.protocol.setLayerContentRect(width, height, rect);
+            }
             pub fn suspendedOpaque(ctx: *anyopaque) bool {
                 const self: *Window = @ptrCast(@alignCast(ctx));
                 return self.protocol.suspended;

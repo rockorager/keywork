@@ -16,6 +16,8 @@ const wayland_options = @import("../backend/wayland/options.zig");
 const wayland_shm = @import("../backend/wayland/shm.zig");
 const wayland_vulkan = @import("../backend/wayland/vulkan.zig");
 const wayland_window = @import("../backend/wayland/window.zig");
+const WayringBackend = @import("../backend/wayring/Backend.zig");
+const wayring_transport = @import("wayring-uring");
 
 const log = std.log.scoped(.keywork_runner);
 
@@ -33,7 +35,10 @@ fn desktopSettingsChanged(ctx: *anyopaque, color_scheme: desktop_settings.ColorS
 
 fn setRuntimeClipboard(runtime: *runtime_mod.Runtime, backend: anytype) void {
     const Backend = @TypeOf(backend.*);
-    const platform = platform_mod.WaylandPlatform(Backend).platform(backend);
+    const platform = if (Backend == WayringBackend)
+        platform_mod.WayringPlatform(Backend).platform(backend)
+    else
+        platform_mod.WaylandPlatform(Backend).platform(backend);
     runtime.setClipboardReader(platform.ptr, platform.vtable.clipboard_read);
 }
 
@@ -74,7 +79,248 @@ pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywo
             runWaylandWindowed(allocator, loop, windows_host, options, wayland_vulkan.Backend)
         else
             runWayland(allocator, loop, app, constraints, options, wayland_vulkan.Backend),
+        .wayring => if (options.windows_host) |windows_host|
+            runWayringWindowed(allocator, loop, windows_host, options, .dma_buf)
+        else
+            runWayring(allocator, loop, app, options, .dma_buf),
+        .wayring_shm => if (options.windows_host) |windows_host|
+            runWayringWindowed(allocator, loop, windows_host, options, .shm)
+        else
+            runWayring(allocator, loop, app, options, .shm),
     };
+}
+
+fn runWayringWindowed(
+    allocator: std.mem.Allocator,
+    loop: *event_loop.EventLoop,
+    windows_host: app_windows.WindowsHost,
+    options: Options,
+    presentation: WayringBackend.Presentation,
+) !void {
+    const Manager = WindowManager(WayringBackend);
+    const backend = try WayringBackend.createWithLoop(allocator, loop.ioLoop(), .{ .presentation = presentation });
+    defer backend.destroyBorrowed();
+    if (options.session_lock) try backend.beginSessionLock();
+
+    const wayring_platform = platform_mod.WayringPlatform(WayringBackend).platform(backend);
+    if (options.host_bindings) |bindings| bindings.bindPlatform(wayring_platform);
+    defer if (options.host_bindings) |bindings| bindings.unbindPlatform();
+
+    var raster_cache: keywork.RasterCache = .{};
+    defer raster_cache.deinit(allocator);
+    var manager: Manager = .{
+        .allocator = allocator,
+        .backend = backend,
+        .windows_host = windows_host,
+        .options = &options,
+        .raster_cache = &raster_cache,
+    };
+    defer manager.deinit();
+    backend.setOutputsChangedHandler(&manager, Manager.outputsChanged);
+
+    if (options.host_bindings) |bindings| bindings.bindInvalidator(manager.invalidator());
+    defer if (options.host_bindings) |bindings| bindings.unbindInvalidator();
+    if (options.host_bindings) |bindings| try bindings.bindEventLoop(loop);
+    defer if (options.host_bindings) |bindings| bindings.unbindEventLoop();
+    try backend.installEventTimers(loop);
+    defer backend.uninstallEventTimers();
+
+    try manager.reconcile();
+    if (manager.shouldQuit()) return;
+
+    loop.setAfterPlatformHook(&manager, Manager.afterPlatformHook);
+    defer loop.clearAfterPlatformHook();
+    loop.setEndTurnHook(&manager, Manager.endTurnHook);
+    defer loop.clearEndTurnHook();
+    try loop.run();
+}
+
+fn runWayring(
+    allocator: std.mem.Allocator,
+    loop: *event_loop.EventLoop,
+    app: keywork.AppHost,
+    options: Options,
+    presentation: WayringBackend.Presentation,
+) !void {
+    if (options.layer_shell != null or options.session_lock)
+        return error.UnsupportedWayringWindowMode;
+
+    const display = processEnvironment("WAYLAND_DISPLAY") orelse "wayland-0";
+    const socket_path = try wayring_transport.waylandSocketPathFrom(
+        allocator,
+        processEnvironment("XDG_RUNTIME_DIR"),
+        display,
+    );
+    defer allocator.free(socket_path);
+
+    const ring = loop.ioLoop();
+    var run_context: WayringRunContext = .{ .allocator = allocator };
+    defer run_context.deinit();
+    var backend: WayringBackend = undefined;
+    try backend.initConnect(
+        allocator,
+        socket_path,
+        ring,
+        .{
+            .title = options.title,
+            .app_id = options.app_id,
+            .width = try wayland_window.frameDimension(options.width),
+            .height = try wayland_window.frameDimension(options.height),
+            .presentation = presentation,
+        },
+        &run_context,
+        WayringRunContext.backendEvent,
+    );
+    defer {
+        backend.beginClose() catch {};
+        while (!backend.readyToDeinit() and ring.hasActiveOperations()) {
+            backend.runOnce() catch {};
+        }
+        if (backend.readyToDeinit()) backend.deinit();
+    }
+    try backend.waitConfigured();
+    const wayring_platform = platform_mod.WayringPlatform(WayringBackend).platform(&backend);
+    if (options.host_bindings) |bindings| bindings.bindPlatform(wayring_platform);
+    defer if (options.host_bindings) |bindings| bindings.unbindPlatform();
+
+    const configured_size = try backend.currentSize();
+    var raster_cache: keywork.RasterCache = .{};
+    defer raster_cache.deinit(allocator);
+    var runtime = try runtime_mod.Runtime.initWithRasterCache(
+        allocator,
+        try backend.renderBackend(),
+        .{
+            .max_width = @floatFromInt(configured_size.width),
+            .max_height = @floatFromInt(configured_size.height),
+        },
+        app,
+        .no_preference,
+        &raster_cache,
+    );
+    defer runtime.deinit();
+    runtime.setClipboardReader(wayring_platform.ptr, wayring_platform.vtable.clipboard_read);
+    run_context.runtime = &runtime;
+    defer run_context.runtime = null;
+    run_context.backend = &backend;
+    defer run_context.backend = null;
+    if (options.host_bindings) |bindings| bindings.bindInvalidator(.fromRuntime(&runtime));
+    defer if (options.host_bindings) |bindings| bindings.unbindInvalidator();
+    runtime.setDeferredRepaint(true);
+    if (options.host_bindings) |bindings| try bindings.bindEventLoop(loop);
+    defer if (options.host_bindings) |bindings| bindings.unbindEventLoop();
+    try backend.installEventTimers(loop);
+    defer backend.uninstallEventTimers();
+
+    loop.setAfterPlatformHook(&run_context, WayringRunContext.afterPlatformHook);
+    defer loop.clearAfterPlatformHook();
+    loop.setEndTurnHook(&run_context, WayringRunContext.endTurnHook);
+    defer loop.clearEndTurnHook();
+    try runtime.repaint();
+    try loop.run();
+}
+
+const WayringRunContext = struct {
+    allocator: std.mem.Allocator,
+    runtime: ?*runtime_mod.Runtime = null,
+    backend: ?*WayringBackend = null,
+    stop: bool = false,
+    events: std.ArrayList(WayringBackend.Event) = .empty,
+
+    fn deinit(self: *WayringRunContext) void {
+        self.clear(&self.events);
+        self.events.deinit(self.allocator);
+    }
+
+    fn backendEvent(
+        context: *anyopaque,
+        _: *WayringBackend,
+        event: WayringBackend.Event,
+    ) !void {
+        const self: *WayringRunContext = @ptrCast(@alignCast(context));
+        if (self.runtime == null) {
+            switch (event) {
+                .close, .disconnected, .fatal => self.stop = true,
+                else => {},
+            }
+            return;
+        }
+        const copied = switch (event) {
+            .key => |key| WayringBackend.Event{ .key = switch (key) {
+                .text => |text| .{ .text = try self.allocator.dupe(u8, text) },
+                else => key,
+            } },
+            else => event,
+        };
+        self.events.append(self.allocator, copied) catch |err| {
+            self.deinitEvent(copied);
+            return err;
+        };
+    }
+
+    fn drain(self: *WayringRunContext, backend: *WayringBackend) !void {
+        while (self.events.items.len != 0) {
+            var events = self.events;
+            self.events = .empty;
+            defer {
+                self.clear(&events);
+                events.deinit(self.allocator);
+            }
+            const runtime = self.runtime orelse continue;
+            for (events.items) |event| switch (event) {
+                .configured => |size| try runtime.configure(.{
+                    .width = @floatFromInt(size.width),
+                    .height = @floatFromInt(size.height),
+                }),
+                .repaint => runtime_mod.Runtime.waylandFrameDone(runtime),
+                .close, .disconnected, .fatal => self.stop = true,
+                .pointer_move => |point| {
+                    try runtime.pointerMove(point);
+                    if (point) |position| try backend.setCursorShape(runtime_mod.Runtime.waylandCursorShape(runtime, position));
+                },
+                .pointer_button => |button| try runtime.pointerButton(button),
+                .scroll => |scroll| try runtime.scrollBy(scroll),
+                .key => |key| try runtime.keyInput(key),
+            };
+        }
+    }
+
+    fn afterPlatformHook(context: *anyopaque, loop: *event_loop.EventLoop) !void {
+        const self: *WayringRunContext = @ptrCast(@alignCast(context));
+        const backend = self.backend orelse return;
+        try backend.drainDeferred();
+        try self.drain(backend);
+        if (self.stop or backend.isClosing()) loop.quit();
+    }
+
+    fn endTurnHook(context: *anyopaque, loop: *event_loop.EventLoop) !void {
+        const self: *WayringRunContext = @ptrCast(@alignCast(context));
+        const backend = self.backend orelse return;
+        // Input timers are ordinary loop sources and may queue semantic
+        // events after the platform phase.
+        try self.drain(backend);
+        if (self.runtime) |runtime| try runtime.flushPendingRepaint();
+        if (self.stop or backend.isClosing()) loop.quit();
+    }
+
+    fn clear(self: *WayringRunContext, events: *std.ArrayList(WayringBackend.Event)) void {
+        for (events.items) |event| self.deinitEvent(event);
+        events.clearRetainingCapacity();
+    }
+
+    fn deinitEvent(self: *WayringRunContext, event: WayringBackend.Event) void {
+        switch (event) {
+            .key => |key| switch (key) {
+                .text => |text| self.allocator.free(text),
+                else => {},
+            },
+            else => {},
+        }
+    }
+};
+
+fn processEnvironment(name: [*:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(name) orelse return null;
+    return std.mem.span(value);
 }
 
 fn runLog(
@@ -548,7 +794,7 @@ fn PopupManager(comptime Backend: type) type {
             while (index < self.popups.items.len) {
                 const popup = self.popups.items[index];
                 const request = findRequest(requests.items, popup.id);
-                if (popup.win.protocol.closed) {
+                if (popup.win.isClosed()) {
                     // Compositor dismissal (grab break) reaches the app via
                     // on_close so state stops declaring the popup.
                     if (request) |req| if (req.popup.on_close) |on_close| {
@@ -1039,6 +1285,7 @@ fn WindowManager(comptime Backend: type) type {
 
         fn afterPlatformHook(ctx: *anyopaque, _: *event_loop.EventLoop) !void {
             const self: *Self = @ptrCast(@alignCast(ctx));
+            if (Backend == WayringBackend) try self.backend.drainDeferred();
             try self.drainAll();
         }
 
@@ -1054,7 +1301,7 @@ fn WindowManager(comptime Backend: type) type {
                 return;
             }
             for (self.windows.items) |managed| {
-                if (managed.win.protocol.closed) self.reconcile_pending = true;
+                if (managed.win.isClosed()) self.reconcile_pending = true;
             }
             if (self.reconcile_pending) {
                 try self.reconcile();
@@ -1118,7 +1365,7 @@ fn WindowManager(comptime Backend: type) type {
             var index: usize = 0;
             while (index < self.windows.items.len) {
                 const managed = self.windows.items[index];
-                if (managed.win.protocol.closed) {
+                if (managed.win.isClosed()) {
                     // Remember compositor closes so the still-present
                     // declaration does not resurrect the window.
                     self.windows_host.windowClosed(managed.id) catch |err| {
@@ -1341,7 +1588,7 @@ fn WindowManager(comptime Backend: type) type {
                 .wait => false,
                 .request => |request| blk: {
                     if (managed.runtime.frame_content_rect) |rect| {
-                        try managed.win.protocol.setLayerContentRect(request.width, request.height, rect);
+                        try managed.win.setLayerContentRect(request.width, request.height, rect);
                     }
                     try managed.manager.backend.requestLayerSize(
                         managed.win,
@@ -1440,6 +1687,23 @@ test "queued key text is copied" {
     try std.testing.expectEqual(@as(usize, 1), queue.events.items.len);
     const input = queue.events.items[0].key;
     try std.testing.expectEqualStrings("ab", input.text);
+}
+
+test "Wayring events leave completion callbacks with owned key text" {
+    var runtime: runtime_mod.Runtime = undefined;
+    var context: WayringRunContext = .{
+        .allocator = std.testing.allocator,
+        .runtime = &runtime,
+    };
+    defer context.deinit();
+    var backend: WayringBackend = undefined;
+    var buffer = [_]u8{ 'a', 'b' };
+
+    try WayringRunContext.backendEvent(&context, &backend, .{ .key = .{ .text = &buffer } });
+    buffer[0] = 'z';
+
+    try std.testing.expectEqual(@as(usize, 1), context.events.items.len);
+    try std.testing.expectEqualStrings("ab", context.events.items[0].key.text);
 }
 
 test "queued escape dismisses an open popup" {

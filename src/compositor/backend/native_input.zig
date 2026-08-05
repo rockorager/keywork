@@ -3,7 +3,7 @@
 const Self = @This();
 
 const std = @import("std");
-const wayland = @import("wayland");
+const FdWatch = @import("FdWatch.zig");
 const KeymapCompiler = @import("KeymapCompiler.zig");
 const Session = @import("session.zig");
 const render = @import("../render/types.zig");
@@ -14,7 +14,6 @@ const c = @cImport({
     @cInclude("libudev.h");
     @cInclude("linux/input-event-codes.h");
 });
-const wl = wayland.server.wl;
 
 const log = std.log.scoped(.native_input);
 
@@ -22,7 +21,8 @@ allocator: std.mem.Allocator,
 io: std.Io,
 session: *Session,
 session_listener: Session.Listener,
-event_source: ?*wl.EventSource,
+event_watch: FdWatch,
+event_watch_initialized: bool,
 context: *c.struct_libinput,
 listener: Listener,
 devices: std.AutoHashMapUnmanaged(std.posix.fd_t, Session.Device),
@@ -59,25 +59,53 @@ pub const DeviceId = u64;
 pub const PhysicalDeviceId = u64;
 pub const TabletToolId = u64;
 
+pub const KeyboardKeymapFormat = enum(u32) {
+    no_keymap = 0,
+    xkb_v1 = 1,
+    _,
+};
+pub const KeyState = enum(u32) {
+    released = 0,
+    pressed = 1,
+    _,
+};
+pub const ButtonState = enum(u32) {
+    released = 0,
+    pressed = 1,
+    _,
+};
+pub const Axis = enum(u32) {
+    vertical_scroll = 0,
+    horizontal_scroll = 1,
+    _,
+};
+pub const AxisSource = enum(u32) {
+    wheel = 0,
+    finger = 1,
+    continuous = 2,
+    wheel_tilt = 3,
+    _,
+};
+
 pub const Listener = struct {
     context: *anyopaque,
     close: *const fn (*anyopaque) void,
     keyboard_available: *const fn (*anyopaque, bool) void,
-    keyboard_keymap: *const fn (*anyopaque, ?DeviceId, wl.Keyboard.KeymapFormat, std.posix.fd_t, u32) void,
+    keyboard_keymap: *const fn (*anyopaque, ?DeviceId, KeyboardKeymapFormat, std.posix.fd_t, u32) void,
     keyboard_enter: *const fn (*anyopaque, []const u32) void,
-    keyboard_key: *const fn (*anyopaque, DeviceId, u32, u32, wl.Keyboard.KeyState) void,
+    keyboard_key: *const fn (*anyopaque, DeviceId, u32, u32, KeyState) void,
     keyboard_modifiers: *const fn (*anyopaque, ?DeviceId, u32, u32, u32, u32) void,
     keyboard_repeat_info: *const fn (*anyopaque, ?DeviceId, i32, i32) void,
     pointer_available: *const fn (*anyopaque, bool) void,
     pointer_motion: *const fn (*anyopaque, DeviceId, u32, f64, f64) void,
     pointer_relative_motion: *const fn (*anyopaque, DeviceId, u64, f64, f64, f64, f64) void,
-    pointer_button: *const fn (*anyopaque, DeviceId, u32, u32, wl.Pointer.ButtonState) void,
-    pointer_axis: *const fn (*anyopaque, DeviceId, u32, wl.Pointer.Axis, wl.Fixed) void,
+    pointer_button: *const fn (*anyopaque, DeviceId, u32, u32, ButtonState) void,
+    pointer_axis: *const fn (*anyopaque, DeviceId, u32, Axis, i32) void,
     pointer_frame: *const fn (*anyopaque, DeviceId) void,
-    pointer_axis_source: *const fn (*anyopaque, DeviceId, wl.Pointer.AxisSource) void,
-    pointer_axis_stop: *const fn (*anyopaque, DeviceId, u32, wl.Pointer.Axis) void,
-    pointer_axis_discrete: *const fn (*anyopaque, DeviceId, wl.Pointer.Axis, i32) void,
-    pointer_axis_value120: *const fn (*anyopaque, DeviceId, wl.Pointer.Axis, i32) void,
+    pointer_axis_source: *const fn (*anyopaque, DeviceId, AxisSource) void,
+    pointer_axis_stop: *const fn (*anyopaque, DeviceId, u32, Axis) void,
+    pointer_axis_discrete: *const fn (*anyopaque, DeviceId, Axis, i32) void,
+    pointer_axis_value120: *const fn (*anyopaque, DeviceId, Axis, i32) void,
     swipe_begin: *const fn (*anyopaque, DeviceId, u32, u32) void,
     swipe_update: *const fn (*anyopaque, DeviceId, u32, f64, f64) void,
     swipe_end: *const fn (*anyopaque, DeviceId, u32, bool) void,
@@ -156,7 +184,7 @@ pub const KeyboardStateListener = struct {
 pub const KeyboardEvent = struct {
     device_id: DeviceId,
     key_code: u32,
-    state: wl.Keyboard.KeyState,
+    state: KeyState,
     seat_level: bool,
     modifiers: u32,
     keysyms: []const u32,
@@ -390,7 +418,7 @@ pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
     io: std.Io,
-    event_loop: *wl.EventLoop,
+    event_loop: FdWatch.Loop,
     session: *Session,
     size: render.Size,
     listener: Listener,
@@ -406,7 +434,8 @@ pub fn init(
             .deactivated = handleSessionDeactivated,
             .failed = handleSessionFailed,
         },
-        .event_source = null,
+        .event_watch = undefined,
+        .event_watch_initialized = false,
         .context = undefined,
         .listener = listener,
         .devices = .empty,
@@ -466,14 +495,14 @@ pub fn init(
 
     const fd = c.libinput_get_fd(self.context);
     if (fd < 0) return error.GetLibinputFdFailed;
-    self.event_source = try event_loop.addFd(
-        *Self,
+    try self.event_watch.init(
+        event_loop,
         fd,
-        .{ .readable = true },
-        handleEvent,
         self,
+        handleEvent,
     );
-    errdefer self.event_source.?.remove();
+    self.event_watch_initialized = true;
+    errdefer self.event_watch.deinit();
     try session.addListener(&self.session_listener);
     self.initialized = true;
     log.info(
@@ -488,10 +517,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.keyboard_event_listener == null);
     self.initialized = false;
     self.session.removeListener(&self.session_listener);
-    if (self.event_source) |source| {
-        source.remove();
-        self.event_source = null;
-    }
+    self.event_watch.deinit();
     self.clearCapabilities();
     _ = c.libinput_unref(self.context);
     std.debug.assert(self.devices.count() == 0);
@@ -1631,7 +1657,7 @@ fn pointerButton(self: *Self, event: *c.struct_libinput_event_pointer) void {
 fn pointerScroll(
     self: *Self,
     event: *c.struct_libinput_event_pointer,
-    source: wl.Pointer.AxisSource,
+    source: AxisSource,
 ) void {
     const device = self.eventInputDevice(c.libinput_event_pointer_get_base_event(event).?, .pointer) orelse return;
     self.listener.pointer_axis_source(self.listener.context, device.info.id, source);
@@ -1644,9 +1670,9 @@ fn pointerScrollAxis(
     self: *Self,
     device: *const InputDevice,
     event: *c.struct_libinput_event_pointer,
-    source: wl.Pointer.AxisSource,
+    source: AxisSource,
     libinput_axis: c.enum_libinput_pointer_axis,
-    axis: wl.Pointer.Axis,
+    axis: Axis,
 ) void {
     if (c.libinput_event_pointer_has_axis(event, libinput_axis) == 0) return;
     const time = c.libinput_event_pointer_get_time(event);
@@ -1661,7 +1687,7 @@ fn pointerScrollAxis(
         device.info.id,
         time,
         axis,
-        @enumFromInt(saturatingI32(value * 256)),
+        saturatingI32(value * 256),
     );
     if (source == .wheel) {
         const value_120 = c.libinput_event_pointer_get_scroll_value_v120(event, libinput_axis) * factor;
@@ -2164,20 +2190,17 @@ fn fail(self: *Self, err: anyerror) void {
     if (self.failed) return;
     self.failed = true;
     log.err("native input failed: {t}", .{err});
-    if (self.event_source) |source| {
-        source.remove();
-        self.event_source = null;
-    }
+    if (self.event_watch_initialized) self.event_watch.remove();
     if (self.initialized) self.listener.close(self.listener.context);
 }
 
-fn handleEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
-    if (mask.hangup or mask.@"error") {
+fn handleEvent(context: *anyopaque, events: FdWatch.Events) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (events.hangup or events.error_occurred) {
         self.fail(error.InputDisconnected);
-    } else if (mask.readable) {
+    } else if (events.readable) {
         self.dispatchEvents() catch |err| self.fail(err);
     }
-    return 0;
 }
 
 fn handleSessionActivated(context: *anyopaque) void {

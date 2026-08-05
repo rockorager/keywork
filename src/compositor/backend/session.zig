@@ -3,18 +3,17 @@
 const Self = @This();
 
 const std = @import("std");
-const wayland = @import("wayland");
+const FdWatch = @import("FdWatch.zig");
 
 const c = @cImport({
     @cInclude("libseat.h");
 });
-const wl = wayland.server.wl;
 
 const log = std.log.scoped(.session);
 
 allocator: std.mem.Allocator,
 seat: *c.struct_libseat,
-event_source: *wl.EventSource,
+event_watch: FdWatch,
 listeners: std.ArrayList(*Listener),
 device_count: usize,
 active: bool,
@@ -43,12 +42,12 @@ const seat_listener: c.struct_libseat_seat_listener = .{
 pub fn init(
     self: *Self,
     allocator: std.mem.Allocator,
-    event_loop: *wl.EventLoop,
+    event_loop: FdWatch.Loop,
 ) !void {
     self.* = .{
         .allocator = allocator,
         .seat = undefined,
-        .event_source = undefined,
+        .event_watch = undefined,
         .listeners = .empty,
         .device_count = 0,
         .active = false,
@@ -67,19 +66,18 @@ pub fn init(
     }
     if (self.failed) return error.DispatchFailed;
     log.info("acquired seat {s}", .{self.name()});
-    self.event_source = try event_loop.addFd(
-        *Self,
+    try self.event_watch.init(
+        event_loop,
         fd,
-        .{ .readable = true },
-        handleEvent,
         self,
+        handleEvent,
     );
 }
 
 pub fn deinit(self: *Self) void {
     std.debug.assert(self.device_count == 0);
     std.debug.assert(self.listeners.items.len == 0);
-    self.event_source.remove();
+    self.event_watch.deinit();
     if (c.libseat_close_seat(self.seat) < 0) {
         log.err("failed to close libseat session", .{});
     }
@@ -141,13 +139,13 @@ pub fn closeDevice(self: *Self, device: Device) !void {
     if (c.libseat_close_device(self.seat, device.id) < 0) return error.CloseDeviceFailed;
 }
 
-fn handleEvent(_: c_int, mask: wl.EventMask, self: *Self) c_int {
-    if (mask.hangup or mask.@"error") {
+fn handleEvent(context: *anyopaque, events: FdWatch.Events) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (events.hangup or events.error_occurred) {
         self.fail();
-        return 0;
+        return;
     }
-    if (mask.readable and c.libseat_dispatch(self.seat, 0) < 0) self.fail();
-    return 0;
+    if (events.readable and c.libseat_dispatch(self.seat, 0) < 0) self.fail();
 }
 
 fn handleEnable(_: ?*c.struct_libseat, data: ?*anyopaque) callconv(.c) void {
@@ -204,7 +202,7 @@ test "active sessions immediately notify new listeners" {
     var session: Self = .{
         .allocator = std.testing.allocator,
         .seat = undefined,
-        .event_source = undefined,
+        .event_watch = undefined,
         .listeners = .empty,
         .device_count = 0,
         .active = true,

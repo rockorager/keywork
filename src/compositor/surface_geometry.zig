@@ -1,10 +1,7 @@
 //! Pure buffer transform, scale, and viewporter geometry policy for surfaces.
 
 const std = @import("std");
-const wayland = @import("wayland");
-const render = @import("../render/types.zig");
-
-const wl = wayland.server.wl;
+const render = @import("render/types.zig");
 
 pub const ViewportSource = struct {
     x: i32,
@@ -29,29 +26,18 @@ pub const Error = error{
     ViewportOutOfBuffer,
 };
 
-pub fn validTransform(transform: wl.Output.Transform) bool {
+pub fn validTransform(transform: i32) bool {
+    return transform >= 0 and transform <= 7;
+}
+
+fn swapsAxes(transform: i32) bool {
     return switch (transform) {
-        .normal,
-        .@"90",
-        .@"180",
-        .@"270",
-        .flipped,
-        .flipped_90,
-        .flipped_180,
-        .flipped_270,
-        => true,
+        1, 3, 5, 7 => true,
         else => false,
     };
 }
 
-fn swapsAxes(transform: wl.Output.Transform) bool {
-    return switch (transform) {
-        .@"90", .@"270", .flipped_90, .flipped_270 => true,
-        else => false,
-    };
-}
-
-fn transformedSize(buffer_size: render.Size, transform: wl.Output.Transform) render.Size {
+fn transformedSize(buffer_size: render.Size, transform: i32) render.Size {
     return if (swapsAxes(transform))
         .{ .width = buffer_size.height, .height = buffer_size.width }
     else
@@ -61,7 +47,7 @@ fn transformedSize(buffer_size: render.Size, transform: wl.Output.Transform) ren
 fn logicalSize(
     buffer_size: render.Size,
     scale: i32,
-    transform: wl.Output.Transform,
+    transform: i32,
     allow_non_divisible_scale: bool,
 ) error{InvalidSize}!render.Size {
     if (scale <= 0 or !validTransform(transform)) return error.InvalidSize;
@@ -87,7 +73,7 @@ fn logicalSize(
 pub fn calculate(
     buffer_size: render.Size,
     scale: i32,
-    transform: wl.Output.Transform,
+    transform: i32,
     viewport: ViewportState,
     allow_non_divisible_scale: bool,
 ) Error!Geometry {
@@ -140,15 +126,15 @@ pub fn calculate(
 test "logical surface size accounts for scale and transform" {
     try std.testing.expectEqual(
         render.Size{ .width = 100, .height = 50 },
-        try logicalSize(.{ .width = 200, .height = 100 }, 2, .normal, false),
+        try logicalSize(.{ .width = 200, .height = 100 }, 2, 0, false),
     );
     try std.testing.expectEqual(
         render.Size{ .width = 50, .height = 100 },
-        try logicalSize(.{ .width = 200, .height = 100 }, 2, .@"90", false),
+        try logicalSize(.{ .width = 200, .height = 100 }, 2, 1, false),
     );
     try std.testing.expectError(
         error.InvalidSize,
-        logicalSize(.{ .width = 201, .height = 100 }, 2, .normal, false),
+        logicalSize(.{ .width = 201, .height = 100 }, 2, 0, false),
     );
 }
 
@@ -156,7 +142,7 @@ test "cursor compatibility covers non-divisible buffer scale" {
     const geometry = try calculate(
         .{ .width = 31, .height = 17 },
         2,
-        .normal,
+        0,
         .{},
         true,
     );
@@ -169,7 +155,7 @@ test "cursor compatibility covers non-divisible buffer scale" {
         calculate(
             .{ .width = 31, .height = 17 },
             2,
-            .normal,
+            0,
             .{
                 .source = .{ .x = 0, .y = 0, .width = 16 * 256, .height = 8 * 256 },
                 .destination = .{ .width = 16, .height = 8 },
@@ -183,7 +169,7 @@ test "viewport destination defines logical surface size" {
     const geometry = try calculate(
         .{ .width = 1200, .height = 900 },
         1,
-        .normal,
+        0,
         .{ .destination = .{ .width = 800, .height = 600 } },
         false,
     );
@@ -198,7 +184,7 @@ test "viewport source is validated and converted to buffer coordinates" {
     const geometry = try calculate(
         .{ .width = 8, .height = 8 },
         2,
-        .normal,
+        0,
         .{
             .source = .{ .x = 256, .y = 512, .width = 512, .height = 256 },
             .destination = .{ .width = 4, .height = 2 },
@@ -218,7 +204,7 @@ test "viewport source is validated and converted to buffer coordinates" {
         calculate(
             .{ .width = 8, .height = 8 },
             2,
-            .normal,
+            0,
             .{ .source = .{ .x = 768, .y = 0, .width = 512, .height = 256 } },
             false,
         ),
@@ -228,7 +214,7 @@ test "viewport source is validated and converted to buffer coordinates" {
         calculate(
             .{ .width = 8, .height = 8 },
             2,
-            .normal,
+            0,
             .{ .source = .{ .x = 0, .y = 0, .width = 128, .height = 256 } },
             false,
         ),

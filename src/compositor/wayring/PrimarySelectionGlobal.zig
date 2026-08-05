@@ -1,0 +1,1313 @@
+//! Compositor-owned primary-selection policy for native Wayring clients.
+//!
+//! Selection metadata follows keyboard focus. Payload file descriptors pass
+//! directly between clients; the compositor never reads or writes their data.
+
+const PrimarySelectionGlobal = @This();
+
+const std = @import("std");
+const linux = std.os.linux;
+const wayring = @import("wayring");
+const generated = @import("wayring-protocols");
+const Server = @import("wayring-server");
+const SeatGlobal = @import("SeatGlobal.zig");
+const SelectionSource = @import("SelectionSource.zig");
+
+const advertised_version: u32 = 1;
+
+allocator: std.mem.Allocator,
+server: *Server,
+seat: *SeatGlobal,
+global_name: u32,
+sources: std.ArrayList(*Source) = .empty,
+devices: std.ArrayList(*Device) = .empty,
+offers: std.ArrayList(*Offer) = .empty,
+selection: ?*Source = null,
+external_selection: ?*SelectionSource = null,
+selection_generation: u64 = 0,
+listeners: std.ArrayList(SelectionSource.Listener) = .empty,
+selection_serial: ?u32 = null,
+focused_client: ?*Server.Client = null,
+
+const Source = struct {
+    owner: *PrimarySelectionGlobal,
+    client: *Server.Client,
+    resource: wayring.ObjectHandle,
+    mime_types: std.ArrayList([]u8) = .empty,
+    cancelled: bool = false,
+
+    fn deinit(self: *Source) void {
+        for (self.mime_types.items) |mime_type| self.owner.allocator.free(mime_type);
+        self.mime_types.deinit(self.owner.allocator);
+        self.owner.allocator.destroy(self);
+    }
+
+    fn hasMime(self: *const Source, mime_type: []const u8) bool {
+        for (self.mime_types.items) |offered| {
+            if (std.mem.eql(u8, offered, mime_type)) return true;
+        }
+        return false;
+    }
+};
+
+const Device = struct {
+    owner: *PrimarySelectionGlobal,
+    client: *Server.Client,
+    resource: wayring.ObjectHandle,
+    inert: bool,
+};
+
+const Offer = struct {
+    owner: *PrimarySelectionGlobal,
+    client: *Server.Client,
+    resource: wayring.ObjectHandle,
+    device: ?*Device,
+    source: ?*Source,
+    generation: u64,
+    valid: bool = true,
+};
+
+pub fn init(
+    self: *PrimarySelectionGlobal,
+    allocator: std.mem.Allocator,
+    server: *Server,
+    seat: *SeatGlobal,
+) !void {
+    self.* = .{
+        .allocator = allocator,
+        .server = server,
+        .seat = seat,
+        .global_name = undefined,
+    };
+    self.global_name = try server.createGlobal(
+        &generated.zwp_primary_selection_device_manager_v1,
+        advertised_version,
+        .{ .context = self, .bind = bind },
+    );
+}
+
+pub fn deinit(self: *PrimarySelectionGlobal) void {
+    std.debug.assert(self.sources.items.len == 0);
+    std.debug.assert(self.devices.items.len == 0);
+    std.debug.assert(self.offers.items.len == 0);
+    std.debug.assert(self.selection == null);
+    self.server.removeGlobal(self.global_name) catch unreachable;
+    if (self.focused_client) |client| client.unreference();
+    self.offers.deinit(self.allocator);
+    self.devices.deinit(self.allocator);
+    self.sources.deinit(self.allocator);
+    self.listeners.deinit(self.allocator);
+    self.* = undefined;
+}
+
+/// Updates keyboard focus, invalidating old offers and notifying both clients.
+/// The retained reference keeps focus teardown safe after transport shutdown.
+pub fn setKeyboardFocus(
+    self: *PrimarySelectionGlobal,
+    client: ?*Server.Client,
+) !void {
+    if (self.focused_client == client) return;
+    if (client) |focused| try focused.reference();
+    self.invalidateOffers();
+    const old_client = self.focused_client;
+    self.focused_client = client;
+    if (old_client) |old| {
+        if (old.state == .active) self.sendNullSelectionToClient(old) catch {};
+        old.unreference();
+    }
+    if (client) |focused| self.sendSelectionToClient(focused) catch {};
+}
+
+fn bind(
+    context: *anyopaque,
+    client: *Server.Client,
+    id: u32,
+    version: u32,
+) !void {
+    const self: *PrimarySelectionGlobal = @ptrCast(@alignCast(context));
+    _ = client.createResource(
+        id,
+        &generated.zwp_primary_selection_device_manager_v1,
+        version,
+        .{ .context = self, .dispatch = dispatchManager },
+    ) catch return client.postNoMemory();
+}
+
+fn dispatchManager(
+    context: *anyopaque,
+    client: *Server.Client,
+    resource: wayring.ObjectHandle,
+    message: *wayring.Message,
+) !void {
+    const self: *PrimarySelectionGlobal = @ptrCast(@alignCast(context));
+    switch (try generated.zwp_primary_selection_device_manager_v1_types.decodeRequest(
+        &client.connection,
+        resource,
+        message,
+    )) {
+        .create_source => |request| try self.createSource(
+            client,
+            resource,
+            request.id,
+        ),
+        .get_device => |request| try self.createDevice(
+            client,
+            resource,
+            request.id,
+            !self.seat.ownsResource(client, request.seat),
+        ),
+        .destroy => {},
+    }
+}
+
+fn createSource(
+    self: *PrimarySelectionGlobal,
+    client: *Server.Client,
+    manager_resource: wayring.ObjectHandle,
+    id: u32,
+) !void {
+    const source = self.allocator.create(Source) catch
+        return client.postNoMemory();
+    errdefer self.allocator.destroy(source);
+    self.sources.ensureUnusedCapacity(self.allocator, 1) catch
+        return client.postNoMemory();
+    source.* = .{
+        .owner = self,
+        .client = client,
+        .resource = undefined,
+    };
+    const version = @min(
+        try client.resourceVersion(
+            manager_resource,
+            &generated.zwp_primary_selection_device_manager_v1,
+        ),
+        generated.zwp_primary_selection_source_v1.version,
+    );
+    source.resource = client.createResource(
+        id,
+        &generated.zwp_primary_selection_source_v1,
+        version,
+        .{
+            .context = source,
+            .dispatch = dispatchSource,
+            .destroy = destroySource,
+        },
+    ) catch return client.postNoMemory();
+    self.sources.appendAssumeCapacity(source);
+}
+
+fn createDevice(
+    self: *PrimarySelectionGlobal,
+    client: *Server.Client,
+    manager_resource: wayring.ObjectHandle,
+    id: u32,
+    inert: bool,
+) !void {
+    const device = self.allocator.create(Device) catch
+        return client.postNoMemory();
+    var registered = false;
+    errdefer if (!registered) self.allocator.destroy(device);
+    self.devices.ensureUnusedCapacity(self.allocator, 1) catch
+        return client.postNoMemory();
+    device.* = .{
+        .owner = self,
+        .client = client,
+        .resource = undefined,
+        .inert = inert,
+    };
+    const version = @min(
+        try client.resourceVersion(
+            manager_resource,
+            &generated.zwp_primary_selection_device_manager_v1,
+        ),
+        generated.zwp_primary_selection_device_v1.version,
+    );
+    device.resource = client.createResource(
+        id,
+        &generated.zwp_primary_selection_device_v1,
+        version,
+        .{
+            .context = device,
+            .dispatch = dispatchDevice,
+            .destroy = destroyDevice,
+        },
+    ) catch return client.postNoMemory();
+    self.devices.appendAssumeCapacity(device);
+    registered = true;
+    if (!inert and self.focused_client == client)
+        try self.sendSelectionToDevice(device);
+}
+
+fn dispatchSource(
+    context: *anyopaque,
+    client: *Server.Client,
+    resource: wayring.ObjectHandle,
+    message: *wayring.Message,
+) !void {
+    const source: *Source = @ptrCast(@alignCast(context));
+    switch (try generated.zwp_primary_selection_source_v1_types.decodeRequest(
+        &client.connection,
+        resource,
+        message,
+    )) {
+        .offer => |request| try source.owner.offerMime(
+            source,
+            request.mime_type,
+        ),
+        .destroy => {},
+    }
+}
+
+fn offerMime(
+    self: *PrimarySelectionGlobal,
+    source: *Source,
+    mime_type: []const u8,
+) !void {
+    if (source.cancelled or source.hasMime(mime_type)) return;
+    const copy = self.allocator.dupe(u8, mime_type) catch
+        return source.client.postNoMemory();
+    source.mime_types.append(self.allocator, copy) catch {
+        self.allocator.free(copy);
+        return source.client.postNoMemory();
+    };
+    if (self.selection == source) for (self.listeners.items) |listener|
+        listener.offered(listener.context, copy);
+    for (self.offers.items) |offer| {
+        if (offer.source != source) continue;
+        if (offer.client.state != .active) continue;
+        generated.zwp_primary_selection_offer_v1_types.events.offer(
+            &offer.client.connection,
+            offer.resource,
+            copy,
+        ) catch {
+            if (offer.client == source.client)
+                return offer.client.postNoMemory();
+            offer.client.postNoMemory() catch {};
+        };
+    }
+}
+
+fn dispatchDevice(
+    context: *anyopaque,
+    client: *Server.Client,
+    resource: wayring.ObjectHandle,
+    message: *wayring.Message,
+) !void {
+    const device: *Device = @ptrCast(@alignCast(context));
+    switch (try generated.zwp_primary_selection_device_v1_types.decodeRequest(
+        &client.connection,
+        resource,
+        message,
+    )) {
+        .set_selection => |request| {
+            if (!device.inert) try device.owner.claimSelection(
+                device,
+                request.source,
+                request.serial,
+            );
+        },
+        .destroy => {},
+    }
+}
+
+fn claimSelection(
+    self: *PrimarySelectionGlobal,
+    device: *Device,
+    source_id: ?u32,
+    serial: u32,
+) !void {
+    if (!self.seat.acceptsSelectionSerial(device.client, serial)) return;
+    const source: ?*Source = if (source_id) |id| source: {
+        const object = device.client.connection.object(id) orelse return;
+        const context = try device.client.resourceContext(
+            .{ .id = id, .generation = object.generation },
+            &generated.zwp_primary_selection_source_v1,
+        );
+        const candidate: *Source = @ptrCast(@alignCast(context));
+        if (candidate.owner != self or candidate.client != device.client)
+            return;
+        if (candidate.cancelled) return;
+        break :source candidate;
+    } else null;
+    try self.setSelection(source, serial, device.client);
+}
+
+fn setSelection(
+    self: *PrimarySelectionGlobal,
+    source: ?*Source,
+    serial: u32,
+    requester: *Server.Client,
+) !void {
+    if (self.selection_serial) |current| {
+        if (serialIsOlder(serial, current)) return;
+    }
+    if (self.selection == source and self.external_selection == null) {
+        self.selection_serial = serial;
+        return;
+    }
+    try self.replaceSelection(source, serial, true, requester);
+}
+
+fn replaceSelection(
+    self: *PrimarySelectionGlobal,
+    source: ?*Source,
+    serial: u32,
+    cancel_old: bool,
+    requester: ?*Server.Client,
+) !void {
+    const old_source = self.selection;
+    const old_external = self.external_selection;
+    self.selection = source;
+    self.external_selection = null;
+    self.selection_serial = serial;
+    self.selection_generation +%= 1;
+    self.invalidateOffers();
+    var requester_error: ?anyerror = null;
+    if (self.focused_client) |client| self.sendSelectionToClient(client) catch |err| {
+        if (client == requester) requester_error = err;
+    };
+    if (cancel_old) if (old_source) |old| self.cancelSource(old) catch |err| {
+        if (old.client == requester and requester_error == null) requester_error = err;
+    };
+    if (cancel_old) if (old_external) |old| old.cancel(old.context) catch {};
+    for (self.listeners.items) |listener| listener.changed(listener.context);
+    if (requester_error) |err| return err;
+}
+
+pub fn addSelectionListener(self: *PrimarySelectionGlobal, listener: SelectionSource.Listener) !void {
+    try self.listeners.append(self.allocator, listener);
+}
+pub fn removeSelectionListener(self: *PrimarySelectionGlobal, context: *anyopaque) void {
+    for (self.listeners.items, 0..) |listener, index| if (listener.context == context) {
+        _ = self.listeners.swapRemove(index);
+        return;
+    };
+}
+pub fn hasSelection(self: *const PrimarySelectionGlobal) bool {
+    return self.selection != null or self.external_selection != null;
+}
+pub fn selectionGeneration(self: *const PrimarySelectionGlobal) u64 {
+    return self.selection_generation;
+}
+pub fn selectionMimeTypes(self: *const PrimarySelectionGlobal) []const []const u8 {
+    if (self.external_selection) |source| return source.mimeTypes();
+    const source = self.selection orelse return &.{};
+    return source.mime_types.items;
+}
+pub fn sendSelection(self: *PrimarySelectionGlobal, mime_type: []const u8, fd: std.posix.fd_t) !void {
+    if (self.external_selection) |source| return source.send(source.context, mime_type, fd);
+    const source = self.selection orelse return error.NoSelection;
+    if (!source.hasMime(mime_type) or source.client.state != .active) return error.InvalidMime;
+    generated.zwp_primary_selection_source_v1_types.events.send(&source.client.connection, source.resource, mime_type, fd) catch return source.client.postNoMemory();
+}
+pub fn setExternalSelection(self: *PrimarySelectionGlobal, source: ?*SelectionSource) void {
+    if (self.external_selection == source and self.selection == null) return;
+    const old_local = self.selection;
+    const old_external = self.external_selection;
+    self.selection = null;
+    self.external_selection = source;
+    self.selection_serial = self.server.nextSerial();
+    self.selection_generation +%= 1;
+    self.invalidateOffers();
+    if (self.focused_client) |client| self.sendSelectionToClient(client) catch {
+        client.postNoMemory() catch {};
+    };
+    if (old_local) |old| self.cancelSource(old) catch {};
+    if (old_external) |old| old.cancel(old.context) catch {};
+    for (self.listeners.items) |listener| listener.changed(listener.context);
+}
+pub fn externalSourceDestroyed(self: *PrimarySelectionGlobal, source: *SelectionSource) void {
+    if (self.external_selection != source) return;
+    self.external_selection = null;
+    self.selection_generation +%= 1;
+    self.invalidateOffers();
+    if (self.focused_client) |client| self.sendSelectionToClient(client) catch {
+        client.postNoMemory() catch {};
+    };
+    for (self.listeners.items) |listener| listener.changed(listener.context);
+}
+
+fn cancelSource(_: *PrimarySelectionGlobal, source: *Source) !void {
+    source.cancelled = true;
+    generated.zwp_primary_selection_source_v1_types.events.cancelled(
+        &source.client.connection,
+        source.resource,
+    ) catch return source.client.postNoMemory();
+}
+
+fn dispatchOffer(
+    context: *anyopaque,
+    client: *Server.Client,
+    resource: wayring.ObjectHandle,
+    message: *wayring.Message,
+) !void {
+    const offer: *Offer = @ptrCast(@alignCast(context));
+    switch (try generated.zwp_primary_selection_offer_v1_types.decodeRequest(
+        &client.connection,
+        resource,
+        message,
+    )) {
+        .receive => |request| try offer.owner.receiveOffer(
+            offer,
+            message,
+            request.mime_type,
+            request.fd,
+        ),
+        .destroy => {},
+    }
+}
+
+fn receiveOffer(
+    _: *PrimarySelectionGlobal,
+    offer: *Offer,
+    message: *wayring.Message,
+    mime_type: []const u8,
+    fd_index: usize,
+) !void {
+    const fd = try message.takeFd(fd_index);
+    var fd_owned = true;
+    defer if (fd_owned) {
+        _ = linux.close(fd);
+    };
+    if (!offer.valid or offer.device == null) return;
+    if (offer.generation != offer.owner.selection_generation) return;
+    if (!offer.owner.hasCurrentMime(mime_type)) return;
+    offer.owner.sendSelection(mime_type, fd) catch return;
+    fd_owned = false;
+}
+
+fn hasCurrentMime(self: *PrimarySelectionGlobal, mime_type: []const u8) bool {
+    for (self.selectionMimeTypes()) |offered| if (std.mem.eql(u8, offered, mime_type)) return true;
+    return false;
+}
+
+fn sendSelectionToClient(
+    self: *PrimarySelectionGlobal,
+    client: *Server.Client,
+) !void {
+    for (self.devices.items) |device| {
+        if (!device.inert and device.client == client)
+            try self.sendSelectionToDevice(device);
+    }
+}
+
+fn sendNullSelectionToClient(
+    self: *PrimarySelectionGlobal,
+    client: *Server.Client,
+) !void {
+    for (self.devices.items) |device| {
+        if (device.inert or device.client != client) continue;
+        generated.zwp_primary_selection_device_v1_types.events.selection(
+            &client.connection,
+            device.resource,
+            null,
+        ) catch return client.postNoMemory();
+    }
+}
+
+fn sendSelectionToDevice(
+    self: *PrimarySelectionGlobal,
+    device: *Device,
+) !void {
+    self.queueSelectionToDevice(device) catch return device.client.postNoMemory();
+}
+
+fn queueSelectionToDevice(
+    self: *PrimarySelectionGlobal,
+    device: *Device,
+) !void {
+    if (!self.hasSelection())
+        return generated.zwp_primary_selection_device_v1_types.events.selection(
+            &device.client.connection,
+            device.resource,
+            null,
+        );
+    const offer = try self.allocator.create(Offer);
+    var registered = false;
+    errdefer if (!registered) self.allocator.destroy(offer);
+    try self.offers.ensureUnusedCapacity(self.allocator, 1);
+    offer.* = .{
+        .owner = self,
+        .client = device.client,
+        .resource = undefined,
+        .device = device,
+        .source = self.selection,
+        .generation = self.selection_generation,
+    };
+    const version = @min(
+        try device.client.resourceVersion(
+            device.resource,
+            &generated.zwp_primary_selection_device_v1,
+        ),
+        generated.zwp_primary_selection_offer_v1.version,
+    );
+    offer.resource = try device.client.createServerResource(
+        &generated.zwp_primary_selection_offer_v1,
+        version,
+        .{
+            .context = offer,
+            .dispatch = dispatchOffer,
+            .destroy = destroyOffer,
+        },
+    );
+    self.offers.appendAssumeCapacity(offer);
+    registered = true;
+    try generated.zwp_primary_selection_device_v1_types.events.data_offer(
+        &device.client.connection,
+        device.resource,
+        offer.resource,
+    );
+    for (self.selectionMimeTypes()) |mime_type|
+        try generated.zwp_primary_selection_offer_v1_types.events.offer(
+            &device.client.connection,
+            offer.resource,
+            mime_type,
+        );
+    try generated.zwp_primary_selection_device_v1_types.events.selection(
+        &device.client.connection,
+        device.resource,
+        offer.resource,
+    );
+}
+
+fn sourceDestroyed(self: *PrimarySelectionGlobal, source: *Source) void {
+    for (self.offers.items) |offer| {
+        if (offer.source != source) continue;
+        offer.source = null;
+        offer.valid = false;
+    }
+    if (self.selection == source) self.replaceSelection(
+        null,
+        self.server.nextSerial(),
+        false,
+        null,
+    ) catch {};
+}
+
+fn deviceDestroyed(self: *PrimarySelectionGlobal, device: *Device) void {
+    for (self.offers.items) |offer| {
+        if (offer.device != device) continue;
+        offer.device = null;
+        offer.source = null;
+        offer.valid = false;
+    }
+}
+
+fn invalidateOffers(self: *PrimarySelectionGlobal) void {
+    for (self.offers.items) |offer| {
+        offer.source = null;
+        offer.valid = false;
+    }
+}
+
+fn destroySource(
+    context: *anyopaque,
+    _: *Server.Client,
+    _: wayring.ObjectHandle,
+) void {
+    const source: *Source = @ptrCast(@alignCast(context));
+    source.owner.sourceDestroyed(source);
+    removeOwned(Source, &source.owner.sources, source);
+    source.deinit();
+}
+
+fn destroyDevice(
+    context: *anyopaque,
+    _: *Server.Client,
+    _: wayring.ObjectHandle,
+) void {
+    const device: *Device = @ptrCast(@alignCast(context));
+    device.owner.deviceDestroyed(device);
+    removeOwned(Device, &device.owner.devices, device);
+    device.owner.allocator.destroy(device);
+}
+
+fn destroyOffer(
+    context: *anyopaque,
+    _: *Server.Client,
+    _: wayring.ObjectHandle,
+) void {
+    const offer: *Offer = @ptrCast(@alignCast(context));
+    removeOwned(Offer, &offer.owner.offers, offer);
+    offer.owner.allocator.destroy(offer);
+}
+
+fn removeOwned(
+    comptime T: type,
+    list: *std.ArrayList(*T),
+    item: *T,
+) void {
+    for (list.items, 0..) |candidate, index| {
+        if (candidate != item) continue;
+        _ = list.orderedRemove(index);
+        return;
+    }
+    unreachable;
+}
+
+fn serialIsOlder(candidate: u32, current: u32) bool {
+    return candidate -% current > std.math.maxInt(u32) / 2;
+}
+
+const TestPeer = struct {
+    connection: wayring.Connection,
+    registry: wayring.ObjectHandle,
+
+    const Globals = struct {
+        compositor: wayring.ObjectHandle,
+        seat: wayring.ObjectHandle,
+        manager: wayring.ObjectHandle,
+        keyboard: wayring.ObjectHandle,
+    };
+
+    fn init(allocator: std.mem.Allocator) !TestPeer {
+        const core = @import("wayring-core");
+        var connection = wayring.Connection.init(
+            allocator,
+            .client,
+            wayring.default_max_frame_size,
+        );
+        errdefer connection.deinit();
+        _ = try core.bootstrapDisplay(&connection);
+        const registry_generation = try core.getRegistry(&connection, 2);
+        return .{
+            .connection = connection,
+            .registry = .{
+                .id = 2,
+                .generation = registry_generation,
+            },
+        };
+    }
+
+    fn deinit(self: *TestPeer) void {
+        self.connection.deinit();
+    }
+
+    fn toServer(self: *TestPeer, client: *Server.Client) !void {
+        try transfer(&self.connection, &client.connection, client);
+    }
+
+    fn fromServer(self: *TestPeer, client: *Server.Client) !void {
+        try transfer(&client.connection, &self.connection, null);
+        try client.outputDrained();
+    }
+
+    fn bindGlobals(self: *TestPeer, client: *Server.Client) !Globals {
+        const core = @import("wayring-core");
+        try self.toServer(client);
+        try self.fromServer(client);
+        var compositor_name: u32 = 0;
+        var compositor_version: u32 = 0;
+        var seat_name: u32 = 0;
+        var seat_version: u32 = 0;
+        var manager_name: u32 = 0;
+        var manager_version: u32 = 0;
+        while (self.connection.popMessage()) |popped| {
+            var message = popped;
+            defer message.deinit();
+            const event = try core.decodeRegistryEvent(&message, self.registry.id);
+            if (event != .global) continue;
+            if (std.mem.eql(u8, event.global.interface, generated.wl_compositor.name)) {
+                compositor_name = event.global.name;
+                compositor_version = event.global.version;
+            } else if (std.mem.eql(u8, event.global.interface, generated.wl_seat.name)) {
+                seat_name = event.global.name;
+                seat_version = event.global.version;
+            } else if (std.mem.eql(
+                u8,
+                event.global.interface,
+                generated.zwp_primary_selection_device_manager_v1.name,
+            )) {
+                manager_name = event.global.name;
+                manager_version = event.global.version;
+            }
+        }
+        try std.testing.expect(compositor_name != 0);
+        try std.testing.expect(seat_name != 0);
+        try std.testing.expect(manager_name != 0);
+        var globals: Globals = .{
+            .compositor = .{
+                .id = 3,
+                .generation = try core.bind(
+                    &self.connection,
+                    self.registry.id,
+                    compositor_name,
+                    generated.wl_compositor.name,
+                    compositor_version,
+                    3,
+                    &generated.wl_compositor,
+                ),
+            },
+            .seat = .{
+                .id = 4,
+                .generation = try core.bind(
+                    &self.connection,
+                    self.registry.id,
+                    seat_name,
+                    generated.wl_seat.name,
+                    seat_version,
+                    4,
+                    &generated.wl_seat,
+                ),
+            },
+            .manager = .{
+                .id = 5,
+                .generation = try core.bind(
+                    &self.connection,
+                    self.registry.id,
+                    manager_name,
+                    generated.zwp_primary_selection_device_manager_v1.name,
+                    manager_version,
+                    5,
+                    &generated.zwp_primary_selection_device_manager_v1,
+                ),
+            },
+            .keyboard = undefined,
+        };
+        globals.keyboard = try generated.wl_seat_types.requests.get_keyboard(
+            &self.connection,
+            globals.seat,
+        );
+        try self.toServer(client);
+        try self.fromServer(client);
+        while (self.connection.popMessage()) |popped| {
+            var message = popped;
+            message.deinit();
+        }
+        return globals;
+    }
+};
+
+fn transfer(
+    sender: *wayring.Connection,
+    receiver: *wayring.Connection,
+    server_client: ?*Server.Client,
+) !void {
+    while (sender.nextBatch()) |batch| {
+        var duplicated: [wayring.max_fds_per_batch]i32 = undefined;
+        var duplicate_count: usize = 0;
+        errdefer {
+            for (duplicated[0..duplicate_count]) |fd| _ = linux.close(fd);
+        }
+        for (batch.fds) |fd| {
+            const result = linux.dup(fd);
+            if (linux.errno(result) != .SUCCESS) return error.DuplicateFdFailed;
+            duplicated[duplicate_count] = @intCast(result);
+            duplicate_count += 1;
+        }
+        const transferred = duplicated[0..duplicate_count];
+        duplicate_count = 0;
+        if (server_client) |client| {
+            try client.receive(batch.bytes, transferred);
+        } else {
+            try receiver.feed(batch.bytes, transferred);
+        }
+        try sender.acknowledge(batch.token, batch.bytes.len);
+    }
+}
+
+fn serverSurface(
+    client: *Server.Client,
+    handle: wayring.ObjectHandle,
+) !*@import("CompositorGlobal.zig").Surface {
+    const object = client.connection.object(handle.id) orelse
+        return error.MissingSurface;
+    return @import("CompositorGlobal.zig").surfaceFor(client, .{
+        .id = handle.id,
+        .generation = object.generation,
+    });
+}
+
+fn drainKeyboardFocusEvents(
+    peer: *TestPeer,
+    client: *Server.Client,
+    keyboard: wayring.ObjectHandle,
+) !void {
+    try peer.fromServer(client);
+    var event_count: usize = 0;
+    while (peer.connection.popMessage()) |popped| {
+        var message = popped;
+        defer message.deinit();
+        if (message.object_id != keyboard.id)
+            return error.UnexpectedPrimarySelectionObject;
+        switch (try generated.wl_keyboard_types.decodeEvent(
+            &peer.connection,
+            keyboard,
+            &message,
+        )) {
+            .enter, .leave => event_count += 1,
+            else => return error.UnexpectedKeyboardEvent,
+        }
+    }
+    try std.testing.expect(event_count > 0);
+}
+
+fn receiveSelectionOffer(
+    peer: *TestPeer,
+    device: wayring.ObjectHandle,
+    expected_mimes: []const []const u8,
+) !wayring.ObjectHandle {
+    var data_offer_message = peer.connection.popMessage() orelse
+        return error.MissingDataOffer;
+    defer data_offer_message.deinit();
+    const data_offer_event = try generated.zwp_primary_selection_device_v1_types.decodeEvent(
+        &peer.connection,
+        device,
+        &data_offer_message,
+    );
+    const id = switch (data_offer_event) {
+        .data_offer => |event| event.offer,
+        else => return error.UnexpectedPrimarySelectionDeviceEvent,
+    };
+    const offer: wayring.ObjectHandle = .{
+        .id = id,
+        .generation = try peer.connection.registerObject(
+            id,
+            &generated.zwp_primary_selection_offer_v1,
+            1,
+        ),
+    };
+    try peer.connection.resumeParsing();
+    for (expected_mimes) |expected| {
+        var offer_message = peer.connection.popMessage() orelse
+            return error.MissingMimeOffer;
+        defer offer_message.deinit();
+        if (offer_message.object_id != offer.id)
+            return error.UnexpectedPrimarySelectionObject;
+        const event = try generated.zwp_primary_selection_offer_v1_types.decodeEvent(
+            &peer.connection,
+            offer,
+            &offer_message,
+        );
+        switch (event) {
+            .offer => |mime| try std.testing.expectEqualStrings(
+                expected,
+                mime.mime_type,
+            ),
+        }
+    }
+    var selection_message = peer.connection.popMessage() orelse
+        return error.MissingSelection;
+    defer selection_message.deinit();
+    const selection_event = try generated.zwp_primary_selection_device_v1_types.decodeEvent(
+        &peer.connection,
+        device,
+        &selection_message,
+    );
+    switch (selection_event) {
+        .selection => |selection| try std.testing.expectEqual(
+            offer.id,
+            selection.id.?,
+        ),
+        else => return error.UnexpectedPrimarySelectionDeviceEvent,
+    }
+    return offer;
+}
+
+fn expectNullSelection(
+    peer: *TestPeer,
+    device: wayring.ObjectHandle,
+) !void {
+    var message = peer.connection.popMessage() orelse
+        return error.MissingSelection;
+    defer message.deinit();
+    const event = try generated.zwp_primary_selection_device_v1_types.decodeEvent(
+        &peer.connection,
+        device,
+        &message,
+    );
+    switch (event) {
+        .selection => |selection| try std.testing.expect(selection.id == null),
+        else => return error.UnexpectedPrimarySelectionDeviceEvent,
+    }
+}
+
+fn expectCancelled(
+    peer: *TestPeer,
+    source: wayring.ObjectHandle,
+) !void {
+    var message = peer.connection.popMessage() orelse
+        return error.MissingCancellation;
+    defer message.deinit();
+    if (message.object_id != source.id)
+        return error.UnexpectedPrimarySelectionObject;
+    const event = try generated.zwp_primary_selection_source_v1_types.decodeEvent(
+        &peer.connection,
+        source,
+        &message,
+    );
+    if (event != .cancelled) return error.UnexpectedPrimarySelectionSourceEvent;
+}
+
+test "native primary selection follows focus and relays transfer FDs" {
+    const CompositorGlobal = @import("CompositorGlobal.zig");
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator);
+    defer server.deinit();
+    var compositor: CompositorGlobal = undefined;
+    try compositor.init(allocator, &server);
+    defer compositor.deinit();
+    var seat: SeatGlobal = undefined;
+    try seat.init(
+        allocator,
+        &server,
+        "default",
+        SeatGlobal.Capability.keyboard,
+        null,
+    );
+    defer seat.deinit();
+    var primary_selection: PrimarySelectionGlobal = undefined;
+    try primary_selection.init(allocator, &server, &seat);
+    defer primary_selection.deinit();
+
+    const sender_client = try server.createClient();
+    defer server.destroyClient(sender_client) catch unreachable;
+    const receiver_client = try server.createClient();
+    defer server.destroyClient(receiver_client) catch unreachable;
+    var sender = try TestPeer.init(allocator);
+    defer sender.deinit();
+    var receiver = try TestPeer.init(allocator);
+    defer receiver.deinit();
+    const sender_globals = try sender.bindGlobals(sender_client);
+    const receiver_globals = try receiver.bindGlobals(receiver_client);
+
+    const sender_surface_handle = try generated.wl_compositor_types.requests.create_surface(
+        &sender.connection,
+        sender_globals.compositor,
+    );
+    const receiver_surface_handle = try generated.wl_compositor_types.requests.create_surface(
+        &receiver.connection,
+        receiver_globals.compositor,
+    );
+    const foreign_seat = try sender.connection.allocateObject(
+        &generated.wl_seat,
+        4,
+    );
+    _ = try sender_client.createResource(
+        foreign_seat.id,
+        &generated.wl_seat,
+        4,
+        .{ .context = &primary_selection },
+    );
+    const inert_device = try generated.zwp_primary_selection_device_manager_v1_types.requests.get_device(
+        &sender.connection,
+        sender_globals.manager,
+        foreign_seat,
+    );
+    const sender_device = try generated.zwp_primary_selection_device_manager_v1_types.requests.get_device(
+        &sender.connection,
+        sender_globals.manager,
+        sender_globals.seat,
+    );
+    const receiver_device = try generated.zwp_primary_selection_device_manager_v1_types.requests.get_device(
+        &receiver.connection,
+        receiver_globals.manager,
+        receiver_globals.seat,
+    );
+    try sender.toServer(sender_client);
+    try receiver.toServer(receiver_client);
+    const sender_surface = try serverSurface(sender_client, sender_surface_handle);
+    const receiver_surface = try serverSurface(receiver_client, receiver_surface_handle);
+
+    const source_one = try generated.zwp_primary_selection_device_manager_v1_types.requests.create_source(
+        &sender.connection,
+        sender_globals.manager,
+    );
+    try generated.zwp_primary_selection_source_v1_types.requests.offer(
+        &sender.connection,
+        source_one,
+        "text/plain",
+    );
+    try generated.zwp_primary_selection_source_v1_types.requests.offer(
+        &sender.connection,
+        source_one,
+        "text/plain",
+    );
+    const first_serial = try seat.keyboardEnter(sender_surface, &.{});
+    try drainKeyboardFocusEvents(
+        &sender,
+        sender_client,
+        sender_globals.keyboard,
+    );
+    try generated.zwp_primary_selection_device_v1_types.requests.set_selection(
+        &sender.connection,
+        inert_device,
+        source_one,
+        first_serial,
+    );
+    try generated.zwp_primary_selection_device_v1_types.requests.set_selection(
+        &sender.connection,
+        sender_device,
+        source_one,
+        first_serial,
+    );
+    try sender.toServer(sender_client);
+    try std.testing.expectEqual(
+        source_one.id,
+        primary_selection.selection.?.resource.id,
+    );
+
+    try primary_selection.setKeyboardFocus(receiver_client);
+    try receiver.fromServer(receiver_client);
+    const first_offer = try receiveSelectionOffer(
+        &receiver,
+        receiver_device,
+        &.{"text/plain"},
+    );
+    try std.testing.expect(receiver.connection.popMessage() == null);
+
+    try generated.zwp_primary_selection_source_v1_types.requests.offer(
+        &sender.connection,
+        source_one,
+        "text/html",
+    );
+    try sender.toServer(sender_client);
+    try receiver.fromServer(receiver_client);
+    var late_mime_message = receiver.connection.popMessage() orelse
+        return error.MissingMimeOffer;
+    defer late_mime_message.deinit();
+    const late_mime = try generated.zwp_primary_selection_offer_v1_types.decodeEvent(
+        &receiver.connection,
+        first_offer,
+        &late_mime_message,
+    );
+    switch (late_mime) {
+        .offer => |event| try std.testing.expectEqualStrings(
+            "text/html",
+            event.mime_type,
+        ),
+    }
+
+    var pipe: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })) != .SUCCESS)
+        return error.PipeFailed;
+    defer _ = linux.close(pipe[0]);
+    var write_owned = true;
+    defer if (write_owned) {
+        _ = linux.close(pipe[1]);
+    };
+    try generated.zwp_primary_selection_offer_v1_types.requests.receive(
+        &receiver.connection,
+        first_offer,
+        "text/plain",
+        pipe[1],
+    );
+    write_owned = false;
+    try receiver.toServer(receiver_client);
+    try sender.fromServer(sender_client);
+    var send_message = sender.connection.popMessage() orelse
+        return error.MissingPrimarySelectionSend;
+    defer send_message.deinit();
+    const send_event = try generated.zwp_primary_selection_source_v1_types.decodeEvent(
+        &sender.connection,
+        source_one,
+        &send_message,
+    );
+    const transfer_fd = switch (send_event) {
+        .send => |event| transfer_fd: {
+            try std.testing.expectEqualStrings("text/plain", event.mime_type);
+            break :transfer_fd try send_message.takeFd(event.fd);
+        },
+        else => return error.UnexpectedPrimarySelectionSourceEvent,
+    };
+    const payload = "native primary selection";
+    const written = linux.write(transfer_fd, payload.ptr, payload.len);
+    if (linux.errno(written) != .SUCCESS) return error.WriteFailed;
+    try std.testing.expectEqual(payload.len, written);
+    _ = linux.close(transfer_fd);
+    var received: [32]u8 = undefined;
+    const received_len = linux.read(pipe[0], &received, received.len);
+    if (linux.errno(received_len) != .SUCCESS) return error.ReadFailed;
+    try std.testing.expectEqualStrings(payload, received[0..received_len]);
+
+    // Losing focus invalidates the old offer without changing the selection
+    // generation. Receiving through it must close the FD without relaying.
+    try primary_selection.setKeyboardFocus(null);
+    try receiver.fromServer(receiver_client);
+    try expectNullSelection(&receiver, receiver_device);
+    var invalidated_pipe: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(
+        &invalidated_pipe,
+        .{ .CLOEXEC = true },
+    )) != .SUCCESS) return error.PipeFailed;
+    defer _ = linux.close(invalidated_pipe[0]);
+    var invalidated_write_owned = true;
+    defer if (invalidated_write_owned) {
+        _ = linux.close(invalidated_pipe[1]);
+    };
+    try generated.zwp_primary_selection_offer_v1_types.requests.receive(
+        &receiver.connection,
+        first_offer,
+        "text/plain",
+        invalidated_pipe[1],
+    );
+    invalidated_write_owned = false;
+    try receiver.toServer(receiver_client);
+    try sender.fromServer(sender_client);
+    try std.testing.expect(sender.connection.popMessage() == null);
+    const invalidated_len = linux.read(
+        invalidated_pipe[0],
+        &received,
+        received.len,
+    );
+    if (linux.errno(invalidated_len) != .SUCCESS) return error.ReadFailed;
+    try std.testing.expectEqual(@as(usize, 0), invalidated_len);
+    try primary_selection.setKeyboardFocus(receiver_client);
+    try receiver.fromServer(receiver_client);
+    _ = try receiveSelectionOffer(
+        &receiver,
+        receiver_device,
+        &.{ "text/plain", "text/html" },
+    );
+
+    const source_two = try generated.zwp_primary_selection_device_manager_v1_types.requests.create_source(
+        &sender.connection,
+        sender_globals.manager,
+    );
+    try generated.zwp_primary_selection_source_v1_types.requests.offer(
+        &sender.connection,
+        source_two,
+        "UTF8_STRING",
+    );
+    const foreign_serial = try seat.keyboardEnter(receiver_surface, &.{});
+    try drainKeyboardFocusEvents(
+        &sender,
+        sender_client,
+        sender_globals.keyboard,
+    );
+    try drainKeyboardFocusEvents(
+        &receiver,
+        receiver_client,
+        receiver_globals.keyboard,
+    );
+    try generated.zwp_primary_selection_device_v1_types.requests.set_selection(
+        &sender.connection,
+        sender_device,
+        source_two,
+        foreign_serial,
+    );
+    try sender.toServer(sender_client);
+    try std.testing.expectEqual(
+        source_one.id,
+        primary_selection.selection.?.resource.id,
+    );
+    const second_serial = try seat.keyboardEnter(sender_surface, &.{});
+    try drainKeyboardFocusEvents(
+        &receiver,
+        receiver_client,
+        receiver_globals.keyboard,
+    );
+    try drainKeyboardFocusEvents(
+        &sender,
+        sender_client,
+        sender_globals.keyboard,
+    );
+    try generated.zwp_primary_selection_device_v1_types.requests.set_selection(
+        &sender.connection,
+        sender_device,
+        source_two,
+        second_serial,
+    );
+    try sender.toServer(sender_client);
+    try sender.fromServer(sender_client);
+    try expectCancelled(&sender, source_one);
+    try receiver.fromServer(receiver_client);
+    _ = try receiveSelectionOffer(
+        &receiver,
+        receiver_device,
+        &.{"UTF8_STRING"},
+    );
+
+    try primary_selection.setKeyboardFocus(sender_client);
+    try receiver.fromServer(receiver_client);
+    try expectNullSelection(&receiver, receiver_device);
+    try sender.fromServer(sender_client);
+    _ = try receiveSelectionOffer(
+        &sender,
+        sender_device,
+        &.{"UTF8_STRING"},
+    );
+
+    try generated.zwp_primary_selection_source_v1_types.requests.destroy(
+        &sender.connection,
+        source_two,
+    );
+    try sender.toServer(sender_client);
+    try sender.fromServer(sender_client);
+    try expectNullSelection(&sender, sender_device);
+    try std.testing.expect(primary_selection.selection == null);
+    const cleared_serial = primary_selection.selection_serial.?;
+    while (sender.connection.popMessage()) |popped| {
+        var message = popped;
+        message.deinit();
+    }
+
+    const stale_source = try generated.zwp_primary_selection_device_manager_v1_types.requests.create_source(
+        &sender.connection,
+        sender_globals.manager,
+    );
+    try generated.zwp_primary_selection_source_v1_types.requests.offer(
+        &sender.connection,
+        stale_source,
+        "application/stale",
+    );
+    try generated.zwp_primary_selection_device_v1_types.requests.set_selection(
+        &sender.connection,
+        sender_device,
+        stale_source,
+        first_serial,
+    );
+    try generated.zwp_primary_selection_device_v1_types.requests.set_selection(
+        &sender.connection,
+        sender_device,
+        null,
+        first_serial,
+    );
+    try sender.toServer(sender_client);
+    try std.testing.expect(primary_selection.selection == null);
+    try std.testing.expectEqual(
+        cleared_serial,
+        primary_selection.selection_serial.?,
+    );
+
+    try primary_selection.setKeyboardFocus(null);
+    try sender.fromServer(sender_client);
+    try expectNullSelection(&sender, sender_device);
+
+    const External = struct {
+        cancellations: usize = 0,
+
+        fn mimeTypes(_: *anyopaque) []const []const u8 {
+            return &.{};
+        }
+
+        fn send(_: *anyopaque, _: []const u8, _: std.posix.fd_t) !void {
+            return error.UnexpectedTransfer;
+        }
+
+        fn cancel(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.cancellations += 1;
+        }
+    };
+    var external_context: External = .{};
+    var external: SelectionSource = .{
+        .context = &external_context,
+        .mime_types = External.mimeTypes,
+        .send = External.send,
+        .cancel = External.cancel,
+    };
+    primary_selection.setExternalSelection(&external);
+    const external_generation = primary_selection.selection_generation;
+    try primary_selection.setSelection(
+        null,
+        primary_selection.selection_serial.? +% 1,
+        sender_client,
+    );
+    try std.testing.expect(primary_selection.external_selection == null);
+    try std.testing.expectEqual(
+        external_generation +% 1,
+        primary_selection.selection_generation,
+    );
+    try std.testing.expectEqual(@as(usize, 1), external_context.cancellations);
+}

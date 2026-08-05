@@ -134,7 +134,7 @@ function M.app(options)
 
     return kw.app({
         app_id = "dev.rockorager.keywork.Shell",
-        backend = "vulkan",
+        backend = "wayring",
         start = start,
         stop = stop,
         windows = function(ctx)
