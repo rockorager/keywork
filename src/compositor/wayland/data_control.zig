@@ -364,10 +364,19 @@ const Device = struct {
         if (kind == .regular) {
             const source_id = if (source) |value| value.register(self.state.data_device.?) catch {
                 value.postNoMemory();
+                value.used = false;
                 return;
             } else null;
+            const previous = self.state.regular.source;
             self.state.regular.source = source;
-            self.state.data_device.?.setExternalSelection(source_id) catch unreachable;
+            self.state.data_device.?.setExternalSelection(source_id) catch {
+                self.state.regular.source = previous;
+                if (source) |value| {
+                    value.used = false;
+                    value.postNoMemory();
+                }
+                return;
+            };
         } else {
             self.state.replace(kind, source, true);
         }
@@ -809,8 +818,7 @@ fn primarySelectionChanged(context: *anyopaque) void {
 
 pub fn neutralMimeOffered(self: *Self, source_id: DataDevice.SourceId, mime_type: []const u8) void {
     for (self.seats.items) |state| if (state.data_device != null) {
-        const source = state.regular.source orelse continue;
-        if (source.source_id != null and std.meta.eql(source.source_id.?, source_id)) {
+        if (state.data_device.?.selectionIs(source_id)) {
             state.offered(.regular, @ptrCast(mime_type.ptr));
         }
     };
