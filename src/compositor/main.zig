@@ -14,6 +14,7 @@ const Systemd = @import("systemd.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCursorShape = @import("wayland/WayringCursorShape.zig");
+const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
 const WayringHost = @import("wayland/WayringHost.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
@@ -197,6 +198,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_cursor_shape: WayringCursorShape = undefined;
     var wayring_cursor_shape_initialized = false;
     var wayring_cursor_shape_published = false;
+    var wayring_xdg_decoration: WayringXdgDecoration = undefined;
+    var wayring_xdg_decoration_initialized = false;
+    var wayring_xdg_decoration_published = false;
     var wayring_seat_adapter: WayringSeatAdapter = undefined;
     var wayring_seat_adapter_initialized = false;
     var wayring_seat_published = false;
@@ -207,6 +211,7 @@ pub fn main(init: std.process.Init) !void {
         viewporter: *WayringViewporter,
         fractional_scale: ?*WayringFractionalScale,
         cursor_shape: ?*WayringCursorShape,
+        xdg_decoration: ?*WayringXdgDecoration,
         compositor: *WayringCompositor,
         seat: *WayringSeatAdapter,
 
@@ -219,6 +224,7 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            if (self.xdg_decoration) |decoration| decoration.destroyClientResources(client);
             if (self.cursor_shape) |cursor_shape| cursor_shape.destroyClientResources(client);
             self.seat.destroyClientResources(client);
             if (self.fractional_scale) |fractional_scale|
@@ -236,6 +242,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_xdg_decoration_initialized) {
+            if (wayring_xdg_decoration_published) wayring_xdg_decoration.unpublish();
+            wayring_xdg_decoration.deinit();
+        }
         if (wayring_cursor_shape_initialized) {
             if (wayring_cursor_shape_published) wayring_cursor_shape.unpublish();
             wayring_cursor_shape.deinit();
@@ -319,6 +329,8 @@ pub fn main(init: std.process.Init) !void {
         );
         wayring_xdg_shell.setSeatAdapter(&wayring_seat_adapter);
         wayring_xdg_shell_initialized = true;
+        wayring_xdg_decoration.init(init.gpa, &wayring_protocol_server.?, &wayring_xdg_shell, server.neutralXdgShell());
+        wayring_xdg_decoration_initialized = true;
         wayring_viewporter.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
         wayring_viewporter_initialized = true;
         if (wayring_outputs_initialized) {
@@ -348,6 +360,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_fractional_scale_published = true;
             try wayring_cursor_shape.publish();
             wayring_cursor_shape_published = true;
+            try wayring_xdg_decoration.publish();
+            wayring_xdg_decoration_published = true;
         }
         wayring_lifecycle = .{
             .clients = &wayring_clients,
@@ -356,6 +370,7 @@ pub fn main(init: std.process.Init) !void {
             .viewporter = &wayring_viewporter,
             .fractional_scale = if (wayring_fractional_scale_initialized) &wayring_fractional_scale else null,
             .cursor_shape = if (wayring_cursor_shape_initialized) &wayring_cursor_shape else null,
+            .xdg_decoration = if (wayring_xdg_decoration_initialized) &wayring_xdg_decoration else null,
             .compositor = &wayring_compositor,
             .seat = &wayring_seat_adapter,
         };
@@ -811,6 +826,7 @@ test {
     _ = @import("wayland/session_lock.zig");
     _ = @import("wayland/cursor_shape.zig");
     _ = @import("wayland/WayringCursorShape.zig");
+    _ = @import("wayland/WayringXdgDecoration.zig");
     _ = @import("wayland/tablet.zig");
     _ = @import("wayland/pointer_gestures.zig");
     _ = @import("wayland/relative_pointer.zig");

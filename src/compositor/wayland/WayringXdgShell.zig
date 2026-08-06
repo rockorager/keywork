@@ -23,7 +23,10 @@ const WayringSeatAdapter = @import("WayringSeatAdapter.zig");
 const server = wayring.server;
 const wire = wayring.wire;
 
-const prepared_configure_bytes = 192;
+// One atomic batch can contain capabilities, decoration, toplevel, and
+// xdg_surface configure events. Keep enough reserved output for the largest
+// generated transaction so publication never grows the queue mid-batch.
+const prepared_configure_bytes = 256;
 
 allocator: std.mem.Allocator,
 protocol_server: *server.Server,
@@ -32,6 +35,7 @@ clients: *WayringClients,
 compositor: *WayringCompositor,
 outputs: ?*WayringOutput,
 seat: ?*WayringSeatAdapter = null,
+decoration_endpoint: ?DecorationEndpoint = null,
 managers: std.ArrayList(*Manager) = .empty,
 positioners: std.ArrayList(*Positioner) = .empty,
 surfaces: std.ArrayList(*Surface) = .empty,
@@ -103,6 +107,22 @@ const Toplevel = struct {
     interaction_activated: bool = false,
 };
 
+pub const ToplevelIdentity = struct {
+    client: *server.Client,
+    object_id: u32,
+    generation: u64,
+    core_id: XdgShell.WindowId,
+};
+
+pub const DecorationEndpoint = struct {
+    context: *anyopaque,
+    prepare_configure: *const fn (*anyopaque, ToplevelIdentity, XdgShell.DecorationMode) ?server.Client.PreparedEvent,
+    configured: *const fn (*anyopaque, ToplevelIdentity) void,
+    allows_buffer_commit: *const fn (*anyopaque, ToplevelIdentity) bool,
+    reset: *const fn (*anyopaque, ToplevelIdentity) void,
+    destroyed: *const fn (*anyopaque, ToplevelIdentity) void,
+};
+
 const Popup = struct {
     adapter: *WayringXdgShell,
     surface: *Surface,
@@ -139,6 +159,40 @@ pub fn init(
 pub fn setSeatAdapter(self: *WayringXdgShell, seat: *WayringSeatAdapter) void {
     std.debug.assert(self.seat == null);
     self.seat = seat;
+}
+
+pub fn setDecorationEndpoint(self: *WayringXdgShell, endpoint: DecorationEndpoint) void {
+    std.debug.assert(self.decoration_endpoint == null);
+    self.decoration_endpoint = endpoint;
+}
+
+pub fn clearDecorationEndpoint(self: *WayringXdgShell) void {
+    self.decoration_endpoint = null;
+}
+
+pub fn toplevelIdentity(self: *WayringXdgShell, client: *server.Client, object_id: u32) ?ToplevelIdentity {
+    for (self.toplevels.items) |value| if (value.surface.client == client and value.resource.runtime.id() == object_id) {
+        return .{ .client = client, .object_id = object_id, .generation = value.generation, .core_id = value.core_id };
+    };
+    return null;
+}
+
+pub fn identityIsCurrent(self: *WayringXdgShell, identity: ToplevelIdentity) bool {
+    const current = self.toplevelIdentity(identity.client, identity.object_id) orelse return false;
+    return current.generation == identity.generation and std.meta.eql(current.core_id, identity.core_id);
+}
+
+pub fn toplevelContentState(
+    self: *WayringXdgShell,
+    identity: ToplevelIdentity,
+) ?WayringCompositor.XdgContentState {
+    if (!self.identityIsCurrent(identity)) return null;
+    for (self.toplevels.items) |toplevel| if (toplevel.generation == identity.generation and
+        std.meta.eql(toplevel.core_id, identity.core_id))
+    {
+        return self.compositor.xdgContentState(toplevel.surface.surface_id);
+    };
+    return null;
 }
 
 pub fn deinit(self: *WayringXdgShell) void {
@@ -1044,6 +1098,18 @@ fn validateCommit(
             return .reject;
         },
     };
+    if (commit.next_size != null) if (surface.active_role) |active| switch (active) {
+        .toplevel => |toplevel| if (surface.adapter.decoration_endpoint) |endpoint| {
+            const identity: ToplevelIdentity = .{
+                .client = surface.client,
+                .object_id = toplevel.resource.runtime.id(),
+                .generation = toplevel.generation,
+                .core_id = toplevel.core_id,
+            };
+            if (!endpoint.allows_buffer_commit(endpoint.context, identity)) return .reject;
+        },
+        .popup => {},
+    };
     if (commit.next_size != null and !surface.adapter.core_shell.surfaceConfigured(surface.core_id) and
         surface.accepted_configure == null)
     {
@@ -1211,7 +1277,7 @@ fn configureToplevel(
     const capabilities = [_]wire.Value{.{
         .array = std.mem.sliceAsBytes(&capability_values),
     }};
-    var events: [3]server.Client.PreparedEvent = undefined;
+    var events: [4]server.Client.PreparedEvent = undefined;
     var event_count: usize = 0;
     if (toplevel.resource.version() >= 5 and !surface.sent_capabilities) {
         events[event_count] = .{
@@ -1221,6 +1287,20 @@ fn configureToplevel(
             .values = &capabilities,
         };
         event_count += 1;
+    }
+    const identity: ToplevelIdentity = .{
+        .client = surface.client,
+        .object_id = toplevel.resource.runtime.id(),
+        .generation = toplevel.generation,
+        .core_id = toplevel.core_id,
+    };
+    var decoration_configured = false;
+    if (surface.adapter.decoration_endpoint) |endpoint| {
+        if (endpoint.prepare_configure(endpoint.context, identity, configuration.decoration_mode)) |event| {
+            events[event_count] = event;
+            event_count += 1;
+            decoration_configured = true;
+        }
     }
     events[event_count] = .{
         .resource = &toplevel.resource.runtime,
@@ -1241,6 +1321,10 @@ fn configureToplevel(
         .accepted = .{ .token = token },
     }) catch return error.OutOfMemory;
     surface.sent_capabilities = true;
+    if (decoration_configured) {
+        const endpoint = surface.adapter.decoration_endpoint.?;
+        endpoint.configured(endpoint.context, identity);
+    }
 }
 
 fn configurePopup(
@@ -1393,6 +1477,15 @@ fn ackConfigure(self: *WayringXdgShell, surface: *Surface, serial: u32) void {
 }
 
 fn resetWireState(surface: *Surface) void {
+    if (surface.active_role) |active| switch (active) {
+        .toplevel => |toplevel| if (surface.adapter.decoration_endpoint) |endpoint| endpoint.reset(endpoint.context, .{
+            .client = surface.client,
+            .object_id = toplevel.resource.runtime.id(),
+            .generation = toplevel.generation,
+            .core_id = toplevel.core_id,
+        }),
+        .popup => {},
+    };
     surface.initial_configure_sent = false;
     surface.sent_capabilities = false;
     surface.accepted_configure = null;
@@ -1420,6 +1513,12 @@ fn destroyToplevel(self: *WayringXdgShell, toplevel: *Toplevel, surface_gone: bo
     const surface = toplevel.surface;
     std.debug.assert(surface.active_role != null and surface.active_role.? == .toplevel and
         surface.active_role.?.toplevel == toplevel);
+    if (self.decoration_endpoint) |endpoint| endpoint.destroyed(endpoint.context, .{
+        .client = surface.client,
+        .object_id = toplevel.resource.runtime.id(),
+        .generation = toplevel.generation,
+        .core_id = toplevel.core_id,
+    });
     surface.active_role = null;
     self.core_shell.destroyToplevel(toplevel.core_id);
     if (!surface_gone) self.compositor.detachXdgRole(surface.reservation, .toplevel) catch unreachable;
