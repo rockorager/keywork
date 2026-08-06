@@ -172,7 +172,7 @@ const GeneratedCursor = struct {
 
 const OwnedShapeCursor = struct {
     client: ClientRegistry.Id,
-    image: ShapeCursor,
+    image: CursorImage,
 };
 
 const CursorController = struct {
@@ -2974,6 +2974,27 @@ pub fn setGeneratedCursor(self: *Self, request: SeatDelivery.CursorRequest) Seat
     return .accepted;
 }
 
+/// Applies a scanner-backed cursor-shape request after validating the same
+/// canonical pointer-enter authority used by generated wl_pointer.set_cursor.
+pub fn setGeneratedCursorShape(self: *Self, request: SeatDelivery.ShapeRequest) bool {
+    if (!self.clients.contains(request.client) or request.serial.domain != .wayring_server or
+        !self.delivery.capability(.pointer).resourceActive(request.capability_generation) or
+        !self.authority.acceptsPointerEnter(request.client, request.serial)) return false;
+    const target = self.generatedPointerTarget() orelse return false;
+    if (!std.meta.eql(target.client, request.client)) return false;
+    const old_cursor = self.cursorInfo();
+    self.active_cursor = .{ .shape = .{
+        .client = request.client,
+        .image = .{
+            .buffer = request.image.buffer,
+            .hotspot_x = request.image.hotspot_x,
+            .hotspot_y = request.image.hotspot_y,
+        },
+    } };
+    self.notifyCursorChanged(old_cursor);
+    return true;
+}
+
 pub fn generatedCursorCommitted(self: *Self, id: SurfaceRegistry.Id, x: i32, y: i32) void {
     if (self.active_cursor) |*cursor| switch (cursor.*) {
         .generated => |*generated| if (std.meta.eql(generated.surface_id, id)) {
@@ -3018,7 +3039,11 @@ pub fn setCursorShape(
         false;
     if (!controller and !focused_client and !self.activeCursorOwnedBy(client)) return;
 
-    const requested: ActiveCursor = .{ .shape = .{ .client = client_id.?, .image = shape } };
+    const requested: ActiveCursor = .{ .shape = .{ .client = client_id.?, .image = .{
+        .buffer = shape.buffer,
+        .hotspot_x = shape.hotspot_x,
+        .hotspot_y = shape.hotspot_y,
+    } } };
     const old_cursor = self.cursorInfo();
     if (manager_controller and !drag_controller) {
         self.cursor_controller.?.cursor = requested;

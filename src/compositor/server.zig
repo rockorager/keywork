@@ -90,6 +90,7 @@ const Surface = @import("wayland/surface.zig");
 const MatureClients = @import("wayland/MatureClients.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
+const WayringCursorShape = @import("wayland/WayringCursorShape.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
@@ -3787,6 +3788,7 @@ pub fn generatedSeatRequestSink(self: *Self) SeatDelivery.RequestSink {
         .accepts_pointer_grab = generatedAcceptsPointerGrab,
         .accepts_action = generatedAcceptsAction,
         .set_cursor = generatedSetCursor,
+        .set_shape = generatedSetShape,
         .cursor_committed = generatedCursorCommitted,
         .cursor_removed = generatedCursorRemoved,
         .client_retiring = generatedClientRetiring,
@@ -3835,6 +3837,15 @@ fn generatedKeyboardResourceSnapshot(
 fn generatedSetCursor(context: *anyopaque, request: SeatDelivery.CursorRequest) SeatDelivery.CursorRequestResult {
     const self: *Self = @ptrCast(@alignCast(context));
     return self.seat.setGeneratedCursor(request);
+}
+
+fn generatedSetShape(context: *anyopaque, request: SeatDelivery.ShapeRequest) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.seat.setGeneratedCursorShape(request);
+}
+
+pub fn generatedCursorShape(self: *Self) *CursorShape {
+    return &self.cursor_shape;
 }
 
 fn generatedCursorCommitted(context: *anyopaque, id: SurfaceRegistry.Id, x: i32, y: i32) void {
@@ -15258,6 +15269,7 @@ const WayringHeadlessClient = struct {
     output: ?*wayland.client.wl.Output = null,
     viewporter: ?*wayland.client.wp.Viewporter = null,
     fractional_scale_manager: ?*wayland.client.wp.FractionalScaleManagerV1 = null,
+    cursor_shape_manager: ?*wayland.client.wp.CursorShapeManagerV1 = null,
     compositor_version: std.atomic.Value(u32) = .init(0),
     global_count: usize = 0,
     globals_exact: bool = true,
@@ -15289,6 +15301,7 @@ const WayringHeadlessClient = struct {
         .{ .name = "xdg_wm_base", .version = 7 },
         .{ .name = "wp_viewporter", .version = 1 },
         .{ .name = "wp_fractional_scale_manager_v1", .version = 1 },
+        .{ .name = "wp_cursor_shape_manager_v1", .version = 2 },
     };
 
     fn run(self: *WayringHeadlessClient) void {
@@ -15337,6 +15350,8 @@ const WayringHeadlessClient = struct {
         const output = self.output orelse return error.OutputMissing;
         const viewporter = self.viewporter orelse return error.ViewporterMissing;
         const fractional_scale_manager = self.fractional_scale_manager orelse return error.FractionalScaleMissing;
+        const cursor_shape_manager = self.cursor_shape_manager orelse return error.CursorShapeMissing;
+        defer cursor_shape_manager.destroy();
         defer fractional_scale_manager.destroy();
         defer viewporter.destroy();
         defer output.release();
@@ -15687,6 +15702,12 @@ const WayringHeadlessClient = struct {
                         global.name,
                         wayland.client.wp.FractionalScaleManagerV1,
                         1,
+                    ) catch null;
+                } else if (std.mem.eql(u8, interface, "wp_cursor_shape_manager_v1") and self.cursor_shape_manager == null) {
+                    self.cursor_shape_manager = registry.bind(
+                        global.name,
+                        wayland.client.wp.CursorShapeManagerV1,
+                        global.version,
                     ) catch null;
                 }
             },
@@ -16402,10 +16423,14 @@ const WayringXdgClient = struct {
 
 const WayringSeatClient = struct {
     const client_wl = wayland.client.wl;
+    const client_wp = wayland.client.wp;
     const Stage = enum(u8) {
         starting,
         ready,
+        shape_ready,
+        stale_shape_ignored,
         cursor_ready,
+        cursor_cleared,
         cursor_and_late_touch_ready,
         resources_released,
         registry_ready,
@@ -16443,6 +16468,7 @@ const WayringSeatClient = struct {
     shm: ?*client_wl.Shm = null,
     output: ?*client_wl.Output = null,
     seat: ?*client_wl.Seat = null,
+    cursor_shape_manager: ?*client_wp.CursorShapeManagerV1 = null,
     global_count: usize = 0,
     globals_exact: bool = true,
     seat_name_valid: bool = false,
@@ -16514,6 +16540,8 @@ const WayringSeatClient = struct {
         const seat = self.seat orelse return error.SeatMissing;
         var seat_live = true;
         defer if (seat_live) seat.release();
+        const cursor_shape_manager = self.cursor_shape_manager orelse return error.CursorShapeMissing;
+        defer cursor_shape_manager.destroy();
         try expectClientRoundtrip(display);
         if (!self.seat_name_valid or !self.seat_capabilities_valid or
             self.seat_event_count != 2 or seat.getVersion() != client_wl.Seat.generated_version)
@@ -16555,6 +16583,8 @@ const WayringSeatClient = struct {
         var pointer_live = true;
         defer if (pointer_live) pointer.release();
         pointer.setListener(*WayringSeatClient, pointerEvent, self);
+        const cursor_shape_device = try cursor_shape_manager.getPointer(pointer);
+        defer cursor_shape_device.destroy();
         const keyboard = try seat.getKeyboard();
         var keyboard_live = true;
         defer if (keyboard_live) keyboard.release();
@@ -16569,9 +16599,18 @@ const WayringSeatClient = struct {
 
         try expectClientRoundtrip(display);
         if (self.pointer_enter_serial == 0) return error.PointerEnterMissing;
+        cursor_shape_device.setShape(self.pointer_enter_serial, .crosshair);
+        try expectClientRoundtrip(display);
+        try self.pause(.shape_ready);
+        cursor_shape_device.setShape(self.pointer_enter_serial - 1, .text);
+        try expectClientRoundtrip(display);
+        try self.pause(.stale_shape_ignored);
         pointer.setCursor(self.pointer_enter_serial, cursor_surface, 1, 1);
         try expectClientRoundtrip(display);
         try self.pause(.cursor_ready);
+        pointer.setCursor(self.pointer_enter_serial, null, 0, 0);
+        try expectClientRoundtrip(display);
+        try self.pause(.cursor_cleared);
         const late_touch = try seat.getTouch();
         var late_touch_live = true;
         defer if (late_touch_live) late_touch.release();
@@ -16651,6 +16690,7 @@ const WayringSeatClient = struct {
         .{ .name = "wl_subcompositor", .version = 1 },
         .{ .name = "wl_seat", .version = 11 },
         .{ .name = "wl_output", .version = 4 },
+        .{ .name = "wp_cursor_shape_manager_v1", .version = 2 },
     };
 
     fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *WayringSeatClient) void {
@@ -16675,6 +16715,12 @@ const WayringSeatClient = struct {
                 } else if (std.mem.eql(u8, interface, "wl_seat") and self.seat == null) {
                     self.seat = registry.bind(global.name, client_wl.Seat, global.version) catch null;
                     if (self.seat) |seat| seat.setListener(*WayringSeatClient, seatEvent, self);
+                } else if (std.mem.eql(u8, interface, "wp_cursor_shape_manager_v1") and self.cursor_shape_manager == null) {
+                    self.cursor_shape_manager = registry.bind(
+                        global.name,
+                        client_wp.CursorShapeManagerV1,
+                        global.version,
+                    ) catch null;
                 }
             },
             .global_remove => {},
@@ -17481,12 +17527,27 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     });
     default_output_listener_live = true;
     try fractional_scale.publish();
+    var cursor_shape: WayringCursorShape = undefined;
+    cursor_shape.init(
+        std.testing.allocator,
+        &protocol_server,
+        &seat,
+        server.generatedCursorShape(),
+        server.generatedSeatRequestSink(),
+    );
+    var cursor_shape_live = true;
+    defer if (cursor_shape_live) {
+        cursor_shape.unpublish();
+        cursor_shape.deinit();
+    };
+    try cursor_shape.publish();
     const Lifecycle = struct {
         clients: *WayringClients,
         outputs: *WayringOutput,
         xdg: *WayringXdgShell,
         viewporter: *WayringViewporter,
         fractional_scale: *WayringFractionalScale,
+        cursor_shape: *WayringCursorShape,
         compositor: *WayringCompositor,
         seat: *WayringSeatAdapter,
 
@@ -17499,6 +17560,7 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            self.cursor_shape.destroyClientResources(client);
             self.seat.destroyClientResources(client);
             self.fractional_scale.destroyClientResources(client);
             self.viewporter.destroyClientResources(client);
@@ -17514,6 +17576,7 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
         .xdg = &xdg,
         .viewporter = &viewporter,
         .fractional_scale = &fractional_scale,
+        .cursor_shape = &cursor_shape,
         .compositor = &compositor,
         .seat = &seat,
     };
@@ -17819,6 +17882,8 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
     try std.testing.expectEqual(@as(usize, 0), fractional_scale.fractional_scales.items.len);
     try std.testing.expectEqual(@as(usize, 0), fractional_scale.managers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cursor_shape.deviceCount());
+    try std.testing.expectEqual(@as(usize, 0), cursor_shape.managerCount());
     try std.testing.expectEqual(@as(usize, 0), viewporter.viewports.items.len);
     try std.testing.expectEqual(@as(usize, 0), viewporter.managers.items.len);
     try std.testing.expectEqual(@as(usize, 0), server.client_registry.len());
@@ -17833,6 +17898,9 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     } else return error.WayringTransportDrainTimedOut;
     try host.destroy();
     host_live = false;
+    cursor_shape.unpublish();
+    cursor_shape.deinit();
+    cursor_shape_live = false;
     server.clearWayringDefaultOutputListener(&fractional_scale);
     default_output_listener_live = false;
     fractional_scale.unpublish();
@@ -18649,10 +18717,26 @@ test "production Wayring seat global accepts canonical input through the real ho
     );
     var outputs_live = true;
     defer if (outputs_live) wayring_outputs.deinit();
+    server.generatedCursorShape().setForceFallback(true);
+    var cursor_shape: WayringCursorShape = undefined;
+    cursor_shape.init(
+        std.testing.allocator,
+        &protocol_server,
+        &seat_adapter,
+        server.generatedCursorShape(),
+        server.generatedSeatRequestSink(),
+    );
+    var cursor_shape_live = true;
+    defer if (cursor_shape_live) {
+        cursor_shape.unpublish();
+        cursor_shape.deinit();
+    };
+    try cursor_shape.publish();
 
     const Lifecycle = struct {
         clients: *WayringClients,
         outputs: *WayringOutput,
+        cursor_shape: *WayringCursorShape,
         compositor: *WayringCompositor,
         seat: *WayringSeatAdapter,
         ids: [2]ClientRegistry.Id = undefined,
@@ -18670,6 +18754,7 @@ test "production Wayring seat global accepts canonical input through the real ho
 
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            self.cursor_shape.destroyClientResources(client);
             self.seat.destroyClientResources(client);
             self.outputs.destroyClientResources(client);
             self.compositor.destroyClientResources(client);
@@ -18679,6 +18764,7 @@ test "production Wayring seat global accepts canonical input through the real ho
     var lifecycle: Lifecycle = .{
         .clients = &clients,
         .outputs = &wayring_outputs,
+        .cursor_shape = &cursor_shape,
         .compositor = &compositor,
         .seat = &seat_adapter,
     };
@@ -18725,6 +18811,31 @@ test "production Wayring seat global accepts canonical input through the real ho
     pointerButton(output, 3, linux_button_left, .pressed);
     pointerFrame(output);
     try signalWayringCommand(command_fd);
+    try waitForWayringSeatStage(server, host, &client, .shape_ready);
+    const shape_info = server.seat.cursorInfo() orelse return error.GeneratedShapeMissing;
+    const shape_source = switch (shape_info) {
+        .shape => |shape| shape.buffer.source_cache orelse return error.GeneratedShapeCacheMissing,
+        .surface, .generated => return error.UnexpectedCursorOwner,
+    };
+    try std.testing.expectEqual(@as(i32, 0), shape_info.shape.x);
+    try std.testing.expectEqual(@as(i32, 0), shape_info.shape.y);
+    const previous_cursor_frames = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_cursor_frames);
+    const cursor_target = switch (output.backend.acquire().?) {
+        .pixels => |pixels| pixels,
+        else => return error.ExpectedCpuHeadlessTarget,
+    };
+    try std.testing.expectEqual(@as(u32, 0xff00_0000), cursor_target.pixels[0]);
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), cursor_target.pixels[5]);
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSeatStage(server, host, &client, .stale_shape_ignored);
+    switch (server.seat.cursorInfo() orelse return error.GeneratedShapeMissing) {
+        .shape => |shape| try std.testing.expectEqual(shape_source, shape.buffer.source_cache.?),
+        .surface, .generated => return error.UnexpectedCursorOwner,
+    }
+
+    try signalWayringCommand(command_fd);
     try waitForWayringSeatStage(server, host, &client, .cursor_ready);
     switch (server.seat.cursorInfo() orelse return error.GeneratedCursorMissing) {
         .generated => |cursor| {
@@ -18733,6 +18844,10 @@ test "production Wayring seat global accepts canonical input through the real ho
         },
         .surface, .shape => return error.UnexpectedCursorOwner,
     }
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringSeatStage(server, host, &client, .cursor_cleared);
+    try std.testing.expect(server.seat.cursorInfo() == null);
 
     touchDown(output, 4, 7, 0.5, 0.5);
     try signalWayringCommand(command_fd);
@@ -18810,6 +18925,9 @@ test "production Wayring seat global accepts canonical input through the real ho
 
     try host.destroy();
     host_live = false;
+    cursor_shape.unpublish();
+    cursor_shape.deinit();
+    cursor_shape_live = false;
     wayring_outputs.deinit();
     outputs_live = false;
     seat_adapter.unpublish();
