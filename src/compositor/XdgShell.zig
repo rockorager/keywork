@@ -1793,7 +1793,10 @@ pub fn requestWindow(self: *XdgShell, id: WindowId, request: WindowRequest) void
         .pointer_move => |a| if (!windowAcceptsAction(window, state, a)) return,
         .pointer_resize => |v| if (!windowAcceptsAction(window, state, v.action)) return,
         .show_window_menu => |v| if (!windowAcceptsAction(window, state, v.action)) return,
-        .activate => |a| if (!windowAcceptsAction(window, state, a)) return,
+        // Activation provenance is decided by the caller (for example,
+        // foreign-toplevel policy). It is intentionally serialless and may
+        // originate from a client other than the target window.
+        .activate => |a| if (!window.interaction_enabled or !a.granted) return,
         else => {},
     }
     if (self.window_listener) |l| l.request(l.context, id, request);
