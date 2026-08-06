@@ -55,11 +55,26 @@ pub const RequestSink = struct {
     context: *anyopaque,
     pointer_enter_snapshot: *const fn (*anyopaque, ClientRegistry.Id, ResourceGeneration) ?PointerEnterSnapshot = unavailablePointerEnterSnapshot,
     keyboard_resource_snapshot: *const fn (*anyopaque, ClientRegistry.Id, ResourceGeneration) ?KeyboardResourceSnapshot = unavailableKeyboardResourceSnapshot,
+    accepts_pointer_grab: *const fn (
+        *anyopaque,
+        ClientRegistry.Id,
+        ClientRegistry.Serial,
+        SurfaceRegistry.Id,
+    ) bool = rejectsPointerGrab,
     set_cursor: *const fn (*anyopaque, CursorRequest) CursorRequestResult,
     cursor_committed: *const fn (*anyopaque, SurfaceRegistry.Id, i32, i32) void,
     cursor_removed: *const fn (*anyopaque, SurfaceRegistry.Id) void,
     client_retiring: *const fn (*anyopaque, ClientRegistry.Id) void,
 };
+
+fn rejectsPointerGrab(
+    _: *anyopaque,
+    _: ClientRegistry.Id,
+    _: ClientRegistry.Serial,
+    _: SurfaceRegistry.Id,
+) bool {
+    return false;
+}
 
 fn unavailablePointerEnterSnapshot(_: *anyopaque, _: ClientRegistry.Id, _: ResourceGeneration) ?PointerEnterSnapshot {
     return null;

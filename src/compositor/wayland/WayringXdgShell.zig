@@ -18,11 +18,12 @@ const XdgShell = @import("../XdgShell.zig");
 const WayringClients = @import("WayringClients.zig");
 const WayringCompositor = @import("WayringCompositor.zig");
 const WayringOutput = @import("WayringOutput.zig");
+const WayringSeatAdapter = @import("WayringSeatAdapter.zig");
 
 const server = wayring.server;
 const wire = wayring.wire;
 
-const prepared_configure_bytes = 128;
+const prepared_configure_bytes = 192;
 
 allocator: std.mem.Allocator,
 protocol_server: *server.Server,
@@ -30,6 +31,7 @@ core_shell: *XdgShell,
 clients: *WayringClients,
 compositor: *WayringCompositor,
 outputs: ?*WayringOutput,
+seat: ?*WayringSeatAdapter = null,
 managers: std.ArrayList(*Manager) = .empty,
 positioners: std.ArrayList(*Positioner) = .empty,
 surfaces: std.ArrayList(*Surface) = .empty,
@@ -84,6 +86,7 @@ const Surface = struct {
     configures: std.ArrayList(Configure) = .empty,
     accepted_configure: ?Configure = null,
     initial_configure_sent: bool = false,
+    sent_capabilities: bool = false,
     prepared_events: ?wire.PreparedBatch = null,
     prepared_commit: ?WayringCompositor.XdgDirectCommit = null,
 };
@@ -94,6 +97,9 @@ const Toplevel = struct {
     generation: u64,
     resource: core.xdg_toplevel.Resource,
     core_id: XdgShell.WindowId,
+    /// The generated role gains input capability only once. A later policy
+    /// disable is therefore persistent across unmap/remap.
+    interaction_activated: bool = false,
 };
 
 const Popup = struct {
@@ -127,6 +133,11 @@ pub fn init(
         .compositor = compositor,
         .outputs = outputs,
     };
+}
+
+pub fn setSeatAdapter(self: *WayringXdgShell, seat: *WayringSeatAdapter) void {
+    std.debug.assert(self.seat == null);
+    self.seat = seat;
 }
 
 pub fn deinit(self: *WayringXdgShell) void {
@@ -543,7 +554,7 @@ fn createToplevel(
     errdefer if (core_owned) self.core_shell.destroyToplevel(toplevel.core_id);
     // Generated toplevels begin private and non-interactive. The first
     // configured non-null-buffer commit atomically hands presentation to the
-    // Scene after Wayring content publication; Wave 5 owns interaction.
+    // Scene after Wayring content publication, then enables interaction.
     try self.core_shell.setWindowScenePresentationEnabled(toplevel.core_id, false);
     self.core_shell.setWindowInteractionEnabled(toplevel.core_id, false);
     _ = self.compositor.assignXdgRole(surface.reservation, .toplevel) catch unreachable;
@@ -596,16 +607,34 @@ fn handleToplevel(
             .width = set.width,
             .height = set.height,
         }),
-        .resize => |set| if (!validResizeEdge(set.edges)) {
-            toplevel.surface.client.postProtocolError(
-                &resource.runtime,
-                @intCast(core.xdg_toplevel.@"error".invalid_resize_edge),
-                "invalid xdg_toplevel resize edge",
-            );
+        .resize => |set| {
+            if (!validResizeEdge(set.edges)) {
+                toplevel.surface.client.postProtocolError(
+                    &resource.runtime,
+                    @intCast(core.xdg_toplevel.@"error".invalid_resize_edge),
+                    "invalid xdg_toplevel resize edge",
+                );
+                return;
+            }
+            const edges = resizeEdges(set.edges);
+            if (@as(u4, @bitCast(edges)) == 0) return;
+            const action = xdgPointerAction(toplevel, set.seat, set.serial) orelse return;
+            shell.requestWindow(toplevel.core_id, .{
+                .pointer_resize = .{ .action = action, .edges = edges },
+            });
         },
-        .show_window_menu,
-        .move,
-        => {},
+        .move => |set| {
+            const action = xdgPointerAction(toplevel, set.seat, set.serial) orelse return;
+            shell.requestWindow(toplevel.core_id, .{ .pointer_move = action });
+        },
+        .show_window_menu => |set| {
+            const action = xdgPointerAction(toplevel, set.seat, set.serial) orelse return;
+            shell.requestWindow(toplevel.core_id, .{ .show_window_menu = .{
+                .action = action,
+                .x = set.x,
+                .y = set.y,
+            } });
+        },
         .set_maximized => forwardStateRequest(toplevel, .maximize),
         .unset_maximized => forwardStateRequest(toplevel, .unmaximize),
         .set_fullscreen => |set| {
@@ -623,6 +652,44 @@ fn handleToplevel(
         .unset_fullscreen => forwardStateRequest(toplevel, .exit_fullscreen),
         .set_minimized => forwardStateRequest(toplevel, .minimize),
     }
+}
+
+fn xdgPointerAction(
+    toplevel: *Toplevel,
+    seat_object_id: u32,
+    serial: u32,
+) ?XdgShell.UserAction {
+    const adapter = toplevel.adapter;
+    const info = adapter.core_shell.windowInfo(toplevel.core_id) orelse return null;
+    if (!info.mapped or !info.scene_presentation_enabled or !info.interaction_enabled) return null;
+    const surface = adapter.core_shell.windowSurface(toplevel.core_id) orelse return null;
+    const client = (adapter.seat orelse return null).acceptsXdgPointerGrab(
+        toplevel.surface.client,
+        seat_object_id,
+        serial,
+        surface,
+    ) orelse return null;
+    if (!std.meta.eql(client, info.client)) return null;
+    return .{
+        .client = client,
+        .serial = .{ .domain = .wayring_server, .value = serial },
+        .granted = true,
+    };
+}
+
+fn resizeEdges(edge: u32) XdgShell.ResizeEdges {
+    return switch (edge) {
+        0 => .{},
+        1 => .{ .top = true },
+        2 => .{ .bottom = true },
+        4 => .{ .left = true },
+        5 => .{ .top = true, .left = true },
+        6 => .{ .bottom = true, .left = true },
+        8 => .{ .right = true },
+        9 => .{ .top = true, .right = true },
+        10 => .{ .bottom = true, .right = true },
+        else => unreachable,
+    };
 }
 
 fn forwardStateRequest(toplevel: *Toplevel, request: XdgShell.WindowRequest) void {
@@ -961,6 +1028,22 @@ fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
         finishPreparedCommit(surface);
         return;
     };
+    if (commit.next_size != null) switch (surface.active_role.?) {
+        .toplevel => |toplevel| if (!toplevel.interaction_activated) {
+            // Presentation was made fallible above and the neutral map has
+            // now completed. Publish interaction only after both succeeded,
+            // so OOM can never leave a focusable generated role behind.
+            const info = surface.adapter.core_shell.windowInfo(toplevel.core_id) orelse {
+                finishPreparedCommit(surface);
+                return;
+            };
+            if (info.mapped and info.scene_presentation_enabled) {
+                toplevel.interaction_activated = true;
+                surface.adapter.core_shell.setWindowInteractionEnabled(toplevel.core_id, true);
+            }
+        },
+        .popup => {},
+    };
     if (applies_buffer and !dismissed_popup) surface.accepted_configure = null;
     if (commit.current_size != null and commit.next_size == null and !dismissed_popup) {
         resetWireState(surface);
@@ -1005,24 +1088,40 @@ fn configureToplevel(
         .{ .array = std.mem.sliceAsBytes(states) },
     };
     const surface_values = [_]wire.Value{.{ .uint = serial }};
-    const events = [_]server.Client.PreparedEvent{
-        .{
+    const capability_values = [_]u32{ 2, 3, 4 };
+    const capabilities = [_]wire.Value{.{
+        .array = std.mem.sliceAsBytes(&capability_values),
+    }};
+    var events: [3]server.Client.PreparedEvent = undefined;
+    var event_count: usize = 0;
+    if (toplevel.resource.version() >= 5 and !surface.sent_capabilities) {
+        events[event_count] = .{
             .resource = &toplevel.resource.runtime,
-            .opcode = 0,
-            .descriptor = &core.xdg_toplevel.event_messages[0],
-            .values = &role_values,
-        },
-        .{
-            .resource = &surface.resource.runtime,
-            .opcode = 0,
-            .descriptor = &core.xdg_surface.event_messages[0],
-            .values = &surface_values,
-        },
+            .opcode = 3,
+            .descriptor = &core.xdg_toplevel.event_messages[3],
+            .values = &capabilities,
+        };
+        event_count += 1;
+    }
+    events[event_count] = .{
+        .resource = &toplevel.resource.runtime,
+        .opcode = 0,
+        .descriptor = &core.xdg_toplevel.event_messages[0],
+        .values = &role_values,
     };
-    emitConfigure(surface, &events, .{
+    event_count += 1;
+    events[event_count] = .{
+        .resource = &surface.resource.runtime,
+        .opcode = 0,
+        .descriptor = &core.xdg_surface.event_messages[0],
+        .values = &surface_values,
+    };
+    event_count += 1;
+    emitConfigure(surface, events[0..event_count], .{
         .serial = serial,
         .accepted = .{ .token = token },
     }) catch return error.OutOfMemory;
+    surface.sent_capabilities = true;
 }
 
 fn configurePopup(
@@ -1176,6 +1275,7 @@ fn ackConfigure(self: *WayringXdgShell, surface: *Surface, serial: u32) void {
 
 fn resetWireState(surface: *Surface) void {
     surface.initial_configure_sent = false;
+    surface.sent_capabilities = false;
     surface.accepted_configure = null;
     surface.configures.clearRetainingCapacity();
     surface.pending_geometry = null;
@@ -1361,6 +1461,15 @@ fn validResizeEdge(value: u32) bool {
         0, 1, 2, 4, 5, 6, 8, 9, 10 => true,
         else => false,
     };
+}
+
+test "resize edge validation rejects none forwarding and maps every valid edge" {
+    try std.testing.expect(validResizeEdge(0));
+    try std.testing.expectEqual(@as(u4, 0), @as(u4, @bitCast(resizeEdges(0))));
+    for ([_]u32{ 3, 7, 11, std.math.maxInt(u32) }) |invalid|
+        try std.testing.expect(!validResizeEdge(invalid));
+    try std.testing.expectEqual(XdgShell.ResizeEdges{ .top = true, .left = true }, resizeEdges(5));
+    try std.testing.expectEqual(XdgShell.ResizeEdges{ .bottom = true, .right = true }, resizeEdges(10));
 }
 
 fn toplevelStates(
@@ -1818,10 +1927,17 @@ test "toplevel configure ack map unmap and remap retain exact snapshots" {
     try commitTestSurface(harness.client());
     const initial = try drainTest(harness.client());
     defer std.testing.allocator.free(initial);
-    try std.testing.expectEqual(@as(usize, 32), initial.len);
+    // v5 capabilities precede configure, advertise maximize/fullscreen/minimize
+    // in protocol order, and intentionally omit the unsupported window menu.
+    try std.testing.expectEqual(@as(usize, 56), initial.len);
     try std.testing.expectEqual(@as(u32, 7), testWord(initial, 0));
-    try std.testing.expectEqual(@as(u32, 6), testWord(initial, 20));
-    const first_serial = testWord(initial, 28);
+    try std.testing.expectEqual(@as(u32, 12), testWord(initial, 8));
+    try std.testing.expectEqual(@as(u32, 2), testWord(initial, 12));
+    try std.testing.expectEqual(@as(u32, 3), testWord(initial, 16));
+    try std.testing.expectEqual(@as(u32, 4), testWord(initial, 20));
+    try std.testing.expectEqual(@as(u32, 7), testWord(initial, 24));
+    try std.testing.expectEqual(@as(u32, 6), testWord(initial, 44));
+    const first_serial = testWord(initial, 52);
     try std.testing.expectEqual(@as(u32, 2), first_serial);
     try std.testing.expectEqual(@as(u64, 1), adapter_surface.configures.items[0].accepted.token.sequence);
     try sendTest(harness.client(), 6, 4, &core.xdg_surface.request_messages[4], &.{.{ .uint = first_serial }});
@@ -1838,7 +1954,7 @@ test "toplevel configure ack map unmap and remap retain exact snapshots" {
     try std.testing.expect(harness.core_shell.windowInfo(toplevel.core_id).?.mapped);
     var scene_windows = harness.scene.iterator();
     try std.testing.expect(scene_windows.next().?.window.mapped);
-    try std.testing.expect(!harness.core_shell.windowInfo(toplevel.core_id).?.interaction_enabled);
+    try std.testing.expect(harness.core_shell.windowInfo(toplevel.core_id).?.interaction_enabled);
     const first_release = try drainTest(harness.client());
     std.testing.allocator.free(first_release);
 
@@ -1868,12 +1984,24 @@ test "toplevel configure ack map unmap and remap retain exact snapshots" {
     try commitTestSurface(harness.client());
     const remap = try drainTest(harness.client());
     defer std.testing.allocator.free(remap);
+    try std.testing.expectEqual(@as(usize, 56), remap.len);
+    try std.testing.expectEqual(@as(u32, 12), testWord(remap, 8));
+    try std.testing.expectEqual(@as(u32, 2), testWord(remap, 12));
+    try std.testing.expectEqual(@as(u32, 3), testWord(remap, 16));
+    try std.testing.expectEqual(@as(u32, 4), testWord(remap, 20));
     const remap_serial = testWord(remap, remap.len - 4);
     try std.testing.expectEqual(@as(u64, 3), adapter_surface.configures.items[0].accepted.token.sequence);
     try sendTest(harness.client(), 6, 4, &core.xdg_surface.request_messages[4], &.{.{ .uint = remap_serial }});
     try attachTestBuffer(harness.client(), 10);
     try commitTestSurface(harness.client());
     try std.testing.expect(harness.core_shell.surfaceConfigured(adapter_surface.core_id));
+    try std.testing.expect(harness.core_shell.windowInfo(toplevel.core_id).?.interaction_enabled);
+
+    // Interaction is a one-shot capability: explicit policy disable is not
+    // undone by subsequent commits or remaps.
+    harness.core_shell.setWindowInteractionEnabled(toplevel.core_id, false);
+    try commitTestSurface(harness.client());
+    try std.testing.expect(!harness.core_shell.windowInfo(toplevel.core_id).?.interaction_enabled);
     try std.testing.expect(adapter_surface.accepted_configure == null);
     scene_windows = harness.scene.iterator();
     try std.testing.expect(scene_windows.next().?.window.mapped);
