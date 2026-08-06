@@ -14841,6 +14841,37 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     try T.send(client, 15, 0, &core.xdg_positioner.request_messages[0], &.{});
     try T.send(client, 18, 0, &core.xdg_positioner.request_messages[0], &.{});
 
+    // Foreign-toplevel activation is caller-authorized, serialless, and
+    // cross-client. It must still reach sole WM policy to unminimize and
+    // publish an activated configure; an ungranted generated action remains
+    // inert.
+    const controller_client = try server.client_registry.register(.mature_display);
+    defer server.client_registry.unregister(controller_client);
+    server.xdg_shell_core.requestWindow(window_id, .minimize);
+    var activation_snapshots = try server.window_manager.windowSnapshots(std.testing.allocator);
+    try std.testing.expect(activation_snapshots[0].minimized);
+    try std.testing.expect(!activation_snapshots[0].focused);
+    std.testing.allocator.free(activation_snapshots);
+    server.xdg_shell_core.requestWindow(window_id, .{ .activate = .{
+        .client = clients.id(client).?,
+        .serial = null,
+        .granted = false,
+    } });
+    activation_snapshots = try server.window_manager.windowSnapshots(std.testing.allocator);
+    try std.testing.expect(activation_snapshots[0].minimized);
+    try std.testing.expect(!activation_snapshots[0].focused);
+    std.testing.allocator.free(activation_snapshots);
+    server.xdg_shell_core.requestWindow(window_id, .{ .activate = .{
+        .client = controller_client,
+        .serial = null,
+        .granted = true,
+    } });
+    activation_snapshots = try server.window_manager.windowSnapshots(std.testing.allocator);
+    try std.testing.expect(!activation_snapshots[0].minimized);
+    try std.testing.expect(activation_snapshots[0].focused);
+    std.testing.allocator.free(activation_snapshots);
+    try std.testing.expect(server.xdg_shell_core.windowInfo(window_id).?.configuration.activated);
+
     // A presented, interactive window migrates output ownership through
     // the same public workspace topology as a mature toplevel.
     server.primary_render_output = replacement_output;
