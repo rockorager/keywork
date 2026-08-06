@@ -5577,6 +5577,7 @@ fn damageHeadlessCompound(self: *Self, id: SurfaceRegistry.Id) void {
         self.headless_surface_forest.isCursorRole(id)) return;
     const root = self.headless_surface_forest.compoundRoot(id) orelse return;
     if (self.managedGeneratedWindow(root)) |window| {
+        if (!self.scene.surfaceMapped(root)) return;
         sceneNodeDamage(self, .{ .window = window.scene_id });
         return;
     }
@@ -13944,6 +13945,89 @@ test "Wayring listener applies XDG presentation progression without detaching ma
         HeadlessSurfaceForest.Placement.root,
         server.headless_surface_forest.state(id).?.placement,
     );
+}
+
+test "hidden managed publication stays damage-free and mapped overflow repaints fully" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 100, .height = 100 } },
+    );
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+    var root_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff11_2233,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    var child_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff44_5566,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    var grandchild_provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff77_8899,
+        .logical_size = .{ .width = 1, .height = 1 },
+    };
+    const root = try server.surface_registry.add(root_provider.provider());
+    const child = try server.surface_registry.add(child_provider.provider());
+    const grandchild = try server.surface_registry.add(grandchild_provider.provider());
+    try server.addHeadlessSurface(root, null);
+    try server.addHeadlessSurface(child, null);
+    try server.addHeadlessSurface(grandchild, null);
+    const client: ClientRegistry.Id = .{ .index = 1, .generation = 1 };
+    const xdg_surface = try server.xdg_shell_core.createSurface(root, client, undefined);
+    const window = try server.xdg_shell_core.createToplevel(xdg_surface, 1);
+    try std.testing.expect(server.headless_surface_forest.setRootPresentationClass(root, .managed));
+    defer {
+        server.xdg_shell_core.destroyToplevel(window);
+        server.xdg_shell_core.removeSurface(xdg_surface);
+        server.removeHeadlessSurface(root);
+        server.removeHeadlessSurface(child);
+        server.removeHeadlessSurface(grandchild);
+        server.surface_registry.remove(root);
+        server.surface_registry.remove(child);
+        server.surface_registry.remove(grandchild);
+    }
+
+    resetTestOutputDamage(output);
+    server.commitHeadlessSurface(root, root_provider.logical_size, false);
+    try std.testing.expect(output.damage.isEmpty());
+    server.commitHeadlessSurface(root, null, false);
+    server.commitHeadlessSurface(root, root_provider.logical_size, false);
+    try std.testing.expect(output.damage.isEmpty());
+
+    const scene_id = server.xdg_shell_core.windowInfo(window).?.scene_id;
+    server.scene.setContentGeometry(scene_id, .{ .size = root_provider.logical_size });
+    server.scene.setMapped(scene_id, true);
+    try std.testing.expect(output.damage.contains(0, 0));
+    try std.testing.expect(!output.damage.contains(99, 99));
+    resetTestOutputDamage(output);
+    server.damageHeadlessCompound(root);
+    try std.testing.expect(output.damage.contains(0, 0));
+    try std.testing.expect(!output.damage.contains(99, 99));
+
+    resetTestOutputDamage(output);
+    const root_stack = [_]HeadlessSurfaceForest.AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = child, .position = .{ .x = std.math.maxInt(i32) } } },
+    };
+    const child_stack = [_]HeadlessSurfaceForest.AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = grandchild, .position = .{ .x = 1 } } },
+    };
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{
+            .{ .id = child, .mapped_size = child_provider.logical_size, .callbacks_committed = false },
+            .{ .id = grandchild, .mapped_size = grandchild_provider.logical_size, .callbacks_committed = false },
+        },
+        .parents = &.{
+            .{ .id = root, .stack = &root_stack },
+            .{ .id = child, .stack = &child_stack },
+        },
+    });
+    try std.testing.expect(output.damage.coversRectangle(0, 0, 100, 100));
 }
 
 const WayringXdgServerTest = struct {
