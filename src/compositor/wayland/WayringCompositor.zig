@@ -154,6 +154,7 @@ const FrameCallback = struct {
 
     resource: core.wl_callback.Resource,
     state: State,
+    callback_only: bool = false,
 };
 
 const Surface = struct {
@@ -324,6 +325,7 @@ const PreparedCommit = struct {
     input: ?InputRegion = null,
     buffer: ?CopiedBufferSnapshot = null,
     pending_frame_callback_count: usize,
+    callback_only: bool = false,
     attachment_changed: bool,
     publishes_snapshot: bool = false,
     physical_size: ?render.Size = null,
@@ -937,6 +939,61 @@ pub fn completeFrame(self: *WayringCompositor, id: SurfaceId, timestamp_ms: u32)
     }
 }
 
+fn hasCallbackOnlyFrame(self: *WayringCompositor, id: SurfaceId) bool {
+    const surface = self.surfaceForId(id) orelse return false;
+    if (surface.destroying or surface.frame_callbacks.items.len == 0) return false;
+    const callback = surface.frame_callbacks.items[0];
+    return callback.state == .committed and callback.callback_only;
+}
+
+fn hasCallbackOnlyFrameThunk(context: *anyopaque, id: SurfaceId) bool {
+    const self: *WayringCompositor = @ptrCast(@alignCast(context));
+    return self.hasCallbackOnlyFrame(id);
+}
+
+fn completeCallbackOnlyFrame(
+    self: *WayringCompositor,
+    id: SurfaceId,
+    timestamp_ms: u32,
+) SurfaceFrameCompletion.CallbackOnlyResult {
+    if (self.completing_frame_callbacks) {
+        if (builtin.mode == .Debug) std.debug.assert(false);
+        return .none;
+    }
+    self.completing_frame_callbacks = true;
+    defer self.completing_frame_callbacks = false;
+
+    const surface = self.surfaceForId(id) orelse return .none;
+    if (surface.destroying) return .none;
+    const client = self.clientForResource(&surface.resource.runtime) orelse return .none;
+    var completed = false;
+    while (surface.frame_callbacks.items.len > 0) {
+        const callback = surface.frame_callbacks.items[0];
+        switch (callback.state) {
+            .pending, .queued => return if (completed) .drained else .none,
+            .committed => if (!callback.callback_only)
+                return if (completed) .remaining else .none,
+        }
+        core.wl_callback.@"send:done"(&callback.resource, timestamp_ms) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed => client.postOutOfMemory(&callback.resource.runtime, "queueing wl_callback.done"),
+            error.OutputSealed, error.ClientFatal => {},
+            else => client.postImplementationError(&callback.resource.runtime, "queueing wl_callback.done"),
+        };
+        destroyFrameCallback(self, surface, 0);
+        completed = true;
+    }
+    return if (completed) .drained else .none;
+}
+
+fn completeCallbackOnlyFrameThunk(
+    context: *anyopaque,
+    id: SurfaceId,
+    timestamp_ms: u32,
+) SurfaceFrameCompletion.CallbackOnlyResult {
+    const self: *WayringCompositor = @ptrCast(@alignCast(context));
+    return self.completeCallbackOnlyFrame(id, timestamp_ms);
+}
+
 fn completeFrameThunk(context: *anyopaque, id: SurfaceId, timestamp_ms: u32) void {
     const self: *WayringCompositor = @ptrCast(@alignCast(context));
     self.completeFrame(id, timestamp_ms);
@@ -1214,6 +1271,8 @@ fn createSurface(self: *WayringCompositor, compositor: *core.wl_compositor.Resou
         try listener.added(listener.context, surface.id, .{
             .context = self,
             .complete = completeFrameThunk,
+            .has_callback_only = hasCallbackOnlyFrameThunk,
+            .complete_callback_only = completeCallbackOnlyFrameThunk,
         });
         listener_added = true;
     }
@@ -1969,6 +2028,15 @@ fn prepareCommit(self: *WayringCompositor, surface: *Surface) !PreparedCommit {
         input_owned = false;
     }
 
+    prepared.callback_only = prepared.damage.isEmpty() and
+        !prepared.attachment_changed and
+        prepared.opaque_region == null and
+        prepared.input == null and
+        prepared.scale == surface.current_scale and
+        prepared.transform == surface.current_transform and
+        prepared.offset_x == 0 and prepared.offset_y == 0 and
+        !surface.topology_dirty;
+
     if (surface.has_pending_attachment) {
         if (surface.pending_attachment) |*pending| {
             try self.preparePendingBuffer(surface, pending, &prepared);
@@ -2080,6 +2148,7 @@ fn publishPreparedCommit(
     for (surface.frame_callbacks.items) |callback| switch (callback.state) {
         .queued => |queued| if (std.meta.eql(queued, token)) {
             callback.state = .committed;
+            callback.callback_only = prepared.callback_only;
             callbacks_to_commit -= 1;
         },
         .pending, .committed => {},
@@ -3773,6 +3842,8 @@ test "frame callback materializes immediately and waits for null commit completi
     try compositor.replaceSurfaceResourceForTest(client, surface, 4);
     const completion = listener_state.frame_completion.?;
     try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&compositor)), completion.context);
+    try std.testing.expect(completion.has_callback_only != null);
+    try std.testing.expect(completion.complete_callback_only != null);
 
     try requestFrame(client, 4, 5);
     try std.testing.expect(client.fatal() == null);
@@ -3798,7 +3869,11 @@ test "frame callback materializes immediately and waits for null commit completi
     defer std.testing.allocator.free(no_automatic_done);
     try std.testing.expectEqual(@as(usize, 0), no_automatic_done.len);
 
-    completion.complete(completion.context, id, 0xaabb_ccdd);
+    try std.testing.expect(completion.has_callback_only.?(completion.context, id));
+    try std.testing.expectEqual(
+        SurfaceFrameCompletion.CallbackOnlyResult.drained,
+        completion.complete_callback_only.?(completion.context, id, 0xaabb_ccdd),
+    );
     const completed = try drain(client);
     defer std.testing.allocator.free(completed);
     try std.testing.expectEqual(@as(usize, 24), completed.len);
@@ -3810,10 +3885,23 @@ test "frame callback materializes immediately and waits for null commit completi
     const completed_again = try drain(client);
     defer std.testing.allocator.free(completed_again);
     try std.testing.expectEqual(@as(usize, 0), completed_again.len);
+
+    try requestFrame(client, 4, 6);
+    try damageSurface(client, 4, .{ .x = 0, .y = 0, .width = 1, .height = 1 });
     try commitSurfaceResource(client, 4);
     try std.testing.expectEqual(@as(usize, 2), listener_state.committed_count);
-    try std.testing.expect(!listener_state.last_callbacks_committed);
-    try std.testing.expectEqual(@as(usize, 1), listener_state.callbacks_committed_count);
+    try std.testing.expect(listener_state.last_callbacks_committed);
+    try std.testing.expectEqual(@as(usize, 2), listener_state.callbacks_committed_count);
+    try std.testing.expect(!completion.has_callback_only.?(completion.context, id));
+    try std.testing.expectEqual(
+        SurfaceFrameCompletion.CallbackOnlyResult.none,
+        completion.complete_callback_only.?(completion.context, id, 99),
+    );
+    try std.testing.expectEqual(@as(usize, 1), surface.frame_callbacks.items.len);
+    completion.complete(completion.context, id, 100);
+    const repaint_completed = try drain(client);
+    defer std.testing.allocator.free(repaint_completed);
+    try expectCallbackDoneAndDelete(repaint_completed, 0, 6, 100);
     try std.testing.expect(client.fatal() == null);
 }
 

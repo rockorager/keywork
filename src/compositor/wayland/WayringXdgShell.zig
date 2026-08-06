@@ -541,9 +541,11 @@ fn createToplevel(
     };
     var core_owned = true;
     errdefer if (core_owned) self.core_shell.destroyToplevel(toplevel.core_id);
-    // Generated toplevels become semantically managed by the mature policy,
-    // but remain absent from presentation until a later wave owns it.
+    // Generated toplevels begin private and non-interactive. The first
+    // configured non-null-buffer commit atomically hands presentation to the
+    // Scene after Wayring content publication; Wave 5 owns interaction.
     try self.core_shell.setWindowScenePresentationEnabled(toplevel.core_id, false);
+    self.core_shell.setWindowInteractionEnabled(toplevel.core_id, false);
     _ = self.compositor.assignXdgRole(surface.reservation, .toplevel) catch unreachable;
 
     surface.active_role = .{ .toplevel = toplevel };
@@ -920,6 +922,30 @@ fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
     }) {
         .toplevel => false,
         .popup => |popup| surface.adapter.core_shell.popupDismissed(popup.core_id),
+    };
+    if (commit.next_size != null) switch (surface.active_role.?) {
+        .toplevel => |toplevel| {
+            const info = surface.adapter.core_shell.windowInfo(toplevel.core_id) orelse {
+                finishPreparedCommit(surface);
+                return;
+            };
+            const mapping_configured = accepted != null or
+                surface.adapter.core_shell.surfaceConfigured(surface.core_id);
+            if (mapping_configured and !info.scene_presentation_enabled) {
+                surface.adapter.core_shell.setWindowScenePresentationEnabled(
+                    toplevel.core_id,
+                    true,
+                ) catch {
+                    surface.client.postOutOfMemory(
+                        &surface.resource.runtime,
+                        "enabling generated XDG toplevel presentation",
+                    );
+                    finishPreparedCommit(surface);
+                    return;
+                };
+            }
+        },
+        .popup => {},
     };
     surface.adapter.core_shell.afterAppliedCommit(
         surface.core_id,
@@ -1810,7 +1836,8 @@ test "toplevel configure ack map unmap and remap retain exact snapshots" {
     try std.testing.expect(harness.core_shell.surfaceConfigured(adapter_surface.core_id));
     try std.testing.expect(harness.core_shell.windowInfo(toplevel.core_id).?.mapped);
     var scene_windows = harness.scene.iterator();
-    try std.testing.expect(!scene_windows.next().?.window.mapped);
+    try std.testing.expect(scene_windows.next().?.window.mapped);
+    try std.testing.expect(!harness.core_shell.windowInfo(toplevel.core_id).?.interaction_enabled);
     const first_release = try drainTest(harness.client());
     std.testing.allocator.free(first_release);
 
@@ -1848,6 +1875,72 @@ test "toplevel configure ack map unmap and remap retain exact snapshots" {
     try std.testing.expect(harness.core_shell.surfaceConfigured(adapter_surface.core_id));
     try std.testing.expect(adapter_surface.accepted_configure == null);
     scene_windows = harness.scene.iterator();
+    try std.testing.expect(scene_windows.next().?.window.mapped);
+}
+
+test "first-map presentation OOM leaves published Wayring content private" {
+    var harness: TestHarness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    try harness.createSurface();
+    try harness.installManager(7);
+    try harness.createToplevel();
+    const adapter_surface = harness.adapter.surfaces.items[0];
+    const toplevel = harness.adapter.toplevels.items[0];
+
+    try commitTestSurface(harness.client());
+    const configure = try drainTest(harness.client());
+    defer std.testing.allocator.free(configure);
+    const serial = testWord(configure, configure.len - 4);
+    try sendTest(harness.client(), 6, 4, &core.xdg_surface.request_messages[4], &.{.{ .uint = serial }});
+
+    const Listener = struct {
+        fn ready(_: *anyopaque, _: XdgShell.WindowId) bool {
+            return true;
+        }
+        fn committed(_: *anyopaque, _: XdgShell.WindowId, _: ?XdgShell.ConfigureToken) bool {
+            return true;
+        }
+        fn ignored(_: *anyopaque, _: XdgShell.WindowId) void {}
+        fn metadata(_: *anyopaque, _: XdgShell.WindowId) bool {
+            return true;
+        }
+        fn presentation(
+            _: *anyopaque,
+            _: XdgShell.WindowId,
+            enabled: bool,
+        ) error{OutOfMemory}!void {
+            if (enabled) return error.OutOfMemory;
+        }
+        fn interaction(_: *anyopaque, _: XdgShell.WindowId, _: bool) void {}
+        fn request(_: *anyopaque, _: XdgShell.WindowId, _: XdgShell.WindowRequest) void {}
+    };
+    var listener_context: u8 = 0;
+    harness.core_shell.setWindowListener(.{
+        .context = &listener_context,
+        .ready = Listener.ready,
+        .committed = Listener.committed,
+        .unmapping = Listener.ignored,
+        .unmapped = Listener.ignored,
+        .destroyed = Listener.ignored,
+        .metadata_changed = Listener.metadata,
+        .presentation_changed = Listener.presentation,
+        .interaction_changed = Listener.interaction,
+        .request = Listener.request,
+    });
+    defer harness.core_shell.clearWindowListener();
+
+    try createTestBuffer(&harness);
+    try attachTestBuffer(harness.client(), 10);
+    try commitTestSurface(harness.client());
+    try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, harness.client().fatal().?.kind);
+    try std.testing.expect(harness.compositor.xdgContentState(adapter_surface.surface_id).?.has_committed_buffer);
+    const info = harness.core_shell.windowInfo(toplevel.core_id).?;
+    try std.testing.expect(!info.mapped);
+    try std.testing.expect(!info.scene_presentation_enabled);
+    try std.testing.expect(!info.interaction_enabled);
+    try std.testing.expect(adapter_surface.prepared_commit == null);
+    var scene_windows = harness.scene.iterator();
     try std.testing.expect(!scene_windows.next().?.window.mapped);
 }
 

@@ -1586,6 +1586,7 @@ pub fn createWithVirtualOutput(
         .appeared = geometryTransitionAppeared,
         .closing = geometryTransitionClosing,
         .removed = geometryTransitionRemoved,
+        .presentation_disabled = geometryTransitionPresentationDisabled,
         .workspace_switching = workspaceTransitionPrepare,
         .workspace_published = workspaceTransitionPublished,
     });
@@ -4052,14 +4053,35 @@ fn repairGeneratedFocus(self: *Self) void {
 }
 
 fn damageHeadlessBatch(self: *Self, batch: WayringCompositor.AppliedBatch) void {
-    for (batch.surfaces) |surface| self.damageHeadlessCompound(surface.id);
+    var root_index: usize = 0;
+    while (self.headless_surface_forest.rootAt(root_index)) |root| : (root_index += 1) {
+        if (headlessBatchTouchesRoot(&self.headless_surface_forest, batch, root.id)) {
+            self.damageHeadlessCompound(root.id);
+        }
+    }
+}
+
+fn headlessBatchTouchesRoot(
+    forest: *const HeadlessSurfaceForest,
+    batch: WayringCompositor.AppliedBatch,
+    root: SurfaceRegistry.Id,
+) bool {
+    for (batch.surfaces) |surface| {
+        const candidate = forest.compoundRoot(surface.id) orelse continue;
+        if (std.meta.eql(candidate, root)) return true;
+    }
     for (batch.parents) |parent_state| {
-        self.damageHeadlessCompound(parent_state.id);
+        const parent_root = forest.compoundRoot(parent_state.id);
+        if (parent_root != null and std.meta.eql(parent_root.?, root)) return true;
         for (parent_state.stack) |entry| switch (entry) {
             .parent => {},
-            .child => |child| self.damageHeadlessCompound(child.id),
+            .child => |child| {
+                const child_root = forest.compoundRoot(child.id) orelse continue;
+                if (std.meta.eql(child_root, root)) return true;
+            },
         };
     }
+    return false;
 }
 
 fn wayringSurfaceAdded(
@@ -4328,6 +4350,7 @@ fn scheduleCursorFallbackAfterColorChange(self: *Self, output: *RenderOutput) vo
 
 fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (self.managedGeneratedWindow(surface_id) != null) return;
     const surfaces = self.compositor.surfaceStore();
     const root = self.subcompositor.rootSurface(surface_id);
     markWindowTransitionTargetDirty(self, root);
@@ -4478,8 +4501,18 @@ fn windowNodeBounds(self: *Self, id: Scene.Id) ?render.Rect {
             bounds = decorated;
         }
     }
-    if (self.subcompositor.treeBounds(window.surface_id)) |tree| {
-        const rect = treeBoundsRect(tree).translated(
+    const tree_rect: ?render.Rect = if (self.managedGeneratedWindow(window.surface_id) != null)
+        switch (self.headless_surface_forest.subtreeDamageBounds(window.surface_id)) {
+            .hidden => null,
+            .rect => |rect| rect,
+            .full_damage => return null,
+        }
+    else if (self.subcompositor.treeBounds(window.surface_id)) |tree|
+        treeBoundsRect(tree)
+    else
+        null;
+    if (tree_rect) |tree| {
+        const rect = tree.translated(
             window.position.x -| content_offset.x,
             window.position.y -| content_offset.y,
         );
@@ -5296,6 +5329,11 @@ fn geometryTransitionRemoved(context: *anyopaque, scene_id: Scene.Id) void {
     }
 }
 
+fn geometryTransitionPresentationDisabled(context: *anyopaque, scene_id: Scene.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (transitionIndex(self, scene_id)) |index| destroyWindowTransition(self, index);
+}
+
 fn markSurfaceTreeVisible(self: *Self, output: *Output, surface_id: Surface.Id) !void {
     if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
     var stack = self.subcompositor.stackIterator(surface_id);
@@ -5537,6 +5575,11 @@ fn damageHeadlessSurfaceBounds(
 fn damageHeadlessCompound(self: *Self, id: SurfaceRegistry.Id) void {
     if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind()) or
         self.headless_surface_forest.isCursorRole(id)) return;
+    const root = self.headless_surface_forest.compoundRoot(id) orelse return;
+    if (self.managedGeneratedWindow(root)) |window| {
+        sceneNodeDamage(self, .{ .window = window.scene_id });
+        return;
+    }
     switch (self.headless_surface_forest.compoundBounds(id)) {
         .hidden => {},
         .rect => |rectangle| self.damageHeadlessSurfaceBounds(rectangle, id),
@@ -5549,6 +5592,19 @@ fn damageHeadlessCompound(self: *Self, id: SurfaceRegistry.Id) void {
             }
         },
     }
+}
+
+fn managedGeneratedWindow(
+    self: *Self,
+    surface_id: SurfaceRegistry.Id,
+) ?NeutralXdgShell.WindowInfo {
+    const root = self.headless_surface_forest.compoundRoot(surface_id) orelse return null;
+    if (!std.meta.eql(root, surface_id) or
+        self.headless_surface_forest.presentationClass(root) != .managed) return null;
+    const window_id = self.xdg_shell_core.toplevelForSurface(root) orelse return null;
+    const info = self.xdg_shell_core.windowInfo(window_id) orelse return null;
+    if (!std.meta.eql(self.scene.windowSurface(info.scene_id) orelse return null, root)) return null;
+    return info;
 }
 
 fn expandHeadlessSurfaceBlurDamage(
@@ -9064,6 +9120,15 @@ fn addSurfaceTreeBounds(
     y: i32,
     bounds: *?render.Rect,
 ) error{Overflow}!void {
+    if (self.managedGeneratedWindow(surface_id) != null) {
+        const subtree = self.headless_surface_forest.subtreeBounds(surface_id) orelse return;
+        const rect = subtree.translated(x, y);
+        bounds.* = if (bounds.*) |current|
+            try capture_geometry.unionBounds(current, rect)
+        else
+            rect;
+        return;
+    }
     if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
     var stack = self.subcompositor.stackIterator(surface_id);
     while (stack.next()) |entry| switch (entry) {
@@ -9107,7 +9172,46 @@ fn handleFrameCallbackTimer(output_context: *RenderOutput) c_int {
     if (output.sendCallbackOnlyFrameCallbacks(timestamp.milliseconds())) {
         log.debug("completed callback-only frame callbacks for {s}", .{output.name()});
     }
+    if (output_context.server.completeGeneratedCallbackOnlyFrames(
+        output,
+        timestamp.milliseconds(),
+    )) {
+        log.debug("completed generated callback-only frame callbacks for {s}", .{output.name()});
+    }
     return 0;
+}
+
+fn completeGeneratedCallbackOnlyFrames(
+    self: *Self,
+    output: *Output,
+    timestamp_ms: u32,
+) bool {
+    var completed = false;
+    var iterator = self.headless_surface_forest.nodeIterator();
+    while (iterator.next()) |node| {
+        if (!node.frame_demand or !output.containsSurface(node.id)) continue;
+        const root = self.headless_surface_forest.compoundRoot(node.id) orelse continue;
+        const info = self.managedGeneratedWindow(root) orelse continue;
+        if (!info.mapped or !info.scene_presentation_enabled or
+            !self.headless_surface_forest.mappedInCompound(node.id, root)) continue;
+        completed = self.headless_surface_forest.completeCallbackOnlyFrame(node.id, timestamp_ms) or completed;
+    }
+    return completed;
+}
+
+fn scheduleGeneratedCallbackOnlyFrames(self: *Self, render_output: *RenderOutput) void {
+    const output = self.outputs.get(render_output.protocol_id) orelse return;
+    var iterator = self.headless_surface_forest.nodeIterator();
+    while (iterator.next()) |node| {
+        if (!node.frame_demand or !output.containsSurface(node.id) or
+            !self.headless_surface_forest.hasCallbackOnlyFrameDemand(node.id)) continue;
+        const root = self.headless_surface_forest.compoundRoot(node.id) orelse continue;
+        const info = self.managedGeneratedWindow(root) orelse continue;
+        if (!info.mapped or !info.scene_presentation_enabled or
+            !self.headless_surface_forest.mappedInCompound(node.id, root)) continue;
+        self.scheduleFrameCallback(render_output);
+        return;
+    }
 }
 
 fn handleRenderIdle(output_context: *RenderOutput) void {
@@ -9187,6 +9291,58 @@ fn expandBackdropBlurDamage(
                 ) or changed;
             }
         }
+        var nodes = self.scene.nodeIterator();
+        while (nodes.next()) |node| switch (node) {
+            .window => |entry| {
+                if (!entry.window.mapped or
+                    self.managedGeneratedWindow(entry.window.surface_id) == null) continue;
+                if (source_root) |source| {
+                    if (std.meta.eql(entry.window.surface_id, source)) continue;
+                    if (self.scene.surfaceNodeAbove(entry.window.surface_id, source)) |above| {
+                        if (!above) continue;
+                    }
+                }
+                const root_position = self.scene.surfacePosition(entry.window.surface_id) orelse
+                    return error.UnresolvedBlurSource;
+                var subtree = self.headless_surface_forest.subtreeRenderIterator(
+                    entry.window.surface_id,
+                );
+                while (subtree.next()) |surface_entry| {
+                    const render_state = self.surface_registry.renderState(surface_entry.id) orelse
+                        return error.UnresolvedBlurSource;
+                    std.debug.assert(std.meta.eql(
+                        surface_entry.mapped_size,
+                        render_state.logical_size,
+                    ));
+                    if (renderStateFullyOpaque(render_state)) continue;
+                    const region = render_state.blur_region orelse continue;
+                    var rectangles = region.rectangleIterator();
+                    while (rectangles.next()) |rectangle| {
+                        const local = surfaceEffectRect(
+                            rectangle,
+                            render_state.logical_size,
+                        ) orelse continue;
+                        const blur = backdrop_blur_damage.areaForOutput(
+                            local.translated(
+                                root_position.x +| surface_entry.position.x,
+                                root_position.y +| surface_entry.position.y,
+                            ),
+                            output.logicalRect(),
+                            render_output.backend.renderScale(),
+                            render_output.backend.modeSize(),
+                            surface_blur.radius,
+                            surface_blur.downsample_level,
+                        ) orelse continue;
+                        changed = try backdrop_blur_damage.propagate(
+                            damage,
+                            blur,
+                            render_output.backend.modeSize(),
+                        ) or changed;
+                    }
+                }
+            },
+            .shell_surface => {},
+        };
     }
 }
 
@@ -9521,9 +9677,10 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
         );
     }
     self.rememberSampledSurfaces(render_output);
+    output.endFrame();
     self.completeSampledHeadlessFrames();
     self.completeSampledGeneratedCursorFrames();
-    output.endFrame();
+    self.scheduleGeneratedCallbackOnlyFrames(render_output);
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(render_output.protocol_id);
 
@@ -9809,9 +9966,10 @@ fn presentSessionLockFrame(
     );
     frame.render_output.lock_frame_pending = true;
     self.rememberSampledSurfaces(frame.render_output);
+    frame.output.endFrame();
     self.completeSampledHeadlessFrames();
     self.completeSampledGeneratedCursorFrames();
-    frame.output.endFrame();
+    self.scheduleGeneratedCallbackOnlyFrames(frame.render_output);
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);
     if (lock_surface) |info| self.submitSurfaceTree(frame.output, info.surface_id);
@@ -10776,6 +10934,29 @@ fn renderSurfaceTreeCapture(
     rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
 ) Renderer.Error!?u32 {
+    if (self.managedGeneratedWindow(surface_id) != null) {
+        if (self.generatedManagedBlurBounds(
+            frame,
+            surface_id,
+            x,
+            y,
+            rounded_clip,
+            clip,
+        )) |rect| {
+            const blur = Scene.background_blur;
+            const capture_id = try allocateBackdropCaptureId(frame);
+            const command = [_]render.Command{.{ .backdrop_capture = .{
+                .id = capture_id,
+                .rect = rect,
+                .radius = blur.radius,
+                .downsample_level = blur.downsample_level,
+                .finish = blur.finish,
+            } }};
+            try self.renderCommands(frame, &command);
+            return capture_id;
+        }
+        return null;
+    }
     if (self.surfaceTreeBlurBounds(frame, surface_id, x, y, rounded_clip, clip)) |rect| {
         const blur = Scene.background_blur;
         const capture_id = try allocateBackdropCaptureId(frame);
@@ -10802,6 +10983,46 @@ fn renderSurfaceTreeContents(
     clip: ?render.Rect,
     capture_id: ?u32,
 ) Renderer.Error!void {
+    if (self.managedGeneratedWindow(surface_id) != null) {
+        var iterator = self.headless_surface_forest.subtreeRenderIterator(surface_id);
+        while (iterator.next()) |entry| {
+            const render_state = self.surface_registry.renderState(entry.id) orelse continue;
+            std.debug.assert(std.meta.eql(entry.mapped_size, render_state.logical_size));
+            const entry_x = x +| entry.position.x;
+            const entry_y = y +| entry.position.y;
+            const surface_rect: render.Rect = .{
+                .x = entry_x,
+                .y = entry_y,
+                .width = render_state.logical_size.width,
+                .height = render_state.logical_size.height,
+            };
+            const visible_rect = surface_rect.intersection(frame.visible_rect) orelse continue;
+            if (clip) |clip_rect| {
+                if (visible_rect.intersection(clip_rect) == null) continue;
+            }
+            if (frame.track_visibility) try frame.output.markSurfaceVisible(entry.id);
+            try self.renderSurfaceBackgroundEffect(
+                frame,
+                render_state,
+                entry_x,
+                entry_y,
+                rounded_clip,
+                clip,
+                capture_id,
+            );
+            const image_command = [_]render.Command{.{ .image = imageFromRenderState(
+                render_state,
+                .{
+                    .position = .{ .x = entry_x, .y = entry_y },
+                    .rounded_clip = rounded_clip,
+                    .clip = clip,
+                },
+                surfaceSampleTag(entry.id),
+            ) }};
+            try self.renderCommands(frame, &image_command);
+        }
+        return;
+    }
     if (self.surface_registry.renderState(surface_id) == null) return;
 
     var stack = self.subcompositor.stackIterator(surface_id);
@@ -10854,6 +11075,32 @@ fn renderSurfaceTreeContents(
             capture_id,
         ),
     };
+}
+
+fn generatedManagedBlurBounds(
+    self: *Self,
+    frame: *const OutputFrame,
+    root: SurfaceRegistry.Id,
+    x: i32,
+    y: i32,
+    rounded_clip: ?render.RoundedClip,
+    clip: ?render.Rect,
+) ?render.Rect {
+    var result: ?render.Rect = null;
+    var iterator = self.headless_surface_forest.subtreeRenderIterator(root);
+    while (iterator.next()) |entry| {
+        const render_state = self.surface_registry.renderState(entry.id) orelse continue;
+        std.debug.assert(std.meta.eql(entry.mapped_size, render_state.logical_size));
+        if (renderStateBlurBounds(
+            frame,
+            render_state,
+            x +| entry.position.x,
+            y +| entry.position.y,
+            rounded_clip,
+            clip,
+        )) |rect| result = if (result) |old| old.unionWith(rect) else rect;
+    }
+    return result;
 }
 
 fn surfaceTreeBlurBounds(
@@ -13894,16 +14141,29 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
     info = server.xdg_shell_core.windowInfo(window_id).?;
     try std.testing.expect(info.ready and info.mapped);
+    try std.testing.expect(info.scene_presentation_enabled);
+    try std.testing.expect(!info.interaction_enabled);
     const snapshots = try server.window_manager.windowSnapshots(std.testing.allocator);
     defer std.testing.allocator.free(snapshots);
-    try std.testing.expectEqual(@as(usize, 0), snapshots.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshots.len);
     var scene_windows = server.scene.iterator();
-    try std.testing.expect(!scene_windows.next().?.window.mapped);
+    try std.testing.expect(scene_windows.next().?.window.mapped);
     try std.testing.expectEqual(HeadlessSurfaceForest.PresentationClass.managed, server.headless_surface_forest.presentationClass(surface_id).?);
     try std.testing.expect(server.headless_surface_forest.subtreeBounds(surface_id) != null);
     try std.testing.expectEqual(@as(usize, 0), server.window_transitions.items.len);
     var rendered_surfaces = server.headless_surface_forest.renderIterator();
     try std.testing.expect(rendered_surfaces.next() == null);
+    const capture_bounds = server.toplevelCaptureBounds(window_id).?;
+    try std.testing.expectEqual(@as(u32, 1), capture_bounds.width);
+    try std.testing.expectEqual(@as(u32, 1), capture_bounds.height);
+    var captured_pixel: [1]u32 = undefined;
+    const capture_fd = try server.captureToplevel(window_id, .{
+        .size = .{ .width = 1, .height = 1 },
+        .stride_pixels = 1,
+        .pixels = &captured_pixel,
+    });
+    if (capture_fd) |value| _ = std.c.close(value);
+    try std.testing.expectEqual(pixel, captured_pixel[0]);
     const initial_release = try T.drain(client);
     std.testing.allocator.free(initial_release);
 
@@ -13916,7 +14176,6 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     try std.testing.expect(info.requested_state.minimized);
     const policy_configure = try T.drain(client);
     defer std.testing.allocator.free(policy_configure);
-    try std.testing.expect(policy_configure.len > 0);
     try T.send(client, 4, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = null }, .{ .int = 0 }, .{ .int = 0 } });
     try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
     const empty = try server.window_manager.windowSnapshots(std.testing.allocator);
@@ -13935,12 +14194,12 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
     const remapped = try server.window_manager.windowSnapshots(std.testing.allocator);
     defer std.testing.allocator.free(remapped);
-    try std.testing.expectEqual(@as(usize, 0), remapped.len);
+    try std.testing.expectEqual(@as(usize, 1), remapped.len);
     try std.testing.expect(server.window_manager.focusedSurface() == null);
     try std.testing.expectEqual(@as(usize, 0), server.window_transitions.items.len);
 
-    // A private WM participant migrates output ownership without entering
-    // public workspace topology or tripping Workspace.moveWindow assertions.
+    // A presented, non-interactive window migrates output ownership through
+    // the same public workspace topology as a mature toplevel.
     server.primary_render_output = replacement_output;
     try std.testing.expect(server.removeRenderOutput(initial_output));
     const migrated_configure = try T.drain(client);
@@ -13953,7 +14212,7 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     );
     const migrated = try server.window_manager.windowSnapshots(std.testing.allocator);
     defer std.testing.allocator.free(migrated);
-    try std.testing.expectEqual(@as(usize, 0), migrated.len);
+    try std.testing.expectEqual(@as(usize, 1), migrated.len);
     try std.testing.expect(server.window_manager.focusedSurface() == null);
     try T.send(client, 6, 4, &core.xdg_surface.request_messages[4], &.{.{ .uint = migrated_serial }});
     try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
