@@ -1,9 +1,9 @@
-//! Unpublished scanner-resource adapter for stable xdg-shell.
+//! Scanner-resource adapter and stable xdg-shell global owner.
 //!
 //! The adapter owns generated resources, wire serials, configure snapshots,
 //! and double-buffered requests. XdgShell remains the only semantic role
 //! owner, while WayringCompositor remains the only generated wl_surface and
-//! content owner. No global is registered here; Wave 7 owns publication.
+//! content owner. Publication is explicit so assembly controls global order.
 
 const WayringXdgShell = @This();
 
@@ -38,6 +38,7 @@ surfaces: std.ArrayList(*Surface) = .empty,
 toplevels: std.ArrayList(*Toplevel) = .empty,
 popups: std.ArrayList(*Popup) = .empty,
 next_resource_generation: ?u64 = 1,
+global: ?*const server.Server.Global = null,
 
 const Manager = struct {
     adapter: *WayringXdgShell,
@@ -141,6 +142,7 @@ pub fn setSeatAdapter(self: *WayringXdgShell, seat: *WayringSeatAdapter) void {
 }
 
 pub fn deinit(self: *WayringXdgShell) void {
+    std.debug.assert(self.global == null);
     std.debug.assert(self.popups.items.len == 0);
     std.debug.assert(self.toplevels.items.len == 0);
     std.debug.assert(self.surfaces.items.len == 0);
@@ -154,14 +156,50 @@ pub fn deinit(self: *WayringXdgShell) void {
     self.* = undefined;
 }
 
-/// Installs an xdg_wm_base resource without registering a global. This is the
-/// only Wave-2 bootstrap seam and is intentionally suitable for tests rather
-/// than production assembly.
-pub fn installUnpublishedForTest(
+/// Publishes exactly one stable xdg_wm_base at the scanner interface version.
+pub fn publish(self: *WayringXdgShell) !void {
+    std.debug.assert(self.global == null);
+    self.global = try self.protocol_server.addGlobal(
+        core.xdg_wm_base,
+        core.xdg_wm_base.interface.version,
+        WayringXdgShell,
+        self,
+        bindGlobal,
+    );
+}
+
+pub fn unpublish(self: *WayringXdgShell) void {
+    const global = self.global orelse unreachable;
+    self.protocol_server.removeGlobal(global) catch |err| switch (err) {
+        error.AlreadyRemoved => {},
+        error.ForeignGlobal => unreachable,
+    };
+    self.global = null;
+}
+
+fn bindGlobal(client: *server.Client, object_id: u32, version: u32, self: *WayringXdgShell) !void {
+    try self.installManager(client, object_id, version, .registry_bind);
+}
+
+/// Narrow direct installer for resource and fault fixtures that do not route
+/// through wl_registry. Production and end-to-end acceptance use bindGlobal.
+pub fn installDirectForTest(
     self: *WayringXdgShell,
     client: *server.Client,
     object_id: u32,
     version: u32,
+) !void {
+    try self.installManager(client, object_id, version, .client_initial);
+}
+
+const ManagerInstall = enum { registry_bind, client_initial };
+
+fn installManager(
+    self: *WayringXdgShell,
+    client: *server.Client,
+    object_id: u32,
+    version: u32,
+    install: ManagerInstall,
 ) !void {
     if (version == 0 or version > core.xdg_wm_base.interface.version) {
         return error.InvalidVersion;
@@ -176,8 +214,15 @@ pub fn installUnpublishedForTest(
         .generation = generation,
         .resource = .init(self.allocator, object_id, version, .client, client.ownerHooks()),
     };
-    manager.resource.setHandler(Manager, manager, handleManager, null) catch unreachable;
-    try client.installClientInitial(object_id, &manager.resource.runtime);
+    errdefer {
+        manager.resource.destroy();
+        manager.resource.deinit();
+    }
+    try manager.resource.setHandler(Manager, manager, handleManager, null);
+    switch (install) {
+        .registry_bind => try client.materialize(&manager.resource.runtime),
+        .client_initial => try client.installClientInitial(object_id, &manager.resource.runtime),
+    }
     self.managers.appendAssumeCapacity(manager);
 }
 
@@ -639,10 +684,10 @@ fn handleToplevel(
         .unset_maximized => forwardStateRequest(toplevel, .unmaximize),
         .set_fullscreen => |set| {
             const output: ?OutputLayout.Id = if (set.output) |object_id|
-                (toplevel.adapter.outputs orelse return).outputIdForResource(
+                if (toplevel.adapter.outputs) |outputs| outputs.outputIdForResource(
                     toplevel.surface.client,
                     object_id,
-                ) orelse return
+                ) else null
             else
                 null;
             shell.requestFullscreen(toplevel.core_id, true, output);
@@ -1158,7 +1203,11 @@ fn configureToplevel(
     // This generated-adapter filter is intentionally narrower than the
     // mature compatibility surface. Keep mature behavior unchanged until
     // capabilities have one parity-safe neutral policy source.
-    const capability_values = [_]u32{ 2, 3, 4 };
+    const capability_values = [_]u32{
+        @intCast(core.xdg_toplevel.wm_capabilities.maximize),
+        @intCast(core.xdg_toplevel.wm_capabilities.fullscreen),
+        @intCast(core.xdg_toplevel.wm_capabilities.minimize),
+    };
     const capabilities = [_]wire.Value{.{
         .array = std.mem.sliceAsBytes(&capability_values),
     }};
@@ -1697,7 +1746,7 @@ const TestHarness = struct {
     }
 
     fn installManager(self: *@This(), version: u32) !void {
-        try self.adapter.installUnpublishedForTest(self.client(), 5, version);
+        try self.adapter.installDirectForTest(self.client(), 5, version);
     }
 
     fn createToplevel(self: *@This()) !void {
@@ -1733,8 +1782,8 @@ const TestHarness = struct {
         return .{
             .x = 0,
             .y = 0,
-            .width = @intCast(state.logical_size.width),
-            .height = @intCast(state.logical_size.height),
+            .width = std.math.cast(i32, state.logical_size.width) orelse return null,
+            .height = std.math.cast(i32, state.logical_size.height) orelse return null,
         };
     }
 
@@ -1907,6 +1956,64 @@ test "unpublished manager preserves globals and roleless wrappers roll back clea
     try std.testing.expect(harness.client().fatal() == null);
 }
 
+test "stable global publishes in order at scanner version and supports multiple binds" {
+    var harness: TestHarness = undefined;
+    try harness.init();
+    try harness.adapter.publish();
+    defer {
+        harness.adapter.unpublish();
+        harness.deinit();
+    }
+
+    var globals = harness.host.iterator();
+    var last: *const server.Server.Global = undefined;
+    while (globals.next()) |global| last = global;
+    try std.testing.expectEqualStrings("xdg_wm_base", last.interface().name);
+    try std.testing.expectEqual(core.xdg_wm_base.interface.version, last.version());
+
+    try harness.createSurface();
+    const shell_name = globalName(&harness.host, "xdg_wm_base").?;
+    inline for (.{ @as(u32, 5), 6 }) |object_id| {
+        try sendTest(harness.client(), 2, 0, &core.wl_registry.request_messages[0], &.{
+            .{ .uint = shell_name },
+            .{ .new_id = .{ .generic = .{
+                .interface = "xdg_wm_base",
+                .version = core.xdg_wm_base.interface.version,
+                .id = object_id,
+            } } },
+        });
+    }
+    try std.testing.expectEqual(@as(usize, 2), harness.adapter.managers.items.len);
+    try std.testing.expectEqual(core.xdg_wm_base.interface.version, harness.adapter.managers.items[0].resource.version());
+    try std.testing.expectEqual(core.xdg_wm_base.interface.version, harness.adapter.managers.items[1].resource.version());
+}
+
+test "stable global publication allocation failure leaves no half-installed global" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    failing.fail_index = 0;
+    var host: server.Server = .init(failing.allocator());
+    defer host.deinit();
+    var core_shell: XdgShell = undefined;
+    var clients: WayringClients = undefined;
+    var compositor: WayringCompositor = undefined;
+    var adapter: WayringXdgShell = undefined;
+    adapter.init(
+        std.testing.allocator,
+        &host,
+        &core_shell,
+        &clients,
+        &compositor,
+        null,
+    );
+    defer adapter.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, adapter.publish());
+    try std.testing.expect(adapter.global == null);
+    var globals = host.iterator();
+    try std.testing.expect(globals.next() == null);
+    try std.testing.expect(failing.has_induced_failure);
+}
+
 test "manager child guard is exact and forced teardown is child first" {
     var harness: TestHarness = undefined;
     try harness.init();
@@ -1967,7 +2074,7 @@ test "pending and committed roleless buffers both reject XDG reservation" {
                 const release = try drainTest(harness.client());
                 std.testing.allocator.free(release);
             }
-            try harness.adapter.installUnpublishedForTest(harness.client(), 8, 7);
+            try harness.adapter.installDirectForTest(harness.client(), 8, 7);
             const surface_id = harness.compositor.surfaceId(harness.client(), 4).?;
             try sendTest(harness.client(), 8, 2, &core.xdg_wm_base.request_messages[2], &.{
                 .{ .new_id = .{ .typed = 9 } }, .{ .object = 4 },
@@ -2081,6 +2188,37 @@ test "toplevel configure ack map unmap and remap retain exact snapshots" {
     try std.testing.expect(adapter_surface.accepted_configure == null);
     scene_windows = harness.scene.iterator();
     try std.testing.expect(scene_windows.next().?.window.mapped);
+}
+
+test "raw configure serial exhaustion publishes no alias and leaves preparation clean" {
+    var harness: TestHarness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    try harness.createSurface();
+    try harness.installManager(7);
+    try harness.createToplevel();
+    const surface = harness.adapter.surfaces.items[0];
+    const toplevel = harness.adapter.toplevels.items[0];
+
+    harness.host.next_serial = std.math.maxInt(u32);
+    try commitTestSurface(harness.client());
+    const initial = try drainTest(harness.client());
+    defer std.testing.allocator.free(initial);
+    try std.testing.expectEqual(std.math.maxInt(u32), testWord(initial, initial.len - 4));
+    try std.testing.expectEqual(@as(usize, 1), surface.configures.items.len);
+    try std.testing.expectEqual(@as(u64, 1), surface.configures.items[0].accepted.token.sequence);
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        harness.core_shell.configureWindow(toplevel.core_id, .{ .width = 2, .height = 2 }),
+    );
+    try std.testing.expectEqual(server.Fatal.Kind.implementation, harness.client().fatal().?.kind);
+    try std.testing.expectEqual(@as(usize, 1), surface.configures.items.len);
+    try std.testing.expectEqual(std.math.maxInt(u32), surface.configures.items[0].serial);
+    try std.testing.expectEqual(@as(u64, 1), surface.configures.items[0].accepted.token.sequence);
+    try std.testing.expect(surface.prepared_events == null);
+    try std.testing.expect(surface.prepared_commit == null);
+    try std.testing.expectError(error.SerialExhausted, harness.host.nextSerial());
 }
 
 test "first-map presentation OOM leaves published Wayring content private" {

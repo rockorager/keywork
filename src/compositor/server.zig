@@ -2406,15 +2406,15 @@ fn xdgSubtreeGeometry(context: *anyopaque, id: SurfaceRegistry.Id) ?NeutralXdgSh
     if (self.subcompositor.treeBounds(id)) |bounds| return .{
         .x = bounds.x,
         .y = bounds.y,
-        .width = @intCast(bounds.width),
-        .height = @intCast(bounds.height),
+        .width = std.math.cast(i32, bounds.width) orelse return null,
+        .height = std.math.cast(i32, bounds.height) orelse return null,
     };
     const generated = self.headless_surface_forest.subtreeBounds(id) orelse return null;
     return .{
         .x = generated.x,
         .y = generated.y,
-        .width = @intCast(generated.width),
-        .height = @intCast(generated.height),
+        .width = std.math.cast(i32, generated.width) orelse return null,
+        .height = std.math.cast(i32, generated.height) orelse return null,
     };
 }
 
@@ -14528,7 +14528,7 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     try T.send(client, 3, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 4 } }});
     const surface_id = compositor.surfaceId(client, 4).?;
     try std.testing.expectEqual(HeadlessSurfaceForest.PresentationClass.background, server.headless_surface_forest.presentationClass(surface_id).?);
-    try xdg.installUnpublishedForTest(client, 5, 7);
+    try xdg.installDirectForTest(client, 5, 7);
     try std.testing.expectEqual(globals, T.globalCount(&host));
     try std.testing.expect(T.globalName(&host, "xdg_wm_base") == null);
     try T.send(client, 5, 2, &core.xdg_wm_base.request_messages[2], &.{ .{ .new_id = .{ .typed = 6 } }, .{ .object = 4 } });
@@ -16015,6 +16015,232 @@ const WayringSubsurfaceClient = struct {
     }
 };
 
+// Compact production-path XDG peer: all objects are obtained from the real
+// registry and all configure state is delivered by libwayland-client.
+const WayringXdgClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_xdg = wayland.client.xdg;
+    const Stage = enum(u8) { starting, configured, mapped, frame_done, registry_ready, disconnected, failed };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    registry_only: bool = false,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    shm: ?*client_wl.Shm = null,
+    output: ?*client_wl.Output = null,
+    seat: ?*client_wl.Seat = null,
+    wm_base: ?*client_xdg.WmBase = null,
+    global_count: usize = 0,
+    globals_exact: bool = true,
+    configure_serial: u32 = 0,
+    configure_count: u8 = 0,
+    toplevel_configure_count: u8 = 0,
+    capabilities_count: u8 = 0,
+    output_enter_count: std.atomic.Value(u8) = .init(0),
+    frame_count: std.atomic.Value(u8) = .init(0),
+
+    const expected_globals = [_]struct { name: []const u8, version: u32 }{
+        .{ .name = "wl_compositor", .version = 6 },
+        .{ .name = "wl_shm", .version = 1 },
+        .{ .name = "wl_subcompositor", .version = 1 },
+        .{ .name = "wl_seat", .version = 11 },
+        .{ .name = "wl_output", .version = 4 },
+        .{ .name = "xdg_wm_base", .version = 7 },
+    };
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}/{s}", .{ self.runtime_directory, self.display_name }, 0);
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        var registry_live = true;
+        defer if (registry_live) registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        if (!self.globals_exact or self.global_count != expected_globals.len) return error.UnexpectedRegistrySnapshot;
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        const shm = self.shm orelse return error.ShmMissing;
+        const output = self.output orelse return error.OutputMissing;
+        var output_live = true;
+        defer if (output_live) output.release();
+        const seat = self.seat orelse return error.SeatMissing;
+        var seat_live = true;
+        defer if (seat_live) seat.release();
+        const wm_base = self.wm_base orelse return error.XdgWmBaseMissing;
+        var wm_base_live = true;
+        defer if (wm_base_live) wm_base.destroy();
+        wm_base.setListener(*@This(), wmBaseEvent, self);
+        if (self.registry_only) {
+            try self.pause(.registry_ready);
+            wm_base.destroy();
+            wm_base_live = false;
+            seat.release();
+            seat_live = false;
+            output.release();
+            output_live = false;
+            registry.destroy();
+            registry_live = false;
+            try expectClientRoundtrip(display);
+            return;
+        }
+
+        const surface = try compositor.createSurface();
+        var surface_live = true;
+        defer if (surface_live) surface.destroy();
+        surface.setListener(*@This(), surfaceEvent, self);
+        const xdg_surface = try wm_base.getXdgSurface(surface);
+        var xdg_surface_live = true;
+        defer if (xdg_surface_live) xdg_surface.destroy();
+        xdg_surface.setListener(*@This(), xdgSurfaceEvent, self);
+        const toplevel = try xdg_surface.getToplevel();
+        var toplevel_live = true;
+        defer if (toplevel_live) toplevel.destroy();
+        toplevel.setListener(*@This(), toplevelEvent, self);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.configure_count != 1 or self.toplevel_configure_count != 1 or
+            self.capabilities_count != 1 or self.configure_serial == 0)
+            return error.UnexpectedInitialConfigure;
+        try self.pause(.configured);
+
+        const shm_fd = try std.posix.memfd_create("keywork-wayring-xdg", std.os.linux.MFD.CLOEXEC);
+        defer _ = std.os.linux.close(shm_fd);
+        const pixel: u32 = 0x007a_a2f7;
+        if (std.os.linux.errno(std.os.linux.ftruncate(shm_fd, @sizeOf(u32))) != .SUCCESS) return error.ShmResizeFailed;
+        if (std.c.pwrite(shm_fd, @ptrCast(&pixel), @sizeOf(u32), 0) != @sizeOf(u32)) return error.ShmWriteFailed;
+        const pool = try shm.createPool(shm_fd, @sizeOf(u32));
+        var pool_live = true;
+        defer if (pool_live) pool.destroy();
+        const buffer = try pool.createBuffer(0, 1, 1, @sizeOf(u32), .xrgb8888);
+        var buffer_live = true;
+        defer if (buffer_live) buffer.destroy();
+        const callback = try surface.frame();
+        callback.setListener(*@This(), frameEvent, self);
+        surface.attach(buffer, 0, 0);
+        surface.damageBuffer(0, 0, 1, 1);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        try self.pause(.mapped);
+        try expectClientRoundtrip(display);
+        if (self.output_enter_count.load(.acquire) != 1) return error.OutputEnterMissing;
+        if (self.frame_count.load(.acquire) != 1) return error.FrameDoneMissing;
+        try self.pause(.frame_done);
+
+        buffer.destroy();
+        buffer_live = false;
+        pool.destroy();
+        pool_live = false;
+        toplevel.destroy();
+        toplevel_live = false;
+        xdg_surface.destroy();
+        xdg_surface_live = false;
+        surface.destroy();
+        surface_live = false;
+        wm_base.destroy();
+        wm_base_live = false;
+        seat.release();
+        seat_live = false;
+        output.release();
+        output_live = false;
+        registry.destroy();
+        registry_live = false;
+        try expectClientRoundtrip(display);
+    }
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                const index = self.global_count;
+                self.global_count += 1;
+                if (index >= expected_globals.len or !std.mem.eql(u8, interface, expected_globals[index].name) or
+                    global.version != expected_globals[index].version) self.globals_exact = false;
+                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, 6) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, 4) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, 11) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, 7) catch null;
+            },
+            .global_remove => {},
+        }
+    }
+
+    fn wmBaseEvent(wm_base: *client_xdg.WmBase, event: client_xdg.WmBase.Event, _: *@This()) void {
+        switch (event) {
+            .ping => |ping| wm_base.pong(ping.serial),
+        }
+    }
+    fn xdgSurfaceEvent(xdg_surface: *client_xdg.Surface, event: client_xdg.Surface.Event, self: *@This()) void {
+        switch (event) {
+            .configure => |configure| {
+                self.configure_serial = configure.serial;
+                self.configure_count += 1;
+                xdg_surface.ackConfigure(configure.serial);
+            },
+        }
+    }
+    fn toplevelEvent(_: *client_xdg.Toplevel, event: client_xdg.Toplevel.Event, self: *@This()) void {
+        switch (event) {
+            .configure => self.toplevel_configure_count += 1,
+            .wm_capabilities => self.capabilities_count += 1,
+            .configure_bounds, .close => {},
+        }
+    }
+    fn surfaceEvent(_: *client_wl.Surface, event: client_wl.Surface.Event, self: *@This()) void {
+        switch (event) {
+            .enter => _ = self.output_enter_count.fetchAdd(1, .acq_rel),
+            else => {},
+        }
+    }
+    fn frameEvent(callback: *client_wl.Callback, event: client_wl.Callback.Event, self: *@This()) void {
+        switch (event) {
+            .done => {
+                _ = self.frame_count.fetchAdd(1, .acq_rel);
+                callback.destroy();
+            },
+        }
+    }
+    fn pause(self: *@This(), value: Stage) !void {
+        self.stage.store(@intFromEnum(value), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+    fn closeWake(self: *@This(), shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(-2, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+    fn shutdown(self: *@This()) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
 const WayringSeatClient = struct {
     const client_wl = wayland.client.wl;
     const Stage = enum(u8) {
@@ -16768,6 +16994,17 @@ fn waitForWayringSeatStage(
         if (host.failure()) |err| return err;
     }
     return error.WayringClientTimedOut;
+}
+
+fn waitForWayringXdgStage(server: *Self, host: anytype, client: *WayringXdgClient, expected: WayringXdgClient.Stage) !void {
+    for (0..1_000) |_| {
+        const stage: WayringXdgClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure.?;
+        try server.eventLoop().dispatch(1);
+        if (host.failure()) |err| return err;
+    }
+    return error.WayringXdgClientTimedOut;
 }
 
 fn waitForMatureKeyboardStage(
@@ -17833,6 +18070,139 @@ test "fullscreen selection is isolated to each output" {
         .width = 640,
         .height = 480,
     }).?.id);
+}
+
+test "production Wayring XDG publication accepts a real registry client and survives rebind" {
+    const WayringHost = @import("wayland/WayringHost.zig");
+    const wayring = @import("wayring");
+    const linux = std.os.linux;
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(std.testing.allocator, "/tmp/keywork-wayring-xdg-{d}-{x}", .{ linux.getpid(), @intFromPtr(&marker) }, 0);
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS) return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+
+    const server = try Self.createWithVirtualOutput(std.testing.allocator, std.testing.io, .cpu, .headless, null, .{
+        .size = .{ .width = 4, .height = 4 },
+        .refresh_millihertz = 1,
+    });
+    defer server.destroy();
+    const registry_baseline = server.surface_registry.len();
+    var protocol_server: wayring.server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    var clients: WayringClients = undefined;
+    clients.init(std.testing.allocator, server.clientRegistry());
+    defer clients.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &protocol_server, server.surfaceRegistry(), server.wayringPresentationListener());
+    defer compositor.deinit();
+    var seat: WayringSeatAdapter = .init(std.testing.allocator, &protocol_server, &clients, &compositor, server.generatedSeatRequestSink(), server.generatedSeatName());
+    defer seat.deinit();
+    try seat.publish();
+    defer seat.unpublish();
+    var outputs: WayringOutput = undefined;
+    try outputs.init(std.testing.allocator, &protocol_server, server.wayringOutputLayout().?, &compositor);
+    defer outputs.deinit();
+    var xdg: WayringXdgShell = undefined;
+    xdg.init(std.testing.allocator, &protocol_server, server.neutralXdgShell(), &clients, &compositor, &outputs);
+    defer xdg.deinit();
+    xdg.setSeatAdapter(&seat);
+    try xdg.publish();
+    defer xdg.unpublish();
+
+    const Lifecycle = struct {
+        clients: *WayringClients,
+        compositor: *WayringCompositor,
+        outputs: *WayringOutput,
+        seat: *WayringSeatAdapter,
+        xdg: *WayringXdgShell,
+        accepted_count: usize = 0,
+
+        fn accepted(context: *anyopaque, client: *wayring.server.Client) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = try self.clients.register(client);
+            errdefer self.clients.unregister(client);
+            try self.seat.trackClient(client);
+            self.accepted_count += 1;
+        }
+        fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.xdg.destroyClientResources(client);
+            self.seat.destroyClientResources(client);
+            self.outputs.destroyClientResources(client);
+            self.compositor.destroyClientResources(client);
+            if (self.clients.id(client) != null) self.clients.unregister(client);
+        }
+    };
+    var lifecycle: Lifecycle = .{ .clients = &clients, .compositor = &compositor, .outputs = &outputs, .seat = &seat, .xdg = &xdg };
+    const host = try WayringHost.create(std.testing.allocator, server.eventLoop(), &protocol_server, runtime_directory, .{
+        .context = &lifecycle,
+        .accepted = Lifecycle.accepted,
+        .destroy_resources = Lifecycle.destroy,
+    });
+    var host_live = true;
+    defer if (host_live) host.destroy() catch {};
+
+    const raw_command_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_command_fd) != .SUCCESS) return error.EventFdFailed;
+    const command_fd: std.posix.fd_t = @intCast(raw_command_fd);
+    defer _ = linux.close(command_fd);
+    var client: WayringXdgClient = .{ .runtime_directory = runtime_directory, .display_name = host.displayName(), .command_fd = command_fd };
+    const thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&client});
+    var joined = false;
+    defer if (!joined) {
+        client.shutdown();
+        thread.join();
+    };
+    try waitForWayringXdgStage(server, host, &client, .configured);
+    try std.testing.expectEqual(@as(usize, 1), lifecycle.accepted_count);
+    try std.testing.expectEqual(@as(usize, 1), server.client_registry.len());
+    try std.testing.expectEqual(@as(usize, 1), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 1), server.headless_surface_forest.len());
+    var neutral_windows = server.neutralXdgShell().windowIterator();
+    try std.testing.expect(neutral_windows.next() != null);
+    try std.testing.expect(server.surface_registry.renderState(server.headless_surface_forest.rootAt(0).?.id) == null);
+
+    try signalWayringCommand(command_fd);
+    try waitForWayringXdgStage(server, host, &client, .mapped);
+    const surface_id = server.headless_surface_forest.rootAt(0).?.id;
+    try std.testing.expect(server.scene.topWindowSurface() != null);
+    try std.testing.expect(server.surface_registry.renderState(surface_id) != null);
+    const previous_frames = server.primaryRenderOutput().frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(surface_id)));
+    try signalWayringCommand(command_fd);
+    try waitForWayringXdgStage(server, host, &client, .frame_done);
+    try signalWayringCommand(command_fd);
+    try waitForWayringXdgStage(server, host, &client, .disconnected);
+    thread.join();
+    joined = true;
+    try waitForWayringDisconnect(server, host, &compositor);
+    try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
+    try std.testing.expect(server.scene.topWindowSurface() == null);
+    try std.testing.expectEqual(@as(usize, 0), server.client_registry.len());
+
+    const raw_rebind_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_rebind_fd) != .SUCCESS) return error.EventFdFailed;
+    const rebind_fd: std.posix.fd_t = @intCast(raw_rebind_fd);
+    defer _ = linux.close(rebind_fd);
+    var rebind: WayringXdgClient = .{ .runtime_directory = runtime_directory, .display_name = host.displayName(), .command_fd = rebind_fd, .registry_only = true };
+    const rebind_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&rebind});
+    var rebind_joined = false;
+    defer if (!rebind_joined) {
+        rebind.shutdown();
+        rebind_thread.join();
+    };
+    try waitForWayringXdgStage(server, host, &rebind, .registry_ready);
+    try std.testing.expectEqual(@as(usize, 2), lifecycle.accepted_count);
+    try signalWayringCommand(rebind_fd);
+    try waitForWayringXdgStage(server, host, &rebind, .disconnected);
+    rebind_thread.join();
+    rebind_joined = true;
+    try waitForWayringDisconnect(server, host, &compositor);
+    try std.testing.expect(host.failure() == null);
+    try host.destroy();
+    host_live = false;
 }
 
 test "production Wayring seat global accepts canonical input through the real host" {
