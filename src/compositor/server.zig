@@ -92,6 +92,7 @@ const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
+const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const Viewporter = @import("wayland/viewporter.zig");
 const InputManager = @import("input_manager.zig");
@@ -15200,6 +15201,8 @@ const WayringHeadlessClient = struct {
         transformed_committed,
         transformed_done,
         scale_buffer_released,
+        viewport_committed,
+        viewport_destroyed,
         scaled_committed,
         scaled_done,
         damage_buffer_committed,
@@ -15226,7 +15229,10 @@ const WayringHeadlessClient = struct {
     compositor: ?*wayland.client.wl.Compositor = null,
     shm: ?*wayland.client.wl.Shm = null,
     output: ?*wayland.client.wl.Output = null,
+    viewporter: ?*wayland.client.wp.Viewporter = null,
     compositor_version: std.atomic.Value(u32) = .init(0),
+    global_count: usize = 0,
+    globals_exact: bool = true,
     output_globals: u8 = 0,
     output_version: u32 = 0,
     output_name_valid: bool = false,
@@ -15243,6 +15249,16 @@ const WayringHeadlessClient = struct {
     preferred_buffer_transform: std.atomic.Value(i32) = .init(std.math.maxInt(i32)),
     output_enter_count: std.atomic.Value(u8) = .init(0),
     output_leave_count: std.atomic.Value(u8) = .init(0),
+
+    const expected_globals = [_]struct { name: []const u8, version: u32 }{
+        .{ .name = "wl_compositor", .version = 6 },
+        .{ .name = "wl_shm", .version = 1 },
+        .{ .name = "wl_subcompositor", .version = 1 },
+        .{ .name = "wl_seat", .version = 11 },
+        .{ .name = "wl_output", .version = 4 },
+        .{ .name = "xdg_wm_base", .version = 7 },
+        .{ .name = "wp_viewporter", .version = 1 },
+    };
 
     fn run(self: *WayringHeadlessClient) void {
         self.runFallible() catch |err| {
@@ -15283,9 +15299,13 @@ const WayringHeadlessClient = struct {
         defer registry.destroy();
         registry.setListener(*WayringHeadlessClient, registryEvent, self);
         try expectClientRoundtrip(display);
+        if (!self.globals_exact or self.global_count != expected_globals.len)
+            return error.UnexpectedRegistrySnapshot;
         const compositor = self.compositor orelse return error.CompositorMissing;
         const shm = self.shm orelse return error.ShmMissing;
         const output = self.output orelse return error.OutputMissing;
+        const viewporter = self.viewporter orelse return error.ViewporterMissing;
+        defer viewporter.destroy();
         defer output.release();
         try expectClientRoundtrip(display);
         if (self.output_globals != 1 or self.output_version != 4 or
@@ -15295,6 +15315,9 @@ const WayringHeadlessClient = struct {
             return error.UnexpectedOutputState;
         const surface = try compositor.createSurface();
         defer surface.destroy();
+        const viewport = try viewporter.getViewport(surface);
+        var viewport_live = true;
+        defer if (viewport_live) viewport.destroy();
         surface.setListener(*WayringHeadlessClient, surfaceEvent, self);
         try expectClientRoundtrip(display);
         if (self.preferred_buffer_scale_count.load(.acquire) != 1 or
@@ -15364,6 +15387,25 @@ const WayringHeadlessClient = struct {
         self.stage.store(@intFromEnum(Stage.scale_buffer_released), .release);
         try waitForWayringCommand(self.command_fd);
 
+        viewport.setSource(
+            wayland.client.wl.Fixed.fromInt(1),
+            wayland.client.wl.Fixed.fromInt(0),
+            wayland.client.wl.Fixed.fromInt(2),
+            wayland.client.wl.Fixed.fromInt(2),
+        );
+        viewport.setDestination(4, 2);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        self.stage.store(@intFromEnum(Stage.viewport_committed), .release);
+        try waitForWayringCommand(self.command_fd);
+
+        viewport.destroy();
+        viewport_live = false;
+        surface.commit();
+        try expectClientRoundtrip(display);
+        self.stage.store(@intFromEnum(Stage.viewport_destroyed), .release);
+        try waitForWayringCommand(self.command_fd);
+
         try self.requestFrame(surface);
         surface.setBufferScale(2);
         surface.commit();
@@ -15391,8 +15433,8 @@ const WayringHeadlessClient = struct {
 
         try self.requestFrame(surface);
         try writeWayringScalePixels(scale_shm_fd, .{
-            0x00cc_0000, 0x00cc_0000, 0x0000_dd00, 0x0000_dd00,
-            0x00cc_0000, 0x00cc_0000, 0x0000_dd00, 0x0000_dd00,
+            0x0011_0000, 0x0022_0000, 0x0033_0000, 0x0044_0000,
+            0x0055_0000, 0x0066_0000, 0x0077_0000, 0x0088_0000,
         });
         surface.offset(-3, 2);
         surface.attach(scale_buffer, 0, 0);
@@ -15495,8 +15537,8 @@ const WayringHeadlessClient = struct {
         expected_releases: u8,
     ) !void {
         try writeWayringScalePixels(shm_fd, .{
-            0x00cc_0000, 0x00cc_0000, 0x0000_dd00, 0x0000_dd00,
-            0x00cc_0000, 0x00cc_0000, 0x0000_dd00, 0x0000_dd00,
+            0x0011_0000, 0x0022_0000, 0x0033_0000, 0x0044_0000,
+            0x0055_0000, 0x0066_0000, 0x0077_0000, 0x0088_0000,
         });
         surface.attach(buffer, 0, 0);
         surface.damage(0, 0, 4, 2);
@@ -15516,6 +15558,12 @@ const WayringHeadlessClient = struct {
         switch (event) {
             .global => |global| {
                 const interface = std.mem.span(global.interface);
+                const index = self.global_count;
+                self.global_count += 1;
+                if (index >= expected_globals.len or
+                    !std.mem.eql(u8, interface, expected_globals[index].name) or
+                    global.version != expected_globals[index].version)
+                    self.globals_exact = false;
                 if (std.mem.eql(u8, interface, "wl_compositor") and self.compositor == null) {
                     self.compositor_version.store(global.version, .release);
                     self.compositor = registry.bind(
@@ -15542,6 +15590,12 @@ const WayringHeadlessClient = struct {
                             output.setListener(*WayringHeadlessClient, outputEvent, self);
                         }
                     }
+                } else if (std.mem.eql(u8, interface, "wp_viewporter") and self.viewporter == null) {
+                    self.viewporter = registry.bind(
+                        global.name,
+                        wayland.client.wp.Viewporter,
+                        1,
+                    ) catch null;
                 }
             },
             .global_remove => {},
@@ -17176,7 +17230,7 @@ fn rejectWayringFrames(server: *Self, output: *RenderOutput, child_id: SurfaceRe
     try std.testing.expect(server.headless_surface_forest.state(child_id).?.frame_demand);
 }
 
-test "Wayring wl_compositor v6 preferences offset state and sampled headless content end to end" {
+test "production Wayring viewporter crops and scales real SHM pixels end to end" {
     const WayringHost = @import("wayland/WayringHost.zig");
     const wayring = @import("wayring");
     const linux = std.os.linux;
@@ -17215,6 +17269,10 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     var protocol_server: wayring.server.Server = .init(std.testing.allocator);
     var protocol_server_live = true;
     defer if (protocol_server_live) protocol_server.deinit();
+    var clients: WayringClients = undefined;
+    clients.init(std.testing.allocator, server.clientRegistry());
+    var clients_live = true;
+    defer if (clients_live) clients.deinit();
     var compositor: WayringCompositor = undefined;
     try compositor.init(
         std.testing.allocator,
@@ -17224,6 +17282,20 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     );
     var compositor_live = true;
     defer if (compositor_live) compositor.deinit();
+    var seat: WayringSeatAdapter = .init(
+        std.testing.allocator,
+        &protocol_server,
+        &clients,
+        &compositor,
+        server.generatedSeatRequestSink(),
+        server.generatedSeatName(),
+    );
+    var seat_live = true;
+    defer if (seat_live) {
+        seat.unpublish();
+        seat.deinit();
+    };
+    try seat.publish();
     var wayring_outputs: WayringOutput = undefined;
     try wayring_outputs.init(
         std.testing.allocator,
@@ -17233,19 +17305,63 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     );
     var wayring_outputs_live = true;
     defer if (wayring_outputs_live) wayring_outputs.deinit();
+    var xdg: WayringXdgShell = undefined;
+    xdg.init(
+        std.testing.allocator,
+        &protocol_server,
+        server.neutralXdgShell(),
+        &clients,
+        &compositor,
+        &wayring_outputs,
+    );
+    var xdg_live = true;
+    defer if (xdg_live) {
+        xdg.unpublish();
+        xdg.deinit();
+    };
+    xdg.setSeatAdapter(&seat);
+    try xdg.publish();
+    var viewporter: WayringViewporter = undefined;
+    viewporter.init(std.testing.allocator, &protocol_server, &compositor);
+    var viewporter_live = true;
+    defer if (viewporter_live) {
+        viewporter.unpublish();
+        viewporter.deinit();
+    };
+    try viewporter.publish();
     const Lifecycle = struct {
+        clients: *WayringClients,
         outputs: *WayringOutput,
+        xdg: *WayringXdgShell,
+        viewporter: *WayringViewporter,
         compositor: *WayringCompositor,
+        seat: *WayringSeatAdapter,
 
-        fn accepted(_: *anyopaque, _: *wayring.server.Client) !void {}
+        fn accepted(context: *anyopaque, client: *wayring.server.Client) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = try self.clients.register(client);
+            errdefer self.clients.unregister(client);
+            try self.seat.trackClient(client);
+        }
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            self.seat.destroyClientResources(client);
+            self.viewporter.destroyClientResources(client);
+            self.xdg.destroyClientResources(client);
             self.outputs.destroyClientResources(client);
             self.compositor.destroyClientResources(client);
+            if (self.clients.id(client) != null) self.clients.unregister(client);
         }
     };
-    var lifecycle: Lifecycle = .{ .outputs = &wayring_outputs, .compositor = &compositor };
+    var lifecycle: Lifecycle = .{
+        .clients = &clients,
+        .outputs = &wayring_outputs,
+        .xdg = &xdg,
+        .viewporter = &viewporter,
+        .compositor = &compositor,
+        .seat = &seat,
+    };
     const host = try WayringHost.create(
         std.testing.allocator,
         server.eventLoop(),
@@ -17345,9 +17461,11 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try waitForWayringClientStage(server, host, &client, .transformed_done);
     try std.testing.expectEqual(@as(u8, 2), client.frame_done_count.load(.acquire));
 
+    // Every source pixel is distinct so the CPU target distinguishes an
+    // uncropped buffer from the cropped and linearly scaled result below.
     const scale_pixels = [8]u32{
-        0x00cc_0000, 0x00cc_0000, 0x0000_dd00, 0x0000_dd00,
-        0x00cc_0000, 0x00cc_0000, 0x0000_dd00, 0x0000_dd00,
+        0x0011_0000, 0x0022_0000, 0x0033_0000, 0x0044_0000,
+        0x0055_0000, 0x0066_0000, 0x0077_0000, 0x0088_0000,
     };
     previous_frames = output.frame_statistics.frames_presented;
     try signalWayringCommand(command_fd);
@@ -17357,6 +17475,26 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try expectWayringScaleSnapshot(server, scale_pixels, 3, .{ .width = 4, .height = 2 });
     try std.testing.expect(output.damage.coversRectangle(0, 0, 1, 2));
     try std.testing.expect(output.damage.coversRectangle(0, 0, 4, 2));
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try expectWayringHeadlessExactPixels(server, scale_pixels);
+
+    const viewport_pixels = [8]u32{
+        0x001d_0000, 0x0026_0000, 0x002e_0000, 0x0037_0000,
+        0x0061_0000, 0x006a_0000, 0x0072_0000, 0x007b_0000,
+    };
+    previous_frames = output.frame_statistics.frames_presented;
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .viewport_committed);
+    try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try std.testing.expectEqual(@as(usize, 1), viewporter.viewports.items.len);
+    try renderPendingWayringFrame(server, host, previous_frames);
+    try expectWayringHeadlessExactPixels(server, viewport_pixels);
+
+    previous_frames = output.frame_statistics.frames_presented;
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .viewport_destroyed);
+    try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
+    try std.testing.expectEqual(@as(usize, 0), viewporter.viewports.items.len);
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessExactPixels(server, scale_pixels);
 
@@ -17373,7 +17511,7 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try std.testing.expect(output.render_scheduled);
     try std.testing.expect(server.headless_surface_forest.rootAt(0).?.frame_demand);
     try renderPendingWayringFrame(server, host, previous_frames);
-    try expectWayringHeadlessPixels(server, .{ 0x00cc_0000, 0x0000_dd00 });
+    try expectWayringHeadlessPixels(server, .{ 0x003b_0000, 0x005d_0000 });
 
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .scaled_done);
@@ -17390,7 +17528,7 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try std.testing.expect(output.render_scheduled);
     try std.testing.expect(server.headless_surface_forest.rootAt(0).?.frame_demand);
     try renderPendingWayringFrame(server, host, previous_frames);
-    try expectWayringHeadlessPixels(server, .{ 0x00cc_0000, 0x0000_dd00 });
+    try expectWayringHeadlessPixels(server, .{ 0x003b_0000, 0x005d_0000 });
 
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .damage_buffer_done);
@@ -17408,7 +17546,7 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try std.testing.expect(output.render_scheduled);
     try std.testing.expect(server.headless_surface_forest.rootAt(0).?.frame_demand);
     try renderPendingWayringFrame(server, host, previous_frames);
-    try expectWayringHeadlessPixels(server, .{ 0x00cc_0000, 0x0000_dd00 });
+    try expectWayringHeadlessPixels(server, .{ 0x003b_0000, 0x005d_0000 });
     const attached_offset_state = server.surface_registry.renderState(server.headless_surface_forest.rootAt(0).?.id).?;
     const attached_offset_pointer = attached_offset_state.buffer.pixels.ptr;
     const attached_offset_cache = attached_offset_state.buffer.source_cache.?;
@@ -17432,7 +17570,7 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try std.testing.expect(output.render_scheduled);
     try std.testing.expect(server.headless_surface_forest.rootAt(0).?.frame_demand);
     try renderPendingWayringFrame(server, host, previous_frames);
-    try expectWayringHeadlessPixels(server, .{ 0x00cc_0000, 0x0000_dd00 });
+    try expectWayringHeadlessPixels(server, .{ 0x003b_0000, 0x005d_0000 });
 
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .offset_only_done);
@@ -17488,6 +17626,9 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     try std.testing.expectEqual(@as(u8, 1), client.preferred_buffer_scale_count.load(.acquire));
     try std.testing.expectEqual(@as(u8, 1), client.preferred_buffer_transform_count.load(.acquire));
     try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
+    try std.testing.expectEqual(@as(usize, 0), viewporter.viewports.items.len);
+    try std.testing.expectEqual(@as(usize, 0), viewporter.managers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), server.client_registry.len());
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, null);
 
@@ -17499,10 +17640,21 @@ test "Wayring wl_compositor v6 preferences offset state and sampled headless con
     } else return error.WayringTransportDrainTimedOut;
     try host.destroy();
     host_live = false;
+    viewporter.unpublish();
+    viewporter.deinit();
+    viewporter_live = false;
+    xdg.unpublish();
+    xdg.deinit();
+    xdg_live = false;
     wayring_outputs.deinit();
     wayring_outputs_live = false;
+    seat.unpublish();
+    seat.deinit();
+    seat_live = false;
     compositor.deinit();
     compositor_live = false;
+    clients.deinit();
+    clients_live = false;
     protocol_server.deinit();
     protocol_server_live = false;
     try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
