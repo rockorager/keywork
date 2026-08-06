@@ -48,7 +48,8 @@ pub const ToplevelDragHandler = struct {
 pub const DeviceEndpoint = struct {
     context: *anyopaque,
     selection: *const fn (*anyopaque, ?OfferId) error{OutOfMemory}!void,
-    drag_enter: *const fn (*anyopaque, SurfaceRegistry.Id, f64, f64, ?OfferId) error{OutOfMemory}!void,
+    drag_enter_prepare: *const fn (*anyopaque, ?OfferId) error{OutOfMemory}!void,
+    drag_enter: *const fn (*anyopaque, SurfaceRegistry.Id, f64, f64, ?OfferId) void,
     drag_motion: *const fn (*anyopaque, u32, f64, f64) void,
     drag_leave: *const fn (*anyopaque) void,
     drag_drop: *const fn (*anyopaque) void,
@@ -287,8 +288,10 @@ pub fn createDevice(self: *DataDevice, owner: ClientRegistry.Id, endpoint: Devic
         null else null else null;
     if (self.focused_client != null and std.meta.eql(self.focused_client.?, owner))
         try endpoint.selection(endpoint.context, selection_offer);
-    if (self.drag) |drag| if (drag.target) |target| if (std.meta.eql(target.client, owner))
-        try endpoint.drag_enter(endpoint.context, target.surface, target.x, target.y, drag_offer);
+    if (self.drag) |drag| if (drag.target) |target| if (std.meta.eql(target.client, owner)) {
+        try endpoint.drag_enter_prepare(endpoint.context, drag_offer);
+        endpoint.drag_enter(endpoint.context, target.surface, target.x, target.y, drag_offer);
+    };
     return id;
 }
 
@@ -304,8 +307,11 @@ pub fn destroyDevice(self: *DataDevice, id: DeviceId) void {
 fn removeOffersForDevice(self: *DataDevice, id: DeviceId) void {
     var offers = self.offers.iterator();
     while (offers.next()) |entry| {
-        if (entry.value.device != null and std.meta.eql(entry.value.device.?, id))
-            _ = self.offers.remove(entry.id);
+        if (entry.value.device != null and std.meta.eql(entry.value.device.?, id)) {
+            const offer_id = entry.id;
+            if (self.listener.offer_rolled_back) |rolled_back| rolled_back(self.listener.context, offer_id);
+            _ = self.offers.remove(offer_id);
+        }
     }
 }
 
@@ -727,21 +733,20 @@ pub fn enter(self: *DataDevice, target: Target) Error!void {
             };
         }
     }
-    self.leave();
-    self.drag.?.target = target;
-    errdefer {
-        self.drag.?.target = null;
-        var failed_offers = self.offers.iterator();
-        while (failed_offers.next()) |entry| if (entry.value.kind == .drag and
-            entry.value.drag_generation == generation and entry.value.source != null)
-        {
-            _ = self.offers.remove(entry.id);
-        };
-    }
     var devices = self.devices.iterator();
     while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, target.client)) {
+        const offer = if (self.drag.?.source != null) self.stagedOffer(entry.id, generation) else null;
+        entry.value.endpoint.drag_enter_prepare(entry.value.endpoint.context, offer) catch {
+            self.rollbackStagedOffers(generation);
+            return error.OutOfMemory;
+        };
+    };
+    self.leave();
+    self.drag.?.target = target;
+    devices = self.devices.iterator();
+    while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, target.client)) {
         const offer: ?OfferId = if (self.drag.?.source != null) self.activateStagedOffer(entry.id, generation) else null;
-        try entry.value.endpoint.drag_enter(entry.value.endpoint.context, target.surface, target.x, target.y, offer);
+        entry.value.endpoint.drag_enter(entry.value.endpoint.context, target.surface, target.x, target.y, offer);
     };
 }
 
@@ -754,6 +759,29 @@ fn removeStagedOffers(self: *DataDevice, generation: u64) void {
             _ = self.offers.remove(entry.id);
         }
     }
+}
+
+fn rollbackStagedOffers(self: *DataDevice, generation: u64) void {
+    var offers = self.offers.iterator();
+    while (offers.next()) |entry| {
+        if (entry.value.kind == .drag and entry.value.drag_generation == generation and
+            !entry.value.active and !entry.value.dropped)
+        {
+            const id = entry.id;
+            if (self.listener.offer_rolled_back) |rolled_back| rolled_back(self.listener.context, id);
+            _ = self.offers.remove(id);
+        }
+    }
+}
+
+fn stagedOffer(self: *DataDevice, device: DeviceId, generation: u64) ?OfferId {
+    var offers = self.offers.iterator();
+    while (offers.next()) |entry| {
+        if (entry.value.kind == .drag and entry.value.drag_generation == generation and
+            entry.value.device != null and std.meta.eql(entry.value.device.?, device) and !entry.value.active and
+            !entry.value.dropped and entry.value.source != null) return entry.id;
+    }
+    unreachable;
 }
 
 fn activateStagedOffer(self: *DataDevice, device: DeviceId, generation: u64) ?OfferId {
@@ -1035,7 +1063,8 @@ test "selection authorization, publication, transfer, and replacement are canoni
             const self: *@This() = @ptrCast(@alignCast(context));
             self.selection_offer = offer;
         }
-        fn enter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) error{OutOfMemory}!void {}
+        fn prepareEnter(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
+        fn enter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) void {}
         fn motion(_: *anyopaque, _: u32, _: f64, _: f64) void {}
         fn changed(context: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -1075,6 +1104,7 @@ test "selection authorization, publication, transfer, and replacement are canoni
     const device = try data_device.createDevice(client, .{
         .context = &observer,
         .selection = Observer.selection,
+        .drag_enter_prepare = Observer.prepareEnter,
         .drag_enter = Observer.enter,
         .drag_motion = Observer.motion,
         .drag_leave = Observer.ignored,
@@ -1158,7 +1188,8 @@ test "drag lifecycle rejects cross-client and stale IDs and finishes negotiated 
             self.finishes += 1;
         }
         fn selection(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
-        fn enter(context: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, offer: ?OfferId) error{OutOfMemory}!void {
+        fn prepareEnter(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
+        fn enter(context: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, offer: ?OfferId) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.offer = offer;
             self.enters += 1;
@@ -1201,6 +1232,7 @@ test "drag lifecycle rejects cross-client and stale IDs and finishes negotiated 
     const device_endpoint: DeviceEndpoint = .{
         .context = &observer,
         .selection = Observer.selection,
+        .drag_enter_prepare = Observer.prepareEnter,
         .drag_enter = Observer.enter,
         .drag_motion = Observer.motion,
         .drag_leave = Observer.leave,
@@ -1309,7 +1341,8 @@ test "disconnect retires endpoints without callbacks" {
             self.callbacks += 1;
         }
         fn selection(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
-        fn enter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) error{OutOfMemory}!void {}
+        fn prepareEnter(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
+        fn enter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) void {}
         fn motion(_: *anyopaque, _: u32, _: f64, _: f64) void {}
         fn changed(_: *anyopaque) void {}
     };
@@ -1335,6 +1368,7 @@ test "disconnect retires endpoints without callbacks" {
     _ = try data_device.createDevice(client, .{
         .context = &observer,
         .selection = Observer.selection,
+        .drag_enter_prepare = Observer.prepareEnter,
         .drag_enter = Observer.enter,
         .drag_motion = Observer.motion,
         .drag_leave = Observer.notify,
@@ -1367,6 +1401,8 @@ const RegressionFixture = struct {
         device_drops: usize = 0,
         drag_changes: usize = 0,
         selections: usize = 0,
+        enter_prepares: usize = 0,
+        enters: usize = 0,
         fail_selection: bool = false,
         fail_enter: bool = false,
 
@@ -1394,10 +1430,16 @@ const RegressionFixture = struct {
             self.selection_offer = offer;
             self.selections += 1;
         }
-        fn enter(context: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, offer: ?OfferId) error{OutOfMemory}!void {
+        fn prepareEnter(context: *anyopaque, offer: ?OfferId) error{OutOfMemory}!void {
             const self: *@This() = @ptrCast(@alignCast(context));
-            if (self.fail_enter) return error.OutOfMemory;
             self.drag_offer = offer;
+            self.enter_prepares += 1;
+            if (self.fail_enter) return error.OutOfMemory;
+        }
+        fn enter(context: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, offer: ?OfferId) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.drag_offer = offer;
+            self.enters += 1;
         }
         fn motion(_: *anyopaque, _: u32, _: f64, _: f64) void {}
         fn ignored(_: *anyopaque) void {}
@@ -1415,9 +1457,84 @@ const RegressionFixture = struct {
         return .{ .context = events, .send = Events.send, .target = Events.target, .action = Events.action, .cancelled = Events.cancelled, .drop_performed = Events.dropped, .finished = Events.finished };
     }
     fn deviceEndpoint(events: *Events) DeviceEndpoint {
-        return .{ .context = events, .selection = Events.selection, .drag_enter = Events.enter, .drag_motion = Events.motion, .drag_leave = Events.ignored, .drag_drop = Events.deviceDrop };
+        return .{ .context = events, .selection = Events.selection, .drag_enter_prepare = Events.prepareEnter, .drag_enter = Events.enter, .drag_motion = Events.motion, .drag_leave = Events.ignored, .drag_drop = Events.deviceDrop };
     }
 };
+
+test "drag enter rolls every prepared device back before retrying the batch" {
+    const Rollbacks = struct {
+        ids: [4]OfferId = undefined,
+        count: usize = 0,
+
+        fn offer(context: *anyopaque, id: OfferId) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.ids[self.count] = id;
+            self.count += 1;
+        }
+    };
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    var authority = SeatAuthority.init(std.testing.allocator, &clients, &surfaces);
+    defer authority.deinit();
+    var rollbacks: Rollbacks = .{};
+    var data_device = DataDevice.init(std.testing.allocator, &clients, &surfaces, &authority, .{
+        .context = &rollbacks,
+        .selection_changed = RegressionFixture.Events.ignored,
+        .drag_changed = RegressionFixture.Events.ignored,
+        .offer_rolled_back = Rollbacks.offer,
+    });
+    defer data_device.deinit();
+    const source_client = try clients.register(.mature_display);
+    const target_client = try clients.register(.mature_display);
+    var provider: RegressionFixture.Provider = .{};
+    const origin = try surfaces.add(.{ .context = &provider, .render_state = RegressionFixture.Provider.renderState });
+    const target = try surfaces.add(.{ .context = &provider, .render_state = RegressionFixture.Provider.renderState });
+    var source_events: RegressionFixture.Events = .{};
+    var first: RegressionFixture.Events = .{};
+    var second: RegressionFixture.Events = .{ .fail_enter = true };
+    const source_device = try data_device.createDevice(source_client, RegressionFixture.deviceEndpoint(&source_events));
+    _ = try data_device.createDevice(target_client, RegressionFixture.deviceEndpoint(&first));
+    _ = try data_device.createDevice(target_client, RegressionFixture.deviceEndpoint(&second));
+    const source = try data_device.createSource(source_client, RegressionFixture.sourceEndpoint(&source_events), .{ .actions = .{ .copy = true }, .actions_declared = true });
+    const serial: ClientRegistry.Serial = .{ .domain = .mature_display, .value = 92 };
+    try std.testing.expect(try authority.addPointerPress(source_client, serial, 1, origin));
+    const generation = try data_device.startDrag(source_device, source, origin, null, serial, true);
+    const baseline = data_device.resourceCounts();
+
+    try std.testing.expectError(error.OutOfMemory, data_device.enter(.{ .surface = target, .client = target_client, .x = 1, .y = 2 }));
+    try std.testing.expectEqual(@as(usize, 1), first.enter_prepares);
+    try std.testing.expectEqual(@as(usize, 1), second.enter_prepares);
+    try std.testing.expectEqual(@as(usize, 0), first.enters);
+    try std.testing.expectEqual(@as(usize, 0), second.enters);
+    try std.testing.expectEqual(@as(usize, 2), rollbacks.count);
+    try std.testing.expect(data_device.offerInfo(rollbacks.ids[0]) == null);
+    try std.testing.expect(data_device.offerInfo(rollbacks.ids[1]) == null);
+    try std.testing.expectEqual(baseline, data_device.resourceCounts());
+    try std.testing.expect(data_device.currentTarget() == null);
+    try std.testing.expectEqual(generation, data_device.dragSourceInfo().?.generation);
+
+    second.fail_enter = false;
+    try data_device.enter(.{ .surface = target, .client = target_client, .x = 3, .y = 4 });
+    try std.testing.expectEqual(@as(usize, 2), first.enter_prepares);
+    try std.testing.expectEqual(@as(usize, 2), second.enter_prepares);
+    try std.testing.expectEqual(@as(usize, 1), first.enters);
+    try std.testing.expectEqual(@as(usize, 1), second.enters);
+    try std.testing.expectEqual(@as(usize, 2), data_device.resourceCounts().offers);
+    try std.testing.expectEqual(target, data_device.currentTarget().?.surface);
+
+    data_device.cancelDrag();
+    authority.clearPointerPresses();
+    surfaces.remove(target);
+    surfaces.remove(origin);
+    data_device.clientDisconnected(target_client);
+    data_device.clientDisconnected(source_client);
+    _ = authority.clientDisconnected(target_client);
+    _ = authority.clientDisconnected(source_client);
+    clients.unregister(target_client);
+    clients.unregister(source_client);
+}
 
 test "offers outlive devices until explicit retirement" {
     var clients = ClientRegistry.init(std.testing.allocator);
@@ -1649,7 +1766,8 @@ test "device publication failure rolls IDs offers and selection back" {
 test "device ID registration allocation failure leaves no canonical state" {
     const Endpoint = struct {
         fn selection(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
-        fn enter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) error{OutOfMemory}!void {}
+        fn prepareEnter(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
+        fn enter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) void {}
         fn motion(_: *anyopaque, _: u32, _: f64, _: f64) void {}
         fn notify(_: *anyopaque) void {}
         fn changed(_: *anyopaque) void {}
@@ -1669,6 +1787,7 @@ test "device ID registration allocation failure leaves no canonical state" {
     try std.testing.expectError(error.OutOfMemory, data_device.createDevice(client, .{
         .context = &context,
         .selection = Endpoint.selection,
+        .drag_enter_prepare = Endpoint.prepareEnter,
         .drag_enter = Endpoint.enter,
         .drag_motion = Endpoint.motion,
         .drag_leave = Endpoint.notify,

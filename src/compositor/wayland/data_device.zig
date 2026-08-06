@@ -194,6 +194,7 @@ const DeviceResource = struct {
         self.id = manager.owner.createDevice(client_id, .{
             .context = self,
             .selection = deviceSelection,
+            .drag_enter_prepare = devicePrepareEnter,
             .drag_enter = deviceEnter,
             .drag_motion = deviceMotion,
             .drag_leave = deviceLeave,
@@ -295,6 +296,7 @@ const OfferResource = struct {
     id: OfferId,
     device: ?*DeviceResource,
     enter_serial: u32,
+    published: bool = false,
 
     fn materialize(manager: *Self, id: OfferId, device: *DeviceResource) !*OfferResource {
         if (manager.offers.get(id)) |existing| return existing;
@@ -303,8 +305,6 @@ const OfferResource = struct {
             try manager.owner.setOfferActions(id, .{ .copy = true }, .{ .copy = true });
             info = manager.owner.offerInfo(id) orelse return error.InvalidOffer;
         }
-        const mime_types = if (info.source) |source| try manager.owner.sourceMimeTypes(source) else &.{};
-        const source_actions: NeutralDataDevice.Actions = if (info.source) |source| try manager.owner.sourceActions(source) else .{};
         const resource = try wl.DataOffer.create(device.resource.getClient(), device.resource.getVersion(), 0);
         errdefer resource.destroy();
         const self = manager.allocator.create(OfferResource) catch return error.OutOfMemory;
@@ -312,15 +312,23 @@ const OfferResource = struct {
         self.* = .{ .manager = manager, .resource = resource, .id = id, .device = device, .enter_serial = manager.enter_serial };
         try manager.offers.put(manager.allocator, id, self);
         resource.setHandler(*OfferResource, request, destroyed, self);
-        device.resource.sendDataOffer(resource);
+        return self;
+    }
+
+    fn publish(self: *OfferResource, device: *DeviceResource) !void {
+        if (self.published) return;
+        const info = self.manager.owner.offerInfo(self.id) orelse return error.InvalidOffer;
+        const mime_types = if (info.source) |source| try self.manager.owner.sourceMimeTypes(source) else &.{};
+        const source_actions: NeutralDataDevice.Actions = if (info.source) |source| try self.manager.owner.sourceActions(source) else .{};
+        device.resource.sendDataOffer(self.resource);
         if (info.source != null) {
-            for (mime_types) |mime| resource.sendOffer(@ptrCast(mime.ptr));
-            if (resource.getVersion() >= 3 and info.kind == .drag) {
-                resource.sendSourceActions(toWireActions(source_actions));
-                resource.sendAction(toWireActions(info.selected_action));
+            for (mime_types) |mime| self.resource.sendOffer(@ptrCast(mime.ptr));
+            if (self.resource.getVersion() >= 3 and info.kind == .drag) {
+                self.resource.sendSourceActions(toWireActions(source_actions));
+                self.resource.sendAction(toWireActions(info.selected_action));
             }
         }
-        return self;
+        self.published = true;
     }
 
     fn request(resource: *wl.DataOffer, value: wl.DataOffer.Request, self: *OfferResource) void {
@@ -368,16 +376,20 @@ fn deviceSelection(context: *anyopaque, offer_id: ?OfferId) error{OutOfMemory}!v
         return;
     };
     const offer = OfferResource.materialize(device.manager, offer_id_value, device) catch return error.OutOfMemory;
+    offer.publish(device) catch return error.OutOfMemory;
     device.resource.sendSelection(offer.resource);
 }
 
-fn deviceEnter(context: *anyopaque, surface_id: SurfaceRegistry.Id, x: f64, y: f64, offer_id: ?OfferId) error{OutOfMemory}!void {
+fn devicePrepareEnter(context: *anyopaque, offer_id: ?OfferId) error{OutOfMemory}!void {
+    const device: *DeviceResource = @ptrCast(@alignCast(context));
+    if (offer_id) |id| _ = OfferResource.materialize(device.manager, id, device) catch return error.OutOfMemory;
+}
+
+fn deviceEnter(context: *anyopaque, surface_id: SurfaceRegistry.Id, x: f64, y: f64, offer_id: ?OfferId) void {
     const device: *DeviceResource = @ptrCast(@alignCast(context));
     const surface = Surface.resourceFor(device.manager.surface_store, surface_id) orelse return;
-    const offer = if (offer_id) |id| OfferResource.materialize(device.manager, id, device) catch {
-        device.manager.rollbackEndpointMaterialization(device);
-        return error.OutOfMemory;
-    } else null;
+    const offer = if (offer_id) |id| device.manager.offers.get(id) else null;
+    if (offer) |value| value.publish(device) catch unreachable;
     device.resource.sendEnter(device.manager.enter_serial, surface, fixed(x), fixed(y), if (offer) |value| value.resource else null);
 }
 
@@ -483,6 +495,7 @@ pub fn neutralOfferRolledBack(self: *Self, id: OfferId) void {
     const offer = self.offers.get(id) orelse return;
     offer.resource.destroy();
 }
+
 pub fn neutralOfferSourceActions(self: *Self, id: OfferId, actions: NeutralDataDevice.Actions) void {
     const offer = self.offers.get(id) orelse return;
     if (offer.resource.getVersion() >= 3) offer.resource.sendSourceActions(toWireActions(actions));
@@ -671,19 +684,6 @@ fn detachOffersFromDevice(self: *Self, device: *DeviceResource) void {
     var offers = self.offers.valueIterator();
     while (offers.next()) |entry| {
         if (entry.*.device == device) entry.*.device = null;
-    }
-}
-
-fn rollbackEndpointMaterialization(self: *Self, device: *DeviceResource) void {
-    while (true) {
-        var doomed: ?*OfferResource = null;
-        var offers = self.offers.valueIterator();
-        while (offers.next()) |entry| if (entry.*.device == device) {
-            doomed = entry.*;
-            break;
-        };
-        const offer = doomed orelse return;
-        offer.resource.destroy();
     }
 }
 
