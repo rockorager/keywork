@@ -15241,6 +15241,7 @@ const WayringHeadlessClient = struct {
         unmapped_no_done,
         remapped_released,
         remapped_done,
+        default_replaced,
         outstanding_callback,
         disconnected,
         failed,
@@ -15381,6 +15382,21 @@ const WayringHeadlessClient = struct {
         const buffer = try pool.createBuffer(0, 2, 1, byte_count, .xrgb8888);
         defer buffer.destroy();
         buffer.setListener(*WayringHeadlessClient, bufferEvent, self);
+        const fractional_shm_fd = try std.posix.memfd_create("keywork-wayring-fractional", std.os.linux.MFD.CLOEXEC);
+        defer _ = std.os.linux.close(fractional_shm_fd);
+        if (std.os.linux.errno(std.os.linux.ftruncate(fractional_shm_fd, @sizeOf(@TypeOf(wayring_fractional_pixels)))) != .SUCCESS)
+            return error.ShmResizeFailed;
+        const fractional_pool = try shm.createPool(fractional_shm_fd, @sizeOf(@TypeOf(wayring_fractional_pixels)));
+        defer fractional_pool.destroy();
+        const fractional_buffer = try fractional_pool.createBuffer(
+            0,
+            6,
+            3,
+            6 * @sizeOf(u32),
+            .xrgb8888,
+        );
+        defer fractional_buffer.destroy();
+        fractional_buffer.setListener(*WayringHeadlessClient, bufferEvent, self);
 
         try self.requestFrame(surface);
         try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x0011_2233, 0x0044_5566 }, 1);
@@ -15395,7 +15411,15 @@ const WayringHeadlessClient = struct {
         self.stage.store(@intFromEnum(Stage.initial_done), .release);
         try waitForWayringCommand(self.command_fd);
 
-        try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x0066_7788, 0x0099_aabb }, 2);
+        try writeWayringFractionalPixels(fractional_shm_fd, wayring_fractional_pixels);
+        surface.setBufferScale(1);
+        viewport.setDestination(4, 2);
+        surface.attach(fractional_buffer, 0, 0);
+        surface.damage(0, 0, 4, 2);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.release_count.load(.acquire) != 2) return error.UnexpectedBufferRelease;
+        try writeWayringFractionalPixels(fractional_shm_fd, @splat(0x00de_ad00));
         if (self.fractional_scale_count.load(.acquire) != 2 or
             self.fractional_scale.load(.acquire) != 180)
             return error.UnexpectedFractionalScale;
@@ -15403,9 +15427,15 @@ const WayringHeadlessClient = struct {
         try waitForWayringCommand(self.command_fd);
 
         try self.requestFrame(surface);
+        try writeWayringTestPixels(shm_fd, .{ 0x0066_7788, 0x0099_aabb });
+        viewport.setDestination(-1, -1);
+        surface.attach(buffer, 0, 0);
+        surface.damage(0, 0, 2, 1);
         surface.setBufferTransform(.@"90");
         surface.commit();
         try expectClientRoundtrip(display);
+        if (self.release_count.load(.acquire) != 3) return error.UnexpectedBufferRelease;
+        try writeWayringTestPixels(shm_fd, .{ 0x00de_ad00, 0x00be_ef00 });
         if (self.frame_done_count.load(.acquire) != 1) return error.UnexpectedFrameDone;
         if (self.fractional_scale_count.load(.acquire) != 3 or
             self.fractional_scale.load(.acquire) != 120)
@@ -15427,7 +15457,7 @@ const WayringHeadlessClient = struct {
         const scale_buffer = try scale_pool.createBuffer(0, 4, 2, 4 * @sizeOf(u32), .xrgb8888);
         defer scale_buffer.destroy();
         scale_buffer.setListener(*WayringHeadlessClient, bufferEvent, self);
-        try self.commitScaleBuffer(display, surface, scale_buffer, scale_shm_fd, 3);
+        try self.commitScaleBuffer(display, surface, scale_buffer, scale_shm_fd, 4);
         self.stage.store(@intFromEnum(Stage.scale_buffer_released), .release);
         try waitForWayringCommand(self.command_fd);
 
@@ -15454,7 +15484,7 @@ const WayringHeadlessClient = struct {
         surface.setBufferScale(2);
         surface.commit();
         try expectClientRoundtrip(display);
-        if (self.release_count.load(.acquire) != 3) return error.UnexpectedBufferRelease;
+        if (self.release_count.load(.acquire) != 4) return error.UnexpectedBufferRelease;
         if (self.frame_done_count.load(.acquire) != 2) return error.UnexpectedFrameDone;
         self.stage.store(@intFromEnum(Stage.scaled_committed), .release);
         try waitForWayringCommand(self.command_fd);
@@ -15484,7 +15514,7 @@ const WayringHeadlessClient = struct {
         surface.attach(scale_buffer, 0, 0);
         surface.commit();
         try expectClientRoundtrip(display);
-        if (self.release_count.load(.acquire) != 4) return error.UnexpectedBufferRelease;
+        if (self.release_count.load(.acquire) != 5) return error.UnexpectedBufferRelease;
         if (self.frame_done_count.load(.acquire) != 4) return error.UnexpectedFrameDone;
         self.stage.store(@intFromEnum(Stage.offset_attachment_released), .release);
         try waitForWayringCommand(self.command_fd);
@@ -15497,7 +15527,7 @@ const WayringHeadlessClient = struct {
         surface.offset(7, -5);
         surface.commit();
         try expectClientRoundtrip(display);
-        if (self.release_count.load(.acquire) != 4) return error.UnexpectedBufferRelease;
+        if (self.release_count.load(.acquire) != 5) return error.UnexpectedBufferRelease;
         if (self.frame_done_count.load(.acquire) != 5) return error.UnexpectedFrameDone;
         self.stage.store(@intFromEnum(Stage.offset_only_committed), .release);
         try waitForWayringCommand(self.command_fd);
@@ -15511,7 +15541,7 @@ const WayringHeadlessClient = struct {
         surface.attach(null, 0, 0);
         surface.commit();
         try expectClientRoundtrip(display);
-        if (self.release_count.load(.acquire) != 4) return error.UnexpectedBufferRelease;
+        if (self.release_count.load(.acquire) != 5) return error.UnexpectedBufferRelease;
         if (self.frame_done_count.load(.acquire) != 6) return error.UnexpectedFrameDone;
         self.stage.store(@intFromEnum(Stage.unmapped), .release);
         try waitForWayringCommand(self.command_fd);
@@ -15523,7 +15553,7 @@ const WayringHeadlessClient = struct {
         self.stage.store(@intFromEnum(Stage.unmapped_no_done), .release);
         try waitForWayringCommand(self.command_fd);
 
-        try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x00cc_ddee, 0x0001_0203 }, 5);
+        try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x00cc_ddee, 0x0001_0203 }, 6);
         self.stage.store(@intFromEnum(Stage.remapped_released), .release);
         try waitForWayringCommand(self.command_fd);
         try expectClientRoundtrip(display);
@@ -15532,6 +15562,18 @@ const WayringHeadlessClient = struct {
             self.output_leave_count.load(.acquire) != 1)
             return error.UnexpectedOutputMembership;
         self.stage.store(@intFromEnum(Stage.remapped_done), .release);
+        try waitForWayringCommand(self.command_fd);
+
+        const replacement_surface = try compositor.createSurface();
+        defer replacement_surface.destroy();
+        const replacement_fractional_scale = try fractional_scale_manager.getFractionalScale(replacement_surface);
+        defer replacement_fractional_scale.destroy();
+        replacement_fractional_scale.setListener(*WayringHeadlessClient, fractionalScaleEvent, self);
+        try expectClientRoundtrip(display);
+        if (self.fractional_scale_count.load(.acquire) != 4 or
+            self.fractional_scale.load(.acquire) != 240)
+            return error.UnexpectedFractionalScale;
+        self.stage.store(@intFromEnum(Stage.default_replaced), .release);
         try waitForWayringCommand(self.command_fd);
 
         try self.requestFrame(surface);
@@ -17043,6 +17085,18 @@ fn writeWayringScalePixels(fd: std.posix.fd_t, pixels: [8]u32) !void {
         return error.ShmWriteFailed;
 }
 
+const wayring_fractional_pixels = [18]u32{
+    0x0010_0000, 0x0020_0000, 0x0030_0000, 0x0040_0000, 0x0050_0000, 0x0060_0000,
+    0x0030_0000, 0x0040_0000, 0x0050_0000, 0x0060_0000, 0x0070_0000, 0x0080_0000,
+    0x0050_0000, 0x0060_0000, 0x0070_0000, 0x0080_0000, 0x0090_0000, 0x00a0_0000,
+};
+
+fn writeWayringFractionalPixels(fd: std.posix.fd_t, pixels: [18]u32) !void {
+    const bytes = std.mem.asBytes(&pixels);
+    if (std.c.pwrite(fd, bytes.ptr, bytes.len, 0) != bytes.len)
+        return error.ShmWriteFailed;
+}
+
 fn waitForWayringCommand(fd: std.posix.fd_t) !void {
     var command: u64 = 0;
     while (true) {
@@ -17195,6 +17249,18 @@ fn expectWayringScaleSnapshot(
     try std.testing.expectEqualSlices(u32, &normalized, state.buffer.pixels);
 }
 
+fn expectWayringFractionalSnapshot(server: *Self, expected_version: u64) !void {
+    try std.testing.expectEqual(@as(usize, 1), server.headless_surface_forest.len());
+    const state = server.surface_registry.renderState(server.headless_surface_forest.rootAt(0).?.id).?;
+    try std.testing.expectEqual(render.Size{ .width = 6, .height = 3 }, state.buffer.size);
+    try std.testing.expectEqual(render.Size{ .width = 4, .height = 2 }, state.logical_size);
+    try std.testing.expectEqual(render.BufferTransform.normal, state.transform);
+    try std.testing.expectEqual(expected_version, state.buffer.source_cache.?.version);
+    var normalized = wayring_fractional_pixels;
+    for (&normalized) |*pixel| pixel.* |= 0xff00_0000;
+    try std.testing.expectEqualSlices(u32, &normalized, state.buffer.pixels);
+}
+
 fn expectWayringHeadlessPixels(server: *Self, expected_surface: ?[2]u32) !void {
     const target = switch (server.primaryRenderOutput().backend.acquire().?) {
         .pixels => |pixels| pixels,
@@ -17326,6 +17392,7 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     defer if (server_live) server.destroy();
     const registry_baseline = server.surface_registry.len();
     try std.testing.expectEqual(@as(usize, 0), registry_baseline);
+    const initial_output = server.primary_render_output;
     const output = server.primaryRenderOutput();
     try std.testing.expect(server.wayringPresentationListener() != null);
 
@@ -17402,10 +17469,17 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
         server.wayringDefaultOutputId().?,
     );
     var fractional_scale_live = true;
+    var default_output_listener_live = false;
     defer if (fractional_scale_live) {
+        if (default_output_listener_live) server.clearWayringDefaultOutputListener(&fractional_scale);
         fractional_scale.unpublish();
         fractional_scale.deinit();
     };
+    server.setWayringDefaultOutputListener(.{
+        .context = &fractional_scale,
+        .changed = WayringFractionalScale.defaultOutputChanged,
+    });
+    default_output_listener_live = true;
     try fractional_scale.publish();
     const Lifecycle = struct {
         clients: *WayringClients,
@@ -17520,15 +17594,12 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .replacement_released);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
-    try expectWayringSnapshot(
-        server,
-        .{ 0x0066_7788, 0x0099_aabb },
-        2,
-        .{ .width = 2, .height = 1 },
-        .normal,
-    );
+    try expectWayringFractionalSnapshot(server, 2);
     try renderPendingWayringFrame(server, host, previous_frames);
-    try expectWayringHeadlessPixels(server, .{ 0x0066_7788, 0x0099_aabb });
+    try expectWayringHeadlessExactPixels(server, .{
+        0x001c_0000, 0x0034_0000, 0x004c_0000, 0x0064_0000,
+        0x004c_0000, 0x0064_0000, 0x007c_0000, 0x0094_0000,
+    });
 
     const changed_output_snapshot = server.outputs.get(output.protocol_id).?.snapshot();
     _ = server.outputs.get(output.protocol_id).?.configure(
@@ -17548,7 +17619,7 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     try expectWayringSnapshot(
         server,
         .{ 0x0066_7788, 0x0099_aabb },
-        2,
+        3,
         .{ .width = 1, .height = 2 },
         .rotate_90,
     );
@@ -17572,8 +17643,8 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .scale_buffer_released);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
-    try std.testing.expectEqual(@as(u8, 3), client.release_count.load(.acquire));
-    try expectWayringScaleSnapshot(server, scale_pixels, 3, .{ .width = 4, .height = 2 });
+    try std.testing.expectEqual(@as(u8, 4), client.release_count.load(.acquire));
+    try expectWayringScaleSnapshot(server, scale_pixels, 4, .{ .width = 4, .height = 2 });
     try std.testing.expect(output.damage.coversRectangle(0, 0, 1, 2));
     try std.testing.expect(output.damage.coversRectangle(0, 0, 4, 2));
     try renderPendingWayringFrame(server, host, previous_frames);
@@ -17604,8 +17675,8 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     try waitForWayringClientStage(server, host, &client, .scaled_committed);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
     try std.testing.expectEqual(@as(u8, 2), client.frame_done_count.load(.acquire));
-    try std.testing.expectEqual(@as(u8, 3), client.release_count.load(.acquire));
-    try expectWayringScaleSnapshot(server, scale_pixels, 3, .{ .width = 2, .height = 1 });
+    try std.testing.expectEqual(@as(u8, 4), client.release_count.load(.acquire));
+    try expectWayringScaleSnapshot(server, scale_pixels, 4, .{ .width = 2, .height = 1 });
     try std.testing.expect(output.damage.coversRectangle(0, 0, 4, 2));
     try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 1));
     try std.testing.expect(output.repaint_needed);
@@ -17623,7 +17694,7 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     try waitForWayringClientStage(server, host, &client, .damage_buffer_committed);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
     try std.testing.expectEqual(@as(u8, 3), client.frame_done_count.load(.acquire));
-    try expectWayringScaleSnapshot(server, scale_pixels, 3, .{ .width = 2, .height = 1 });
+    try expectWayringScaleSnapshot(server, scale_pixels, 4, .{ .width = 2, .height = 1 });
     try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 1));
     try std.testing.expect(output.repaint_needed);
     try std.testing.expect(output.render_scheduled);
@@ -17639,9 +17710,9 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .offset_attachment_released);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
-    try std.testing.expectEqual(@as(u8, 4), client.release_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 5), client.release_count.load(.acquire));
     try std.testing.expectEqual(@as(u8, 4), client.frame_done_count.load(.acquire));
-    try expectWayringScaleSnapshot(server, scale_pixels, 4, .{ .width = 2, .height = 1 });
+    try expectWayringScaleSnapshot(server, scale_pixels, 5, .{ .width = 2, .height = 1 });
     try std.testing.expect(output.damage.coversRectangle(0, 0, 2, 1));
     try std.testing.expect(output.repaint_needed);
     try std.testing.expect(output.render_scheduled);
@@ -17660,7 +17731,7 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .offset_only_committed);
     try std.testing.expectEqual(previous_frames, output.frame_statistics.frames_presented);
-    try std.testing.expectEqual(@as(u8, 4), client.release_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 5), client.release_count.load(.acquire));
     try std.testing.expectEqual(@as(u8, 5), client.frame_done_count.load(.acquire));
     const offset_only_state = server.surface_registry.renderState(server.headless_surface_forest.rootAt(0).?.id).?;
     try std.testing.expectEqual(attached_offset_pointer, offset_only_state.buffer.pixels.ptr);
@@ -17699,7 +17770,7 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     try expectWayringSnapshot(
         server,
         .{ 0x00cc_ddee, 0x0001_0203 },
-        5,
+        6,
         .{ .width = 2, .height = 1 },
         .normal,
     );
@@ -17709,6 +17780,23 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .remapped_done);
     try std.testing.expectEqual(@as(u8, 7), client.frame_done_count.load(.acquire));
+
+    const replacement_output = try server.addRenderOutput(std.testing.io, .{
+        .kind = .headless,
+        .size = .{ .width = 4, .height = 2 },
+        .scale = .{ .numerator = 240 },
+        .position = .{ .x = 4 },
+        .name = "HEADLESS-2",
+        .description = "Keywork fractional default replacement output",
+        .model = "headless",
+    });
+    server.replacePrimaryRenderOutput(initial_output);
+    try signalWayringCommand(command_fd);
+    try waitForWayringClientStage(server, host, &client, .default_replaced);
+    try std.testing.expectEqual(@as(u8, 4), client.fractional_scale_count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 240), client.fractional_scale.load(.acquire));
+    server.replacePrimaryRenderOutput(replacement_output);
+    try std.testing.expect(server.removeRenderOutput(replacement_output));
 
     previous_frames = output.frame_statistics.frames_presented;
     try signalWayringCommand(command_fd);
@@ -17726,8 +17814,8 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     try std.testing.expectEqual(@as(u8, 7), client.frame_done_count.load(.acquire));
     try std.testing.expectEqual(@as(u8, 1), client.preferred_buffer_scale_count.load(.acquire));
     try std.testing.expectEqual(@as(u8, 1), client.preferred_buffer_transform_count.load(.acquire));
-    try std.testing.expectEqual(@as(u8, 3), client.fractional_scale_count.load(.acquire));
-    try std.testing.expectEqual(@as(u32, 120), client.fractional_scale.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 4), client.fractional_scale_count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 240), client.fractional_scale.load(.acquire));
     try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
     try std.testing.expectEqual(@as(usize, 0), fractional_scale.fractional_scales.items.len);
     try std.testing.expectEqual(@as(usize, 0), fractional_scale.managers.items.len);
@@ -17745,6 +17833,8 @@ test "production Wayring fractional scale and viewporter render real SHM pixels 
     } else return error.WayringTransportDrainTimedOut;
     try host.destroy();
     host_live = false;
+    server.clearWayringDefaultOutputListener(&fractional_scale);
+    default_output_listener_live = false;
     fractional_scale.unpublish();
     fractional_scale.deinit();
     fractional_scale_live = false;
