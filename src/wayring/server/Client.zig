@@ -29,6 +29,13 @@ pub const ProtocolMessage = struct {
     values: []const wire.Value,
 };
 
+pub const PreparedEvent = struct {
+    resource: *Resource,
+    opcode: u16,
+    descriptor: *const wire.MessageDescriptor,
+    values: []const wire.Value,
+};
+
 pub const ProtocolLogSink = struct {
     context: *anyopaque,
     notify: *const fn (*anyopaque, *Client, ProtocolMessage) void,
@@ -273,6 +280,60 @@ pub fn hasPendingOutput(self: *const Client) bool {
 
 pub fn completeSend(self: *Client, token: wire.BatchToken, bytes_written: usize) !void {
     return self.output.completeSend(token, bytes_written);
+}
+
+/// Reserves transport storage before a semantic configure token or wire serial
+/// is issued. The returned batch must be published or canceled.
+pub fn prepareEvents(self: *Client, maximum_bytes: usize) !wire.PreparedBatch {
+    if (self.fatal_state.recorded) return error.ClientFatal;
+    return self.output.prepareBatch(maximum_bytes);
+}
+
+pub fn cancelPreparedEvents(self: *Client, prepared: *wire.PreparedBatch) void {
+    self.output.cancelPreparedBatch(prepared);
+}
+
+/// Encodes and publishes a complete descriptor-free event sequence without
+/// allocation. Logging occurs only after the whole sequence is visible.
+pub fn emitPreparedEvents(
+    self: *Client,
+    prepared: *wire.PreparedBatch,
+    events: []const PreparedEvent,
+) !void {
+    if (self.fatal_state.recorded) return error.ClientFatal;
+    if (events.len == 0) return error.EmptyPreparedBatch;
+    for (events) |event| {
+        if (event.resource.state() != .live or !event.resource.ownedBy(self.ownerHooks())) {
+            return error.InvalidResourceIdentity;
+        }
+        const installed = self.objects.lookup(event.resource.id()) orelse
+            return error.InvalidResourceIdentity;
+        if (installed.resource != @as(*anyopaque, @ptrCast(event.resource)) or
+            installed.origin != event.resource.origin())
+        {
+            return error.InvalidResourceIdentity;
+        }
+        if (event.values.len != event.descriptor.arguments.len) {
+            return error.InvalidEventDescriptor;
+        }
+    }
+
+    var writer = std.Io.Writer.fixed(prepared.storage);
+    for (events) |event| try wire.encodePreparedMessage(
+        &writer,
+        event.resource.id(),
+        event.opcode,
+        event.descriptor,
+        event.values,
+    );
+    try self.output.publishPreparedBatch(prepared, writer.buffered().len);
+    for (events) |event| self.logProtocol(.{
+        .direction = .event,
+        .resource = event.resource,
+        .opcode = event.opcode,
+        .descriptor = event.descriptor,
+        .values = event.values,
+    });
 }
 
 pub fn ownerHooks(self: *Client) Resource.OwnerHooks {
@@ -1085,6 +1146,51 @@ test "Client retirement and emit require exact installed resource identity" {
     try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, terminal.bytes[12..16], .native));
     try client.completeSend(terminal.token, terminal.bytes.len);
     impostor.deinit();
+}
+
+test "Client prepared events log only after the complete sequence is published" {
+    const event_arguments = [_]wire.ArgumentDescriptor{.{ .name = "value", .kind = .uint }};
+    const first_event: wire.MessageDescriptor = .{ .name = "first", .arguments = &event_arguments };
+    const second_event: wire.MessageDescriptor = .{ .name = "second", .arguments = &event_arguments };
+    const Log = struct {
+        count: usize = 0,
+        opcodes: [2]u16 = undefined,
+
+        fn notify(context: *anyopaque, _: *Client, message: ProtocolMessage) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.opcodes[self.count] = message.opcode;
+            self.count += 1;
+        }
+    };
+    var log: Log = .{};
+    var client: Client = .init(std.testing.allocator, .{ .protocol_log_sink = .{
+        .context = &log,
+        .notify = Log.notify,
+    } });
+    defer client.deinit();
+    var resource: Resource = .init(std.testing.allocator, 1, 1, &test_display_interface, &.{}, .client, client.ownerHooks());
+    try client.installClientInitial(1, &resource);
+    const events = [_]PreparedEvent{
+        .{ .resource = &resource, .opcode = 3, .descriptor = &first_event, .values = &.{.{ .uint = 11 }} },
+        .{ .resource = &resource, .opcode = 4, .descriptor = &second_event, .values = &.{.{ .uint = 12 }} },
+    };
+
+    var too_small = try client.prepareEvents(12);
+    try std.testing.expectError(error.WriteFailed, client.emitPreparedEvents(&too_small, &events));
+    try std.testing.expectEqual(@as(usize, 0), log.count);
+    try std.testing.expect((try client.beginSend()) == null);
+    client.cancelPreparedEvents(&too_small);
+
+    var prepared = try client.prepareEvents(24);
+    try client.emitPreparedEvents(&prepared, &events);
+    try std.testing.expectEqual(@as(usize, 2), log.count);
+    try std.testing.expectEqualSlices(u16, &.{ 3, 4 }, &log.opcodes);
+    const batch = (try client.beginSend()).?;
+    try std.testing.expectEqual(@as(usize, 24), batch.bytes.len);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, batch.bytes[0..4], .native));
+    try std.testing.expectEqual(@as(u16, 3), @as(u16, @truncate(std.mem.readInt(u32, batch.bytes[4..8], .native))));
+    try std.testing.expectEqual(@as(u16, 4), @as(u16, @truncate(std.mem.readInt(u32, batch.bytes[16..20], .native))));
+    try client.completeSend(batch.token, batch.bytes.len);
 }
 
 test "Client server lifecycle reuses ids without delete_id and rejects impostor retirement" {

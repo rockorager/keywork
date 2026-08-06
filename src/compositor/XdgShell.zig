@@ -205,16 +205,19 @@ const XdgSurfaceState = struct {
     configured: bool = false,
     initial_configure_sent: bool = false,
     next_sequence: u64 = 1,
-    fn token(
+    fn nextToken(
         self: *XdgSurfaceState,
         id: XdgSurfaceId,
     ) error{ConfigureSequenceExhausted}!ConfigureToken {
         if (self.next_sequence == 0 or self.next_sequence == std.math.maxInt(u64)) {
             return error.ConfigureSequenceExhausted;
         }
-        const result: ConfigureToken = .{ .surface = id, .sequence = self.next_sequence };
+        return .{ .surface = id, .sequence = self.next_sequence };
+    }
+
+    fn consumeToken(self: *XdgSurfaceState, token: ConfigureToken) void {
+        std.debug.assert(token.sequence == self.next_sequence);
         self.next_sequence += 1;
-        return result;
     }
 };
 const WindowState = struct {
@@ -503,13 +506,14 @@ pub fn configureWindowState(
     const window = self.windows.get(id) orelse return error.InvalidWindow;
     const state = self.xdg_surfaces.get(window.xdg_surface_id) orelse
         return error.InvalidWindow;
-    const token = try state.token(window.xdg_surface_id);
+    const token = try state.nextToken(window.xdg_surface_id);
     try state.endpoint.configure_toplevel(
         state.endpoint.context,
         dimensions,
         configuration,
         token,
     );
+    state.consumeToken(token);
     state.initial_configure_sent = true;
     if (!std.meta.eql(window.configuration, configuration)) {
         window.configuration = configuration;
@@ -1432,12 +1436,13 @@ pub fn sendPopupConfigure(
     const placement = try self.popupPlacement(popup, rules);
     const state = self.xdg_surfaces.get(popup.xdg_surface_id) orelse
         return error.InvalidParent;
-    const token = try state.token(popup.xdg_surface_id);
+    const token = try state.nextToken(popup.xdg_surface_id);
     try state.endpoint.configure_popup(
         state.endpoint.context,
         .{ .rules = rules, .placement = placement },
         token,
     );
+    state.consumeToken(token);
     state.initial_configure_sent = true;
     return token;
 }
@@ -1741,9 +1746,11 @@ test "surface-owned configure sequence and generational identity" {
     const first = try store.insert(std.testing.allocator, dummy);
     var state = store.get(first).?;
     state.next_sequence = 1;
-    try std.testing.expectEqual(@as(u64, 1), (try state.token(first)).sequence);
+    const token = try state.nextToken(first);
+    try std.testing.expectEqual(@as(u64, 1), token.sequence);
+    state.consumeToken(token);
     state.next_sequence = std.math.maxInt(u64);
-    try std.testing.expectError(error.ConfigureSequenceExhausted, state.token(first));
+    try std.testing.expectError(error.ConfigureSequenceExhausted, state.nextToken(first));
     _ = store.remove(first);
     const second = try store.insert(std.testing.allocator, dummy);
     try std.testing.expect(first.index == second.index and first.generation != second.generation);

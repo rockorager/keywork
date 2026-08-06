@@ -92,17 +92,27 @@ pub const XdgDirectCommit = struct {
     attachment_changed: bool,
 };
 
-/// Stable callbacks borrowed by one live reservation. `validate` must be pure,
-/// and every other callback must be allocation-free and must not reenter
-/// surface or reservation lifecycle. `post_apply` runs after the complete
-/// content/topology batch and presentation listener. `surface_destroyed` is
-/// called only after the association has already been invalidated.
+/// Stable callbacks borrowed by one live reservation. `validate` performs no
+/// allocation, does not mutate adapter pending/applied state, and does not
+/// reenter lifecycle, but rejection may synchronously mark the client fatal.
+/// `prepare` may allocate before validation; `abort_prepare` unwinds it on
+/// every non-publication path. All callbacks after validation are
+/// allocation-free. `post_apply` runs after the complete content/topology
+/// batch and presentation listener. `surface_destroyed` is called only after
+/// the association has already been invalidated.
 pub const XdgCommitHandler = struct {
     context: *anyopaque,
+    prepare: *const fn (*anyopaque, XdgDirectCommit) XdgCommitDecision,
+    abort_prepare: *const fn (*anyopaque, SurfaceId) void,
     validate: *const fn (*anyopaque, XdgDirectCommit) XdgCommitDecision,
     pre_unmap: *const fn (*anyopaque, SurfaceId) void,
     post_apply: *const fn (*anyopaque, SurfaceId) void,
     surface_destroyed: *const fn (*anyopaque, SurfaceId) void,
+};
+
+pub const XdgContentState = struct {
+    has_pending_attachment: bool,
+    has_committed_buffer: bool,
 };
 
 /// Final synchronous presentation-publication seam copied by init. The context
@@ -518,6 +528,16 @@ pub fn surfaceEndpoint(self: *WayringCompositor, id: SurfaceId) ?SurfaceEndpoint
     if (surface.destroying or surface.resource.runtime.state() != .live) return null;
     const client = self.clientForResource(&surface.resource.runtime) orelse return null;
     return .{ .client = client, .resource = &surface.resource };
+}
+
+/// Exact content facts required before reserving an xdg_surface family.
+pub fn xdgContentState(self: *const WayringCompositor, id: SurfaceId) ?XdgContentState {
+    const surface = self.surfaceForId(id) orelse return null;
+    if (surface.destroying or surface.resource.runtime.state() != .live) return null;
+    return .{
+        .has_pending_attachment = surface.has_pending_attachment,
+        .has_committed_buffer = surface.current_logical_size != null,
+    };
 }
 
 /// Resolves a live canonical surface to a current neutral client identity.
@@ -1283,7 +1303,11 @@ fn handleSurface(
     switch (request) {
         .destroy => {
             const surface: *Surface = @fieldParentPtr("resource", resource);
-            if (surface.active_subsurface != null or surface.xdg_association != null) {
+            const live_xdg_role = if (surface.xdg_association) |association|
+                association.live_role != null
+            else
+                false;
+            if (surface.active_subsurface != null or live_xdg_role) {
                 const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
                 client.postProtocolError(&resource.runtime, @intCast(core.wl_surface.@"error".defunct_role_object), "surface has a live role object");
                 return;
@@ -1602,16 +1626,28 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
         std.debug.assert(surface.relationship == null and kind == .dcu and scratch != null);
     }
 
-    // Release enqueue is the final fallible operation. Queue, callbacks,
-    // pending state, claims, and applied state are untouched before it.
-    const buffer_resource = if (surface.pending_attachment) |*pending| pending.resource else null;
-    if (buffer_resource != null and self.failCommitAt(.release_enqueue)) return error.OutOfMemory;
-    if (xdg_handler) |handler| if (handler.validate(handler.context, .{
+    const xdg_commit: XdgDirectCommit = .{
         .surface = surface.id,
         .current_size = surface.current_logical_size,
         .next_size = candidate.prepared.logical_size,
         .attachment_changed = candidate.prepared.attachment_changed,
-    }) == .reject) return;
+    };
+    var xdg_prepared = false;
+    defer if (!published and xdg_prepared) {
+        const handler = xdg_handler.?;
+        handler.abort_prepare(handler.context, surface.id);
+    };
+    if (xdg_handler) |handler| {
+        if (handler.prepare(handler.context, xdg_commit) == .reject) return;
+        xdg_prepared = true;
+        if (handler.validate(handler.context, xdg_commit) == .reject) return;
+    }
+
+    // Release enqueue is the final fallible operation. Adapter preparation is
+    // explicitly abortable; callbacks, pending state, claims, and applied
+    // state are untouched before it.
+    const buffer_resource = if (surface.pending_attachment) |*pending| pending.resource else null;
+    if (buffer_resource != null and self.failCommitAt(.release_enqueue)) return error.OutOfMemory;
     if (buffer_resource) |resource| try self.shm.sendRelease(resource);
 
     const unmaps_xdg_root = xdg_handler != null and surface.current_logical_size != null and
@@ -2769,6 +2805,8 @@ const TestPresentationListener = struct {
 };
 
 const TestXdgCommitHandler = struct {
+    preparations: usize = 0,
+    preparation_aborts: usize = 0,
     validations: usize = 0,
     pre_unmaps: usize = 0,
     post_applies: usize = 0,
@@ -2778,11 +2816,24 @@ const TestXdgCommitHandler = struct {
     fn handler(self: *@This()) XdgCommitHandler {
         return .{
             .context = self,
+            .prepare = prepare,
+            .abort_prepare = abortPrepare,
             .validate = validate,
             .pre_unmap = preUnmap,
             .post_apply = postApply,
             .surface_destroyed = surfaceDestroyed,
         };
+    }
+
+    fn prepare(context: *anyopaque, _: XdgDirectCommit) XdgCommitDecision {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.preparations += 1;
+        return .accept;
+    }
+
+    fn abortPrepare(context: *anyopaque, _: SurfaceId) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.preparation_aborts += 1;
     }
 
     fn validate(context: *anyopaque, _: XdgDirectCommit) XdgCommitDecision {
@@ -5404,7 +5455,10 @@ test "prepared commit failures preserve all published surface state and reclaim 
             try std.testing.expectEqual(old_version, surface.next_source_version);
             try std.testing.expectEqual(old_listener_count, listener_state.committed_count);
             try std.testing.expectEqual(old_callbacks_committed_count, listener_state.callbacks_committed_count);
-            try std.testing.expectEqual(@as(usize, 0), xdg_handler.validations);
+            const reaches_xdg_validation: usize = if (fault == .release_enqueue) 1 else 0;
+            try std.testing.expectEqual(reaches_xdg_validation, xdg_handler.preparations);
+            try std.testing.expectEqual(reaches_xdg_validation, xdg_handler.validations);
+            try std.testing.expectEqual(reaches_xdg_validation, xdg_handler.preparation_aborts);
             try std.testing.expectEqual(@as(usize, 0), xdg_handler.pre_unmaps);
             try std.testing.expectEqual(@as(usize, 0), xdg_handler.post_applies);
             try std.testing.expect(compositor.hasXdgReservation(reservation));
@@ -5518,6 +5572,13 @@ test "scanner-backed release failure cleans pending attachment and preserves cur
     try std.testing.expectEqualSlices(u32, pixels[0..2], old_current.pixels);
     try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
 
+    const reservation = try compositor.reserveXdgRoot(client, surface_id);
+    var xdg_handler: TestXdgCommitHandler = .{};
+    try compositor.attachXdgCommitHandler(reservation, xdg_handler.handler());
+    _ = try compositor.assignXdgRole(reservation, .toplevel);
+    const old_pending_scale = surface.pending_scale;
+    const old_pending_transform = surface.pending_transform;
+
     const live_before_attachment = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
     const candidate_resource = client.lookup(8).?;
     try send(client, 5, 1, &core.wl_surface.request_messages[1], &.{
@@ -5543,6 +5604,15 @@ test "scanner-backed release failure cleans pending attachment and preserves cur
     try std.testing.expectEqualSlices(u32, pixels[0..2], preserved.pixels);
     try std.testing.expectEqual(old_version, surface.next_source_version);
     try std.testing.expectEqual(@as(usize, 1), listener_state.committed_count);
+    try std.testing.expectEqual(@as(usize, 1), xdg_handler.preparations);
+    try std.testing.expectEqual(@as(usize, 1), xdg_handler.validations);
+    try std.testing.expectEqual(@as(usize, 1), xdg_handler.preparation_aborts);
+    try std.testing.expectEqual(@as(usize, 0), xdg_handler.pre_unmaps);
+    try std.testing.expectEqual(@as(usize, 0), xdg_handler.post_applies);
+    try std.testing.expect(compositor.hasXdgReservation(reservation));
+    try std.testing.expectEqual(XdgRole.toplevel, compositor.permanentXdgRole(surface_id).?);
+    try std.testing.expectEqual(old_pending_scale, surface.pending_scale);
+    try std.testing.expectEqual(old_pending_transform, surface.pending_transform);
 
     const live_before_buffer_destroy = compositor_allocator.allocated_bytes - compositor_allocator.freed_bytes;
     candidate_resource.destroy();
@@ -7150,7 +7220,7 @@ test "XDG reservation and permanent roles enforce owner root and reconstruction 
     try std.testing.expect(client.fatal() == null);
 }
 
-test "live XDG wrapper guards wl_surface destroy and forced teardown invalidates its handler first" {
+test "roleless XDG wrapper permits wl_surface destroy while a live concrete role guards it" {
     var host: server.Server = .init(std.testing.allocator);
     defer host.deinit();
     var registry = SurfaceRegistry.init(std.testing.allocator);
@@ -7164,23 +7234,34 @@ test "live XDG wrapper guards wl_surface destroy and forced teardown invalidates
 
     try bindCompositor(client, 3);
     try createSurfaceResource(client, 3, 4);
-    const id = compositor.surfaceId(client, 4).?;
-    const reservation = try compositor.reserveXdgRoot(client, id);
+    const roleless_id = compositor.surfaceId(client, 4).?;
+    const roleless = try compositor.reserveXdgRoot(client, roleless_id);
     var handler_probe: TestXdgCommitHandler = .{};
-    try compositor.attachXdgCommitHandler(reservation, handler_probe.handler());
+    try compositor.attachXdgCommitHandler(roleless, handler_probe.handler());
     try send(client, 4, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expect(client.fatal() == null);
+    try std.testing.expectEqual(@as(usize, 1), handler_probe.surface_destroys);
+    try std.testing.expect(!compositor.hasXdgReservation(roleless));
+    try std.testing.expect(!compositor.containsSurface(roleless_id));
+
+    try createSurfaceResource(client, 3, 5);
+    const role_id = compositor.surfaceId(client, 5).?;
+    const role = try compositor.reserveXdgRoot(client, role_id);
+    try compositor.attachXdgCommitHandler(role, handler_probe.handler());
+    _ = try compositor.assignXdgRole(role, .toplevel);
+    try send(client, 5, 0, &core.wl_surface.request_messages[0], &.{});
     try std.testing.expectEqual(server.Fatal.Kind.protocol, client.fatal().?.kind);
     try std.testing.expectEqual(
         @as(?u32, @intCast(core.wl_surface.@"error".defunct_role_object)),
         client.fatal().?.protocol_code,
     );
-    try std.testing.expect(compositor.hasXdgReservation(reservation));
-    try std.testing.expectEqual(@as(usize, 0), handler_probe.surface_destroys);
+    try std.testing.expect(compositor.hasXdgReservation(role));
+    try std.testing.expectEqual(@as(usize, 1), handler_probe.surface_destroys);
 
     compositor.destroyClientResources(client);
-    try std.testing.expectEqual(@as(usize, 1), handler_probe.surface_destroys);
-    try std.testing.expect(!compositor.hasXdgReservation(reservation));
-    try std.testing.expect(!compositor.containsSurface(id));
+    try std.testing.expectEqual(@as(usize, 2), handler_probe.surface_destroys);
+    try std.testing.expect(!compositor.hasXdgReservation(role));
+    try std.testing.expect(!compositor.containsSurface(role_id));
 }
 
 test "direct XDG root hooks bracket the full atomic batch and exclude child scratch application" {
@@ -7204,12 +7285,20 @@ test "direct XDG root hooks bracket the full atomic batch and exclude child scra
         fn handler(self: *@This()) XdgCommitHandler {
             return .{
                 .context = self,
+                .prepare = prepare,
+                .abort_prepare = abortPrepare,
                 .validate = validate,
                 .pre_unmap = preUnmap,
                 .post_apply = postApply,
                 .surface_destroyed = surfaceDestroyed,
             };
         }
+
+        fn prepare(_: *anyopaque, _: XdgDirectCommit) XdgCommitDecision {
+            return .accept;
+        }
+
+        fn abortPrepare(_: *anyopaque, _: SurfaceId) void {}
 
         fn validate(context: *anyopaque, commit: XdgDirectCommit) XdgCommitDecision {
             const self: *@This() = @ptrCast(@alignCast(context));
