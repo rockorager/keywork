@@ -14198,6 +14198,68 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     try std.testing.expect(server.window_manager.focusedSurface() == null);
     try std.testing.expectEqual(@as(usize, 0), server.window_transitions.items.len);
 
+    // Generated popup protocol state may map, but Wave 4 keeps the popup out
+    // of Scene policy and every presentation path until Wave 6.
+    try T.send(client, 3, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 11 } }});
+    const popup_surface_id = compositor.surfaceId(client, 11).?;
+    try T.send(client, 5, 2, &core.xdg_wm_base.request_messages[2], &.{ .{ .new_id = .{ .typed = 12 } }, .{ .object = 11 } });
+    try T.send(client, 5, 1, &core.xdg_wm_base.request_messages[1], &.{.{ .new_id = .{ .typed = 13 } }});
+    try T.send(client, 13, 1, &core.xdg_positioner.request_messages[1], &.{ .{ .int = 1 }, .{ .int = 1 } });
+    try T.send(client, 13, 2, &core.xdg_positioner.request_messages[2], &.{
+        .{ .int = 0 }, .{ .int = 0 }, .{ .int = 1 }, .{ .int = 1 },
+    });
+    try T.send(client, 12, 2, &core.xdg_surface.request_messages[2], &.{
+        .{ .new_id = .{ .typed = 14 } }, .{ .object = 6 }, .{ .object = 13 },
+    });
+    const popup_id = server.xdg_shell_core.popupForSurface(popup_surface_id).?;
+    try std.testing.expect(!server.xdg_shell_core.popupScenePresentationEnabled(popup_id));
+    try T.send(client, 11, 6, &core.wl_surface.request_messages[6], &.{});
+    const popup_configure = try T.drain(client);
+    defer std.testing.allocator.free(popup_configure);
+    const popup_serial = T.word(popup_configure, popup_configure.len - 4);
+    try T.send(client, 12, 4, &core.xdg_surface.request_messages[4], &.{.{ .uint = popup_serial }});
+    try T.send(client, 11, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = 10 }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(client, 11, 6, &core.wl_surface.request_messages[6], &.{});
+    try std.testing.expect(server.xdg_shell_core.popupMapped(popup_id));
+    try std.testing.expect(!server.scene.surfaceMapped(popup_surface_id));
+    try std.testing.expectEqual(HeadlessSurfaceForest.PresentationClass.managed, server.headless_surface_forest.presentationClass(popup_surface_id).?);
+    rendered_surfaces = server.headless_surface_forest.renderIterator();
+    try std.testing.expect(rendered_surfaces.next() == null);
+    const popup_render_output = server.primaryRenderOutput();
+    try renderPendingTestOutput(server, popup_render_output);
+    const popup_output = server.outputs.get(popup_render_output.protocol_id).?;
+    try std.testing.expect(!popup_output.containsSurface(popup_surface_id));
+    try std.testing.expect(popup_render_output.damage.isEmpty());
+    try T.send(client, 11, 6, &core.wl_surface.request_messages[6], &.{});
+    try std.testing.expect(popup_render_output.damage.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), server.window_transitions.items.len);
+
+    // Null-buffer unmap and role reconstruction both preserve private popup
+    // presentation; reconstruction disables the fresh neutral role before
+    // the permanent generated role is republished.
+    try T.send(client, 11, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = null }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(client, 11, 6, &core.wl_surface.request_messages[6], &.{});
+    try std.testing.expect(!server.xdg_shell_core.popupMapped(popup_id));
+    try std.testing.expect(!server.xdg_shell_core.popupScenePresentationEnabled(popup_id));
+    try T.send(client, 14, 0, &core.xdg_popup.request_messages[0], &.{});
+    try T.send(client, 12, 0, &core.xdg_surface.request_messages[0], &.{});
+    try T.send(client, 5, 2, &core.xdg_wm_base.request_messages[2], &.{ .{ .new_id = .{ .typed = 15 } }, .{ .object = 11 } });
+    try T.send(client, 5, 1, &core.xdg_wm_base.request_messages[1], &.{.{ .new_id = .{ .typed = 16 } }});
+    try T.send(client, 16, 1, &core.xdg_positioner.request_messages[1], &.{ .{ .int = 1 }, .{ .int = 1 } });
+    try T.send(client, 16, 2, &core.xdg_positioner.request_messages[2], &.{
+        .{ .int = 0 }, .{ .int = 0 }, .{ .int = 1 }, .{ .int = 1 },
+    });
+    try T.send(client, 15, 2, &core.xdg_surface.request_messages[2], &.{
+        .{ .new_id = .{ .typed = 17 } }, .{ .object = 6 }, .{ .object = 16 },
+    });
+    const reconstructed_popup = server.xdg_shell_core.popupForSurface(popup_surface_id).?;
+    try std.testing.expect(!server.xdg_shell_core.popupScenePresentationEnabled(reconstructed_popup));
+    try T.send(client, 17, 0, &core.xdg_popup.request_messages[0], &.{});
+    try T.send(client, 15, 0, &core.xdg_surface.request_messages[0], &.{});
+    try T.send(client, 11, 0, &core.wl_surface.request_messages[0], &.{});
+    try T.send(client, 13, 0, &core.xdg_positioner.request_messages[0], &.{});
+    try T.send(client, 16, 0, &core.xdg_positioner.request_messages[0], &.{});
+
     // A presented, non-interactive window migrates output ownership through
     // the same public workspace topology as a mature toplevel.
     server.primary_render_output = replacement_output;

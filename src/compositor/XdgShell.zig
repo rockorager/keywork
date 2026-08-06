@@ -326,6 +326,7 @@ const PopupState = struct {
     rules: Rules,
     ready: bool = false,
     mapped: bool = false,
+    scene_presentation_enabled: bool = true,
     grabbed: bool = false,
     dismissed: bool = false,
     order: u64,
@@ -808,8 +809,9 @@ fn commitPopupBuffer(
     self.scene.setPopupContentGeometry(scene_id, self.contentGeometry(state));
     state.mapped = state.configured and !popup.dismissed;
     popup.mapped = state.mapped;
-    self.scene.setPopupMapped(scene_id, popup.mapped);
-    if (was_mapped and popup.mapped) self.scene.popupCommitted(scene_id);
+    self.scene.setPopupMapped(scene_id, popup.mapped and popup.scene_presentation_enabled);
+    if (was_mapped and popup.mapped and popup.scene_presentation_enabled)
+        self.scene.popupCommitted(scene_id);
 }
 
 fn windowCommitNeedsNotification(
@@ -1554,6 +1556,7 @@ fn reconfigureReactivePopups(self: *XdgShell, window_id: WindowId) void {
     while (iterator.next()) |entry| {
         const root = self.popupRootWindow(entry.id) orelse continue;
         if (!std.meta.eql(root, window_id) or !entry.value.mapped or
+            !entry.value.scene_presentation_enabled or
             !entry.value.rules.reactive or entry.value.dismissed) continue;
         _ = self.sendPopupConfigure(entry.id, entry.value.rules) catch |err| switch (err) {
             error.OutOfMemory => failure: {
@@ -1704,6 +1707,19 @@ pub fn popupDismissed(self: *XdgShell, id: PopupId) bool {
 pub fn popupMapped(self: *XdgShell, id: PopupId) bool {
     const popup = self.popups.get(id) orelse return false;
     return popup.mapped;
+}
+
+pub fn popupScenePresentationEnabled(self: *XdgShell, id: PopupId) bool {
+    const popup = self.popups.get(id) orelse return false;
+    return popup.scene_presentation_enabled;
+}
+
+pub fn setPopupScenePresentationEnabled(self: *XdgShell, id: PopupId, enabled: bool) void {
+    const popup = self.popups.get(id) orelse return;
+    if (popup.scene_presentation_enabled == enabled) return;
+    popup.scene_presentation_enabled = enabled;
+    if (popup.scene_id) |scene_id|
+        self.scene.setPopupMapped(scene_id, popup.mapped and enabled);
 }
 
 pub fn surfaceClient(self: *XdgShell, id: XdgSurfaceId) ?ClientRegistry.Id {
@@ -1916,6 +1932,100 @@ test "explicit popup grabs precede popup mapping" {
     try std.testing.expect(std.meta.eql(parent, shell.topMappedGrabbedPopup().?));
     shell.popups.get(child).?.mapped = true;
     try std.testing.expect(std.meta.eql(child, shell.topMappedGrabbedPopup().?));
+}
+
+test "hidden popup maps semantically without Scene policy" {
+    const Support = struct {
+        configure_count: usize = 0,
+
+        fn geometry(_: *anyopaque, _: SurfaceRegistry.Id) ?Geometry {
+            return .{ .x = 0, .y = 0, .width = 1, .height = 1 };
+        }
+        fn size(_: *anyopaque, _: SurfaceRegistry.Id) ?render.Size {
+            return .{ .width = 1, .height = 1 };
+        }
+        fn bounds(_: *anyopaque, _: Scene.Position, _: render.Size, _: OutputLayout.Id) ?render.Rect {
+            return .{ .x = 0, .y = 0, .width = 100, .height = 100 };
+        }
+        fn configureToplevel(_: *anyopaque, _: Dimensions, _: ToplevelConfigure, _: ConfigureToken) error{OutOfMemory}!void {}
+        fn configurePopup(context: *anyopaque, _: PopupConfigure, _: ConfigureToken) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.configure_count += 1;
+        }
+        fn ignore(_: *anyopaque) void {}
+        fn ignoreFailure(_: *anyopaque, _: EndpointFailure) void {}
+
+        fn endpoint(self: *@This()) SurfaceEndpoint {
+            return .{
+                .context = self,
+                .configure_toplevel = configureToplevel,
+                .configure_popup = configurePopup,
+                .close = ignore,
+                .popup_done = ignore,
+                .report_failure = ignoreFailure,
+            };
+        }
+    };
+
+    var support: Support = .{};
+    var scene: Scene = undefined;
+    scene.init(std.testing.allocator);
+    defer scene.deinit();
+    var shell = XdgShell.init(
+        std.testing.allocator,
+        &scene,
+        .{
+            .context = &support,
+            .subtree_geometry = Support.geometry,
+            .surface_size = Support.size,
+            .popup_output_bounds = Support.bounds,
+        },
+        .{ .index = 0, .generation = 1 },
+    );
+    defer shell.deinit();
+    const client: ClientRegistry.Id = .{ .index = 1, .generation = 1 };
+    const parent_surface = try shell.createSurface(.{ .index = 1, .generation = 1 }, client, support.endpoint());
+    const popup_surface = try shell.createSurface(.{ .index = 2, .generation = 1 }, client, support.endpoint());
+    const window_id = try shell.createToplevel(parent_surface, 1);
+    const window = shell.windows.get(window_id).?;
+    shell.xdg_surfaces.get(parent_surface).?.mapped = true;
+    scene.setContentGeometry(window.scene_id, .{ .size = .{ .width = 1, .height = 1 } });
+    scene.setMapped(window.scene_id, true);
+    const rules: Rules = .{
+        .size = .{ .width = 1, .height = 1 },
+        .anchor_rect = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .reactive = true,
+    };
+    const popup_id = try shell.createPopup(popup_surface, parent_surface, rules);
+    const scene_id = shell.popups.get(popup_id).?.scene_id.?;
+    try std.testing.expect(shell.popupScenePresentationEnabled(popup_id));
+    shell.setPopupScenePresentationEnabled(popup_id, false);
+    shell.commitPopupBuffer(popup_surface, popup_id, .{
+        .token = .{ .surface = popup_surface, .sequence = 1 },
+        .popup = .{
+            .rules = rules,
+            .placement = .{
+                .position = .{ .x = 1, .y = 2 },
+                .dimensions = .{ .width = 1, .height = 1 },
+            },
+        },
+    }) catch unreachable;
+
+    try std.testing.expect(shell.popupMapped(popup_id));
+    try std.testing.expect(!scene.popupFor(scene_id).?.mapped);
+    shell.setPopupScenePresentationEnabled(popup_id, true);
+    try std.testing.expect(shell.popupMapped(popup_id));
+    try std.testing.expect(scene.popupFor(scene_id).?.mapped);
+    shell.setPopupScenePresentationEnabled(popup_id, false);
+    try std.testing.expect(shell.popupMapped(popup_id));
+    try std.testing.expect(!scene.popupFor(scene_id).?.mapped);
+    shell.setWindowPosition(window_id, .{ .x = 5, .y = 6 });
+    try std.testing.expectEqual(@as(usize, 0), support.configure_count);
+
+    shell.destroyPopup(popup_id);
+    shell.destroyToplevel(window_id);
+    shell.removeSurface(popup_surface);
+    shell.removeSurface(parent_surface);
 }
 
 test "dismissed popup commits remain inert until role destruction" {
