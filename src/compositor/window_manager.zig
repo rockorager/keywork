@@ -303,6 +303,7 @@ pub fn init(
         .unmapped = windowUnmapped,
         .destroyed = windowDestroyed,
         .metadata_changed = windowMetadataChanged,
+        .presentation_changed = windowPresentationChanged,
         .request = windowRequest,
     });
     layer_shell.setPolicyListener(.{ .context = self, .supported = layerSupported, .changed = layerChanged });
@@ -2760,28 +2761,40 @@ fn windowDestroyed(context: *anyopaque, id: XdgShell.WindowId) void {
 }
 fn windowMetadataChanged(context: *anyopaque, id: XdgShell.WindowId) bool {
     const self: *Self = @ptrCast(@alignCast(context));
-    const managed_id = self.findXdg(id) orelse return false;
-    const window = self.windows.get(managed_id) orelse return false;
+    const window = self.windows.get(self.findXdg(id) orelse return false) orelse return false;
     const info = self.xdg_shell.windowInfo(id) orelse return false;
-    if (info.scene_presentation_enabled and !window.workspace_enrolled) {
-        _ = self.workspaces.items[window.workspace].workspace.insert(
-            self.allocator,
-            neutral(managed_id),
-        ) catch return false;
-        window.workspace_enrolled = true;
-        self.reportWorkspaceOccupancy(window.workspace);
-    } else if (!info.scene_presentation_enabled and window.workspace_enrolled) {
-        _ = self.workspaces.items[window.workspace].workspace.remove(neutral(managed_id));
-        window.workspace_enrolled = false;
-        self.reportWorkspaceOccupancy(window.workspace);
-        self.reportWorkspaceUrgency(window.workspace);
-    }
-    window.presentation_enabled = info.scene_presentation_enabled;
     if (!window.mapped) {
         window.fixed_size_floating = fixedSizeWantsFloating(info.min_size, info.max_size);
     }
     self.relayout();
     return true;
+}
+fn windowPresentationChanged(
+    context: *anyopaque,
+    id: XdgShell.WindowId,
+    enabled: bool,
+) error{OutOfMemory}!void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const managed_id = self.findXdg(id) orelse return;
+    const window = self.windows.get(managed_id) orelse return;
+    if (enabled == window.presentation_enabled) return;
+    if (enabled) {
+        const inserted = try self.workspaces.items[window.workspace].workspace.insert(
+            self.allocator,
+            neutral(managed_id),
+        );
+        std.debug.assert(inserted);
+        window.workspace_enrolled = true;
+        self.reportWorkspaceOccupancy(window.workspace);
+    } else if (window.workspace_enrolled) {
+        const removed = self.workspaces.items[window.workspace].workspace.remove(neutral(managed_id));
+        std.debug.assert(removed);
+        window.workspace_enrolled = false;
+        self.reportWorkspaceOccupancy(window.workspace);
+        self.reportWorkspaceUrgency(window.workspace);
+    }
+    window.presentation_enabled = enabled;
+    self.relayout();
 }
 fn windowRequest(context: *anyopaque, id: XdgShell.WindowId, request: XdgShell.WindowRequest) void {
     const self: *Self = @ptrCast(@alignCast(context));

@@ -543,7 +543,7 @@ fn createToplevel(
     errdefer if (core_owned) self.core_shell.destroyToplevel(toplevel.core_id);
     // Generated toplevels become semantically managed by the mature policy,
     // but remain absent from presentation until a later wave owns it.
-    self.core_shell.setWindowScenePresentationEnabled(toplevel.core_id, false);
+    try self.core_shell.setWindowScenePresentationEnabled(toplevel.core_id, false);
     _ = self.compositor.assignXdgRole(surface.reservation, .toplevel) catch unreachable;
 
     surface.active_role = .{ .toplevel = toplevel };
