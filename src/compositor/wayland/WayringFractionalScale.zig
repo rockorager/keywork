@@ -334,6 +334,35 @@ fn testDrain(client: *server.Client) !void {
         try client.completeSend(batch.token, batch.bytes.len);
 }
 
+fn testDrainBytes(client: *server.Client) ![]u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(std.testing.allocator);
+    while (try client.beginSend()) |batch| {
+        try bytes.appendSlice(std.testing.allocator, batch.bytes);
+        try client.completeSend(batch.token, batch.bytes.len);
+    }
+    return bytes.toOwnedSlice(std.testing.allocator);
+}
+
+fn expectSinglePreferredScaleEvent(bytes: []const u8, object_id: u32, scale: u32) !void {
+    var offset: usize = 0;
+    var count: usize = 0;
+    while (offset + 8 <= bytes.len) {
+        const id = std.mem.readInt(u32, bytes[offset..][0..4], .native);
+        const size_opcode = std.mem.readInt(u32, bytes[offset + 4 ..][0..4], .native);
+        const size: usize = @intCast(size_opcode >> 16);
+        try std.testing.expect(size >= 8 and offset + size <= bytes.len);
+        if (id == object_id and @as(u16, @truncate(size_opcode)) == 0) {
+            try std.testing.expectEqual(@as(usize, 12), size);
+            try std.testing.expectEqual(scale, std.mem.readInt(u32, bytes[offset + 8 ..][0..4], .native));
+            count += 1;
+        }
+        offset += size;
+    }
+    try std.testing.expectEqual(bytes.len, offset);
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
 fn bindTestGlobals(host: *server.Server, client: *server.Client, compositor_id: u32, manager_id: u32) !void {
     try testSend(client, 1, 1, &core.wl_display.request_messages[1], &.{.{ .new_id = .{ .typed = 2 } }});
     try testDrain(client);
@@ -453,9 +482,6 @@ test "fractional resources follow canonical membership and survive either parent
     try second_output.markSurfaceVisible(surface_id);
     second_output.endFrame();
     try std.testing.expectEqual(@as(u32, 240), fractional.fractional_scales.items[0].preferred_scale);
-    second_output.beginFrame();
-    second_output.endFrame();
-    try std.testing.expectEqual(@as(u32, 180), fractional.fractional_scales.items[0].preferred_scale);
 
     fractional.setDefaultOutput(second_output_id);
     try testSend(client, 3, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 7 } }});
@@ -466,7 +492,13 @@ test "fractional resources follow canonical membership and survive either parent
     try testSend(client, 8, 0, &core.wp_fractional_scale_v1.request_messages[0], &.{});
     try testSend(client, 7, 0, &core.wl_surface.request_messages[0], &.{});
     fractional.setDefaultOutput(output_id);
+    try testDrain(client);
     try std.testing.expect(layout.remove(second_output_id));
+    const removal_events = try testDrainBytes(client);
+    defer std.testing.allocator.free(removal_events);
+    try expectSinglePreferredScaleEvent(removal_events, 6, 180);
+    try std.testing.expectEqual(@as(u32, 180), fractional.fractional_scales.items[0].preferred_scale);
+    try std.testing.expect((try client.beginSend()) == null);
 
     try testSend(client, 4, 0, &core.wp_fractional_scale_manager_v1.request_messages[0], &.{});
     try std.testing.expectEqual(@as(usize, 0), fractional.managers.items.len);
