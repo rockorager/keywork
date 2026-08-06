@@ -17,6 +17,7 @@ const WayringHost = @import("wayland/WayringHost.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
+const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const wayring = @import("wayring");
 
 pub const std_options: std.Options = .{
@@ -185,6 +186,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_xdg_shell: WayringXdgShell = undefined;
     var wayring_xdg_shell_initialized = false;
     var wayring_xdg_shell_published = false;
+    var wayring_viewporter: WayringViewporter = undefined;
+    var wayring_viewporter_initialized = false;
+    var wayring_viewporter_published = false;
     var wayring_seat_adapter: WayringSeatAdapter = undefined;
     var wayring_seat_adapter_initialized = false;
     var wayring_seat_published = false;
@@ -192,6 +196,7 @@ pub fn main(init: std.process.Init) !void {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
         xdg_shell: *WayringXdgShell,
+        viewporter: *WayringViewporter,
         compositor: *WayringCompositor,
         seat: *WayringSeatAdapter,
 
@@ -205,6 +210,7 @@ pub fn main(init: std.process.Init) !void {
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
             self.seat.destroyClientResources(client);
+            self.viewporter.destroyClientResources(client);
             self.xdg_shell.destroyClientResources(client);
             if (self.outputs) |outputs| outputs.destroyClientResources(client);
             self.compositor.destroyClientResources(client);
@@ -217,6 +223,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_viewporter_initialized) {
+            if (wayring_viewporter_published) wayring_viewporter.unpublish();
+            wayring_viewporter.deinit();
+        }
         if (wayring_xdg_shell_initialized) {
             if (wayring_xdg_shell_published) wayring_xdg_shell.unpublish();
             wayring_xdg_shell.deinit();
@@ -279,17 +289,22 @@ pub fn main(init: std.process.Init) !void {
         );
         wayring_xdg_shell.setSeatAdapter(&wayring_seat_adapter);
         wayring_xdg_shell_initialized = true;
+        wayring_viewporter.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
+        wayring_viewporter_initialized = true;
         // Stable generated XDG is authoritative only on the headless path
         // where generated output/presentation policy is available. Outputs
         // and the seat are deliberately published before this shell global.
         if (wayring_outputs_initialized) {
             try wayring_xdg_shell.publish();
             wayring_xdg_shell_published = true;
+            try wayring_viewporter.publish();
+            wayring_viewporter_published = true;
         }
         wayring_lifecycle = .{
             .clients = &wayring_clients,
             .outputs = if (wayring_outputs_initialized) &wayring_outputs else null,
             .xdg_shell = &wayring_xdg_shell,
+            .viewporter = &wayring_viewporter,
             .compositor = &wayring_compositor,
             .seat = &wayring_seat_adapter,
         };
@@ -679,6 +694,7 @@ test {
     _ = @import("wayland/compositor.zig");
     _ = @import("wayland/WayringCompositor.zig");
     _ = @import("wayland/WayringXdgShell.zig");
+    _ = @import("wayland/WayringViewporter.zig");
     _ = @import("wayland/WayringClients.zig");
     _ = @import("wayland/WayringHost.zig");
     _ = @import("wayland/WayringOutput.zig");

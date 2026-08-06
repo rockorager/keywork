@@ -9,10 +9,11 @@ pub const ViewportSource = struct {
     width: i32,
     height: i32,
 };
+pub const ViewportDestination = render.Size;
 
 pub const ViewportState = struct {
     source: ?ViewportSource = null,
-    destination: ?render.Size = null,
+    destination: ?ViewportDestination = null,
 };
 
 pub const Geometry = struct {
@@ -64,19 +65,18 @@ pub fn calculate(
         scale,
         transform,
         allow_non_divisible_scale,
-    ) catch
-        return error.InvalidSize;
+    ) catch return error.InvalidSize;
     const source = viewport.source orelse return .{
         .logical_size = viewport.destination orelse base_size,
         .source = null,
     };
 
-    const right = @as(i64, source.x) + source.width;
-    const bottom = @as(i64, source.y) + source.height;
+    const right = @as(i128, source.x) + source.width;
+    const bottom = @as(i128, source.y) + source.height;
     const transformed = transform.applyToSize(buffer_size);
     if (source.x < 0 or source.y < 0 or source.width <= 0 or source.height <= 0 or
-        right * scale > @as(i64, transformed.width) * 256 or
-        bottom * scale > @as(i64, transformed.height) * 256)
+        right * scale > @as(i128, transformed.width) * 256 or
+        bottom * scale > @as(i128, transformed.height) * 256)
     {
         return error.ViewportOutOfBuffer;
     }
@@ -244,6 +244,45 @@ test "viewport source bounds use post-transform axes" {
             1,
             .normal,
             viewport,
+            false,
+        ),
+    );
+}
+
+test "source and destination combine transformed bounds with buffer scale" {
+    const geometry = try calculate(
+        .{ .width = 12, .height = 8 },
+        2,
+        .rotate_90,
+        .{
+            .source = .{ .x = 256, .y = 512, .width = 768, .height = 1024 },
+            .destination = .{ .width = 9, .height = 5 },
+        },
+        false,
+    );
+    try std.testing.expectEqual(render.Size{ .width = 9, .height = 5 }, geometry.logical_size);
+    try std.testing.expectEqual(@as(f64, 2), geometry.source.?.x);
+    try std.testing.expectEqual(@as(f64, 4), geometry.source.?.y);
+    try std.testing.expectEqual(@as(f64, 6), geometry.source.?.width);
+    try std.testing.expectEqual(@as(f64, 8), geometry.source.?.height);
+}
+
+test "maximum fixed coordinates and scale cannot overflow source bounds" {
+    try std.testing.expectError(
+        error.ViewportOutOfBuffer,
+        calculate(
+            .{
+                .width = std.math.maxInt(i32),
+                .height = std.math.maxInt(i32),
+            },
+            std.math.maxInt(i32),
+            .normal,
+            .{ .source = .{
+                .x = std.math.maxInt(i32),
+                .y = std.math.maxInt(i32),
+                .width = std.math.maxInt(i32),
+                .height = std.math.maxInt(i32),
+            } },
             false,
         ),
     );
