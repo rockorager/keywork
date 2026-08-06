@@ -91,6 +91,7 @@ const MatureClients = @import("wayland/MatureClients.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringCursorShape = @import("wayland/WayringCursorShape.zig");
+const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
@@ -16200,6 +16201,7 @@ const WayringSubsurfaceClient = struct {
 const WayringXdgClient = struct {
     const client_wl = wayland.client.wl;
     const client_xdg = wayland.client.xdg;
+    const client_zxdg = wayland.client.zxdg;
     const Stage = enum(u8) { starting, configured, mapped, frame_done, registry_ready, disconnected, failed };
 
     runtime_directory: []const u8,
@@ -16214,12 +16216,19 @@ const WayringXdgClient = struct {
     output: ?*client_wl.Output = null,
     seat: ?*client_wl.Seat = null,
     wm_base: ?*client_xdg.WmBase = null,
+    decoration_manager: ?*client_zxdg.DecorationManagerV1 = null,
     global_count: usize = 0,
     globals_exact: bool = true,
     configure_serial: u32 = 0,
     configure_count: u8 = 0,
     toplevel_configure_count: u8 = 0,
     capabilities_count: u8 = 0,
+    decoration_configure_count: u8 = 0,
+    decoration_mode: u32 = 0,
+    event_sequence: u8 = 0,
+    decoration_event_sequence: u8 = 0,
+    toplevel_event_sequence: u8 = 0,
+    surface_event_sequence: u8 = 0,
     output_enter_count: std.atomic.Value(u8) = .init(0),
     frame_count: std.atomic.Value(u8) = .init(0),
 
@@ -16230,6 +16239,7 @@ const WayringXdgClient = struct {
         .{ .name = "wl_seat", .version = 11 },
         .{ .name = "wl_output", .version = 4 },
         .{ .name = "xdg_wm_base", .version = 7 },
+        .{ .name = "zxdg_decoration_manager_v1", .version = 2 },
     };
 
     fn run(self: *@This()) void {
@@ -16279,8 +16289,13 @@ const WayringXdgClient = struct {
         var wm_base_live = true;
         defer if (wm_base_live) wm_base.destroy();
         wm_base.setListener(*@This(), wmBaseEvent, self);
+        const decoration_manager = self.decoration_manager orelse return error.DecorationManagerMissing;
+        var decoration_manager_live = true;
+        defer if (decoration_manager_live) decoration_manager.destroy();
         if (self.registry_only) {
             try self.pause(.registry_ready);
+            decoration_manager.destroy();
+            decoration_manager_live = false;
             wm_base.destroy();
             wm_base_live = false;
             seat.release();
@@ -16305,10 +16320,19 @@ const WayringXdgClient = struct {
         var toplevel_live = true;
         defer if (toplevel_live) toplevel.destroy();
         toplevel.setListener(*@This(), toplevelEvent, self);
+        const decoration = try decoration_manager.getToplevelDecoration(toplevel);
+        var decoration_live = true;
+        defer if (decoration_live) decoration.destroy();
+        decoration.setListener(*@This(), decorationEvent, self);
+        decoration.setMode(.server_side);
         surface.commit();
         try expectClientRoundtrip(display);
         if (self.configure_count != 1 or self.toplevel_configure_count != 1 or
-            self.capabilities_count != 1 or self.configure_serial == 0)
+            self.capabilities_count != 1 or self.decoration_configure_count != 1 or
+            self.decoration_mode != @as(u32, @intCast(@intFromEnum(client_zxdg.ToplevelDecorationV1.Mode.server_side))) or
+            self.configure_serial == 0 or
+            !(self.decoration_event_sequence < self.toplevel_event_sequence and
+                self.toplevel_event_sequence < self.surface_event_sequence))
             return error.UnexpectedInitialConfigure;
         try self.pause(.configured);
 
@@ -16339,12 +16363,16 @@ const WayringXdgClient = struct {
         buffer_live = false;
         pool.destroy();
         pool_live = false;
+        decoration.destroy();
+        decoration_live = false;
         toplevel.destroy();
         toplevel_live = false;
         xdg_surface.destroy();
         xdg_surface_live = false;
         surface.destroy();
         surface_live = false;
+        decoration_manager.destroy();
+        decoration_manager_live = false;
         wm_base.destroy();
         wm_base_live = false;
         seat.release();
@@ -16364,7 +16392,7 @@ const WayringXdgClient = struct {
                 self.global_count += 1;
                 if (index >= expected_globals.len or !std.mem.eql(u8, interface, expected_globals[index].name) or
                     global.version != expected_globals[index].version) self.globals_exact = false;
-                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, 6) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, 4) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, 11) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, 7) catch null;
+                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, 6) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, 4) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, 11) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, 7) catch null else if (std.mem.eql(u8, interface, "zxdg_decoration_manager_v1")) self.decoration_manager = registry.bind(global.name, client_zxdg.DecorationManagerV1, 2) catch null;
             },
             .global_remove => {},
         }
@@ -16378,6 +16406,8 @@ const WayringXdgClient = struct {
     fn xdgSurfaceEvent(xdg_surface: *client_xdg.Surface, event: client_xdg.Surface.Event, self: *@This()) void {
         switch (event) {
             .configure => |configure| {
+                self.event_sequence += 1;
+                self.surface_event_sequence = self.event_sequence;
                 self.configure_serial = configure.serial;
                 self.configure_count += 1;
                 xdg_surface.ackConfigure(configure.serial);
@@ -16386,9 +16416,23 @@ const WayringXdgClient = struct {
     }
     fn toplevelEvent(_: *client_xdg.Toplevel, event: client_xdg.Toplevel.Event, self: *@This()) void {
         switch (event) {
-            .configure => self.toplevel_configure_count += 1,
+            .configure => {
+                self.event_sequence += 1;
+                self.toplevel_event_sequence = self.event_sequence;
+                self.toplevel_configure_count += 1;
+            },
             .wm_capabilities => self.capabilities_count += 1,
             .configure_bounds, .close => {},
+        }
+    }
+    fn decorationEvent(_: *client_zxdg.ToplevelDecorationV1, event: client_zxdg.ToplevelDecorationV1.Event, self: *@This()) void {
+        switch (event) {
+            .configure => |configure| {
+                self.event_sequence += 1;
+                self.decoration_event_sequence = self.event_sequence;
+                self.decoration_configure_count += 1;
+                self.decoration_mode = @intCast(@intFromEnum(configure.mode));
+            },
         }
     }
     fn surfaceEvent(_: *client_wl.Surface, event: client_wl.Surface.Event, self: *@This()) void {
@@ -18527,6 +18571,11 @@ test "production Wayring XDG publication accepts a real registry client and surv
     xdg.setSeatAdapter(&seat);
     try xdg.publish();
     defer xdg.unpublish();
+    var decoration: WayringXdgDecoration = undefined;
+    decoration.init(std.testing.allocator, &protocol_server, &xdg, server.neutralXdgShell());
+    defer decoration.deinit();
+    try decoration.publish();
+    defer decoration.unpublish();
 
     const Lifecycle = struct {
         clients: *WayringClients,
@@ -18534,6 +18583,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
         outputs: *WayringOutput,
         seat: *WayringSeatAdapter,
         xdg: *WayringXdgShell,
+        decoration: *WayringXdgDecoration,
         accepted_count: usize = 0,
 
         fn accepted(context: *anyopaque, client: *wayring.server.Client) !void {
@@ -18545,6 +18595,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
         }
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            self.decoration.destroyClientResources(client);
             self.xdg.destroyClientResources(client);
             self.seat.destroyClientResources(client);
             self.outputs.destroyClientResources(client);
@@ -18552,7 +18603,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
             if (self.clients.id(client) != null) self.clients.unregister(client);
         }
     };
-    var lifecycle: Lifecycle = .{ .clients = &clients, .compositor = &compositor, .outputs = &outputs, .seat = &seat, .xdg = &xdg };
+    var lifecycle: Lifecycle = .{ .clients = &clients, .compositor = &compositor, .outputs = &outputs, .seat = &seat, .xdg = &xdg, .decoration = &decoration };
     const host = try WayringHost.create(std.testing.allocator, server.eventLoop(), &protocol_server, runtime_directory, .{
         .context = &lifecycle,
         .accepted = Lifecycle.accepted,
@@ -18578,7 +18629,8 @@ test "production Wayring XDG publication accepts a real registry client and surv
     try std.testing.expectEqual(@as(usize, 1), compositor.surfaceCount());
     try std.testing.expectEqual(@as(usize, 1), server.headless_surface_forest.len());
     var neutral_windows = server.neutralXdgShell().windowIterator();
-    try std.testing.expect(neutral_windows.next() != null);
+    const neutral_window = neutral_windows.next().?;
+    try std.testing.expectEqual(NeutralXdgShell.DecorationPreference.prefers_ssd, server.neutralXdgShell().windowInfo(neutral_window).?.decoration_preference);
     try std.testing.expect(server.surface_registry.renderState(server.headless_surface_forest.rootAt(0).?.id) == null);
 
     try signalWayringCommand(command_fd);
