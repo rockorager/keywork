@@ -66,6 +66,14 @@ pub const Value = union(enum) {
     fd: ?std.posix.fd_t,
 };
 
+/// Storage reserved before an atomic descriptor-free event sequence is
+/// encoded. The caller must either publish or cancel it.
+pub const PreparedBatch = struct {
+    storage: []u8,
+    batch_count: usize,
+    active: bool = true,
+};
+
 pub const FrameHeader = struct {
     object_id: u32,
     opcode: u16,
@@ -281,6 +289,7 @@ pub const Output = struct {
     next_token: u64 = 1,
     in_flight: ?BatchToken = null,
     in_flight_target: ?AttemptTarget = null,
+    prepared_batch_active: bool = false,
     sealed: bool = false,
     terminal: [terminal_capacity]u8 = undefined,
     terminal_len: u16 = 0,
@@ -304,6 +313,7 @@ pub const Output = struct {
         values: []const Value,
     ) !void {
         if (self.sealed) return error.OutputSealed;
+        if (self.prepared_batch_active) return error.PreparedBatchActive;
         if (values.len != descriptor.arguments.len) return error.ArgumentCountMismatch;
 
         var writer: std.Io.Writer.Allocating = .init(self.allocator);
@@ -313,7 +323,7 @@ pub const Output = struct {
         var borrowed_fds: std.ArrayList(std.posix.fd_t) = .empty;
         defer borrowed_fds.deinit(self.allocator);
         for (descriptor.arguments, values) |argument, value| {
-            try encodeValue(&writer, &borrowed_fds, argument.kind, value, self.allocator);
+            try encodeValue(&writer.writer, &borrowed_fds, argument.kind, value, self.allocator);
         }
         const encoded = writer.written();
         if (encoded.len > max_message_size) return error.MessageTooLarge;
@@ -346,6 +356,59 @@ pub const Output = struct {
             .fds = owned_fds,
             .kind = if (owned_fds.len == 0) .coalesced else .file_descriptors,
         });
+    }
+
+    /// Reserves both payload and queue storage for one later descriptor-free
+    /// event sequence. Publication is allocation-free and requires no other
+    /// batch to be appended between prepare and publish.
+    pub fn prepareBatch(self: *Output, maximum_bytes: usize) !PreparedBatch {
+        if (self.sealed) return error.OutputSealed;
+        if (self.prepared_batch_active) return error.PreparedBatchActive;
+        if (maximum_bytes == 0) return error.EmptyPreparedBatch;
+        try self.batches.ensureUnusedCapacity(self.allocator, 1);
+        const prepared: PreparedBatch = .{
+            .storage = try self.allocator.alloc(u8, maximum_bytes),
+            .batch_count = self.batches.items.len,
+        };
+        self.prepared_batch_active = true;
+        return prepared;
+    }
+
+    pub fn cancelPreparedBatch(self: *Output, prepared: *PreparedBatch) void {
+        if (!prepared.active) return;
+        std.debug.assert(self.prepared_batch_active);
+        self.allocator.free(prepared.storage);
+        prepared.active = false;
+        self.prepared_batch_active = false;
+    }
+
+    /// Publishes one already encoded sequence as a single ordered batch.
+    /// Ownership of its storage transfers to Output on success.
+    pub fn publishPreparedBatch(
+        self: *Output,
+        prepared: *PreparedBatch,
+        encoded_length: usize,
+    ) !void {
+        if (!prepared.active) return error.PreparedBatchConsumed;
+        if (!self.prepared_batch_active) return error.PreparedBatchConsumed;
+        if (self.sealed) return error.OutputSealed;
+        if (self.batches.items.len != prepared.batch_count) {
+            return error.PreparedBatchInterleaved;
+        }
+        if (encoded_length == 0 or encoded_length > prepared.storage.len) {
+            return error.InvalidPreparedBatchLength;
+        }
+        std.debug.assert(self.batches.capacity - self.batches.items.len >= 1);
+        self.batches.appendAssumeCapacity(.{
+            .bytes = .{
+                .items = prepared.storage[0..encoded_length],
+                .capacity = prepared.storage.len,
+            },
+            .fds = &.{},
+            .kind = .coalesced,
+        });
+        prepared.active = false;
+        self.prepared_batch_active = false;
     }
 
     fn appendableTail(self: *Output) ?*QueuedBatch {
@@ -472,7 +535,7 @@ fn decodeValue(
 }
 
 fn encodeValue(
-    writer: *std.Io.Writer.Allocating,
+    writer: *std.Io.Writer,
     fds: *std.ArrayList(std.posix.fd_t),
     kind: ArgumentKind,
     value: Value,
@@ -507,6 +570,58 @@ fn encodeValue(
             const fd = value.fd orelse return error.MissingFileDescriptor;
             try fds.append(allocator, fd);
         } else return error.ArgumentTypeMismatch,
+    }
+}
+
+/// Encodes one descriptor-free message into caller-owned fixed storage.
+/// Used with PreparedBatch so an event sequence cannot become partly visible.
+pub fn encodePreparedMessage(
+    writer: *std.Io.Writer,
+    object_id: u32,
+    opcode: u16,
+    descriptor: *const MessageDescriptor,
+    values: []const Value,
+) !void {
+    if (object_id == 0) return error.NullObject;
+    if (values.len != descriptor.arguments.len) return error.ArgumentCountMismatch;
+    const start = writer.buffered().len;
+    try writer.writeAll(&.{ 0, 0, 0, 0, 0, 0, 0, 0 });
+    for (descriptor.arguments, values) |argument, value| {
+        try encodePreparedValue(writer, argument.kind, value);
+    }
+    const encoded = writer.buffered()[start..];
+    if (encoded.len > max_message_size) return error.MessageTooLarge;
+    writeU32(encoded[0..4], object_id);
+    writeU32(encoded[4..8], (@as(u32, @intCast(encoded.len)) << 16) | opcode);
+}
+
+fn encodePreparedValue(writer: *std.Io.Writer, kind: ArgumentKind, value: Value) !void {
+    switch (kind) {
+        .int => if (value == .int) try encodeU32(writer, @bitCast(value.int)) else return error.ArgumentTypeMismatch,
+        .uint => if (value == .uint) try encodeU32(writer, value.uint) else return error.ArgumentTypeMismatch,
+        .fixed => if (value == .fixed) try encodeU32(writer, @bitCast(value.fixed)) else return error.ArgumentTypeMismatch,
+        .string => |nullability| if (value == .string)
+            try encodeString(writer, value.string, nullability)
+        else
+            return error.ArgumentTypeMismatch,
+        .object => |object_type| if (value == .object)
+            try encodeObject(writer, value.object, object_type.nullability)
+        else
+            return error.ArgumentTypeMismatch,
+        .new_id => |interface| if (value == .new_id) switch (value.new_id) {
+            .typed => |id| {
+                if (interface == null) return error.ArgumentTypeMismatch;
+                try encodeRequiredId(writer, id);
+            },
+            .generic => |new_id| {
+                if (interface != null) return error.ArgumentTypeMismatch;
+                try encodeString(writer, new_id.interface, .required);
+                try encodeU32(writer, new_id.version);
+                try encodeRequiredId(writer, new_id.id);
+            },
+        } else return error.ArgumentTypeMismatch,
+        .array => if (value == .array) try encodeArray(writer, value.array) else return error.ArgumentTypeMismatch,
+        .fd => return error.PreparedFileDescriptorUnsupported,
     }
 }
 
@@ -551,24 +666,24 @@ fn decodeArray(body: []const u8, cursor: *usize) ![]const u8 {
     return bytes[0..length];
 }
 
-fn encodeU32(writer: *std.Io.Writer.Allocating, value: u32) !void {
+fn encodeU32(writer: *std.Io.Writer, value: u32) !void {
     var bytes: [4]u8 = undefined;
     writeU32(&bytes, value);
-    try writer.writer.writeAll(&bytes);
+    try writer.writeAll(&bytes);
 }
 
-fn encodeRequiredId(writer: *std.Io.Writer.Allocating, id: u32) !void {
+fn encodeRequiredId(writer: *std.Io.Writer, id: u32) !void {
     if (id == 0) return error.NullNewId;
     try encodeU32(writer, id);
 }
 
-fn encodeObject(writer: *std.Io.Writer.Allocating, id: ?u32, nullability: Nullability) !void {
+fn encodeObject(writer: *std.Io.Writer, id: ?u32, nullability: Nullability) !void {
     if (id == null and nullability == .required) return error.NullObject;
     try encodeU32(writer, id orelse 0);
 }
 
 fn encodeString(
-    writer: *std.Io.Writer.Allocating,
+    writer: *std.Io.Writer,
     string: ?[]const u8,
     nullability: Nullability,
 ) !void {
@@ -580,22 +695,22 @@ fn encodeString(
     const length = std.math.add(usize, value.len, 1) catch return error.MessageTooLarge;
     if (length > std.math.maxInt(u32)) return error.MessageTooLarge;
     try encodeU32(writer, @intCast(length));
-    try writer.writer.writeAll(value);
-    try writer.writer.writeByte(0);
+    try writer.writeAll(value);
+    try writer.writeByte(0);
     try writePadding(writer, length);
 }
 
-fn encodeArray(writer: *std.Io.Writer.Allocating, array: []const u8) !void {
+fn encodeArray(writer: *std.Io.Writer, array: []const u8) !void {
     if (array.len > std.math.maxInt(u32)) return error.MessageTooLarge;
     try encodeU32(writer, @intCast(array.len));
-    try writer.writer.writeAll(array);
+    try writer.writeAll(array);
     try writePadding(writer, array.len);
 }
 
-fn writePadding(writer: *std.Io.Writer.Allocating, length: usize) !void {
+fn writePadding(writer: *std.Io.Writer, length: usize) !void {
     const padded = try paddedLength(length);
     const padding = padded - length;
-    try writer.writer.splatByteAll(0, padding);
+    try writer.splatByteAll(0, padding);
 }
 
 fn paddedLength(length: usize) !usize {
@@ -1037,6 +1152,69 @@ test "failed coalesced-tail growth leaves existing output unchanged" {
     try std.testing.expectEqual(before.len + 8, batch.bytes.len);
     try std.testing.expectEqual(@as(u32, 2), readU32(batch.bytes[before.len..][0..4]));
     try output.completeSend(batch.token, batch.bytes.len);
+}
+
+test "prepared output publishes one complete batch or cancels without output" {
+    const argument = [_]ArgumentDescriptor{.{ .name = "value", .kind = .uint }};
+    const descriptor: MessageDescriptor = .{ .name = "value", .arguments = &argument };
+    var output = Output.init(std.testing.allocator);
+    defer output.deinit();
+
+    var canceled = try output.prepareBatch(12);
+    output.cancelPreparedBatch(&canceled);
+    try std.testing.expect((try output.beginSend()) == null);
+
+    var prepared = try output.prepareBatch(24);
+    var writer = std.Io.Writer.fixed(prepared.storage);
+    try encodePreparedMessage(&writer, 7, 1, &descriptor, &.{.{ .uint = 11 }});
+    try encodePreparedMessage(&writer, 8, 2, &descriptor, &.{.{ .uint = 12 }});
+    try output.publishPreparedBatch(&prepared, writer.buffered().len);
+
+    const batch = (try output.beginSend()).?;
+    try std.testing.expectEqual(@as(usize, 24), batch.bytes.len);
+    try std.testing.expectEqual(@as(u32, 7), readU32(batch.bytes[0..4]));
+    try std.testing.expectEqual(@as(u32, 8), readU32(batch.bytes[12..16]));
+    try output.completeSend(batch.token, batch.bytes.len);
+    try std.testing.expect((try output.beginSend()) == null);
+}
+
+test "prepared output encoding failure and interleaving rejection remain atomic" {
+    const argument = [_]ArgumentDescriptor{.{ .name = "value", .kind = .uint }};
+    const descriptor: MessageDescriptor = .{ .name = "value", .arguments = &argument };
+    var output = Output.init(std.testing.allocator);
+    defer output.deinit();
+
+    var too_small = try output.prepareBatch(8);
+    var short_writer = std.Io.Writer.fixed(too_small.storage);
+    try std.testing.expectError(error.WriteFailed, encodePreparedMessage(
+        &short_writer,
+        7,
+        1,
+        &descriptor,
+        &.{.{ .uint = 11 }},
+    ));
+    output.cancelPreparedBatch(&too_small);
+    try std.testing.expect((try output.beginSend()) == null);
+
+    try output.enqueue(9, 3, &descriptor, &.{.{ .uint = 13 }});
+    var interleaved = try output.prepareBatch(12);
+    var writer = std.Io.Writer.fixed(interleaved.storage);
+    try encodePreparedMessage(&writer, 7, 1, &descriptor, &.{.{ .uint = 11 }});
+    try std.testing.expectError(
+        error.PreparedBatchActive,
+        output.enqueue(8, 2, &descriptor, &.{.{ .uint = 12 }}),
+    );
+    try output.publishPreparedBatch(&interleaved, writer.buffered().len);
+
+    const prior = (try output.beginSend()).?;
+    try std.testing.expectEqual(@as(usize, 12), prior.bytes.len);
+    try std.testing.expectEqual(@as(u32, 9), readU32(prior.bytes[0..4]));
+    try std.testing.expectEqual(@as(u16, 3), @as(u16, @truncate(readU32(prior.bytes[4..8]))));
+    try output.completeSend(prior.token, prior.bytes.len);
+    const prepared = (try output.beginSend()).?;
+    try std.testing.expectEqual(@as(u32, 7), readU32(prepared.bytes[0..4]));
+    try output.completeSend(prepared.token, prepared.bytes.len);
+    try std.testing.expect((try output.beginSend()) == null);
 }
 
 test "sealed terminal output follows ordinary bytes and has independent attempts" {

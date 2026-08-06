@@ -552,6 +552,26 @@ pub fn compoundBounds(
     const root = self.compoundRoot(id) orelse return .hidden;
     const class = self.nodeConst(root).?.presentation_class;
     if (class == .xdg_reserved or class == .managed) return .hidden;
+    return self.geometryBounds(id);
+}
+
+/// Resource-free mapped bounds for semantic surface geometry. Unlike
+/// presentation damage, XDG geometry remains observable while the generated
+/// root is reserved or managed but intentionally hidden from rendering.
+pub fn subtreeBounds(
+    self: *const HeadlessSurfaceForest,
+    id: SurfaceRegistry.Id,
+) ?render.Rect {
+    return switch (self.geometryBounds(id)) {
+        .rect => |rect| rect,
+        .hidden, .full_damage => null,
+    };
+}
+
+fn geometryBounds(
+    self: *const HeadlessSurfaceForest,
+    id: SurfaceRegistry.Id,
+) CompoundBounds {
     if (self.exactGeometry(id) == null) return .hidden;
     var has_bounds = false;
     var left: i64 = 0;
@@ -1017,6 +1037,10 @@ test "root presentation progression hides reservations and keeps managed and cur
     try std.testing.expect(forest.setRootPresentationClass(managed, .xdg_reserved));
     try std.testing.expectEqual(PresentationClass.xdg_reserved, forest.presentationClass(managed).?);
     try std.testing.expectEqual(CompoundBounds.hidden, forest.compoundBounds(managed));
+    try std.testing.expectEqual(
+        render.Rect{ .x = 0, .y = 0, .width = 2, .height = 1 },
+        forest.subtreeBounds(managed).?,
+    );
     var reserved_subtree = forest.subtreeRenderIterator(managed);
     try std.testing.expectEqual(managed, reserved_subtree.next().?.id);
     try std.testing.expect(reserved_subtree.next() == null);
@@ -1028,6 +1052,10 @@ test "root presentation progression hides reservations and keeps managed and cur
         try std.testing.expect(!forest.setRootPresentationClass(managed, invalid));
     try std.testing.expectEqual(Placement.root, forest.state(managed).?.placement);
     try std.testing.expectEqual(CompoundBounds.hidden, forest.compoundBounds(managed));
+    try std.testing.expectEqual(
+        render.Rect{ .x = 0, .y = 0, .width = 2, .height = 1 },
+        forest.subtreeBounds(managed).?,
+    );
     var managed_subtree = forest.subtreeRenderIterator(managed);
     try std.testing.expectEqual(managed, managed_subtree.next().?.id);
 

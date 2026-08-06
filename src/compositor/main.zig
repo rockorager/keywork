@@ -650,6 +650,7 @@ test {
     _ = @import("window_manager/workspace.zig");
     _ = @import("wayland/compositor.zig");
     _ = @import("wayland/WayringCompositor.zig");
+    _ = @import("wayland/WayringXdgShell.zig");
     _ = @import("wayland/WayringClients.zig");
     _ = @import("wayland/WayringHost.zig");
     _ = @import("wayland/WayringOutput.zig");

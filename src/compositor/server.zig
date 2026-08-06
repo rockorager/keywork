@@ -2398,12 +2398,18 @@ fn findProtocolRenderOutput(self: *Self, output_id: OutputLayout.Id) ?*RenderOut
 
 fn xdgSubtreeGeometry(context: *anyopaque, id: SurfaceRegistry.Id) ?NeutralXdgShell.Geometry {
     const self: *Self = @ptrCast(@alignCast(context));
-    const bounds = self.subcompositor.treeBounds(id) orelse return null;
-    return .{
+    if (self.subcompositor.treeBounds(id)) |bounds| return .{
         .x = bounds.x,
         .y = bounds.y,
         .width = @intCast(bounds.width),
         .height = @intCast(bounds.height),
+    };
+    const generated = self.headless_surface_forest.subtreeBounds(id) orelse return null;
+    return .{
+        .x = generated.x,
+        .y = generated.y,
+        .width = @intCast(generated.width),
+        .height = @intCast(generated.height),
     };
 }
 
