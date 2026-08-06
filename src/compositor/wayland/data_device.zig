@@ -462,6 +462,19 @@ pub fn dragIsExternal(self: *const Self) bool {
     return self.owner.dragIsExternal();
 }
 
+pub const ResourceCounts = struct {
+    sources: usize,
+    devices: usize,
+    offers: usize,
+};
+pub fn resourceCounts(self: *const Self) ResourceCounts {
+    return .{
+        .sources = self.sources.count(),
+        .devices = self.devices.count(),
+        .offers = self.offers.count(),
+    };
+}
+
 pub fn sourceId(self: *Self, resource: ?*wl.DataSource) ?SourceId {
     const value = resource orelse return null;
     const data = value.getUserData() orelse return null;
