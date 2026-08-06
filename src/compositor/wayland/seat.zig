@@ -513,6 +513,31 @@ pub fn matureSurfaceOwner(
     return self.matureClient(surface.getClient());
 }
 
+/// Resolves a mature frontend client to its neutral compositor identity.
+/// The returned generational ID is weak and becomes invalid on disconnect.
+pub fn matureClientId(self: *const Self, client: *wl.Client) ?ClientRegistry.Id {
+    return self.matureClient(client);
+}
+
+/// Borrowed canonical registries used by protocol adapters owned by this seat.
+pub fn clientRegistry(self: *const Self) *const ClientRegistry {
+    return self.clients;
+}
+
+pub fn mutableClientRegistry(self: *Self) *ClientRegistry {
+    return @constCast(self.clients);
+}
+
+pub fn surfaceRegistry(self: *const Self) *const SurfaceRegistry {
+    return self.surface_registry;
+}
+
+/// Mutable authority is exposed only as the canonical policy dependency for
+/// seat-owned neutral state machines. Protocol adapters must not inspect it.
+pub fn dataDeviceAuthority(self: *Self) *SeatAuthority {
+    return &self.authority;
+}
+
 /// Canonical contact state used only to gate first-touch focus policy. It does
 /// not expose touch targets or permit a frontend to mutate the sequence.
 pub fn touchSequenceActive(self: *const Self) bool {

@@ -3,12 +3,10 @@
 const Self = @This();
 
 const std = @import("std");
-const wayland = @import("wayland");
-const DataDevice = @import("../wayland/data_device.zig");
+const DataDevice = @import("../DataDevice.zig");
 const XSelection = @import("selection.zig");
 const c = @import("xcb.zig").c;
 
-const wl = wayland.server.wl;
 const log = std.log.scoped(.xwayland_dnd);
 
 const protocol_version: u32 = 5;
@@ -27,8 +25,8 @@ incoming_source: c.xcb_window_t,
 incoming_generation: ?u64,
 incoming_version: u32,
 incoming_timestamp: c.xcb_timestamp_t,
-incoming_actions: wl.DataDeviceManager.DndAction,
-incoming_selected_action: wl.DataDeviceManager.DndAction,
+incoming_actions: DataDevice.Actions,
+incoming_selected_action: DataDevice.Actions,
 incoming_target_accepted: bool,
 incoming_mime_types: std.ArrayList([:0]u8),
 incoming_target_atoms: std.ArrayList(c.xcb_atom_t),
@@ -36,7 +34,7 @@ incoming_x_dropped: bool,
 incoming_wl_cancelled: bool,
 incoming_wl_finished: bool,
 proxy_mapped: bool,
-external_source: DataDevice.ExternalDragSource,
+external_source: ?DataDevice.SourceId,
 
 pub const Atoms = struct {
     aware: c.xcb_atom_t,
@@ -60,7 +58,7 @@ const Target = struct {
     version: u32,
     generation: u64,
     accepted: bool = false,
-    action: wl.DataDeviceManager.DndAction = .{},
+    action: DataDevice.Actions = .{},
 };
 
 pub fn init(
@@ -96,17 +94,7 @@ pub fn init(
         .incoming_wl_cancelled = false,
         .incoming_wl_finished = false,
         .proxy_mapped = false,
-        .external_source = .{
-            .context = self,
-            .mime_types = externalMimeTypes,
-            .actions = externalActions,
-            .send = externalSend,
-            .target = externalTarget,
-            .action = externalAction,
-            .drop_performed = externalDropPerformed,
-            .finished = externalFinished,
-            .cancel = externalCancelled,
-        },
+        .external_source = null,
     };
     errdefer self.incoming_mime_types.deinit(allocator);
     errdefer self.incoming_target_atoms.deinit(allocator);
@@ -127,10 +115,10 @@ pub fn deinit(self: *Self) void {
     self.clearIncoming(true);
     if (self.target) |target| {
         if (self.dropped) {
-            self.data_device.finishExternalDrag(target.generation, false);
+            self.data_device.finishRetained(target.generation, false);
         } else {
             self.sendLeave(target);
-            self.data_device.externalDragStatus(target.generation, false, .{});
+            self.data_device.externalTargetStatus(target.generation, false, .{});
         }
     }
     self.incoming_mime_types.deinit(self.allocator);
@@ -188,7 +176,7 @@ pub fn dragLeft(self: *Self) void {
     const target = self.target orelse return;
     if (self.dropped) return;
     self.sendLeave(target);
-    self.data_device.externalDragStatus(target.generation, false, .{});
+    self.data_device.externalTargetStatus(target.generation, false, .{});
     self.target = null;
 }
 
@@ -201,7 +189,7 @@ pub fn drop(self: *Self, time: u32) bool {
         self.sendDrop(target, time);
     } else {
         self.sendLeave(target);
-        self.data_device.externalDragStatus(target.generation, false, .{});
+        self.data_device.externalTargetStatus(target.generation, false, .{});
         self.target = null;
     }
     if (!self.data_device.dropOnExternalTarget(target.generation, accepted)) {
@@ -232,9 +220,9 @@ pub fn windowDestroyed(self: *Self, window: c.xcb_window_t) void {
     const target = self.target orelse return;
     if (target.surface_window != window and target.destination != window) return;
     if (self.dropped) {
-        self.data_device.finishExternalDrag(target.generation, false);
+        self.data_device.finishRetained(target.generation, false);
     } else {
-        self.data_device.externalDragStatus(target.generation, false, .{});
+        self.data_device.externalTargetStatus(target.generation, false, .{});
     }
     self.target = null;
     self.dropped = false;
@@ -262,7 +250,28 @@ pub fn handleXfixesNotify(
     }
     self.incoming_owner = event.owner;
     self.setProxyMapped(true);
-    self.incoming_generation = self.data_device.startExternalDrag(&self.external_source) orelse {
+    const source_id = self.data_device.createSource(null, .{
+        .context = self,
+        .send = externalSend,
+        .target = externalTarget,
+        .action = externalAction,
+        .cancelled = externalCancelled,
+        .drop_performed = externalDropPerformed,
+        .finished = externalFinished,
+    }, .{ .actions = self.incoming_actions, .actions_declared = true }) catch {
+        self.clearIncoming(false);
+        return;
+    };
+    self.external_source = source_id;
+    const initial = self.data_device.externalDragStart() orelse {
+        self.data_device.destroySource(source_id);
+        self.external_source = null;
+        self.clearIncoming(false);
+        return;
+    };
+    self.incoming_generation = self.data_device.startExternalDrag(source_id, initial) catch {
+        self.data_device.destroySource(source_id);
+        self.external_source = null;
         self.clearIncoming(false);
         return;
     };
@@ -334,7 +343,7 @@ fn handlePosition(self: *Self, event: *const c.xcb_client_message_event_t) void 
     }
     if (actionBits(actions) != actionBits(self.incoming_actions)) {
         self.incoming_actions = actions;
-        self.data_device.externalDragActionsChanged(&self.external_source);
+        if (self.external_source) |source_id| self.data_device.updateExternalSourceActions(source_id, self.incoming_actions) catch {};
     }
     self.sendIncomingStatus();
 }
@@ -415,7 +424,7 @@ fn offerIncomingTarget(self: *Self, target_atom: c.xcb_atom_t) void {
         self.allocator.free(self.incoming_mime_types.pop().?);
         return;
     };
-    self.data_device.externalDragMimeOffered(&self.external_source, mime_type.ptr);
+    if (self.external_source) |source_id| self.data_device.offerMime(source_id, mime_type) catch {};
 }
 
 fn handleStatus(self: *Self, event: *const c.xcb_client_message_event_t) void {
@@ -426,18 +435,18 @@ fn handleStatus(self: *Self, event: *const c.xcb_client_message_event_t) void {
     if (source.generation != target.generation) return;
     const accepted = event.data.data32[1] & 1 != 0 and
         actionBits(requested_action) & actionBits(source.actions) != 0;
-    const selected: wl.DataDeviceManager.DndAction = if (accepted) requested_action else .{};
+    const selected: DataDevice.Actions = if (accepted) requested_action else .{};
     if (target.accepted == accepted and actionBits(target.action) == actionBits(selected)) return;
     target.accepted = accepted;
     target.action = selected;
-    self.data_device.externalDragStatus(target.generation, accepted, target.action);
+    self.data_device.externalTargetStatus(target.generation, accepted, target.action);
 }
 
 fn handleFinished(self: *Self, event: *const c.xcb_client_message_event_t) void {
     const target = self.target orelse return;
     if (!self.dropped or !targetMatches(target, event.data.data32[0])) return;
     const performed = target.version < 5 or event.data.data32[1] & 1 != 0;
-    self.data_device.finishExternalDrag(target.generation, performed);
+    self.data_device.finishRetained(target.generation, performed);
     self.target = null;
     self.dropped = false;
 }
@@ -469,9 +478,9 @@ fn finishIncoming(self: *Self, success: bool) void {
 }
 
 fn clearIncoming(self: *Self, notify_data_device: bool) void {
-    if (notify_data_device and self.incoming_generation != null) {
-        self.data_device.externalDragSourceDestroyed(&self.external_source);
-    }
+    if (notify_data_device and self.incoming_generation != null) self.data_device.cancelDrag();
+    if (self.external_source) |source_id| self.data_device.destroySource(source_id);
+    self.external_source = null;
     self.setProxyMapped(false);
     self.clearIncomingMimeTypes();
     self.incoming_owner = c.XCB_WINDOW_NONE;
@@ -540,26 +549,15 @@ fn rootSize(self: *Self) struct { u16, u16 } {
     return .{ reply.*.width, reply.*.height };
 }
 
-fn externalMimeTypes(context: *anyopaque) []const [:0]const u8 {
+fn externalSend(context: *anyopaque, mime_type: []const u8, fd: std.posix.fd_t) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    return @ptrCast(self.incoming_mime_types.items);
-}
-
-fn externalActions(context: *anyopaque) wl.DataDeviceManager.DndAction {
-    const self: *Self = @ptrCast(@alignCast(context));
-    return self.incoming_actions;
-}
-
-fn externalSend(context: *anyopaque, mime_type: [*:0]const u8, fd: std.posix.fd_t) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    const requested = std.mem.span(mime_type);
     const target = for (self.incoming_mime_types.items, self.incoming_target_atoms.items) |offered, atom| {
-        if (std.mem.eql(u8, offered, requested)) break atom;
+        if (std.mem.eql(u8, offered, mime_type)) break atom;
     } else return;
     self.selection.receiveExternalData(target, self.incoming_timestamp, fd);
 }
 
-fn externalTarget(context: *anyopaque, mime_type: ?[*:0]const u8) void {
+fn externalTarget(context: *anyopaque, mime_type: ?[]const u8) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const accepted = mime_type != null;
     if (self.incoming_target_accepted == accepted) return;
@@ -567,7 +565,7 @@ fn externalTarget(context: *anyopaque, mime_type: ?[*:0]const u8) void {
     self.sendIncomingStatus();
 }
 
-fn externalAction(context: *anyopaque, selected: wl.DataDeviceManager.DndAction) void {
+fn externalAction(context: *anyopaque, selected: DataDevice.Actions) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (actionBits(self.incoming_selected_action) == actionBits(selected)) return;
     self.incoming_selected_action = selected;
@@ -653,7 +651,7 @@ fn readScalarProperty(
 fn sendEnter(
     self: *Self,
     target: Target,
-    mime_types: []const [:0]const u8,
+    mime_types: []const []const u8,
 ) bool {
     var target_atoms: std.ArrayList(c.xcb_atom_t) = .empty;
     defer target_atoms.deinit(self.allocator);
@@ -691,7 +689,7 @@ fn sendEnter(
 fn sendPosition(
     self: *Self,
     target: Target,
-    source_actions: wl.DataDeviceManager.DndAction,
+    source_actions: DataDevice.Actions,
     time: u32,
     x: f64,
     y: f64,
@@ -750,7 +748,7 @@ fn sendEvent(
 
 fn atomForActions(
     self: *const Self,
-    actions: wl.DataDeviceManager.DndAction,
+    actions: DataDevice.Actions,
 ) c.xcb_atom_t {
     if (actions.copy) return self.atoms.action_copy;
     if (actions.move) return self.atoms.action_move;
@@ -761,8 +759,8 @@ fn atomForActions(
 fn actionForAtom(
     self: *const Self,
     atom: c.xcb_atom_t,
-) wl.DataDeviceManager.DndAction {
-    var action: wl.DataDeviceManager.DndAction = .{};
+) DataDevice.Actions {
+    var action: DataDevice.Actions = .{};
     if (atom == self.atoms.action_copy or atom == self.atoms.action_private) {
         action.copy = true;
     } else if (atom == self.atoms.action_move) {
@@ -773,12 +771,12 @@ fn actionForAtom(
     return action;
 }
 
-fn actionBits(actions: wl.DataDeviceManager.DndAction) u32 {
+fn actionBits(actions: DataDevice.Actions) u32 {
     return @bitCast(actions);
 }
 
-fn copyAction() wl.DataDeviceManager.DndAction {
-    var action: wl.DataDeviceManager.DndAction = .{};
+fn copyAction() DataDevice.Actions {
+    var action: DataDevice.Actions = .{};
     action.copy = true;
     return action;
 }

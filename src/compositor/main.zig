@@ -24,6 +24,10 @@ const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const wayring = @import("wayring");
 
+comptime {
+    _ = @import("DataDevice.zig");
+}
+
 pub const std_options: std.Options = .{
     // Compile every level in; Logging applies the selected level at runtime.
     .log_level = .debug,

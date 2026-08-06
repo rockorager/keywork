@@ -4,7 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const DataDevice = @import("data_device.zig");
+const DataDevice = @import("../DataDevice.zig");
 const PrimarySelection = @import("primary_selection.zig");
 const Seat = @import("seat.zig");
 const SecurityContext = @import("security_context.zig");
@@ -48,7 +48,10 @@ const SeatState = struct {
     fn replace(self: *SeatState, kind: Kind, source: ?*Source, cancel_old: bool) void {
         if (self.data_device) |data_device| {
             switch (kind) {
-                .regular => data_device.setExternalSelection(if (source) |value| &value.callbacks else null),
+                .regular => {
+                    self.regular.source = source;
+                    data_device.setExternalSelection(if (source) |value| value.source_id else null) catch unreachable;
+                },
                 .primary => self.primary_selection.?.setExternalSelection(
                     if (source) |value| &value.callbacks else null,
                 ),
@@ -84,19 +87,19 @@ const SeatState = struct {
         return self.channel(kind).generation;
     }
 
-    fn mimeTypes(self: *SeatState, kind: Kind) []const [:0]const u8 {
+    fn mimeTypes(self: *SeatState, kind: Kind) []const []const u8 {
         if (self.data_device) |data_device| return switch (kind) {
             .regular => data_device.selectionMimeTypes(),
-            .primary => self.primary_selection.?.selectionMimeTypes(),
+            .primary => @ptrCast(self.primary_selection.?.selectionMimeTypes()),
         };
         const source = self.channel(kind).source orelse return &.{};
-        return source.callbacks.mime_types(source.callbacks.context);
+        return @ptrCast(source.callbacks.mime_types(source.callbacks.context));
     }
 
     fn send(self: *SeatState, kind: Kind, mime_type: [*:0]const u8, fd: std.posix.fd_t) void {
         if (self.data_device) |data_device| {
             switch (kind) {
-                .regular => data_device.sendSelection(mime_type, fd),
+                .regular => data_device.sendSelection(std.mem.span(mime_type), fd) catch {},
                 .primary => self.primary_selection.?.sendSelection(mime_type, fd),
             }
             return;
@@ -125,7 +128,29 @@ const Source = struct {
     mime_types: std.ArrayList([:0]u8) = .empty,
     used: bool = false,
     cancelled: bool = false,
+    source_id: ?DataDevice.SourceId = null,
     callbacks: SelectionSource,
+
+    fn endpoint(self: *Source) DataDevice.SourceEndpoint {
+        return .{
+            .context = self,
+            .send = neutralSend,
+            .target = neutralTarget,
+            .action = neutralAction,
+            .cancelled = callbackCancel,
+            .drop_performed = neutralDropPerformed,
+            .finished = neutralFinished,
+        };
+    }
+
+    fn register(self: *Source, data_device: *DataDevice) DataDevice.Error!DataDevice.SourceId {
+        if (self.source_id) |id| return id;
+        const id = try data_device.createSource(null, self.endpoint(), .{});
+        errdefer data_device.destroySource(id);
+        for (self.mime_types.items) |mime_type| try data_device.offerMime(id, mime_type);
+        self.source_id = id;
+        return id;
+    }
 
     const Resource = union(enum) {
         ext: *ext.DataControlSourceV1,
@@ -170,6 +195,19 @@ const Source = struct {
             .wlr => |resource| resource.sendSend(mime_type, fd),
         }
     }
+
+    fn neutralSend(context: *anyopaque, mime_type: []const u8, fd: std.posix.fd_t) void {
+        const self: *Source = @ptrCast(@alignCast(context));
+        switch (self.resource) {
+            .ext => |resource| resource.sendSend(@ptrCast(mime_type.ptr), fd),
+            .wlr => |resource| resource.sendSend(@ptrCast(mime_type.ptr), fd),
+        }
+    }
+
+    fn neutralTarget(_: *anyopaque, _: ?[]const u8) void {}
+    fn neutralAction(_: *anyopaque, _: DataDevice.Actions) void {}
+    fn neutralDropPerformed(_: *anyopaque) void {}
+    fn neutralFinished(_: *anyopaque) void {}
 
     fn callbackCancel(context: *anyopaque) void {
         const self: *Source = @ptrCast(@alignCast(context));
@@ -226,6 +264,13 @@ const Source = struct {
         self.mime_types.append(self.manager.allocator, copy) catch {
             self.manager.allocator.free(copy);
             self.postNoMemory();
+            return;
+        };
+        if (self.source_id) |id| for (self.manager.seats.items) |seat| {
+            if (seat.data_device) |data_device| {
+                data_device.offerMime(id, copy) catch self.postNoMemory();
+                break;
+            }
         };
     }
 
@@ -247,7 +292,8 @@ const Source = struct {
     fn destroy(self: *Source) void {
         for (self.manager.seats.items) |seat| {
             if (seat.data_device) |data_device| {
-                data_device.externalSourceDestroyed(&self.callbacks);
+                if (seat.regular.source == self) seat.regular.source = null;
+                if (self.source_id) |id| data_device.destroySource(id);
                 seat.primary_selection.?.externalSourceDestroyed(&self.callbacks);
             } else {
                 if (seat.regular.source == self) seat.replace(.regular, null, false);
@@ -315,7 +361,16 @@ const Device = struct {
             }
             value.used = true;
         }
-        self.state.replace(kind, source, true);
+        if (kind == .regular) {
+            const source_id = if (source) |value| value.register(self.state.data_device.?) catch {
+                value.postNoMemory();
+                return;
+            } else null;
+            self.state.regular.source = source;
+            self.state.data_device.?.setExternalSelection(source_id) catch unreachable;
+        } else {
+            self.state.replace(kind, source, true);
+        }
     }
 
     fn handleExtRequest(
@@ -356,7 +411,7 @@ const Device = struct {
         }
         const offer = try Offer.create(self, kind, self.state.generation(kind));
         self.sendDataOffer(offer);
-        for (self.state.mimeTypes(kind)) |mime_type| offer.sendOffer(mime_type.ptr);
+        for (self.state.mimeTypes(kind)) |mime_type| offer.sendOffer(@ptrCast(mime_type.ptr));
         self.sendSelectionEvent(kind, offer);
     }
 
@@ -601,12 +656,6 @@ pub fn init(
     const state = try self.addSeatState(default_seat);
     state.data_device = data_device;
     state.primary_selection = primary_selection;
-    try data_device.addSelectionListener(.{
-        .context = state,
-        .changed = regularSelectionChanged,
-        .offered = regularMimeOffered,
-    });
-    errdefer data_device.removeSelectionListener(state);
     try primary_selection.addSelectionListener(.{
         .context = state,
         .changed = primarySelectionChanged,
@@ -617,8 +666,7 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     for (self.seats.items) |state| {
-        if (state.data_device) |data_device| {
-            data_device.removeSelectionListener(state);
+        if (state.data_device != null) {
             state.primary_selection.?.removeSelectionListener(state);
         }
     }
@@ -750,9 +798,8 @@ fn inertWlrRequest(
     if (request == .destroy) resource.destroy();
 }
 
-fn regularSelectionChanged(context: *anyopaque) void {
-    const state: *SeatState = @ptrCast(@alignCast(context));
-    state.broadcast(.regular);
+pub fn neutralSelectionChanged(self: *Self) void {
+    for (self.seats.items) |state| if (state.data_device != null) state.broadcast(.regular);
 }
 
 fn primarySelectionChanged(context: *anyopaque) void {
@@ -760,9 +807,13 @@ fn primarySelectionChanged(context: *anyopaque) void {
     state.broadcast(.primary);
 }
 
-fn regularMimeOffered(context: *anyopaque, mime_type: [*:0]const u8) void {
-    const state: *SeatState = @ptrCast(@alignCast(context));
-    state.offered(.regular, mime_type);
+pub fn neutralMimeOffered(self: *Self, source_id: DataDevice.SourceId, mime_type: []const u8) void {
+    for (self.seats.items) |state| if (state.data_device != null) {
+        const source = state.regular.source orelse continue;
+        if (source.source_id != null and std.meta.eql(source.source_id.?, source_id)) {
+            state.offered(.regular, @ptrCast(mime_type.ptr));
+        }
+    };
 }
 
 fn primaryMimeOffered(context: *anyopaque, mime_type: [*:0]const u8) void {
@@ -770,7 +821,7 @@ fn primaryMimeOffered(context: *anyopaque, mime_type: [*:0]const u8) void {
     state.offered(.primary, mime_type);
 }
 
-fn hasMime(mime_types: []const [:0]const u8, mime_type: [*:0]const u8) bool {
+fn hasMime(mime_types: []const []const u8, mime_type: [*:0]const u8) bool {
     const requested = std.mem.span(mime_type);
     for (mime_types) |offered| {
         if (std.mem.eql(u8, offered, requested)) return true;
