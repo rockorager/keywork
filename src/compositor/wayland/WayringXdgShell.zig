@@ -733,6 +733,7 @@ fn createPopup(
     };
     var core_owned = true;
     errdefer if (core_owned) self.core_shell.destroyPopup(popup.core_id);
+    self.core_shell.setPopupScenePresentationEnabled(popup.core_id, false);
     _ = self.compositor.assignXdgRole(surface.reservation, .popup) catch unreachable;
 
     surface.active_role = .{ .popup = popup };
@@ -2037,6 +2038,32 @@ test "role destruction reconstructs only the permanent concrete role" {
         harness.client().fatal().?.protocol_code,
     );
     try std.testing.expectEqual(@as(usize, 0), harness.adapter.popups.items.len);
+}
+
+test "generated popup disables Scene presentation before role publication" {
+    var harness: TestHarness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    try harness.createSurface();
+    try harness.installManager(7);
+
+    try sendTest(harness.client(), 5, 2, &core.xdg_wm_base.request_messages[2], &.{
+        .{ .new_id = .{ .typed = 6 } }, .{ .object = 4 },
+    });
+    try sendTest(harness.client(), 5, 1, &core.xdg_wm_base.request_messages[1], &.{.{ .new_id = .{ .typed = 7 } }});
+    try sendTest(harness.client(), 7, 1, &core.xdg_positioner.request_messages[1], &.{ .{ .int = 1 }, .{ .int = 1 } });
+    try sendTest(harness.client(), 7, 2, &core.xdg_positioner.request_messages[2], &.{
+        .{ .int = 0 }, .{ .int = 0 }, .{ .int = 1 }, .{ .int = 1 },
+    });
+    try sendTest(harness.client(), 6, 2, &core.xdg_surface.request_messages[2], &.{
+        .{ .new_id = .{ .typed = 8 } }, .{ .object = null }, .{ .object = 7 },
+    });
+
+    try std.testing.expect(harness.client().fatal() == null);
+    try std.testing.expectEqual(@as(usize, 1), harness.adapter.popups.items.len);
+    const popup = harness.adapter.popups.items[0];
+    try std.testing.expect(!harness.core_shell.popupScenePresentationEnabled(popup.core_id));
+    try std.testing.expectEqual(WayringCompositor.XdgRole.popup, harness.compositor.permanentXdgRole(popup.surface.surface_id).?);
 }
 
 test "same role reconstruction accepts existing committed content" {
