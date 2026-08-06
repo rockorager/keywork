@@ -3828,6 +3828,12 @@ fn generatedCursorRemoved(context: *anyopaque, id: SurfaceRegistry.Id) void {
 
 fn generatedClientRetiring(context: *anyopaque, client: ClientRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (self.window_manager_initialized and self.window_manager.clientXdgPointerGrabActive()) {
+        if (self.seat.generatedPointerState()) |state| {
+            if (std.meta.eql(state.target.client, client))
+                _ = self.endCompositorPointerGrab(false);
+        }
+    }
     if (self.seat.retireGeneratedClient(client)) self.refreshKeyboardFocus();
 }
 
@@ -14654,6 +14660,34 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     try std.testing.expect(!server.seat.hasPressedPointerButtons());
     try server.xdg_shell_core.setWindowScenePresentationEnabled(window_id, true);
 
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 25, presentation_x, presentation_y);
+    const retiring_resize_enter = try T.drain(client);
+    defer std.testing.allocator.free(retiring_resize_enter);
+    server.pointerButtonForSeat(&server.seat, 26, linux_button_left, .pressed);
+    const retiring_resize_press = try T.drain(client);
+    defer std.testing.allocator.free(retiring_resize_press);
+    const retiring_resize_serial = T.eventWord(retiring_resize_press, 12, 3, 0) orelse return error.Unexpected;
+    try T.send(client, 7, 6, &core.xdg_toplevel.request_messages[6], &.{
+        .{ .object = 11 }, .{ .uint = retiring_resize_serial }, .{ .uint = 10 },
+    });
+    try std.testing.expect(server.window_manager.clientXdgPointerGrabActive());
+    var before_retiring_resize = server.scene.iterator();
+    const retiring_resize_geometry = before_retiring_resize.next().?.window.content_geometry;
+    const retiring_client = clients.id(client).?;
+    const request_sink = server.generatedSeatRequestSink();
+    request_sink.client_retiring(request_sink.context, retiring_client);
+    try std.testing.expect(!server.window_manager.directManipulationActive());
+    try std.testing.expect(!server.seat.hasPressedPointerButtons());
+    try std.testing.expect(server.seat.generatedPointerState() == null);
+    try std.testing.expect(!server.seat.authority.acceptsAction(retiring_client, .{
+        .domain = .wayring_server,
+        .value = retiring_resize_serial,
+    }));
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 27, presentation_x + 30, presentation_y + 30);
+    var after_retiring_resize = server.scene.iterator();
+    try std.testing.expectEqual(retiring_resize_geometry, after_retiring_resize.next().?.window.content_geometry);
+    server.pointerButtonForSeat(&server.seat, 28, linux_button_left, .released);
+
     var resized_windows = server.scene.iterator();
     const resized_window = resized_windows.next().?.window;
     const resized_offset = resized_window.content_geometry.?.offset;
@@ -14737,6 +14771,39 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     try T.send(client, 4, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = 10 }, .{ .int = 0 }, .{ .int = 0 } });
     try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
 
+    // A terminal generated client loses WM manipulation before Seat authority
+    // is retired, even while its protocol resources remain allocated for
+    // fatal-output draining. Later motion cannot continue either operation.
+    var retiring_windows = server.scene.iterator();
+    const retiring_window = retiring_windows.next().?.window;
+    const retiring_offset = retiring_window.content_geometry.?.offset;
+    const retiring_x: f64 = @as(f64, @floatFromInt(retiring_window.position.x - retiring_offset.x)) + 10;
+    const retiring_y: f64 = @as(f64, @floatFromInt(retiring_window.position.y - retiring_offset.y)) + 10;
+
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 30, retiring_x, retiring_y);
+    const retiring_move_enter = try T.drain(client);
+    defer std.testing.allocator.free(retiring_move_enter);
+    server.pointerButtonForSeat(&server.seat, 31, linux_button_left, .pressed);
+    const retiring_move_press = try T.drain(client);
+    defer std.testing.allocator.free(retiring_move_press);
+    const retiring_move_serial = T.eventWord(retiring_move_press, 12, 3, 0) orelse return error.Unexpected;
+    try T.send(client, 7, 5, &core.xdg_toplevel.request_messages[5], &.{
+        .{ .object = 11 }, .{ .uint = retiring_move_serial },
+    });
+    try std.testing.expect(server.window_manager.clientXdgPointerGrabActive());
+    const retiring_move_position = server.scene.windowPosition(info.scene_id).?;
+    request_sink.client_retiring(request_sink.context, retiring_client);
+    try std.testing.expect(!server.window_manager.directManipulationActive());
+    try std.testing.expect(!server.seat.hasPressedPointerButtons());
+    try std.testing.expect(server.seat.generatedPointerState() == null);
+    try std.testing.expect(!server.seat.authority.acceptsAction(retiring_client, .{
+        .domain = .wayring_server,
+        .value = retiring_move_serial,
+    }));
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 32, retiring_x + 30, retiring_y + 30);
+    try std.testing.expectEqual(retiring_move_position, server.scene.windowPosition(info.scene_id).?);
+    server.pointerButtonForSeat(&server.seat, 33, linux_button_left, .released);
+
     // Losing the final pointer capability performs the same ordered cancel
     // and revokes grants before the device can disappear.
     var capability_windows = server.scene.iterator();
@@ -14744,10 +14811,10 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     const capability_offset = capability_window.content_geometry.?.offset;
     const capability_x: f64 = @as(f64, @floatFromInt(capability_window.position.x - capability_offset.x)) + 10;
     const capability_y: f64 = @as(f64, @floatFromInt(capability_window.position.y - capability_offset.y)) + 10;
-    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 25, capability_x, capability_y);
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 38, capability_x, capability_y);
     const capability_enter = try T.drain(client);
     defer std.testing.allocator.free(capability_enter);
-    server.pointerButtonForSeat(&server.seat, 26, linux_button_left, .pressed);
+    server.pointerButtonForSeat(&server.seat, 39, linux_button_left, .pressed);
     const capability_press = try T.drain(client);
     defer std.testing.allocator.free(capability_press);
     const capability_serial = T.eventWord(capability_press, 12, 3, 0) orelse return error.Unexpected;
@@ -14762,7 +14829,7 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
         .domain = .wayring_server,
         .value = capability_serial,
     }));
-    server.pointerButtonForSeat(&server.seat, 27, linux_button_left, .released);
+    server.pointerButtonForSeat(&server.seat, 40, linux_button_left, .released);
     pointerAvailable(server.primaryRenderOutput(), true);
 
     // Generated popup protocol state may map, but Wave 4 keeps the popup out
