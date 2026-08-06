@@ -184,6 +184,7 @@ pub fn main(init: std.process.Init) !void {
     var wayring_outputs_initialized = false;
     var wayring_xdg_shell: WayringXdgShell = undefined;
     var wayring_xdg_shell_initialized = false;
+    var wayring_xdg_shell_published = false;
     var wayring_seat_adapter: WayringSeatAdapter = undefined;
     var wayring_seat_adapter_initialized = false;
     var wayring_seat_published = false;
@@ -216,7 +217,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
-        if (wayring_xdg_shell_initialized) wayring_xdg_shell.deinit();
+        if (wayring_xdg_shell_initialized) {
+            if (wayring_xdg_shell_published) wayring_xdg_shell.unpublish();
+            wayring_xdg_shell.deinit();
+        }
         if (wayring_outputs_initialized) wayring_outputs.deinit();
         if (wayring_seat_adapter_initialized) {
             if (wayring_seat_published) wayring_seat_adapter.unpublish();
@@ -275,6 +279,13 @@ pub fn main(init: std.process.Init) !void {
         );
         wayring_xdg_shell.setSeatAdapter(&wayring_seat_adapter);
         wayring_xdg_shell_initialized = true;
+        // Stable generated XDG is authoritative only on the headless path
+        // where generated output/presentation policy is available. Outputs
+        // and the seat are deliberately published before this shell global.
+        if (wayring_outputs_initialized) {
+            try wayring_xdg_shell.publish();
+            wayring_xdg_shell_published = true;
+        }
         wayring_lifecycle = .{
             .clients = &wayring_clients,
             .outputs = if (wayring_outputs_initialized) &wayring_outputs else null,
