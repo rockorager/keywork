@@ -4,7 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const DataDevice = @import("../wayland/data_device.zig");
+const DataDevice = @import("../DataDevice.zig");
 const PrimarySelection = @import("../wayland/primary_selection.zig");
 const Surface = @import("../wayland/surface.zig");
 const Xdnd = @import("dnd.zig");
@@ -451,6 +451,10 @@ pub fn init(
         self,
     );
     self.event_source.check();
+}
+
+pub fn selectionChanged(self: *Self) void {
+    self.clipboard_selection.selectionChanged();
 }
 
 pub fn deinit(self: *Self) void {

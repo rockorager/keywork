@@ -1,4 +1,4 @@
-//! Protocol-neutral selection source callbacks.
+//! Protocol-neutral externally owned selection source callbacks.
 
 const SelectionSource = @This();
 

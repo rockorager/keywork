@@ -4,7 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
-const DataDevice = @import("../wayland/data_device.zig");
+const DataDevice = @import("../DataDevice.zig");
 const PrimarySelection = @import("../wayland/primary_selection.zig");
 const SelectionSource = @import("../wayland/SelectionSource.zig");
 const c = @import("xcb.zig").c;
@@ -24,7 +24,8 @@ wayland_selection: WaylandSelection,
 window: c.xcb_window_t,
 owner: c.xcb_window_t,
 targets_request: ?TargetsRequest,
-source: SelectionSource,
+source_id: ?DataDevice.SourceId,
+primary_source: SelectionSource,
 mime_types: std.ArrayList([:0]u8),
 target_atoms: std.ArrayList(c.xcb_atom_t),
 outgoing_transfers: std.ArrayList(*OutgoingTransfer),
@@ -64,26 +65,6 @@ pub const WaylandSelection = union(enum) {
     primary: *PrimarySelection,
     drag: *DataDevice,
 
-    fn addListener(self: WaylandSelection, listener: DataDevice.SelectionListener) !void {
-        switch (self) {
-            .clipboard => |selection| try selection.addSelectionListener(listener),
-            .primary => |selection| try selection.addSelectionListener(.{
-                .context = listener.context,
-                .changed = listener.changed,
-                .offered = listener.offered,
-            }),
-            .drag => |selection| try selection.addDragSelectionListener(listener),
-        }
-    }
-
-    fn removeListener(self: WaylandSelection, context: *anyopaque) void {
-        switch (self) {
-            .clipboard => |selection| selection.removeSelectionListener(context),
-            .primary => |selection| selection.removeSelectionListener(context),
-            .drag => |selection| selection.removeDragSelectionListener(context),
-        }
-    }
-
     fn hasSelection(self: WaylandSelection) bool {
         return switch (self) {
             .clipboard => |selection| selection.hasSelection(),
@@ -94,41 +75,17 @@ pub const WaylandSelection = union(enum) {
 
     fn mimeTypes(self: WaylandSelection) []const [:0]const u8 {
         return switch (self) {
-            .clipboard => |selection| selection.selectionMimeTypes(),
+            .clipboard => |selection| @ptrCast(selection.selectionMimeTypes()),
             .primary => |selection| selection.selectionMimeTypes(),
-            .drag => |selection| if (selection.dragSourceInfo()) |source| source.mime_types else &.{},
+            .drag => |selection| if (selection.dragSourceInfo()) |source| @ptrCast(source.mime_types) else &.{},
         };
     }
 
     fn send(self: WaylandSelection, mime_type: [*:0]const u8, fd: std.posix.fd_t) void {
         switch (self) {
-            .clipboard => |selection| selection.sendSelection(mime_type, fd),
+            .clipboard => |selection| selection.sendSelection(std.mem.span(mime_type), fd) catch {},
             .primary => |selection| selection.sendSelection(mime_type, fd),
-            .drag => |selection| selection.sendDragSelection(mime_type, fd),
-        }
-    }
-
-    fn isExternal(self: WaylandSelection, source: *const SelectionSource) bool {
-        return switch (self) {
-            .clipboard => |selection| selection.externalSelectionIs(source),
-            .primary => |selection| selection.externalSelectionIs(source),
-            .drag => |selection| selection.dragIsExternal(),
-        };
-    }
-
-    fn setExternal(self: WaylandSelection, source: ?*const SelectionSource) void {
-        switch (self) {
-            .clipboard => |selection| selection.setExternalSelection(source),
-            .primary => |selection| selection.setExternalSelection(source),
-            .drag => {},
-        }
-    }
-
-    fn externalDestroyed(self: WaylandSelection, source: *const SelectionSource) void {
-        switch (self) {
-            .clipboard => |selection| selection.externalSourceDestroyed(source),
-            .primary => |selection| selection.externalSourceDestroyed(source),
-            .drag => {},
+            .drag => |selection| sendNeutralDrag(selection, mime_type, fd),
         }
     }
 
@@ -139,6 +96,11 @@ pub const WaylandSelection = union(enum) {
         };
     }
 };
+
+fn sendNeutralDrag(selection: *DataDevice, mime_type: [*:0]const u8, fd: std.posix.fd_t) void {
+    const source = selection.dragSourceInfo() orelse return;
+    selection.sendSource(source.source, std.mem.span(mime_type), fd) catch {};
+}
 
 const IncomingTransfer = struct {
     selection: *Self,
@@ -462,10 +424,11 @@ pub fn init(
         .window = c.xcb_generate_id(connection),
         .owner = c.XCB_WINDOW_NONE,
         .targets_request = null,
-        .source = .{
+        .source_id = null,
+        .primary_source = .{
             .context = self,
             .mime_types = sourceMimeTypes,
-            .send = sourceSend,
+            .send = primarySourceSend,
             .cancel = sourceCancelled,
         },
         .mime_types = .empty,
@@ -494,6 +457,13 @@ pub fn init(
         c.XCB_CW_EVENT_MASK,
         &event_mask,
     ));
+    if (wayland_selection == .primary) {
+        try wayland_selection.primary.addSelectionListener(.{
+            .context = self,
+            .changed = waylandSelectionChanged,
+            .offered = waylandMimeOffered,
+        });
+    }
     errdefer _ = c.xcb_destroy_window(connection, self.window);
     try checkRequest(connection, c.xcb_xfixes_select_selection_input_checked(
         connection,
@@ -503,18 +473,14 @@ pub fn init(
             c.XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY |
             c.XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_CLIENT_CLOSE,
     ));
-    try wayland_selection.addListener(.{
-        .context = self,
-        .changed = waylandSelectionChanged,
-        .offered = waylandMimeOffered,
-    });
-    errdefer wayland_selection.removeListener(self);
     self.updateOwner();
     self.discoverCurrentOwner();
 }
 
 pub fn deinit(self: *Self) void {
-    self.wayland_selection.removeListener(self);
+    if (self.wayland_selection == .primary) {
+        self.wayland_selection.primary.removeSelectionListener(self);
+    }
     self.clearExternalSource();
     self.cancelTargetsRequest();
     while (self.outgoing_transfers.items.len > 0) {
@@ -542,7 +508,7 @@ pub fn ownerWindow(self: *const Self) c.xcb_window_t {
     return self.window;
 }
 
-pub fn targetAtomForMime(self: *Self, mime_type: [:0]const u8) ?c.xcb_atom_t {
+pub fn targetAtomForMime(self: *Self, mime_type: []const u8) ?c.xcb_atom_t {
     return self.mimeAtom(mime_type);
 }
 
@@ -671,7 +637,12 @@ pub fn handlePropertyNotify(self: *Self, event: *const c.xcb_property_notify_eve
 
 fn waylandSelectionChanged(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (self.wayland_selection.isExternal(&self.source)) return;
+    if (self.source_id != null) return;
+    self.updateOwner();
+}
+
+pub fn selectionChanged(self: *Self) void {
+    if (self.wayland_selection != .clipboard or self.source_id != null) return;
     self.updateOwner();
 }
 
@@ -682,7 +653,7 @@ fn sourceMimeTypes(context: *anyopaque) []const [:0]const u8 {
     return @ptrCast(self.mime_types.items);
 }
 
-fn sourceSend(context: *anyopaque, mime_type: [*:0]const u8, fd: std.posix.fd_t) void {
+fn sourceSend(context: *anyopaque, mime_type: []const u8, fd: std.posix.fd_t) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const duplicate = std.c.fcntl(
         fd,
@@ -690,12 +661,28 @@ fn sourceSend(context: *anyopaque, mime_type: [*:0]const u8, fd: std.posix.fd_t)
         @as(c_int, 0),
     );
     if (duplicate < 0) return;
-    self.startIncomingTransfer(std.mem.span(mime_type), duplicate) catch {};
+    self.startIncomingTransfer(mime_type, duplicate) catch {};
 }
+
+fn primarySourceSend(context: *anyopaque, mime_type: [*:0]const u8, fd: std.posix.fd_t) void {
+    sourceSend(context, std.mem.span(mime_type), fd);
+}
+
+fn sourceTarget(_: *anyopaque, _: ?[]const u8) void {}
+fn sourceAction(_: *anyopaque, _: DataDevice.Actions) void {}
+fn sourceDropped(_: *anyopaque) void {}
+fn sourceFinished(_: *anyopaque) void {}
 
 fn sourceCancelled(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (self.wayland_selection == .clipboard) {
+        if (self.source_id) |source_id| {
+            self.source_id = null;
+            self.wayland_selection.clipboard.destroySource(source_id);
+        }
+    }
     self.clearMimeTypes();
+    self.updateOwner();
 }
 
 fn discoverCurrentOwner(self: *Self) void {
@@ -818,7 +805,31 @@ fn receiveTargets(
             return;
         };
     }
-    if (self.mime_types.items.len > 0) self.wayland_selection.setExternal(&self.source);
+    if (self.mime_types.items.len == 0) return;
+    switch (self.wayland_selection) {
+        .clipboard => |selection| {
+            const source_id = selection.createSource(null, .{
+                .context = self,
+                .send = sourceSend,
+                .target = sourceTarget,
+                .action = sourceAction,
+                .cancelled = sourceCancelled,
+                .drop_performed = sourceDropped,
+                .finished = sourceFinished,
+            }, .{}) catch return;
+            for (self.mime_types.items) |mime_type| selection.offerMime(source_id, mime_type) catch {
+                selection.destroySource(source_id);
+                return;
+            };
+            selection.setExternalSelection(source_id) catch {
+                selection.destroySource(source_id);
+                return;
+            };
+            self.source_id = source_id;
+        },
+        .primary => |selection| selection.setExternalSelection(&self.primary_source),
+        .drag => {},
+    }
 }
 
 fn targetMime(self: *Self, atom: c.xcb_atom_t) ?[:0]u8 {
@@ -845,8 +856,15 @@ fn targetMime(self: *Self, atom: c.xcb_atom_t) ?[:0]u8 {
 }
 
 fn clearExternalSource(self: *Self) void {
-    if (self.wayland_selection.isExternal(&self.source)) {
-        self.wayland_selection.externalDestroyed(&self.source);
+    switch (self.wayland_selection) {
+        .clipboard => |selection| if (self.source_id) |source_id| {
+            self.source_id = null;
+            selection.destroySource(source_id);
+        },
+        .primary => |selection| if (selection.externalSelectionIs(&self.primary_source)) {
+            selection.externalSourceDestroyed(&self.primary_source);
+        },
+        .drag => {},
     }
     self.clearMimeTypes();
 }
@@ -1138,7 +1156,7 @@ fn sendNotify(self: *Self, request: c.xcb_selection_request_event_t, property: c
     _ = c.xcb_flush(self.connection);
 }
 
-fn mimeAtom(self: *Self, mime_type: [:0]const u8) ?c.xcb_atom_t {
+fn mimeAtom(self: *Self, mime_type: []const u8) ?c.xcb_atom_t {
     if (std.mem.eql(u8, mime_type, "text/plain;charset=utf-8")) return self.atoms.utf8_string;
     if (std.mem.eql(u8, mime_type, "text/plain")) return self.atoms.text;
     if (mime_type.len > std.math.maxInt(u16)) return null;

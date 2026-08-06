@@ -33,7 +33,8 @@ const KeyboardShortcutsInhibit = @import("wayland/keyboard_shortcuts_inhibit.zig
 const IdleNotify = @import("wayland/idle_notify.zig");
 const Seat = @import("wayland/seat.zig");
 const SeatDelivery = @import("SeatDelivery.zig");
-const DataDevice = @import("wayland/data_device.zig");
+const NeutralDataDevice = @import("DataDevice.zig");
+const WaylandDataDevice = @import("wayland/data_device.zig");
 const XdgToplevelDrag = @import("wayland/xdg_toplevel_drag.zig");
 const XdgToplevelIcon = @import("wayland/xdg_toplevel_icon.zig");
 const XdgDialog = @import("wayland/xdg_dialog.zig");
@@ -232,7 +233,8 @@ routed_buttons: std.ArrayList(RoutedButton),
 routed_gestures: std.ArrayList(RoutedGesture),
 routed_touches: std.ArrayList(RoutedTouch),
 next_touch_id: u31,
-data_device: DataDevice,
+data_device: NeutralDataDevice,
+mature_data_device: WaylandDataDevice,
 xdg_toplevel_drag: XdgToplevelDrag,
 xdg_toplevel_icon: XdgToplevelIcon,
 xdg_dialog: XdgDialog,
@@ -1062,6 +1064,7 @@ pub fn createWithVirtualOutput(
         .routed_touches = .empty,
         .next_touch_id = 0,
         .data_device = undefined,
+        .mature_data_device = undefined,
         .xdg_toplevel_drag = undefined,
         .xdg_toplevel_icon = undefined,
         .xdg_dialog = undefined,
@@ -1496,11 +1499,32 @@ pub fn createWithVirtualOutput(
     }
     try self.xdg_activation.init(allocator, io, display, &self.seat);
     errdefer self.xdg_activation.deinit();
-    try self.data_device.init(
+    self.data_device = NeutralDataDevice.init(
+        allocator,
+        self.seat.clientRegistry(),
+        self.seat.surfaceRegistry(),
+        self.seat.dataDeviceAuthority(),
+        .{
+            .context = self,
+            .selection_changed = dataDeviceSelectionChanged,
+            .drag_changed = dataDeviceDragChanged,
+            .mime_offered = dataDeviceMimeOffered,
+            .offer_mime_offered = dataDeviceOfferMimeOffered,
+            .offer_source_actions_changed = dataDeviceOfferSourceActionsChanged,
+            .offer_action_changed = dataDeviceOfferActionChanged,
+            .external_drag_start = dataDeviceExternalDragStart,
+            .retained_source_destroyed = dragExternalSourceDestroyed,
+        },
+    );
+    errdefer self.data_device.deinit();
+    try self.seat.mutableClientRegistry().addDisconnectListener(.{ .context = &self.data_device, .notify = dataDeviceClientDisconnected });
+    errdefer self.seat.mutableClientRegistry().removeDisconnectListener(&self.data_device);
+    try self.mature_data_device.init(
         allocator,
         display,
         &self.seat,
         self.compositor.surfaceStore(),
+        &self.data_device,
         .{
             .context = self,
             .started = dragStarted,
@@ -1509,7 +1533,7 @@ pub fn createWithVirtualOutput(
             .repaint = requestRepaint,
         },
     );
-    errdefer self.data_device.deinit();
+    errdefer self.mature_data_device.deinit();
     try self.primary_selection.init(allocator, display, &self.seat);
     errdefer self.primary_selection.deinit();
     try self.data_control.init(
@@ -1616,7 +1640,7 @@ pub fn createWithVirtualOutput(
     try self.xdg_toplevel_drag.init(
         allocator,
         display,
-        &self.data_device,
+        &self.mature_data_device,
         &self.xdg_shell,
         &self.xdg_shell_core,
         &self.seat,
@@ -1944,6 +1968,8 @@ pub fn destroy(self: *Self) void {
     self.text_input.deinit();
     self.data_control.deinit();
     self.primary_selection.deinit();
+    self.mature_data_device.deinit();
+    self.seat.mutableClientRegistry().removeDisconnectListener(&self.data_device);
     self.data_device.deinit();
     self.xdg_activation.deinit();
     self.idle_notify.deinit();
@@ -2254,7 +2280,7 @@ fn refreshSeatCapabilities(self: *Self) void {
     }
     if (!pointer and !self.seat.hasVirtualPointers()) {
         self.pointer_constraints.deactivateAll();
-        self.data_device.cancel();
+        self.data_device.cancelDrag();
         if (self.window_manager_initialized and self.window_manager.clientXdgPointerGrabActive())
             _ = self.endCompositorPointerGrab(false);
     }
@@ -4308,7 +4334,7 @@ fn cursorChanged(context: *anyopaque, old: ?Seat.CursorInfo, new: ?Seat.CursorIn
 }
 
 fn shapeCursorForOutput(self: *Self, output: *RenderOutput, info: ?Seat.CursorInfo) ?OutputBackend.ShapeCursor {
-    if (self.data_device.iconInfo() != null or output.output_calibration != null) return null;
+    if (self.mature_data_device.iconInfo() != null or output.output_calibration != null) return null;
     const cursor = info orelse return null;
     const shape = switch (cursor) {
         .shape => |shape| shape,
@@ -6022,7 +6048,7 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     }
     self.seat.setCompositorCursor(null);
     self.pointer_constraints.deactivateAll();
-    self.data_device.cancel();
+    self.data_device.cancelDrag();
     self.tablet.cancelFocus();
     self.cancelSeatTouches(&self.seat);
     self.seat.suppressPointerFocus(true);
@@ -6971,7 +6997,7 @@ fn pointerAvailable(context: *anyopaque, available: bool) void {
     const self = serverForOutput(context);
     if (!available and self.window_manager_initialized) {
         self.pointer_constraints.deactivateAll();
-        self.data_device.cancel();
+        self.data_device.cancelDrag();
         if (self.window_manager.clientXdgPointerGrabActive())
             _ = self.endCompositorPointerGrab(false);
     }
@@ -6997,7 +7023,7 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
         self.seat.pointerEnter(
             point.x,
             point.y,
-            self.data_device.externalDragPointerFocus(point.x, point.y),
+            neutralPointerFocus(self.data_device.externalDragPointerFocus(point.x, point.y)),
         );
         self.xdg_toplevel_drag.pointerMotion(point.x, point.y);
         self.routeActiveDrag(0, self.dragPointerRoute(point.x, point.y), point.x, point.y, false);
@@ -7019,7 +7045,7 @@ fn pointerLeave(context: *anyopaque) void {
     if (self.endCompositorPointerGrab(false)) requestRepaint(self);
     self.seat.setCompositorCursor(null);
     self.pointer_constraints.deactivateAll();
-    self.data_device.pointerLeft();
+    self.data_device.leave();
     if (self.xwm_initialized) self.xwm.dragLeft();
     self.forgetRoutedButtonsForSeat(&self.seat);
     self.seat.pointerLeave();
@@ -7066,7 +7092,7 @@ fn pointerMotionGlobalForSeat(
             time,
             x,
             y,
-            self.data_device.externalDragPointerFocus(x, y),
+            neutralPointerFocus(self.data_device.externalDragPointerFocus(x, y)),
         );
         self.xdg_toplevel_drag.pointerMotion(x, y);
         self.routeActiveDrag(
@@ -7479,6 +7505,67 @@ fn pointerButtonForSeat(
     if (state == .released and grab_ended) self.restoreSeatPointerFocus(seat);
 }
 
+fn dataDeviceSelectionChanged(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.data_control.neutralSelectionChanged();
+    if (self.xwm_initialized) self.xwm.selectionChanged();
+}
+
+fn dataDeviceMimeOffered(context: *anyopaque, source: NeutralDataDevice.SourceId, mime_type: []const u8) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.data_control.neutralMimeOffered(source, mime_type);
+}
+
+fn dataDeviceOfferMimeOffered(context: *anyopaque, offer: NeutralDataDevice.OfferId, mime_type: []const u8) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.mature_data_device.neutralOfferMime(offer, mime_type);
+}
+
+fn dataDeviceOfferSourceActionsChanged(context: *anyopaque, offer: NeutralDataDevice.OfferId, actions: NeutralDataDevice.Actions) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.mature_data_device.neutralOfferSourceActions(offer, actions);
+}
+
+fn dataDeviceOfferActionChanged(context: *anyopaque, offer: NeutralDataDevice.OfferId, actions: NeutralDataDevice.Actions) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.mature_data_device.neutralOfferAction(offer, actions);
+}
+
+fn dataDeviceExternalDragStart(context: *anyopaque) ?NeutralDataDevice.ExternalDragStart {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (!self.seat.dataDeviceAuthority().hasPointerButtons()) return null;
+    const focus = self.seat.maturePointerFocus() orelse return null;
+    const client = self.seat.matureSurfaceOwner(focus.surface_id) orelse return null;
+    const position = self.seat.pointerPosition() orelse return null;
+    return .{
+        .target = .{ .surface = focus.surface_id, .client = client, .x = focus.x, .y = focus.y },
+        .global_x = position.x,
+        .global_y = position.y,
+    };
+}
+
+fn dataDeviceClientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
+    const data_device: *NeutralDataDevice = @ptrCast(@alignCast(context));
+    data_device.clientDisconnected(client);
+}
+
+fn dataDeviceDragChanged(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.data_device.dragIsExternal()) {
+        if (self.seat.maturePointerFocus()) |focus| {
+            if (self.seat.matureSurfaceOwner(focus.surface_id)) |client| {
+                if (self.seat.pointerPosition()) |position| self.data_device.setExternalPointerDelivery(.{
+                    .surface = focus.surface_id,
+                    .client = client,
+                    .x = focus.x,
+                    .y = focus.y,
+                }, position.x, position.y);
+            }
+        }
+    }
+    self.mature_data_device.neutralDragChanged();
+}
+
 fn dragStarted(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.endCompositorPointerGrab(false)) requestRepaint(self);
@@ -7580,14 +7667,14 @@ fn routeActiveDrag(
     if (self.xwm_initialized) {
         if (self.data_device.dragIsExternal()) {
             if (route.root) |surface_id| if (self.xwaylandWindowForSurface(surface_id) != null) {
-                self.data_device.pointerLeft();
+                self.data_device.leave();
                 self.xwm.routeExternalDragOverXwayland(true);
                 return;
             };
             self.xwm.routeExternalDragOverXwayland(false);
         } else {
             if (route.root) |surface_id| if (self.xwaylandWindowForSurface(surface_id)) |window_id| {
-                self.data_device.pointerLeft();
+                self.data_device.leave();
                 self.xwm.dragMotion(window_id, time, x, y);
                 return;
             };
@@ -7595,9 +7682,9 @@ fn routeActiveDrag(
         }
     }
     if (motion) {
-        self.data_device.pointerMotion(time, maturePointerFocus(route.focus));
+        self.mature_data_device.pointerMotion(time, maturePointerFocus(route.focus));
     } else {
-        self.data_device.pointerEntered(maturePointerFocus(route.focus));
+        self.mature_data_device.pointerEntered(maturePointerFocus(route.focus));
     }
 }
 
@@ -7733,6 +7820,11 @@ fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
 fn maturePointerFocus(focus: ?Seat.PointerFocus) ?Seat.PointerFocus {
     const value = focus orelse return null;
     return if (value.generated == null) value else null;
+}
+
+fn neutralPointerFocus(focus: ?NeutralDataDevice.Target) ?Seat.PointerFocus {
+    const value = focus orelse return null;
+    return .{ .surface_id = value.surface, .x = value.x, .y = value.y };
 }
 
 fn pointerFocusExcluding(
@@ -10066,7 +10158,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     self.submitLayerPopups(output);
     var input_popups = self.input_method.popupIterator();
     while (input_popups.next()) |popup| self.submitSurfaceTree(output, popup.surface_id);
-    const drag_icon = self.data_device.iconInfo();
+    const drag_icon = self.mature_data_device.iconInfo();
     if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
     if (paint_primary_cursor) self.submitSeatCursor(output, &self.seat, false);
     self.submitTabletCursors(output, false);
@@ -10222,7 +10314,7 @@ fn renderDesktopContents(
         );
     }
 
-    const drag_icon = self.data_device.iconInfo();
+    const drag_icon = self.mature_data_device.iconInfo();
     if (drag_icon) |info| {
         try self.renderSurfaceTree(
             frame,
