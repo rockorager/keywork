@@ -30,6 +30,7 @@ scaled_images: std.ArrayList(ScaledImage),
 theme: ?[*:0]u8,
 size: c_int,
 device_count: usize,
+force_fallback: bool,
 
 const ScaledImage = struct {
     shape: Shape,
@@ -63,7 +64,15 @@ pub fn init(
         .theme = std.c.getenv("XCURSOR_THEME"),
         .size = configuredSize(),
         .device_count = 0,
+        .force_fallback = false,
     };
+}
+
+/// Test seam for deterministic operation independent of host Xcursor themes.
+/// Changing this after an image has been requested intentionally has no effect
+/// on that already-owned cache entry.
+pub fn setForceFallback(self: *Self, force: bool) void {
+    self.force_fallback = force;
 }
 
 pub fn deinit(self: *Self) void {
@@ -146,6 +155,17 @@ pub fn cursorImage(self: *Self, shape: Shape) ?Seat.CursorImage {
         break :loaded loaded_image;
     };
     return seatCursorImage(image, self.source_cache_ids[index]);
+}
+
+/// Maps a generated protocol value through the mature shape naming, fallback,
+/// cache, scaling, and image-lifetime path.
+pub fn generatedCursorImage(self: *Self, value: u32, version: u32) ?Seat.CursorImage {
+    if (!generatedShapeValid(value, version)) return null;
+    return self.cursorImage(@enumFromInt(value));
+}
+
+pub fn generatedShapeValid(value: u32, version: u32) bool {
+    return value >= @intFromEnum(Shape.default) and value <= maximumShape(version);
 }
 
 pub const OutputCursorImage = struct {
@@ -242,19 +262,45 @@ fn scaledImage(self: *Self, shape: Shape, requested_size: c_int) ?ScaledImage {
 
 fn loadImage(self: *Self, shape: Shape, requested_size: c_int) ?*xcursor.XcursorImage {
     const name = shapeName(shape);
-    const image_c = xcursor.XcursorLibraryLoadImage(
-        name,
-        if (self.theme) |theme| theme else null,
-        requested_size,
-    ) orelse xcursor.XcursorLibraryLoadImage(
-        if (shape == .default) "left_ptr" else "default",
-        if (self.theme) |theme| theme else null,
-        requested_size,
-    ) orelse {
-        log.warn("Xcursor theme has no image for {s} at size {d}", .{ name, requested_size });
+    const themed = if (self.force_fallback) null else themed: {
+        break :themed xcursor.XcursorLibraryLoadImage(
+            name,
+            if (self.theme) |theme| theme else null,
+            requested_size,
+        ) orelse xcursor.XcursorLibraryLoadImage(
+            if (shape == .default) "left_ptr" else "default",
+            if (self.theme) |theme| theme else null,
+            requested_size,
+        );
+    };
+    const image_c = themed orelse fallbackImage() orelse {
+        log.warn("unable to allocate built-in cursor fallback for {s}", .{name});
         return null;
     };
     return @ptrCast(image_c);
+}
+
+// Owned 8x8 ARGB8888 premultiplied arrow. Keeping this deliberately tiny and
+// fixed makes headless rendering reproducible; output scaling remains in the
+// same canonical path as themed images.
+const fallback_pixels = [64]u32{
+    0xff000000, 0,          0,          0,          0,          0,          0, 0,
+    0xff000000, 0xffffffff, 0,          0,          0,          0,          0, 0,
+    0xff000000, 0xffffffff, 0xffffffff, 0,          0,          0,          0, 0,
+    0xff000000, 0xffffffff, 0xffffffff, 0xffffffff, 0,          0,          0, 0,
+    0xff000000, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0,          0, 0,
+    0xff000000, 0xffffffff, 0xff000000, 0xff000000, 0xff000000, 0xff000000, 0, 0,
+    0xff000000, 0xff000000, 0,          0xff000000, 0xff000000, 0,          0, 0,
+    0,          0,          0,          0,          0xff000000, 0xff000000, 0, 0,
+};
+
+fn fallbackImage() ?*xcursor.XcursorImage {
+    const image = xcursor.XcursorImageCreate(8, 8) orelse return null;
+    image.*.xhot = 0;
+    image.*.yhot = 0;
+    const pixels: [*]u32 = @ptrCast(image.*.pixels);
+    @memcpy(pixels[0..fallback_pixels.len], &fallback_pixels);
+    return @ptrCast(image);
 }
 
 fn seatCursorImage(image: *xcursor.XcursorImage, source_cache_id: u64) ?Seat.CursorImage {
@@ -419,4 +465,28 @@ test "version one excludes version two cursor shapes" {
 test "cursor hotspots follow output image rescaling" {
     try std.testing.expectEqual(@as(i32, 3), scaledHotspot(3, 30, 30));
     try std.testing.expectEqual(@as(i32, 4), scaledHotspot(6, 48, 30));
+}
+
+test "built-in fallback is an exact owned 8x8 ARGB image" {
+    const first = fallbackImage() orelse return error.OutOfMemory;
+    defer xcursor.XcursorImageDestroy(first);
+    const second = fallbackImage() orelse return error.OutOfMemory;
+    defer xcursor.XcursorImageDestroy(second);
+
+    try std.testing.expect(first != second);
+    try std.testing.expectEqual(@as(u32, 8), first.width);
+    try std.testing.expectEqual(@as(u32, 8), first.height);
+    try std.testing.expectEqual(@as(u32, 0), first.xhot);
+    try std.testing.expectEqual(@as(u32, 0), first.yhot);
+    const pixels: [*]const u32 = @ptrCast(first.pixels);
+    try std.testing.expectEqualSlices(u32, &fallback_pixels, pixels[0..fallback_pixels.len]);
+    const bytes = std.mem.sliceAsBytes(pixels[0..fallback_pixels.len]);
+    try std.testing.expectEqual(@as(usize, 8 * 8 * 4), bytes.len);
+    try std.testing.expectEqual(@as(usize, 8 * 4), @as(usize, first.width) * @sizeOf(u32));
+
+    const buffer = pixelBuffer(first, 91).?;
+    try std.testing.expectEqual(@as(u32, 8), buffer.size.width);
+    try std.testing.expectEqual(@as(u32, 8), buffer.stride_pixels);
+    try std.testing.expectEqual(@as(u64, 91), buffer.source_cache.?.id);
+    try std.testing.expectEqualSlices(u32, &fallback_pixels, buffer.pixels);
 }

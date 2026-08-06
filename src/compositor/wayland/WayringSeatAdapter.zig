@@ -73,6 +73,15 @@ const TouchResource = struct {
     frame_pending: bool = false,
 };
 
+/// Resource-free identity for an exact live generated wl_pointer. Consumers
+/// must pass the same raw client that supplied the protocol object id; object
+/// ids are client-local and are never accepted by numeric coincidence alone.
+pub const PointerIdentity = struct {
+    client: ClientRegistry.Id,
+    resource_generation: SeatDelivery.ResourceGeneration,
+    capability_generation: SeatDelivery.ResourceGeneration,
+};
+
 pub fn init(
     allocator: std.mem.Allocator,
     protocol_server: *wayring.server.Server,
@@ -209,6 +218,46 @@ pub fn destroyClientResources(self: *WayringSeatAdapter, client: *wayring.server
         i -= 1;
         if (self.seats.items[i].client == client) destroySeat(self.seats.items[i]);
     }
+}
+
+/// Resolves an exact materialized wl_pointer without exposing its generated
+/// resource. The returned generations are the canonical request credentials.
+pub fn pointerIdentity(
+    self: *const WayringSeatAdapter,
+    client: *wayring.server.Client,
+    object_id: u32,
+) ?PointerIdentity {
+    if (client.fatal() != null) return null;
+    const installed = client.lookup(object_id) orelse return null;
+    for (self.pointers.items) |pointer_resource| {
+        if (pointer_resource.client != client or pointer_resource.resource.id() != object_id or
+            installed != &pointer_resource.resource.runtime or pointer_resource.resource.runtime.state() != .live or
+            !self.snapshot.pointer.resourceActive(pointer_resource.generation)) continue;
+        return .{
+            .client = self.clients.id(client) orelse return null,
+            .resource_generation = pointer_resource.resource_generation,
+            .capability_generation = pointer_resource.generation,
+        };
+    }
+    return null;
+}
+
+/// Re-resolves a cursor device's target and proves that this exact pointer
+/// resource received the supplied enter serial.
+pub fn acceptsCursorShape(
+    self: *const WayringSeatAdapter,
+    client: *wayring.server.Client,
+    object_id: u32,
+    expected: PointerIdentity,
+    serial: u32,
+) bool {
+    const current = self.pointerIdentity(client, object_id) orelse return false;
+    if (!std.meta.eql(current, expected)) return false;
+    for (self.pointers.items) |pointer_resource| {
+        if (pointer_resource.client == client and pointer_resource.resource.id() == object_id)
+            return pointer_resource.last_enter_serial != null and pointer_resource.last_enter_serial.? == serial;
+    }
+    return false;
 }
 
 /// Validates an XDG direct-manipulation request against this adapter's exact

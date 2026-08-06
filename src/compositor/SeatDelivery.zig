@@ -10,11 +10,24 @@ const SeatDelivery = @This();
 const std = @import("std");
 const ClientRegistry = @import("ClientRegistry.zig");
 const SurfaceRegistry = @import("SurfaceRegistry.zig");
+const render = @import("render/types.zig");
 
 pub const ResourceGeneration = u64;
 
 pub const CursorRoleResult = enum { assigned, already_cursor, role_conflict, not_live, wrong_client };
 pub const CursorRequestResult = enum { accepted, ignored, role_conflict, unavailable };
+pub const ShapeRequest = struct {
+    client: ClientRegistry.Id,
+    resource_generation: ResourceGeneration,
+    capability_generation: ResourceGeneration,
+    serial: ClientRegistry.Serial,
+    image: CursorImage,
+};
+pub const CursorImage = struct {
+    buffer: render.PixelBuffer,
+    hotspot_x: i32,
+    hotspot_y: i32,
+};
 pub const CursorRequest = struct {
     client: ClientRegistry.Id,
     resource_generation: ResourceGeneration,
@@ -67,10 +80,15 @@ pub const RequestSink = struct {
         ClientRegistry.Serial,
     ) bool = rejectsAction,
     set_cursor: *const fn (*anyopaque, CursorRequest) CursorRequestResult,
+    set_shape: *const fn (*anyopaque, ShapeRequest) bool = rejectsShape,
     cursor_committed: *const fn (*anyopaque, SurfaceRegistry.Id, i32, i32) void,
     cursor_removed: *const fn (*anyopaque, SurfaceRegistry.Id) void,
     client_retiring: *const fn (*anyopaque, ClientRegistry.Id) void,
 };
+
+fn rejectsShape(_: *anyopaque, _: ShapeRequest) bool {
+    return false;
+}
 
 fn rejectsPointerGrab(
     _: *anyopaque,
