@@ -2940,6 +2940,12 @@ fn configureTimeout(self: *Self) c_int {
     return 0;
 }
 
+/// Deterministically settles the configure barrier in production-path tests
+/// whose real clients are deliberately paused between protocol phases.
+pub fn settleConfigureTransactionForTest(self: *Self) void {
+    while (self.transaction.timeout()) self.publish();
+}
+
 fn handleOutOfMemory(self: *Self) void {
     // A timer allocation failure must not freeze every managed window.
     _ = self.transaction.timeout();

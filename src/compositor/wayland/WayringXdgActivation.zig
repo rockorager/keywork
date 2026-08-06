@@ -89,6 +89,29 @@ pub fn deinit(self: *WayringXdgActivation) void {
 }
 
 fn bind(client: *wayring.server.Client, id: u32, version: u32, self: *WayringXdgActivation) !void {
+    try self.installManager(client, id, version, .registry_bind);
+}
+
+/// Narrow direct installer for resource fixtures that do not route through
+/// wl_registry. Production and end-to-end acceptance use bind.
+pub fn installDirectForTest(
+    self: *WayringXdgActivation,
+    client: *wayring.server.Client,
+    id: u32,
+    version: u32,
+) !void {
+    try self.installManager(client, id, version, .client_initial);
+}
+
+const ManagerInstall = enum { registry_bind, client_initial };
+
+fn installManager(
+    self: *WayringXdgActivation,
+    client: *wayring.server.Client,
+    id: u32,
+    version: u32,
+    install: ManagerInstall,
+) !void {
     try self.managers.ensureUnusedCapacity(self.allocator, 1);
     const value = try self.allocator.create(Manager);
     errdefer self.allocator.destroy(value);
@@ -102,7 +125,10 @@ fn bind(client: *wayring.server.Client, id: u32, version: u32, self: *WayringXdg
         value.resource.deinit();
     }
     try value.resource.setHandler(Manager, value, handleManager, null);
-    try client.materialize(&value.resource.runtime);
+    switch (install) {
+        .registry_bind => try client.materialize(&value.resource.runtime),
+        .client_initial => try client.installClientInitial(id, &value.resource.runtime),
+    }
     self.managers.appendAssumeCapacity(value);
 }
 
@@ -286,4 +312,158 @@ test "activation publishes after decoration at pinned version" {
         previous = global;
     }
     return error.MissingActivationGlobal;
+}
+
+fn initTestActivation(activation: *XdgActivation) !void {
+    activation.allocator = std.testing.allocator;
+    activation.io = std.testing.io;
+    activation.tokens = .empty;
+    activation.activation_listener = null;
+
+    // Keep issue() off its first-token timer path.  The timer belongs to the
+    // mature Wayland server and is deliberately not part of this adapter test.
+    const sentinel = try std.testing.allocator.dupe(u8, "sentinel");
+    try activation.tokens.put(std.testing.allocator, sentinel, .{
+        .expires_at = std.math.maxInt(i96),
+        .proven_interaction = false,
+    });
+}
+
+fn deinitTestActivation(activation: *XdgActivation) void {
+    var iterator = activation.tokens.iterator();
+    while (iterator.next()) |entry| std.testing.allocator.free(entry.key_ptr.*);
+    activation.tokens.deinit(std.testing.allocator);
+}
+
+fn drainActivationToken(client: *wayring.server.Client) !?[XdgActivation.token_character_count]u8 {
+    const batch = (try client.beginSend()) orelse return null;
+    defer client.completeSend(batch.token, batch.bytes.len) catch {};
+    if (batch.bytes.len < 12) return error.TruncatedEvent;
+    const length = std.mem.readInt(u32, batch.bytes[8..12], .native);
+    if (length != XdgActivation.token_character_count + 1 or batch.bytes.len < 12 + length)
+        return error.InvalidTokenEvent;
+    var token: [XdgActivation.token_character_count]u8 = undefined;
+    @memcpy(&token, batch.bytes[12..][0..XdgActivation.token_character_count]);
+    return token;
+}
+
+test "activation manager and token allocation failures roll back ownership" {
+    inline for (.{ false, true }) |fail_token| {
+        var harness: WayringXdgShell.TestHarness = undefined;
+        try harness.init();
+        defer harness.deinit();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var adapter: WayringXdgActivation = undefined;
+        adapter.init(failing.allocator(), &harness.host, undefined, &harness.adapter, undefined);
+        try adapter.publish();
+        defer {
+            adapter.destroyClientResources(harness.client());
+            adapter.unpublish();
+            adapter.deinit();
+        }
+        try harness.createSurface();
+        if (fail_token) try harness.bindGlobal("xdg_activation_v1", 8, 1);
+
+        failing.fail_index = failing.alloc_index;
+        if (fail_token) {
+            harness.send(8, 1, &protocol.xdg_activation_v1.request_messages[1], &.{
+                .{ .new_id = .{ .typed = 9 } },
+            }) catch {};
+            try std.testing.expectEqual(@as(usize, 0), adapter.tokens.items.len);
+            try std.testing.expect(harness.client().lookup(9) == null);
+        } else {
+            harness.bindGlobal("xdg_activation_v1", 8, 1) catch {};
+            try std.testing.expectEqual(@as(usize, 0), adapter.managers.items.len);
+            try std.testing.expect(harness.client().lookup(8) == null);
+        }
+    }
+}
+
+test "token destruction brackets commit without revoking delivered token" {
+    var harness: WayringXdgShell.TestHarness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var activation: XdgActivation = undefined;
+    try initTestActivation(&activation);
+    defer deinitTestActivation(&activation);
+    var adapter: WayringXdgActivation = undefined;
+    adapter.init(std.testing.allocator, &harness.host, undefined, &harness.adapter, &activation);
+    try adapter.publish();
+    defer {
+        adapter.destroyClientResources(harness.client());
+        adapter.unpublish();
+        adapter.deinit();
+    }
+    try harness.createSurface();
+    try adapter.installDirectForTest(harness.client(), 5, 1);
+
+    try harness.send(5, 1, &protocol.xdg_activation_v1.request_messages[1], &.{
+        .{ .new_id = .{ .typed = 6 } },
+    });
+    try harness.send(6, 4, &protocol.xdg_activation_token_v1.request_messages[4], &.{});
+    try std.testing.expectEqual(@as(usize, 0), adapter.tokens.items.len);
+    try std.testing.expectEqual(@as(usize, 1), activation.tokens.count());
+    while (try harness.client().beginSend()) |batch|
+        try harness.client().completeSend(batch.token, batch.bytes.len);
+
+    try harness.send(5, 1, &protocol.xdg_activation_v1.request_messages[1], &.{
+        .{ .new_id = .{ .typed = 7 } },
+    });
+    try handleToken(&adapter.tokens.items[0].resource, .commit, adapter.tokens.items[0]);
+    const token = (try drainActivationToken(harness.client())).?;
+    try std.testing.expect(activation.tokens.contains(&token));
+    try handleToken(&adapter.tokens.items[0].resource, .destroy, adapter.tokens.items[0]);
+    try std.testing.expect(activation.tokens.contains(&token));
+}
+
+test "stale and reused source identity cannot prove a token" {
+    var harness: WayringXdgShell.TestHarness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var activation: XdgActivation = undefined;
+    try initTestActivation(&activation);
+    defer deinitTestActivation(&activation);
+    var adapter: WayringXdgActivation = undefined;
+    adapter.init(std.testing.allocator, &harness.host, undefined, &harness.adapter, &activation);
+    try adapter.publish();
+    defer {
+        adapter.destroyClientResources(harness.client());
+        adapter.unpublish();
+        adapter.deinit();
+    }
+    try harness.createSurface();
+    try harness.installManager(1);
+    try harness.createToplevel();
+    try harness.bindGlobal("xdg_activation_v1", 8, 1);
+    try harness.send(8, 1, &protocol.xdg_activation_v1.request_messages[1], &.{.{ .new_id = .{ .typed = 9 } }});
+    try harness.send(9, 2, &protocol.xdg_activation_token_v1.request_messages[2], &.{.{ .object = 4 }});
+    const old = adapter.tokens.items[0].source_surface.?;
+    try harness.destroyToplevel();
+    try harness.send(6, 0, &protocol.xdg_surface.request_messages[0], &.{});
+    try harness.send(4, 0, &protocol.wl_surface.request_messages[0], &.{});
+    while (try harness.client().beginSend()) |batch|
+        try harness.client().completeSend(batch.token, batch.bytes.len);
+    try harness.send(3, 0, &protocol.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 4 } }});
+    const current = harness.adapter.surfaceIdentity(harness.client(), 4).?;
+    try std.testing.expectEqual(old.index, current.index);
+    try std.testing.expect(old.generation != current.generation);
+    try std.testing.expect(!std.meta.eql(old, current));
+    try handleToken(&adapter.tokens.items[0].resource, .commit, adapter.tokens.items[0]);
+    const token = (try drainActivationToken(harness.client())).?;
+    const Capture = struct {
+        called: bool = false,
+        proven: bool = true,
+
+        fn requested(context: *anyopaque, _: SurfaceRegistry.Id, proven: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.called = true;
+            self.proven = proven;
+        }
+    };
+    var capture: Capture = .{};
+    activation.activation_listener = .{ .context = &capture, .requested = Capture.requested };
+    activation.activateToken(&token, current);
+    try std.testing.expect(capture.called);
+    try std.testing.expect(!capture.proven);
+    try std.testing.expectEqual(@as(usize, 1), activation.tokens.count());
 }

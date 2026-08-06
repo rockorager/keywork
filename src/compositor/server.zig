@@ -92,6 +92,7 @@ const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringCursorShape = @import("wayland/WayringCursorShape.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
+const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
@@ -6000,7 +6001,10 @@ fn xdgActivationRequested(
     const self: *Self = @ptrCast(@alignCast(context));
     if (!self.window_manager_initialized) return;
     const allow_focus = proven_interaction and !self.session_lock.isLocked();
-    if (self.window_manager.activationRequested(surface_id, allow_focus)) requestRepaint(self);
+    if (self.window_manager.activationRequested(surface_id, allow_focus)) {
+        self.refreshKeyboardFocusReplacingGenerated();
+        requestRepaint(self);
+    }
 }
 
 fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
@@ -16223,14 +16227,36 @@ const WayringXdgClient = struct {
     const client_wl = wayland.client.wl;
     const client_xdg = wayland.client.xdg;
     const client_zxdg = wayland.client.zxdg;
-    const Stage = enum(u8) { starting, configured, mapped, mode_changed, frame_done, registry_ready, disconnected, failed };
-    const Offense = enum { duplicate_decoration, invalid_mode };
+    const Stage = enum(u8) {
+        starting,
+        initial_commit_ready,
+        configured,
+        mapped,
+        map_settled,
+        token_ready,
+        activated,
+        source_left,
+        invalids_checked,
+        mode_changed,
+        frame_done,
+        registry_ready,
+        disconnected,
+        failed,
+    };
+    const Offense = enum { duplicate_decoration, invalid_mode, activation_already_used };
+    const ActivationRole = enum { source, target };
+    const ActivationExchange = struct {
+        token: [XdgActivation.token_character_count:0]u8 = @splat(0),
+        unauthorized_token: [XdgActivation.token_character_count:0]u8 = @splat(0),
+    };
 
     runtime_directory: []const u8,
     display_name: []const u8,
     command_fd: std.posix.fd_t,
     registry_only: bool = false,
     offense: ?Offense = null,
+    activation_role: ?ActivationRole = null,
+    activation_exchange: ?*ActivationExchange = null,
     stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
     wake_fd: std.atomic.Value(i32) = .init(-1),
     failure: ?anyerror = null,
@@ -16240,6 +16266,7 @@ const WayringXdgClient = struct {
     seat: ?*client_wl.Seat = null,
     wm_base: ?*client_xdg.WmBase = null,
     decoration_manager: ?*client_zxdg.DecorationManagerV1 = null,
+    activation: ?*client_xdg.ActivationV1 = null,
     global_count: usize = 0,
     globals_exact: bool = true,
     configure_serial: u32 = 0,
@@ -16256,6 +16283,19 @@ const WayringXdgClient = struct {
     later_configure_serial: u32 = 0,
     output_enter_count: std.atomic.Value(u8) = .init(0),
     frame_count: std.atomic.Value(u8) = .init(0),
+    pointer_button_serial: u32 = 0,
+    surface_object_id: u32 = 0,
+    keyboard_enter_count: u8 = 0,
+    keyboard_leave_count: u8 = 0,
+    keyboard_enter_surface: u32 = 0,
+    keyboard_leave_surface: u32 = 0,
+    keyboard_enter_serial: u32 = 0,
+    keyboard_leave_serial: u32 = 0,
+    pending_activated: bool = false,
+    activated_configure_serial: u32 = 0,
+    activated_toplevel_sequence: u8 = 0,
+    activated_surface_sequence: u8 = 0,
+    activated_ack_sequence: u8 = 0,
 
     const expected_globals = [_]struct { name: []const u8, version: u32 }{
         .{ .name = "wl_compositor", .version = 6 },
@@ -16268,6 +16308,7 @@ const WayringXdgClient = struct {
         .{ .name = "wp_fractional_scale_manager_v1", .version = 1 },
         .{ .name = "wp_cursor_shape_manager_v1", .version = 2 },
         .{ .name = "zxdg_decoration_manager_v1", .version = 2 },
+        .{ .name = "xdg_activation_v1", .version = 1 },
     };
 
     fn run(self: *@This()) void {
@@ -16320,8 +16361,13 @@ const WayringXdgClient = struct {
         const decoration_manager = self.decoration_manager orelse return error.DecorationManagerMissing;
         var decoration_manager_live = true;
         defer if (decoration_manager_live) decoration_manager.destroy();
+        const activation = self.activation orelse return error.ActivationMissing;
+        var activation_live = true;
+        defer if (activation_live) activation.destroy();
         if (self.registry_only) {
             try self.pause(.registry_ready);
+            activation.destroy();
+            activation_live = false;
             decoration_manager.destroy();
             decoration_manager_live = false;
             wm_base.destroy();
@@ -16336,7 +16382,15 @@ const WayringXdgClient = struct {
             return;
         }
 
+        const pointer: ?*client_wl.Pointer = if (self.activation_role != null) try seat.getPointer() else null;
+        defer if (pointer) |value| value.release();
+        if (pointer) |value| value.setListener(*@This(), pointerEvent, self);
+        const keyboard: ?*client_wl.Keyboard = if (self.activation_role != null) try seat.getKeyboard() else null;
+        defer if (keyboard) |value| value.release();
+        if (keyboard) |value| value.setListener(*@This(), keyboardEvent, self);
+
         const surface = try compositor.createSurface();
+        self.surface_object_id = surface.getId();
         var surface_live = true;
         defer if (surface_live) surface.destroy();
         surface.setListener(*@This(), surfaceEvent, self);
@@ -16355,16 +16409,32 @@ const WayringXdgClient = struct {
             switch (offense) {
                 .duplicate_decoration => _ = try decoration_manager.getToplevelDecoration(toplevel),
                 .invalid_mode => decoration.setMode(@enumFromInt(99)),
+                .activation_already_used => {
+                    const token = try activation.getActivationToken();
+                    token.commit();
+                    try expectClientRoundtrip(display);
+                    token.setAppId("org.keywork.activation-offender");
+                },
             }
             expectClientRoundtrip(display) catch return;
-            return error.ExpectedDecorationProtocolFailure;
+            return error.ExpectedProtocolFailure;
         }
         decoration.setListener(*@This(), decorationEvent, self);
         decoration.setMode(.server_side);
+        if (self.activation_role) |role| toplevel.setAppId(switch (role) {
+            .source => "org.keywork.activation-source",
+            .target => "org.keywork.activation-target",
+        });
+        if (self.activation_role == .target) try self.pause(.initial_commit_ready);
         surface.commit();
         try expectClientRoundtrip(display);
-        if (self.configure_count != 1 or self.toplevel_configure_count != 1 or
-            self.capabilities_count != 1 or self.decoration_configure_count != 1 or
+        const initial_configure_valid = if (self.activation_role == null)
+            self.configure_count == 1 and self.toplevel_configure_count == 1 and
+                self.decoration_configure_count == 1
+        else
+            self.configure_count >= 1 and self.toplevel_configure_count >= 1 and
+                self.decoration_configure_count >= 1;
+        if (!initial_configure_valid or self.capabilities_count != 1 or
             self.decoration_mode != @as(u32, @intCast(@intFromEnum(client_zxdg.ToplevelDecorationV1.Mode.server_side))) or
             self.configure_serial == 0 or
             !(self.decoration_event_sequence < self.toplevel_event_sequence and
@@ -16391,23 +16461,94 @@ const WayringXdgClient = struct {
         try expectClientRoundtrip(display);
         try self.pause(.mapped);
 
-        self.event_sequence = 0;
-        decoration.unsetMode();
-        try expectClientRoundtrip(display);
-        if (self.configure_count != 2 or self.toplevel_configure_count != 2 or
-            self.decoration_configure_count != 2 or
-            self.decoration_mode != @as(u32, @intCast(@intFromEnum(client_zxdg.ToplevelDecorationV1.Mode.server_side))) or
-            self.configure_serial == self.initial_configure_serial or
-            !(self.decoration_event_sequence < self.toplevel_event_sequence and
-                self.toplevel_event_sequence < self.surface_event_sequence))
-            return error.UnexpectedLaterConfigure;
-        self.later_configure_serial = self.configure_serial;
-        try self.pause(.mode_changed);
+        if (self.activation_role) |role| {
+            const exchange = self.activation_exchange orelse return error.ActivationExchangeMissing;
+            switch (role) {
+                .source => {
+                    try expectClientRoundtrip(display);
+                    try self.pause(.map_settled);
+                    try expectClientRoundtrip(display);
+                    if (self.pointer_button_serial == 0) return error.PointerButtonSerialMissing;
+                    try self.requestActivationToken(
+                        display,
+                        activation,
+                        seat,
+                        surface,
+                        self.pointer_button_serial,
+                        "org.keywork.activation-target",
+                        &exchange.token,
+                    );
+                    try self.requestActivationToken(
+                        display,
+                        activation,
+                        seat,
+                        surface,
+                        self.pointer_button_serial ^ 0x8000_0000,
+                        "org.keywork.activation-unauthorized",
+                        &exchange.unauthorized_token,
+                    );
+                    try self.pause(.token_ready);
+                    try expectClientRoundtrip(display);
+                    if (self.keyboard_leave_count == 0 or
+                        self.keyboard_leave_surface != self.surface_object_id or
+                        self.keyboard_leave_serial == 0)
+                        return error.SourceKeyboardLeaveMissing;
+                    surface.commit();
+                    try expectClientRoundtrip(display);
+                    try self.pause(.source_left);
+                },
+                .target => {
+                    self.event_sequence = 0;
+                    self.activated_configure_serial = 0;
+                    self.activated_toplevel_sequence = 0;
+                    self.activated_surface_sequence = 0;
+                    self.activated_ack_sequence = 0;
+                    self.pending_activated = false;
+                    activation.activate(&exchange.token, surface);
+                    try expectClientRoundtrip(display);
+                    if (self.activated_configure_serial == 0 or
+                        self.activated_toplevel_sequence == 0 or
+                        !(self.activated_toplevel_sequence < self.activated_surface_sequence and
+                            self.activated_surface_sequence < self.activated_ack_sequence) or
+                        self.keyboard_enter_count == 0 or
+                        self.keyboard_enter_surface != self.surface_object_id or
+                        self.keyboard_enter_serial == 0)
+                        return error.TargetActivationEvidenceMissing;
+                    surface.commit();
+                    try expectClientRoundtrip(display);
+                    try self.pause(.activated);
+                    const configure_count = self.configure_count;
+                    const keyboard_enter_count = self.keyboard_enter_count;
+                    activation.activate(&exchange.token, surface);
+                    activation.activate("unknown", surface);
+                    activation.activate("not-a-32-character-hex-token", surface);
+                    activation.activate(&exchange.unauthorized_token, surface);
+                    try expectClientRoundtrip(display);
+                    if (self.configure_count != configure_count or
+                        self.keyboard_enter_count != keyboard_enter_count)
+                        return error.InvalidActivationChangedState;
+                    try self.pause(.invalids_checked);
+                },
+            }
+        } else {
+            self.event_sequence = 0;
+            decoration.unsetMode();
+            try expectClientRoundtrip(display);
+            if (self.configure_count != 2 or self.toplevel_configure_count != 2 or
+                self.decoration_configure_count != 2 or
+                self.decoration_mode != @as(u32, @intCast(@intFromEnum(client_zxdg.ToplevelDecorationV1.Mode.server_side))) or
+                self.configure_serial == self.initial_configure_serial or
+                !(self.decoration_event_sequence < self.toplevel_event_sequence and
+                    self.toplevel_event_sequence < self.surface_event_sequence))
+                return error.UnexpectedLaterConfigure;
+            self.later_configure_serial = self.configure_serial;
+            try self.pause(.mode_changed);
 
-        try expectClientRoundtrip(display);
-        if (self.output_enter_count.load(.acquire) != 1) return error.OutputEnterMissing;
-        if (self.frame_count.load(.acquire) != 1) return error.FrameDoneMissing;
-        try self.pause(.frame_done);
+            try expectClientRoundtrip(display);
+            if (self.output_enter_count.load(.acquire) != 1) return error.OutputEnterMissing;
+            if (self.frame_count.load(.acquire) != 1) return error.FrameDoneMissing;
+            try self.pause(.frame_done);
+        }
 
         buffer.destroy();
         buffer_live = false;
@@ -16423,6 +16564,8 @@ const WayringXdgClient = struct {
         surface_live = false;
         decoration_manager.destroy();
         decoration_manager_live = false;
+        activation.destroy();
+        activation_live = false;
         wm_base.destroy();
         wm_base_live = false;
         seat.release();
@@ -16442,7 +16585,7 @@ const WayringXdgClient = struct {
                 self.global_count += 1;
                 if (index >= expected_globals.len or !std.mem.eql(u8, interface, expected_globals[index].name) or
                     global.version != expected_globals[index].version) self.globals_exact = false;
-                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, 6) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, 4) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, 11) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, 7) catch null else if (std.mem.eql(u8, interface, "zxdg_decoration_manager_v1")) self.decoration_manager = registry.bind(global.name, client_zxdg.DecorationManagerV1, 2) catch null;
+                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, 6) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, 4) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, 11) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, 7) catch null else if (std.mem.eql(u8, interface, "zxdg_decoration_manager_v1")) self.decoration_manager = registry.bind(global.name, client_zxdg.DecorationManagerV1, 2) catch null else if (std.mem.eql(u8, interface, "xdg_activation_v1")) self.activation = registry.bind(global.name, client_xdg.ActivationV1, 1) catch null;
             },
             .global_remove => {},
         }
@@ -16458,19 +16601,34 @@ const WayringXdgClient = struct {
             .configure => |configure| {
                 self.event_sequence += 1;
                 self.surface_event_sequence = self.event_sequence;
+                if (self.pending_activated) {
+                    self.activated_configure_serial = configure.serial;
+                    self.activated_surface_sequence = self.event_sequence;
+                }
                 self.configure_serial = configure.serial;
                 self.configure_count += 1;
                 if (self.configure_count == 1) self.initial_configure_serial = configure.serial;
                 xdg_surface.ackConfigure(configure.serial);
+                if (self.pending_activated) {
+                    self.event_sequence += 1;
+                    self.activated_ack_sequence = self.event_sequence;
+                    self.pending_activated = false;
+                }
             },
         }
     }
     fn toplevelEvent(_: *client_xdg.Toplevel, event: client_xdg.Toplevel.Event, self: *@This()) void {
         switch (event) {
-            .configure => {
+            .configure => |configure| {
                 self.event_sequence += 1;
                 self.toplevel_event_sequence = self.event_sequence;
                 self.toplevel_configure_count += 1;
+                const activated_raw: u32 = @intCast(@intFromEnum(client_xdg.Toplevel.State.activated));
+                for (configure.states.slice(u32)) |state| if (state == activated_raw) {
+                    self.pending_activated = true;
+                    self.activated_toplevel_sequence = self.event_sequence;
+                    break;
+                };
             },
             .wm_capabilities => self.capabilities_count += 1,
             .configure_bounds, .close => {},
@@ -16499,6 +16657,68 @@ const WayringXdgClient = struct {
                 callback.destroy();
             },
         }
+    }
+    fn pointerEvent(_: *client_wl.Pointer, event: client_wl.Pointer.Event, self: *@This()) void {
+        switch (event) {
+            .button => |button| if (button.state == .pressed) {
+                self.pointer_button_serial = button.serial;
+            },
+            else => {},
+        }
+    }
+    fn keyboardEvent(_: *client_wl.Keyboard, event: client_wl.Keyboard.Event, self: *@This()) void {
+        switch (event) {
+            .keymap => |keymap| _ = std.os.linux.close(keymap.fd),
+            .enter => |enter| {
+                self.keyboard_enter_count += 1;
+                self.keyboard_enter_surface = (enter.surface orelse return).getId();
+                self.keyboard_enter_serial = enter.serial;
+            },
+            .leave => |leave| {
+                self.keyboard_leave_count += 1;
+                self.keyboard_leave_surface = (leave.surface orelse return).getId();
+                self.keyboard_leave_serial = leave.serial;
+            },
+            else => {},
+        }
+    }
+    const ActivationTokenCapture = struct {
+        destination: *[XdgActivation.token_character_count:0]u8,
+        done_count: u8 = 0,
+
+        fn event(_: *client_xdg.ActivationTokenV1, value: client_xdg.ActivationTokenV1.Event, self: *@This()) void {
+            switch (value) {
+                .done => |done| {
+                    const token = std.mem.span(done.token);
+                    if (token.len != XdgActivation.token_character_count) return;
+                    @memcpy(self.destination[0..XdgActivation.token_character_count], token);
+                    self.destination[XdgActivation.token_character_count] = 0;
+                    self.done_count += 1;
+                },
+            }
+        }
+    };
+    fn requestActivationToken(
+        self: *@This(),
+        display: *client_wl.Display,
+        activation: *client_xdg.ActivationV1,
+        seat: *client_wl.Seat,
+        surface: *client_wl.Surface,
+        serial: u32,
+        app_id: [*:0]const u8,
+        destination: *[XdgActivation.token_character_count:0]u8,
+    ) !void {
+        _ = self;
+        const token = try activation.getActivationToken();
+        defer token.destroy();
+        var capture: ActivationTokenCapture = .{ .destination = destination };
+        token.setListener(*ActivationTokenCapture, ActivationTokenCapture.event, &capture);
+        token.setSerial(serial, seat);
+        token.setAppId(app_id);
+        token.setSurface(surface);
+        token.commit();
+        try expectClientRoundtrip(display);
+        if (capture.done_count != 1 or destination[0] == 0) return error.UnexpectedActivationDone;
     }
     fn pause(self: *@This(), value: Stage) !void {
         self.stage.store(@intFromEnum(value), .release);
@@ -18596,11 +18816,23 @@ test "production Wayring XDG publication accepts a real registry client and surv
     defer _ = linux.rmdir(runtime_directory.ptr);
 
     const server = try Self.createWithVirtualOutput(std.testing.allocator, std.testing.io, .cpu, .headless, null, .{
-        .size = .{ .width = 4, .height = 4 },
+        .size = .{ .width = 640, .height = 480 },
         .refresh_millihertz = 1,
     });
     defer server.destroy();
+    const output = server.primaryRenderOutput();
     const registry_baseline = server.surface_registry.len();
+
+    const keymap_fd = try std.posix.memfd_create("keywork-wayring-xdg-keymap", linux.MFD.CLOEXEC);
+    const keymap = "keymap\x00\x00";
+    if (linux.errno(linux.ftruncate(keymap_fd, keymap.len)) != .SUCCESS)
+        return error.KeymapResizeFailed;
+    if (std.c.pwrite(keymap_fd, keymap.ptr, keymap.len, 0) != keymap.len)
+        return error.KeymapWriteFailed;
+    server.seat.setKeymap(.xkb_v1, keymap_fd, keymap.len);
+    server.seat.setRepeatInfo(0, 500);
+    server.seat.setKeyboardAvailable(true);
+    server.seat.setPointerAvailable(true);
     var protocol_server: wayring.server.Server = .init(std.testing.allocator);
     defer protocol_server.deinit();
     var clients: WayringClients = undefined;
@@ -18611,6 +18843,8 @@ test "production Wayring XDG publication accepts a real registry client and surv
     defer compositor.deinit();
     var seat: WayringSeatAdapter = .init(std.testing.allocator, &protocol_server, &clients, &compositor, server.generatedSeatRequestSink(), server.generatedSeatName());
     defer seat.deinit();
+    server.setGeneratedSeatDeliverySink(seat.sink());
+    defer server.clearGeneratedSeatDeliverySink(&seat);
     try seat.publish();
     defer seat.unpublish();
     var outputs: WayringOutput = undefined;
@@ -18649,6 +18883,11 @@ test "production Wayring XDG publication accepts a real registry client and surv
     defer decoration.deinit();
     try decoration.publish();
     defer decoration.unpublish();
+    var activation: WayringXdgActivation = undefined;
+    activation.init(std.testing.allocator, &protocol_server, &seat, &xdg, server.xdgActivationOwner());
+    defer activation.deinit();
+    try activation.publish();
+    defer activation.unpublish();
 
     const Lifecycle = struct {
         clients: *WayringClients,
@@ -18660,6 +18899,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
         fractional_scale: *WayringFractionalScale,
         cursor_shape: *WayringCursorShape,
         decoration: *WayringXdgDecoration,
+        activation: *WayringXdgActivation,
         accepted_count: usize = 0,
 
         fn accepted(context: *anyopaque, client: *wayring.server.Client) !void {
@@ -18671,6 +18911,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
         }
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            self.activation.destroyClientResources(client);
             self.decoration.destroyClientResources(client);
             self.cursor_shape.destroyClientResources(client);
             self.fractional_scale.destroyClientResources(client);
@@ -18682,7 +18923,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
             if (self.clients.id(client) != null) self.clients.unregister(client);
         }
     };
-    var lifecycle: Lifecycle = .{ .clients = &clients, .compositor = &compositor, .outputs = &outputs, .seat = &seat, .xdg = &xdg, .viewporter = &viewporter, .fractional_scale = &fractional_scale, .cursor_shape = &cursor_shape, .decoration = &decoration };
+    var lifecycle: Lifecycle = .{ .clients = &clients, .compositor = &compositor, .outputs = &outputs, .seat = &seat, .xdg = &xdg, .viewporter = &viewporter, .fractional_scale = &fractional_scale, .cursor_shape = &cursor_shape, .decoration = &decoration, .activation = &activation };
     const host = try WayringHost.create(std.testing.allocator, server.eventLoop(), &protocol_server, runtime_directory, .{
         .context = &lifecycle,
         .accepted = Lifecycle.accepted,
@@ -18783,6 +19024,177 @@ test "production Wayring XDG publication accepts a real registry client and surv
     try std.testing.expect(server.scene.topWindowSurface() == null);
     try std.testing.expectEqual(@as(usize, 0), server.client_registry.len());
 
+    var exchange: WayringXdgClient.ActivationExchange = .{};
+    const raw_source_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_source_fd) != .SUCCESS) return error.EventFdFailed;
+    const source_fd: std.posix.fd_t = @intCast(raw_source_fd);
+    defer _ = linux.close(source_fd);
+    var source: WayringXdgClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = source_fd,
+        .activation_role = .source,
+        .activation_exchange = &exchange,
+    };
+    const source_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&source});
+    var source_joined = false;
+    defer if (!source_joined) {
+        source.shutdown();
+        source_thread.join();
+    };
+    try waitForWayringXdgStage(server, host, &source, .configured);
+    try signalWayringCommand(source_fd);
+    try waitForWayringXdgStage(server, host, &source, .mapped);
+    try signalWayringCommand(source_fd);
+    try waitForWayringXdgStage(server, host, &source, .map_settled);
+    // The client remains intentionally paused. Settle its first-map barrier
+    // before asking WindowManager to begin the target's relayout transaction.
+    server.window_manager.settleConfigureTransactionForTest();
+
+    const raw_target_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_target_fd) != .SUCCESS) return error.EventFdFailed;
+    const target_fd: std.posix.fd_t = @intCast(raw_target_fd);
+    defer _ = linux.close(target_fd);
+    var target: WayringXdgClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = target_fd,
+        .activation_role = .target,
+        .activation_exchange = &exchange,
+    };
+    const target_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&target});
+    var target_joined = false;
+    defer if (!target_joined) {
+        target.shutdown();
+        target_thread.join();
+    };
+    try waitForWayringXdgStage(server, host, &target, .initial_commit_ready);
+    try signalWayringCommand(target_fd);
+    for (0..1_000) |_| {
+        if (server.headless_surface_forest.len() == 2) break;
+        try server.eventLoop().dispatch(1);
+        if (host.failure()) |err| return err;
+    } else return error.WayringXdgClientTimedOut;
+    // The target's first commit coalesces behind the paused source's current
+    // configure. Publishing that barrier emits the target's initial batch.
+    server.window_manager.settleConfigureTransactionForTest();
+    try waitForWayringXdgStage(server, host, &target, .configured);
+    try signalWayringCommand(target_fd);
+    try waitForWayringXdgStage(server, host, &target, .mapped);
+    server.window_manager.settleConfigureTransactionForTest();
+    try std.testing.expectEqual(@as(usize, 2), host.connectionCount());
+    try std.testing.expectEqual(@as(usize, 2), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 2), server.client_registry.len());
+    try std.testing.expectEqual(@as(usize, 2), server.headless_surface_forest.len());
+
+    const snapshots = try server.window_manager.windowSnapshots(std.testing.allocator);
+    defer std.testing.allocator.free(snapshots);
+    try std.testing.expectEqual(@as(usize, 2), snapshots.len);
+    var source_root: ?SurfaceRegistry.Id = null;
+    var target_root: ?SurfaceRegistry.Id = null;
+    var source_rect: ?WindowManager.WindowRect = null;
+    var neutral_iterator = server.neutralXdgShell().windowIterator();
+    while (neutral_iterator.next()) |window_id| {
+        const info = server.neutralXdgShell().windowInfo(window_id).?;
+        const app_id = info.app_id orelse continue;
+        if (std.mem.eql(u8, app_id, "org.keywork.activation-source"))
+            source_root = server.scene.windowSurface(info.scene_id)
+        else if (std.mem.eql(u8, app_id, "org.keywork.activation-target"))
+            target_root = server.scene.windowSurface(info.scene_id);
+    }
+    for (snapshots) |snapshot| {
+        const app_id = snapshot.app_id orelse continue;
+        if (std.mem.eql(u8, app_id, "org.keywork.activation-source"))
+            source_rect = snapshot.rect;
+    }
+    const exact_source = source_root orelse return error.ActivationSourceMissing;
+    const exact_target = target_root orelse return error.ActivationTargetMissing;
+    const rect = source_rect orelse return error.ActivationSourceGeometryMissing;
+    try std.testing.expect(rect.width > 0 and rect.height > 0);
+    const source_position = server.scene.surfacePosition(exact_source) orelse
+        return error.ActivationSourceGeometryMissing;
+    pointerMotion(
+        output,
+        20,
+        @as(f64, @floatFromInt(source_position.x)) + 0.5,
+        @as(f64, @floatFromInt(source_position.y)) + 0.5,
+    );
+    pointerButton(output, 21, linux_button_left, .pressed);
+    pointerFrame(output);
+    try std.testing.expectEqual(exact_source, server.window_manager.focusedSurface().?);
+    try std.testing.expectEqual(exact_source, server.seat.generatedKeyboardFocus().?.surface);
+
+    try signalWayringCommand(source_fd);
+    try waitForWayringXdgStage(server, host, &source, .token_ready);
+    try std.testing.expect(source.pointer_button_serial != 0);
+    inline for (.{ &exchange.token, &exchange.unauthorized_token }) |token| {
+        try std.testing.expectEqual(@as(u8, 0), token[XdgActivation.token_character_count]);
+        for (token[0..XdgActivation.token_character_count]) |character|
+            try std.testing.expect(std.ascii.isDigit(character) or (character >= 'a' and character <= 'f'));
+    }
+    try std.testing.expect(!std.mem.eql(u8, &exchange.token, &exchange.unauthorized_token));
+
+    server.window_manager.settleConfigureTransactionForTest();
+    try signalWayringCommand(target_fd);
+    try waitForWayringXdgStage(server, host, &target, .activated);
+    try std.testing.expectEqual(exact_target, server.window_manager.focusedSurface().?);
+    try std.testing.expectEqual(exact_target, server.seat.generatedKeyboardFocus().?.surface);
+    try std.testing.expect(target.activated_configure_serial != target.initial_configure_serial);
+    try std.testing.expect(target.activated_configure_serial != 0);
+    try std.testing.expect(server.surface_registry.renderState(exact_source) != null);
+    try std.testing.expect(server.surface_registry.renderState(exact_target) != null);
+
+    try signalWayringCommand(source_fd);
+    try waitForWayringXdgStage(server, host, &source, .source_left);
+    server.window_manager.settleConfigureTransactionForTest();
+    try std.testing.expectEqual(exact_target, server.scene.focusedSurface().?);
+    try std.testing.expectEqual(source.surface_object_id, source.keyboard_leave_surface);
+    try std.testing.expectEqual(target.surface_object_id, target.keyboard_enter_surface);
+
+    try signalWayringCommand(target_fd);
+    try waitForWayringXdgStage(server, host, &target, .invalids_checked);
+    try std.testing.expectEqual(exact_target, server.window_manager.focusedSurface().?);
+    try std.testing.expectEqual(exact_target, server.seat.generatedKeyboardFocus().?.surface);
+
+    const raw_activation_offender_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_activation_offender_fd) != .SUCCESS) return error.EventFdFailed;
+    const activation_offender_fd: std.posix.fd_t = @intCast(raw_activation_offender_fd);
+    defer _ = linux.close(activation_offender_fd);
+    var activation_offender: WayringXdgClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = activation_offender_fd,
+        .offense = .activation_already_used,
+    };
+    const activation_offender_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&activation_offender});
+    try waitForWayringXdgStage(server, host, &activation_offender, .disconnected);
+    activation_offender_thread.join();
+    for (0..1_000) |_| {
+        if (host.connectionCount() == 2 and compositor.surfaceCount() == 2 and
+            server.client_registry.len() == 2) break;
+        try server.eventLoop().dispatch(1);
+        if (host.failure()) |err| return err;
+    } else return error.WayringActivationOffenderCleanupTimedOut;
+    try std.testing.expectEqual(exact_target, server.window_manager.focusedSurface().?);
+    try std.testing.expectEqual(WayringXdgClient.Stage.source_left, @as(WayringXdgClient.Stage, @enumFromInt(source.stage.load(.acquire))));
+    try std.testing.expectEqual(WayringXdgClient.Stage.invalids_checked, @as(WayringXdgClient.Stage, @enumFromInt(target.stage.load(.acquire))));
+
+    pointerButton(output, 22, linux_button_left, .released);
+    pointerFrame(output);
+    try signalWayringCommand(source_fd);
+    try signalWayringCommand(target_fd);
+    try waitForWayringXdgStage(server, host, &source, .disconnected);
+    try waitForWayringXdgStage(server, host, &target, .disconnected);
+    source_thread.join();
+    source_joined = true;
+    target_thread.join();
+    target_joined = true;
+    try waitForWayringDisconnect(server, host, &compositor);
+    try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
+    try std.testing.expectEqual(@as(usize, 0), server.client_registry.len());
+    try std.testing.expect(server.scene.topWindowSurface() == null);
+    try std.testing.expect(server.seat.generatedKeyboardFocus() == null);
+
     const raw_rebind_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_rebind_fd) != .SUCCESS) return error.EventFdFailed;
     const rebind_fd: std.posix.fd_t = @intCast(raw_rebind_fd);
@@ -18795,7 +19207,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
         rebind_thread.join();
     };
     try waitForWayringXdgStage(server, host, &rebind, .registry_ready);
-    try std.testing.expectEqual(@as(usize, 4), lifecycle.accepted_count);
+    try std.testing.expectEqual(@as(usize, 7), lifecycle.accepted_count);
     try signalWayringCommand(rebind_fd);
     try waitForWayringXdgStage(server, host, &rebind, .disconnected);
     rebind_thread.join();
