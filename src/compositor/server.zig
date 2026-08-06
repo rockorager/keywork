@@ -90,6 +90,7 @@ const Surface = @import("wayland/surface.zig");
 const MatureClients = @import("wayland/MatureClients.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
+const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
@@ -282,11 +283,17 @@ renderer: Renderer,
 socket_buffer: [11]u8,
 listening: bool,
 xwayland_display_listener: ?XwaylandDisplayListener,
+wayring_default_output_listener: ?WayringDefaultOutputListener,
 
 pub const XwaylandDisplayListener = struct {
     context: *anyopaque,
     available: *const fn (*anyopaque, []const u8) void,
     unavailable: *const fn (*anyopaque) void,
+};
+
+pub const WayringDefaultOutputListener = struct {
+    context: *anyopaque,
+    changed: *const fn (*anyopaque, OutputLayout.Id) void,
 };
 
 const ComposedCaptureSource = struct {
@@ -1105,6 +1112,7 @@ pub fn createWithVirtualOutput(
         .socket_buffer = undefined,
         .listening = false,
         .xwayland_display_listener = null,
+        .wayring_default_output_listener = null,
     };
     errdefer self.client_registry.deinit();
     self.mature_clients.init(allocator, display, &self.client_registry);
@@ -2663,6 +2671,8 @@ fn replacePrimaryRenderOutput(self: *Self, removed_id: RenderOutputId) void {
     while (iterator.next()) |entry| if (!std.meta.eql(entry.id, removed_id)) {
         self.primary_render_output = entry.id;
         const replacement = entry.value.*;
+        if (self.wayring_default_output_listener) |listener|
+            listener.changed(listener.context, replacement.protocol_id);
         self.fractional_scale.setDefaultOutput(replacement.protocol_id);
         self.xdg_shell_core.setDefaultOutput(replacement.protocol_id);
         self.layer_shell.setDefaultOutput(replacement.protocol_id);
@@ -3886,6 +3896,22 @@ fn wayringSurfacePresentationClass(
 pub fn wayringOutputLayout(self: *Self) ?*OutputLayout {
     if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return null;
     return &self.outputs;
+}
+
+pub fn wayringDefaultOutputId(self: *Self) ?OutputLayout.Id {
+    if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return null;
+    return self.primaryRenderOutput().protocol_id;
+}
+
+pub fn setWayringDefaultOutputListener(self: *Self, listener: WayringDefaultOutputListener) void {
+    std.debug.assert(self.wayring_default_output_listener == null);
+    self.wayring_default_output_listener = listener;
+}
+
+pub fn clearWayringDefaultOutputListener(self: *Self, context: *anyopaque) void {
+    std.debug.assert(self.wayring_default_output_listener != null and
+        self.wayring_default_output_listener.?.context == context);
+    self.wayring_default_output_listener = null;
 }
 
 fn wayringPresentationEnabled(output_kind: OutputBackend.Kind) bool {
@@ -15230,6 +15256,7 @@ const WayringHeadlessClient = struct {
     shm: ?*wayland.client.wl.Shm = null,
     output: ?*wayland.client.wl.Output = null,
     viewporter: ?*wayland.client.wp.Viewporter = null,
+    fractional_scale_manager: ?*wayland.client.wp.FractionalScaleManagerV1 = null,
     compositor_version: std.atomic.Value(u32) = .init(0),
     global_count: usize = 0,
     globals_exact: bool = true,
@@ -15249,6 +15276,8 @@ const WayringHeadlessClient = struct {
     preferred_buffer_transform: std.atomic.Value(i32) = .init(std.math.maxInt(i32)),
     output_enter_count: std.atomic.Value(u8) = .init(0),
     output_leave_count: std.atomic.Value(u8) = .init(0),
+    fractional_scale_count: std.atomic.Value(u8) = .init(0),
+    fractional_scale: std.atomic.Value(u32) = .init(0),
 
     const expected_globals = [_]struct { name: []const u8, version: u32 }{
         .{ .name = "wl_compositor", .version = 6 },
@@ -15258,6 +15287,7 @@ const WayringHeadlessClient = struct {
         .{ .name = "wl_output", .version = 4 },
         .{ .name = "xdg_wm_base", .version = 7 },
         .{ .name = "wp_viewporter", .version = 1 },
+        .{ .name = "wp_fractional_scale_manager_v1", .version = 1 },
     };
 
     fn run(self: *WayringHeadlessClient) void {
@@ -15305,6 +15335,8 @@ const WayringHeadlessClient = struct {
         const shm = self.shm orelse return error.ShmMissing;
         const output = self.output orelse return error.OutputMissing;
         const viewporter = self.viewporter orelse return error.ViewporterMissing;
+        const fractional_scale_manager = self.fractional_scale_manager orelse return error.FractionalScaleMissing;
+        defer fractional_scale_manager.destroy();
         defer viewporter.destroy();
         defer output.release();
         try expectClientRoundtrip(display);
@@ -15315,6 +15347,9 @@ const WayringHeadlessClient = struct {
             return error.UnexpectedOutputState;
         const surface = try compositor.createSurface();
         defer surface.destroy();
+        const fractional_scale = try fractional_scale_manager.getFractionalScale(surface);
+        defer fractional_scale.destroy();
+        fractional_scale.setListener(*WayringHeadlessClient, fractionalScaleEvent, self);
         const viewport = try viewporter.getViewport(surface);
         var viewport_live = true;
         defer if (viewport_live) viewport.destroy();
@@ -15326,6 +15361,9 @@ const WayringHeadlessClient = struct {
         if (self.preferred_buffer_transform_count.load(.acquire) != 1 or
             self.preferred_buffer_transform.load(.acquire) != @intFromEnum(wayland.client.wl.Output.Transform.normal))
             return error.UnexpectedPreferredBufferTransform;
+        if (self.fractional_scale_count.load(.acquire) != 1 or
+            self.fractional_scale.load(.acquire) != 120)
+            return error.UnexpectedFractionalScale;
         const region = try compositor.createRegion();
         region.add(0, 0, 2, 1);
         region.subtract(1, 0, 1, 1);
@@ -15358,6 +15396,9 @@ const WayringHeadlessClient = struct {
         try waitForWayringCommand(self.command_fd);
 
         try self.commitBuffer(display, surface, buffer, shm_fd, .{ 0x0066_7788, 0x0099_aabb }, 2);
+        if (self.fractional_scale_count.load(.acquire) != 2 or
+            self.fractional_scale.load(.acquire) != 180)
+            return error.UnexpectedFractionalScale;
         self.stage.store(@intFromEnum(Stage.replacement_released), .release);
         try waitForWayringCommand(self.command_fd);
 
@@ -15366,6 +15407,9 @@ const WayringHeadlessClient = struct {
         surface.commit();
         try expectClientRoundtrip(display);
         if (self.frame_done_count.load(.acquire) != 1) return error.UnexpectedFrameDone;
+        if (self.fractional_scale_count.load(.acquire) != 3 or
+            self.fractional_scale.load(.acquire) != 120)
+            return error.UnexpectedFractionalScale;
         self.stage.store(@intFromEnum(Stage.transformed_committed), .release);
         try waitForWayringCommand(self.command_fd);
         try expectClientRoundtrip(display);
@@ -15596,6 +15640,12 @@ const WayringHeadlessClient = struct {
                         wayland.client.wp.Viewporter,
                         1,
                     ) catch null;
+                } else if (std.mem.eql(u8, interface, "wp_fractional_scale_manager_v1") and self.fractional_scale_manager == null) {
+                    self.fractional_scale_manager = registry.bind(
+                        global.name,
+                        wayland.client.wp.FractionalScaleManagerV1,
+                        1,
+                    ) catch null;
                 }
             },
             .global_remove => {},
@@ -15647,6 +15697,19 @@ const WayringHeadlessClient = struct {
                 self.output_name_valid = std.mem.eql(u8, std.mem.span(name.name), "HEADLESS-1");
             },
             .done => self.output_done_count += 1,
+        }
+    }
+
+    fn fractionalScaleEvent(
+        _: *wayland.client.wp.FractionalScaleV1,
+        event: wayland.client.wp.FractionalScaleV1.Event,
+        self: *WayringHeadlessClient,
+    ) void {
+        switch (event) {
+            .preferred_scale => |preferred| {
+                self.fractional_scale.store(preferred.scale, .monotonic);
+                _ = self.fractional_scale_count.fetchAdd(1, .release);
+            },
         }
     }
 
@@ -17230,7 +17293,7 @@ fn rejectWayringFrames(server: *Self, output: *RenderOutput, child_id: SurfaceRe
     try std.testing.expect(server.headless_surface_forest.state(child_id).?.frame_demand);
 }
 
-test "production Wayring viewporter crops and scales real SHM pixels end to end" {
+test "production Wayring fractional scale and viewporter render real SHM pixels end to end" {
     const WayringHost = @import("wayland/WayringHost.zig");
     const wayring = @import("wayring");
     const linux = std.os.linux;
@@ -17329,11 +17392,27 @@ test "production Wayring viewporter crops and scales real SHM pixels end to end"
         viewporter.deinit();
     };
     try viewporter.publish();
+    var fractional_scale: WayringFractionalScale = undefined;
+    try fractional_scale.init(
+        std.testing.allocator,
+        &protocol_server,
+        &compositor,
+        &wayring_outputs,
+        server.wayringOutputLayout().?,
+        server.wayringDefaultOutputId().?,
+    );
+    var fractional_scale_live = true;
+    defer if (fractional_scale_live) {
+        fractional_scale.unpublish();
+        fractional_scale.deinit();
+    };
+    try fractional_scale.publish();
     const Lifecycle = struct {
         clients: *WayringClients,
         outputs: *WayringOutput,
         xdg: *WayringXdgShell,
         viewporter: *WayringViewporter,
+        fractional_scale: *WayringFractionalScale,
         compositor: *WayringCompositor,
         seat: *WayringSeatAdapter,
 
@@ -17347,6 +17426,7 @@ test "production Wayring viewporter crops and scales real SHM pixels end to end"
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
             self.seat.destroyClientResources(client);
+            self.fractional_scale.destroyClientResources(client);
             self.viewporter.destroyClientResources(client);
             self.xdg.destroyClientResources(client);
             self.outputs.destroyClientResources(client);
@@ -17359,6 +17439,7 @@ test "production Wayring viewporter crops and scales real SHM pixels end to end"
         .outputs = &wayring_outputs,
         .xdg = &xdg,
         .viewporter = &viewporter,
+        .fractional_scale = &fractional_scale,
         .compositor = &compositor,
         .seat = &seat,
     };
@@ -17425,6 +17506,16 @@ test "production Wayring viewporter crops and scales real SHM pixels end to end"
     try waitForWayringClientStage(server, host, &client, .initial_done);
     try std.testing.expectEqual(@as(u8, 1), client.frame_done_count.load(.acquire));
 
+    const output_snapshot = server.outputs.get(output.protocol_id).?.snapshot();
+    _ = server.outputs.get(output.protocol_id).?.configure(
+        output_snapshot.position,
+        output_snapshot.size,
+        output_snapshot.mode_size,
+        output_snapshot.refresh_millihertz,
+        output_snapshot.mode_preferred,
+        @intCast(output_snapshot.scale),
+        .{ .numerator = 180 },
+    );
     previous_frames = output.frame_statistics.frames_presented;
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .replacement_released);
@@ -17439,6 +17530,16 @@ test "production Wayring viewporter crops and scales real SHM pixels end to end"
     try renderPendingWayringFrame(server, host, previous_frames);
     try expectWayringHeadlessPixels(server, .{ 0x0066_7788, 0x0099_aabb });
 
+    const changed_output_snapshot = server.outputs.get(output.protocol_id).?.snapshot();
+    _ = server.outputs.get(output.protocol_id).?.configure(
+        changed_output_snapshot.position,
+        changed_output_snapshot.size,
+        changed_output_snapshot.mode_size,
+        changed_output_snapshot.refresh_millihertz,
+        changed_output_snapshot.mode_preferred,
+        @intCast(changed_output_snapshot.scale),
+        .{ .numerator = 120 },
+    );
     previous_frames = output.frame_statistics.frames_presented;
     try signalWayringCommand(command_fd);
     try waitForWayringClientStage(server, host, &client, .transformed_committed);
@@ -17625,7 +17726,11 @@ test "production Wayring viewporter crops and scales real SHM pixels end to end"
     try std.testing.expectEqual(@as(u8, 7), client.frame_done_count.load(.acquire));
     try std.testing.expectEqual(@as(u8, 1), client.preferred_buffer_scale_count.load(.acquire));
     try std.testing.expectEqual(@as(u8, 1), client.preferred_buffer_transform_count.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 3), client.fractional_scale_count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 120), client.fractional_scale.load(.acquire));
     try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
+    try std.testing.expectEqual(@as(usize, 0), fractional_scale.fractional_scales.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fractional_scale.managers.items.len);
     try std.testing.expectEqual(@as(usize, 0), viewporter.viewports.items.len);
     try std.testing.expectEqual(@as(usize, 0), viewporter.managers.items.len);
     try std.testing.expectEqual(@as(usize, 0), server.client_registry.len());
@@ -17640,6 +17745,9 @@ test "production Wayring viewporter crops and scales real SHM pixels end to end"
     } else return error.WayringTransportDrainTimedOut;
     try host.destroy();
     host_live = false;
+    fractional_scale.unpublish();
+    fractional_scale.deinit();
+    fractional_scale_live = false;
     viewporter.unpublish();
     viewporter.deinit();
     viewporter_live = false;

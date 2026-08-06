@@ -25,6 +25,13 @@ protocol_server: *server.Server,
 layout: *OutputLayout,
 compositor: *WayringCompositor,
 adapters: std.ArrayList(*Adapter) = .empty,
+scale_listener: ?ScaleListener = null,
+
+pub const ScaleListener = struct {
+    context: *anyopaque,
+    configured: *const fn (*anyopaque, OutputLayout.Id, Output.Changes) void,
+    membership_changed: *const fn (*anyopaque, WayringCompositor.SurfaceId, ?OutputLayout.Id) void,
+};
 
 const Binding = struct {
     resource: core.wl_output.Resource,
@@ -105,6 +112,16 @@ pub fn destroyClientResources(self: *WayringOutput, client: *server.Client) void
     }
 }
 
+pub fn setScaleListener(self: *WayringOutput, listener: ScaleListener) void {
+    std.debug.assert(self.scale_listener == null);
+    self.scale_listener = listener;
+}
+
+pub fn clearScaleListener(self: *WayringOutput, context: *anyopaque) void {
+    std.debug.assert(self.scale_listener != null and self.scale_listener.?.context == context);
+    self.scale_listener = null;
+}
+
 /// Resolves only the identity of a currently live generated wl_output owned by
 /// `client`. Object ids from another client or retired/released resources do
 /// not name an output.
@@ -155,7 +172,10 @@ fn layoutRemoving(context: *anyopaque, id: OutputLayout.Id) void {
     const adapter = self.findAdapter(id) orelse unreachable;
     self.protocol_server.removeGlobal(adapter.global) catch unreachable;
     var memberships = adapter.output.membershipIterator();
-    while (memberships.next()) |surface_id| membershipEvent(adapter, surface_id, false);
+    while (memberships.next()) |surface_id| {
+        membershipEvent(adapter, surface_id, false);
+        if (self.scale_listener) |listener| listener.membership_changed(listener.context, surface_id, id);
+    }
     adapter.output.clearDeliveryListener();
     adapter.retired = true;
 }
@@ -217,17 +237,25 @@ fn configured(context: *anyopaque, snapshot: Output.Snapshot, changes: Output.Ch
                 eventFailure(binding, err, "queueing wl_output scale");
                 continue;
             };
-        if (binding.resource.version() >= 2)
+        if ((changes.geometry or changes.mode or changes.scale) and binding.resource.version() >= 2)
             core.wl_output.@"send:done"(&binding.resource) catch |err| eventFailure(binding, err, "queueing wl_output done");
     }
+    if (changes.preferred_scale) if (adapter.manager.scale_listener) |listener|
+        listener.configured(listener.context, adapter.id, changes);
 }
 
 fn entered(context: *anyopaque, id: WayringCompositor.SurfaceId) void {
-    membershipEvent(@ptrCast(@alignCast(context)), id, true);
+    const adapter: *Adapter = @ptrCast(@alignCast(context));
+    membershipEvent(adapter, id, true);
+    if (adapter.manager.scale_listener) |listener|
+        listener.membership_changed(listener.context, id, null);
 }
 
 fn left(context: *anyopaque, id: WayringCompositor.SurfaceId) void {
-    membershipEvent(@ptrCast(@alignCast(context)), id, false);
+    const adapter: *Adapter = @ptrCast(@alignCast(context));
+    membershipEvent(adapter, id, false);
+    if (adapter.manager.scale_listener) |listener|
+        listener.membership_changed(listener.context, id, null);
 }
 
 fn membershipEvent(adapter: *Adapter, id: WayringCompositor.SurfaceId, is_enter: bool) void {

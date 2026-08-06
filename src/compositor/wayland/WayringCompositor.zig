@@ -44,6 +44,16 @@ pub const ViewportAttachResult = union(enum) {
     not_live,
     wrong_client,
 };
+pub const FractionalScaleHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+pub const FractionalScaleAttachResult = union(enum) {
+    attached: SurfaceId,
+    fractional_scale_exists,
+    not_live,
+    wrong_client,
+};
 
 /// Frontend-local delivery endpoint borrowed for one synchronous event fanout.
 /// Callers must not retain either pointer or use it after returning to the
@@ -201,6 +211,7 @@ const Surface = struct {
     pending_viewport: ViewportState = .{},
     current_viewport: ViewportState = .{},
     viewport_handler: ?ViewportHandler = null,
+    fractional_scale_handler: ?FractionalScaleHandler = null,
     current_source: ?render.SourceRect = null,
     source_cache_id: u64,
     next_source_version: u64 = 1,
@@ -623,6 +634,29 @@ pub fn attachViewport(self: *WayringCompositor, client: *server.Client, object_i
     };
     if (client.lookup(object_id)) |resource| if (resource.interface() == &core.wl_surface.interface) return .wrong_client;
     return .not_live;
+}
+
+pub fn attachFractionalScale(
+    self: *WayringCompositor,
+    client: *server.Client,
+    object_id: u32,
+    handler: FractionalScaleHandler,
+) FractionalScaleAttachResult {
+    const objects = self.findClient(client) orelse return .not_live;
+    for (objects.surfaces.items) |surface| if (surface.resource.id() == object_id and !surface.destroying) {
+        if (surface.fractional_scale_handler != null) return .fractional_scale_exists;
+        surface.fractional_scale_handler = handler;
+        return .{ .attached = surface.id };
+    };
+    if (client.lookup(object_id)) |resource| if (resource.interface() == &core.wl_surface.interface) return .wrong_client;
+    return .not_live;
+}
+
+pub fn detachFractionalScale(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque) void {
+    const surface = self.surfaceForId(id) orelse return;
+    const handler = surface.fractional_scale_handler orelse return;
+    if (handler.context != handler_context) return;
+    surface.fractional_scale_handler = null;
 }
 
 pub fn setViewportSource(
@@ -2370,6 +2404,10 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     surface.destroying = true;
     if (surface.viewport_handler) |handler| {
         surface.viewport_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (surface.fractional_scale_handler) |handler| {
+        surface.fractional_scale_handler = null;
         handler.surface_destroyed(handler.context);
     }
     if (surface.xdg_association) |association| {
