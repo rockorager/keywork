@@ -300,11 +300,7 @@ const OfferResource = struct {
 
     fn materialize(manager: *Self, id: OfferId, device: *DeviceResource) !*OfferResource {
         if (manager.offers.get(id)) |existing| return existing;
-        var info = manager.owner.offerInfo(id) orelse return error.InvalidOffer;
-        if (info.kind == .drag and device.resource.getVersion() < 3) {
-            try manager.owner.setOfferActions(id, .{ .copy = true }, .{ .copy = true });
-            info = manager.owner.offerInfo(id) orelse return error.InvalidOffer;
-        }
+        _ = manager.owner.offerInfo(id) orelse return error.InvalidOffer;
         const resource = try wl.DataOffer.create(device.resource.getClient(), device.resource.getVersion(), 0);
         errdefer resource.destroy();
         const self = manager.allocator.create(OfferResource) catch return error.OutOfMemory;
@@ -380,9 +376,10 @@ fn deviceSelection(context: *anyopaque, offer_id: ?OfferId) error{OutOfMemory}!v
     device.resource.sendSelection(offer.resource);
 }
 
-fn devicePrepareEnter(context: *anyopaque, offer_id: ?OfferId) error{OutOfMemory}!void {
+fn devicePrepareEnter(context: *anyopaque, offer_id: ?OfferId) error{OutOfMemory}!NeutralDataDevice.DragPreparation {
     const device: *DeviceResource = @ptrCast(@alignCast(context));
     if (offer_id) |id| _ = OfferResource.materialize(device.manager, id, device) catch return error.OutOfMemory;
+    return .{ .legacy_copy = offer_id != null and device.resource.getVersion() < 3 };
 }
 
 fn deviceEnter(context: *anyopaque, surface_id: SurfaceRegistry.Id, x: f64, y: f64, offer_id: ?OfferId) void {
@@ -707,4 +704,186 @@ fn iconCoordinate(position: f64, offset: i32) i32 {
 test "wire actions round trip through neutral actions" {
     const wire: wl.DataDeviceManager.DndAction = .{ .copy = true, .ask = true };
     try std.testing.expectEqual(@as(u32, @bitCast(wire)), @as(u32, @bitCast(toWireActions(fromWireActions(wire)))));
+}
+
+test "mature offer resources follow the exact neutral drag enter batch" {
+    const Fixture = struct {
+        const Provider = struct {
+            fn renderState(_: *anyopaque) ?SurfaceRegistry.RenderState {
+                return null;
+            }
+        };
+        const SourceEvents = struct {
+            actions: usize = 0,
+            copy_actions: usize = 0,
+
+            fn send(_: *anyopaque, _: []const u8, _: std.posix.fd_t) void {}
+            fn target(_: *anyopaque, _: ?[]const u8) void {}
+            fn action(context: *anyopaque, actions: NeutralDataDevice.Actions) void {
+                const self: *@This() = @ptrCast(@alignCast(context));
+                self.actions += 1;
+                if (actions.copy) self.copy_actions += 1;
+            }
+            fn notify(_: *anyopaque) void {}
+        };
+        const Endpoint = struct {
+            device: *DeviceResource,
+            fail_prepare: bool = false,
+
+            fn selection(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
+            fn prepare(context: *anyopaque, offer: ?OfferId) error{OutOfMemory}!NeutralDataDevice.DragPreparation {
+                const self: *@This() = @ptrCast(@alignCast(context));
+                const prepared = try devicePrepareEnter(self.device, offer);
+                if (self.fail_prepare) return error.OutOfMemory;
+                return prepared;
+            }
+            fn enter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) void {}
+            fn motion(_: *anyopaque, _: u32, _: f64, _: f64) void {}
+            fn notify(_: *anyopaque) void {}
+
+            fn neutral(self: *@This()) NeutralDataDevice.DeviceEndpoint {
+                return .{
+                    .context = self,
+                    .selection = selection,
+                    .drag_enter_prepare = prepare,
+                    .drag_enter = enter,
+                    .drag_motion = motion,
+                    .drag_leave = notify,
+                    .drag_drop = notify,
+                };
+            }
+        };
+
+        fn changed(_: *anyopaque) void {}
+        fn rolledBack(context: *anyopaque, offer: OfferId) void {
+            const manager: *Self = @ptrCast(@alignCast(context));
+            manager.neutralOfferRolledBack(offer);
+        }
+        fn sourceEndpoint(events: *SourceEvents) NeutralDataDevice.SourceEndpoint {
+            return .{
+                .context = events,
+                .send = SourceEvents.send,
+                .target = SourceEvents.target,
+                .action = SourceEvents.action,
+                .cancelled = SourceEvents.notify,
+                .drop_performed = SourceEvents.notify,
+                .finished = SourceEvents.notify,
+            };
+        }
+    };
+
+    const display = try wl.Server.create();
+    defer display.destroy();
+    var sockets: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &sockets),
+    );
+    defer _ = std.c.close(sockets[1]);
+    const protocol_client = wl.Client.create(display, sockets[0]) orelse return error.OutOfMemory;
+    defer protocol_client.destroy();
+
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    var authority = @import("../SeatAuthority.zig").init(std.testing.allocator, &clients, &surfaces);
+    defer authority.deinit();
+    var manager: Self = undefined;
+    var owner = NeutralDataDevice.init(std.testing.allocator, &clients, &surfaces, &authority, .{
+        .context = &manager,
+        .selection_changed = Fixture.changed,
+        .drag_changed = Fixture.changed,
+        .offer_rolled_back = Fixture.rolledBack,
+    });
+    defer owner.deinit();
+    manager = .{
+        .allocator = std.testing.allocator,
+        .display = display,
+        .global = undefined,
+        .seat = undefined,
+        .surface_store = undefined,
+        .listener = undefined,
+        .owner = &owner,
+    };
+    defer manager.offers.deinit(std.testing.allocator);
+    defer manager.devices.deinit(std.testing.allocator);
+    defer manager.sources.deinit(std.testing.allocator);
+
+    const first_resource = try wl.DataDevice.create(protocol_client, 2, 0);
+    defer first_resource.destroy();
+    const second_resource = try wl.DataDevice.create(protocol_client, 3, 0);
+    defer second_resource.destroy();
+    var first_device: DeviceResource = .{ .manager = &manager, .resource = first_resource };
+    var second_device: DeviceResource = .{ .manager = &manager, .resource = second_resource };
+    var first_endpoint: Fixture.Endpoint = .{ .device = &first_device };
+    var second_endpoint: Fixture.Endpoint = .{ .device = &second_device };
+
+    const source_client = try clients.register(.mature_display);
+    const target_client = try clients.register(.mature_display);
+    var provider: Fixture.Provider = .{};
+    const origin = try surfaces.add(.{ .context = &provider, .render_state = Fixture.Provider.renderState });
+    const target_a = try surfaces.add(.{ .context = &provider, .render_state = Fixture.Provider.renderState });
+    const target_b = try surfaces.add(.{ .context = &provider, .render_state = Fixture.Provider.renderState });
+    const target_c = try surfaces.add(.{ .context = &provider, .render_state = Fixture.Provider.renderState });
+    var source_events: Fixture.SourceEvents = .{};
+    const source_device = try owner.createDevice(source_client, first_endpoint.neutral());
+    first_device.id = try owner.createDevice(target_client, first_endpoint.neutral());
+    second_device.id = try owner.createDevice(target_client, second_endpoint.neutral());
+    const source = try owner.createSource(source_client, Fixture.sourceEndpoint(&source_events), .{
+        .actions = .{ .copy = true },
+        .actions_declared = true,
+    });
+    const serial: ClientRegistry.Serial = .{ .domain = .mature_display, .value = 17 };
+    try std.testing.expect(try authority.addPointerPress(source_client, serial, 1, origin));
+    const generation = try owner.startDrag(source_device, source, origin, null, serial, true);
+    try owner.enter(.{ .surface = target_a, .client = target_client, .x = 1, .y = 2 });
+    try owner.enter(.{ .surface = target_b, .client = target_client, .x = 3, .y = 4 });
+    try std.testing.expectEqual(@as(usize, 4), manager.offers.count());
+    try std.testing.expectEqual(@as(usize, 4), owner.resourceCounts().offers);
+    const baseline_actions = source_events.actions;
+    const baseline_copy_actions = source_events.copy_actions;
+
+    owner.failEnterStageAllocationAfterForTest(1);
+    try std.testing.expectError(error.OutOfMemory, owner.enter(.{ .surface = target_c, .client = target_client, .x = 5, .y = 6 }));
+    try std.testing.expectEqual(@as(usize, 4), manager.offers.count());
+    try std.testing.expectEqual(@as(usize, 4), owner.resourceCounts().offers);
+    try std.testing.expectEqual(target_b, owner.currentTarget().?.surface);
+
+    second_endpoint.fail_prepare = true;
+    try std.testing.expectError(error.OutOfMemory, owner.enter(.{ .surface = target_c, .client = target_client, .x = 5, .y = 6 }));
+    try std.testing.expectEqual(@as(usize, 4), manager.offers.count());
+    try std.testing.expectEqual(@as(usize, 4), owner.resourceCounts().offers);
+    try std.testing.expectEqual(baseline_actions, source_events.actions);
+    try std.testing.expectEqual(baseline_copy_actions, source_events.copy_actions);
+    try std.testing.expectEqual(target_b, owner.currentTarget().?.surface);
+    try std.testing.expectEqual(generation, owner.dragSourceInfo().?.generation);
+
+    second_endpoint.fail_prepare = false;
+    try owner.enter(.{ .surface = target_c, .client = target_client, .x = 7, .y = 8 });
+    try std.testing.expectEqual(@as(usize, 6), manager.offers.count());
+    try std.testing.expectEqual(@as(usize, 6), owner.resourceCounts().offers);
+    try std.testing.expectEqual(baseline_actions + 2, source_events.actions);
+    try std.testing.expectEqual(baseline_copy_actions + 1, source_events.copy_actions);
+    try std.testing.expectEqual(target_c, owner.currentTarget().?.surface);
+
+    owner.cancelDrag();
+    while (manager.offers.count() != 0) {
+        var offers = manager.offers.valueIterator();
+        offers.next().?.*.resource.destroy();
+    }
+    authority.clearPointerPresses();
+    authority.discardGrants();
+    surfaces.remove(target_c);
+    surfaces.remove(target_b);
+    surfaces.remove(target_a);
+    surfaces.remove(origin);
+    owner.clientDisconnected(target_client);
+    owner.clientDisconnected(source_client);
+    _ = authority.clientDisconnected(target_client);
+    _ = authority.clientDisconnected(source_client);
+    clients.unregister(target_client);
+    clients.unregister(source_client);
+    try std.testing.expectEqual(@as(usize, 0), manager.offers.count());
+    try std.testing.expectEqual(@as(usize, 0), owner.resourceCounts().offers);
 }
