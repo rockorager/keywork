@@ -798,7 +798,7 @@ fn prepareCommit(
 
 fn abortPreparedCommit(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
     const surface: *Surface = @ptrCast(@alignCast(context));
-    if (surface.prepared_events) |*prepared| surface.client.cancelPreparedEvents(prepared);
+    if (surface.prepared_events) |prepared| surface.client.cancelPreparedEvents(prepared);
     surface.prepared_events = null;
     surface.prepared_commit = null;
 }
@@ -913,7 +913,7 @@ fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
 }
 
 fn finishPreparedCommit(surface: *Surface) void {
-    if (surface.prepared_events) |*prepared| surface.client.cancelPreparedEvents(prepared);
+    if (surface.prepared_events) |prepared| surface.client.cancelPreparedEvents(prepared);
     surface.prepared_events = null;
     surface.prepared_commit = null;
 }
@@ -1045,7 +1045,7 @@ fn emitConfigure(
     events: []const server.Client.PreparedEvent,
     configure: Configure,
 ) error{OutOfMemory}!void {
-    const prepared = &surface.prepared_events.?;
+    const prepared = surface.prepared_events.?;
     surface.client.emitPreparedEvents(prepared, events) catch |err| {
         surface.client.cancelPreparedEvents(prepared);
         surface.prepared_events = null;
@@ -1058,7 +1058,7 @@ fn emitConfigure(
 }
 
 fn failPreparedConfigure(surface: *Surface, detail: []const u8) void {
-    if (surface.prepared_events) |*prepared| surface.client.cancelPreparedEvents(prepared);
+    if (surface.prepared_events) |prepared| surface.client.cancelPreparedEvents(prepared);
     surface.prepared_events = null;
     surface.client.postImplementationError(&surface.resource.runtime, detail);
 }
@@ -1155,7 +1155,7 @@ fn destroyToplevel(self: *WayringXdgShell, toplevel: *Toplevel, surface_gone: bo
 }
 
 fn destroySurface(self: *WayringXdgShell, surface: *Surface, surface_gone: bool) void {
-    if (surface.prepared_events) |*prepared| surface.client.cancelPreparedEvents(prepared);
+    if (surface.prepared_events) |prepared| surface.client.cancelPreparedEvents(prepared);
     surface.prepared_events = null;
     surface.prepared_commit = null;
     if (surface.active_role) |role| switch (role) {

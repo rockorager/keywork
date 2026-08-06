@@ -95,11 +95,13 @@ pub const XdgDirectCommit = struct {
 /// Stable callbacks borrowed by one live reservation. `validate` performs no
 /// allocation, does not mutate adapter pending/applied state, and does not
 /// reenter lifecycle, but rejection may synchronously mark the client fatal.
-/// `prepare` may allocate before validation; `abort_prepare` unwinds it on
-/// every non-publication path. All callbacks after validation are
-/// allocation-free. `post_apply` runs after the complete content/topology
-/// batch and presentation listener. `surface_destroyed` is called only after
-/// the association has already been invalidated.
+/// `prepare` may allocate before validation. Every prepare attempt that does
+/// not publish, including one that returns reject, is paired with exactly one
+/// `abort_prepare`; it must be idempotent and safely unwind absent or partial
+/// state. All callbacks after validation are allocation-free. `post_apply`
+/// runs after the complete content/topology batch and presentation listener.
+/// `surface_destroyed` is called only after the association has already been
+/// invalidated.
 pub const XdgCommitHandler = struct {
     context: *anyopaque,
     prepare: *const fn (*anyopaque, XdgDirectCommit) XdgCommitDecision,
@@ -1632,14 +1634,14 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
         .next_size = candidate.prepared.logical_size,
         .attachment_changed = candidate.prepared.attachment_changed,
     };
-    var xdg_prepared = false;
-    defer if (!published and xdg_prepared) {
+    var xdg_prepare_attempted = false;
+    defer if (!published and xdg_prepare_attempted) {
         const handler = xdg_handler.?;
         handler.abort_prepare(handler.context, surface.id);
     };
     if (xdg_handler) |handler| {
+        xdg_prepare_attempted = true;
         if (handler.prepare(handler.context, xdg_commit) == .reject) return;
-        xdg_prepared = true;
         if (handler.validate(handler.context, xdg_commit) == .reject) return;
     }
 
@@ -2807,10 +2809,12 @@ const TestPresentationListener = struct {
 const TestXdgCommitHandler = struct {
     preparations: usize = 0,
     preparation_aborts: usize = 0,
+    preparation_active: bool = false,
     validations: usize = 0,
     pre_unmaps: usize = 0,
     post_applies: usize = 0,
     surface_destroys: usize = 0,
+    prepare_decision: XdgCommitDecision = .accept,
     decision: XdgCommitDecision = .accept,
 
     fn handler(self: *@This()) XdgCommitHandler {
@@ -2827,13 +2831,16 @@ const TestXdgCommitHandler = struct {
 
     fn prepare(context: *anyopaque, _: XdgDirectCommit) XdgCommitDecision {
         const self: *@This() = @ptrCast(@alignCast(context));
+        std.debug.assert(!self.preparation_active);
+        self.preparation_active = true;
         self.preparations += 1;
-        return .accept;
+        return self.prepare_decision;
     }
 
     fn abortPrepare(context: *anyopaque, _: SurfaceId) void {
         const self: *@This() = @ptrCast(@alignCast(context));
         self.preparation_aborts += 1;
+        self.preparation_active = false;
     }
 
     fn validate(context: *anyopaque, _: XdgDirectCommit) XdgCommitDecision {
@@ -2849,6 +2856,8 @@ const TestXdgCommitHandler = struct {
 
     fn postApply(context: *anyopaque, _: SurfaceId) void {
         const self: *@This() = @ptrCast(@alignCast(context));
+        std.debug.assert(self.preparation_active);
+        self.preparation_active = false;
         self.post_applies += 1;
     }
 
@@ -5459,6 +5468,7 @@ test "prepared commit failures preserve all published surface state and reclaim 
             try std.testing.expectEqual(reaches_xdg_validation, xdg_handler.preparations);
             try std.testing.expectEqual(reaches_xdg_validation, xdg_handler.validations);
             try std.testing.expectEqual(reaches_xdg_validation, xdg_handler.preparation_aborts);
+            try std.testing.expect(!xdg_handler.preparation_active);
             try std.testing.expectEqual(@as(usize, 0), xdg_handler.pre_unmaps);
             try std.testing.expectEqual(@as(usize, 0), xdg_handler.post_applies);
             try std.testing.expect(compositor.hasXdgReservation(reservation));
@@ -5501,6 +5511,84 @@ test "prepared commit failures preserve all published surface state and reclaim 
         .access_end,
         .release_enqueue,
     }) |fault| try Case.run(fault);
+}
+
+test "XDG prepare rejection aborts partial preparation exactly once" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &surface_registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(
+        std.testing.allocator,
+        &host,
+        &surface_registry,
+        listener_state.listener(),
+    );
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try bindShm(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    const surface_id = compositor.surfaceId(client, 5).?;
+    const surface = compositor.surfaceForId(surface_id).?;
+    const pixels = [_]u32{ 0xff11_2233, 0xff44_5566 };
+    const fd = try memfdWithPixels(&pixels);
+    defer _ = std.c.close(fd);
+    try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
+    try createShmBuffer(client, 6, 7, 0, .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+    try createShmBuffer(client, 6, 8, @sizeOf(u32), .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+    try attachBuffer(client, 5, 7);
+    try commitSurfaceResource(client, 5);
+    const initial_release = try drain(client);
+    defer std.testing.allocator.free(initial_release);
+    try std.testing.expect(client.fatal() == null);
+
+    const reservation = try compositor.reserveXdgRoot(client, surface_id);
+    var xdg_handler: TestXdgCommitHandler = .{ .prepare_decision = .reject };
+    try compositor.attachXdgCommitHandler(reservation, xdg_handler.handler());
+    try std.testing.expectEqual(
+        XdgRoleAssignment.assigned,
+        try compositor.assignXdgRole(reservation, .toplevel),
+    );
+    try std.testing.expect(client.fatal() == null);
+    const content_before = compositor.currentBuffer(surface_id).?;
+    const sequence_before = surface.next_content_sequence;
+    const listener_before = listener_state.committed_count;
+    try setBufferTransform(client, 5, @intCast(core.wl_output.transform.@"90"));
+    try attachBuffer(client, 5, 8);
+    try std.testing.expect(surface.has_pending_attachment);
+
+    try commitSurfaceResource(client, 5);
+
+    try std.testing.expectEqual(@as(usize, 1), xdg_handler.preparations);
+    try std.testing.expectEqual(@as(usize, 1), xdg_handler.preparation_aborts);
+    try std.testing.expect(!xdg_handler.preparation_active);
+    try std.testing.expectEqual(@as(usize, 0), xdg_handler.validations);
+    try std.testing.expectEqual(@as(usize, 0), xdg_handler.pre_unmaps);
+    try std.testing.expectEqual(@as(usize, 0), xdg_handler.post_applies);
+    try std.testing.expect(!surface.has_pending_attachment);
+    try std.testing.expect(surface.pending_attachment == null);
+    try std.testing.expectEqual(sequence_before, surface.next_content_sequence);
+    try std.testing.expectEqual(content_before.pixels.ptr, compositor.currentBuffer(surface_id).?.pixels.ptr);
+    try std.testing.expectEqualSlices(u32, pixels[0..1], compositor.currentBuffer(surface_id).?.pixels);
+    try std.testing.expectEqual(listener_before, listener_state.committed_count);
+    try std.testing.expectEqual(render.BufferTransform.rotate_90, surface.pending_transform);
+    try std.testing.expectEqual(render.BufferTransform.normal, surface.current_transform);
+    try std.testing.expect(compositor.hasXdgReservation(reservation));
+    try std.testing.expectEqual(XdgRole.toplevel, compositor.permanentXdgRole(surface_id).?);
+    try std.testing.expect(client.fatal() == null);
+    const rejected_release = try drain(client);
+    defer std.testing.allocator.free(rejected_release);
+    try std.testing.expectEqual(@as(usize, 0), rejected_release.len);
 }
 
 test "scanner-backed release failure cleans pending attachment and preserves current pixels" {
@@ -5607,6 +5695,7 @@ test "scanner-backed release failure cleans pending attachment and preserves cur
     try std.testing.expectEqual(@as(usize, 1), xdg_handler.preparations);
     try std.testing.expectEqual(@as(usize, 1), xdg_handler.validations);
     try std.testing.expectEqual(@as(usize, 1), xdg_handler.preparation_aborts);
+    try std.testing.expect(!xdg_handler.preparation_active);
     try std.testing.expectEqual(@as(usize, 0), xdg_handler.pre_unmaps);
     try std.testing.expectEqual(@as(usize, 0), xdg_handler.post_applies);
     try std.testing.expect(compositor.hasXdgReservation(reservation));

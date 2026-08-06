@@ -289,7 +289,7 @@ pub fn prepareEvents(self: *Client, maximum_bytes: usize) !wire.PreparedBatch {
     return self.output.prepareBatch(maximum_bytes);
 }
 
-pub fn cancelPreparedEvents(self: *Client, prepared: *wire.PreparedBatch) void {
+pub fn cancelPreparedEvents(self: *Client, prepared: wire.PreparedBatch) void {
     self.output.cancelPreparedBatch(prepared);
 }
 
@@ -297,7 +297,7 @@ pub fn cancelPreparedEvents(self: *Client, prepared: *wire.PreparedBatch) void {
 /// allocation. Logging occurs only after the whole sequence is visible.
 pub fn emitPreparedEvents(
     self: *Client,
-    prepared: *wire.PreparedBatch,
+    prepared: wire.PreparedBatch,
     events: []const PreparedEvent,
 ) !void {
     if (self.fatal_state.recorded) return error.ClientFatal;
@@ -318,7 +318,7 @@ pub fn emitPreparedEvents(
         }
     }
 
-    var writer = std.Io.Writer.fixed(prepared.storage);
+    var writer = std.Io.Writer.fixed(try self.output.preparedBatchStorage(prepared));
     for (events) |event| try wire.encodePreparedMessage(
         &writer,
         event.resource.id(),
@@ -1175,14 +1175,14 @@ test "Client prepared events log only after the complete sequence is published" 
         .{ .resource = &resource, .opcode = 4, .descriptor = &second_event, .values = &.{.{ .uint = 12 }} },
     };
 
-    var too_small = try client.prepareEvents(12);
-    try std.testing.expectError(error.WriteFailed, client.emitPreparedEvents(&too_small, &events));
+    const too_small = try client.prepareEvents(12);
+    try std.testing.expectError(error.WriteFailed, client.emitPreparedEvents(too_small, &events));
     try std.testing.expectEqual(@as(usize, 0), log.count);
     try std.testing.expect((try client.beginSend()) == null);
-    client.cancelPreparedEvents(&too_small);
+    client.cancelPreparedEvents(too_small);
 
-    var prepared = try client.prepareEvents(24);
-    try client.emitPreparedEvents(&prepared, &events);
+    const prepared = try client.prepareEvents(24);
+    try client.emitPreparedEvents(prepared, &events);
     try std.testing.expectEqual(@as(usize, 2), log.count);
     try std.testing.expectEqualSlices(u16, &.{ 3, 4 }, &log.opcodes);
     const batch = (try client.beginSend()).?;
