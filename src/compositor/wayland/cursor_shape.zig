@@ -460,6 +460,13 @@ test "shape names use the standard Xcursor spelling" {
 test "version one excludes version two cursor shapes" {
     try std.testing.expectEqual(@intFromEnum(Shape.zoom_out), maximumShape(1));
     try std.testing.expectEqual(@intFromEnum(Shape.all_resize), maximumShape(2));
+    try std.testing.expect(!generatedShapeValid(0, 2));
+    try std.testing.expect(generatedShapeValid(@intFromEnum(Shape.zoom_out), 1));
+    try std.testing.expect(!generatedShapeValid(@intFromEnum(Shape.dnd_ask), 1));
+    try std.testing.expect(!generatedShapeValid(@intFromEnum(Shape.all_resize), 1));
+    try std.testing.expect(generatedShapeValid(@intFromEnum(Shape.dnd_ask), 2));
+    try std.testing.expect(generatedShapeValid(@intFromEnum(Shape.all_resize), 2));
+    try std.testing.expect(!generatedShapeValid(@intFromEnum(Shape.all_resize) + 1, 2));
 }
 
 test "cursor hotspots follow output image rescaling" {

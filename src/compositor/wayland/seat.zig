@@ -3253,7 +3253,8 @@ pub fn retireGeneratedClient(self: *Self, client: ClientRegistry.Id) bool {
     if (self.authority.clientDisconnected(client)) self.pointer_grab = null;
     if (self.active_cursor) |cursor| switch (cursor) {
         .generated => |generated| if (std.meta.eql(generated.client, client)) self.clearCursor(),
-        .surface, .shape => {},
+        .shape => |shape| if (std.meta.eql(shape.client, client)) self.clearCursor(),
+        .surface => {},
     };
     if (self.cursor_controller) |controller| {
         if (std.meta.eql(controller.client, client)) self.cursor_controller = null;
@@ -3492,6 +3493,40 @@ test "generated focus arbitration is allocation-free and generation-safe" {
         .client = stale_client,
     }, null));
     clients.unregister(current_client);
+}
+
+test "retiring a generated client immediately revokes its selected shape" {
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    const client = try clients.register(.wayring_server);
+    var pixel: [1]u32 = .{0xff000000};
+    var seat: Self = undefined;
+    seat.authority = SeatAuthority.init(std.testing.allocator, &clients, &surfaces);
+    defer seat.authority.deinit();
+    seat.generated_keyboard_focus = null;
+    seat.generated_keyboard_mature_fallback = null;
+    seat.pointer_focus = null;
+    seat.pointer_grab = null;
+    seat.active_cursor = .{ .shape = .{ .client = client, .image = .{
+        .buffer = .{
+            .pixels = &pixel,
+            .size = .{ .width = 1, .height = 1 },
+            .stride_pixels = 1,
+        },
+        .hotspot_x = 0,
+        .hotspot_y = 0,
+    } } };
+    seat.cursor_controller = null;
+    seat.drag_cursor_client = null;
+    seat.touch_points = .empty;
+    defer seat.touch_points.deinit(std.testing.allocator);
+    seat.repaint_listener = null;
+
+    try std.testing.expect(!seat.retireGeneratedClient(client));
+    try std.testing.expect(seat.active_cursor == null);
+    clients.unregister(client);
 }
 
 test "v10 repeated key event gate requires down key zero rate and recipient version" {
