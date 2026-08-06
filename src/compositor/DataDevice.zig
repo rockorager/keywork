@@ -389,6 +389,18 @@ pub fn selectionGeneration(self: *const DataDevice) u64 {
 pub fn hasSelection(self: *const DataDevice) bool {
     return self.selection != null;
 }
+pub const ResourceCounts = struct {
+    sources: usize,
+    devices: usize,
+    offers: usize,
+};
+pub fn resourceCounts(self: *const DataDevice) ResourceCounts {
+    return .{
+        .sources = self.sources.len(),
+        .devices = self.devices.len(),
+        .offers = self.offers.len(),
+    };
+}
 pub fn selectionMimeTypes(self: *const DataDevice) []const []u8 {
     const id = self.selection orelse return &.{};
     const source = self.sources.getConst(id) orelse return &.{};

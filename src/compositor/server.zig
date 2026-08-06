@@ -2,7 +2,9 @@
 
 const Self = @This();
 
+const builtin = @import("builtin");
 const std = @import("std");
+const libc = @cImport(@cInclude("stdlib.h"));
 const wayland = @import("wayland");
 const slot_map = @import("slot_map.zig");
 const presentation = @import("presentation.zig");
@@ -125,6 +127,24 @@ const c = @cImport({
 });
 const wl = wayland.server.wl;
 const log = std.log.scoped(.server);
+var expected_protocol_errors: if (builtin.is_test) std.atomic.Value(usize) else void =
+    if (builtin.is_test) .init(0) else {};
+
+fn expectProtocolErrorForTest() void {
+    if (!builtin.is_test) unreachable;
+    _ = expected_protocol_errors.fetchAdd(1, .acq_rel);
+}
+
+fn takeExpectedProtocolError() bool {
+    if (!builtin.is_test) return false;
+    var count = expected_protocol_errors.load(.acquire);
+    while (count != 0) {
+        if (expected_protocol_errors.cmpxchgWeak(count, count - 1, .acq_rel, .acquire)) |actual| {
+            count = actual;
+        } else return true;
+    }
+    return false;
+}
 
 fn logProtocolError(
     _: *wl.Server,
@@ -142,20 +162,37 @@ fn logProtocolError(
     const credentials = message.resource.getClient().getCredentials();
     const description = arguments[2].s orelse "unknown protocol error";
     const object: ?*wl.Resource = @ptrCast(arguments[0].o);
+    const expected = takeExpectedProtocolError();
     if (object) |resource| {
-        log.err("Wayland protocol error for pid {d}: {s}@{d} code {d}: {s}", .{
-            credentials.pid,
-            resource.getClass(),
-            resource.getId(),
-            arguments[1].u,
-            description,
-        });
+        if (expected)
+            log.warn("Wayland protocol error for pid {d}: {s}@{d} code {d}: {s}", .{
+                credentials.pid,
+                resource.getClass(),
+                resource.getId(),
+                arguments[1].u,
+                description,
+            })
+        else
+            log.err("Wayland protocol error for pid {d}: {s}@{d} code {d}: {s}", .{
+                credentials.pid,
+                resource.getClass(),
+                resource.getId(),
+                arguments[1].u,
+                description,
+            });
     } else {
-        log.err("Wayland protocol error for pid {d}: unknown object code {d}: {s}", .{
-            credentials.pid,
-            arguments[1].u,
-            description,
-        });
+        if (expected)
+            log.warn("Wayland protocol error for pid {d}: unknown object code {d}: {s}", .{
+                credentials.pid,
+                arguments[1].u,
+                description,
+            })
+        else
+            log.err("Wayland protocol error for pid {d}: unknown object code {d}: {s}", .{
+                credentials.pid,
+                arguments[1].u,
+                description,
+            });
     }
 }
 const linux_button_left = 0x110;
@@ -3791,6 +3828,25 @@ pub fn clientRegistry(self: *Self) *ClientRegistry {
 
 pub fn surfaceRegistry(self: *Self) *SurfaceRegistry {
     return &self.surface_registry;
+}
+
+pub const DataDeviceResourceSnapshot = struct {
+    neutral: NeutralDataDevice.ResourceCounts,
+    mature: WaylandDataDevice.ResourceCounts,
+    selection_generation: u64,
+    has_selection: bool,
+    dragging: bool,
+};
+
+/// Narrow resource and canonical-state snapshot for production protocol E2E tests.
+pub fn dataDeviceResourceSnapshot(self: *const Self) DataDeviceResourceSnapshot {
+    return .{
+        .neutral = self.data_device.resourceCounts(),
+        .mature = self.mature_data_device.resourceCounts(),
+        .selection_generation = self.data_device.selectionGeneration(),
+        .has_selection = self.data_device.hasSelection(),
+        .dragging = self.data_device.isDragging(),
+    };
 }
 
 /// Neutral XDG semantic owner used by unpublished generated adapters.
@@ -13206,6 +13262,280 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
     try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
 }
 
+test "production mature data device v3 serves two canonical socket clients" {
+    const linux = std.os.linux;
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/tmp/keywork-mature-data-device-{d}-{x}",
+        .{ linux.getpid(), @intFromPtr(&marker) },
+        0,
+    );
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS)
+        return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+    const previous_runtime = if (libc.getenv("XDG_RUNTIME_DIR")) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (previous_runtime) |value| {
+            _ = libc.setenv("XDG_RUNTIME_DIR", value, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = libc.unsetenv("XDG_RUNTIME_DIR");
+        }
+    }
+    if (libc.setenv("XDG_RUNTIME_DIR", runtime_directory, 1) != 0)
+        return error.RuntimeEnvironmentFailed;
+
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 640, .height = 480 }, .refresh_millihertz = 1 },
+    );
+    defer server.destroy();
+    const socket_name = try server.listen();
+    const output = server.primaryRenderOutput();
+    const surface_baseline = server.compositor.surfaceStore().len();
+    const registry_baseline = server.surface_registry.len();
+    const resource_baseline = server.dataDeviceResourceSnapshot();
+    try std.testing.expectEqual(
+        NeutralDataDevice.ResourceCounts{ .sources = 0, .devices = 0, .offers = 0 },
+        resource_baseline.neutral,
+    );
+    try std.testing.expectEqual(
+        WaylandDataDevice.ResourceCounts{ .sources = 0, .devices = 0, .offers = 0 },
+        resource_baseline.mature,
+    );
+    try std.testing.expect(!resource_baseline.has_selection and !resource_baseline.dragging);
+
+    const keymap_fd = try std.posix.memfd_create("keywork-mature-data-keymap", linux.MFD.CLOEXEC);
+    const keymap = "keymap\x00\x00";
+    if (linux.errno(linux.ftruncate(keymap_fd, keymap.len)) != .SUCCESS)
+        return error.KeymapResizeFailed;
+    if (std.c.pwrite(keymap_fd, keymap.ptr, keymap.len, 0) != keymap.len)
+        return error.KeymapWriteFailed;
+    server.seat.setKeymap(.xkb_v1, keymap_fd, keymap.len);
+    server.seat.setRepeatInfo(0, 500);
+    server.seat.setKeyboardAvailable(true);
+    server.seat.setPointerAvailable(true);
+
+    const raw_source_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    const raw_target_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_source_command) != .SUCCESS or linux.errno(raw_target_command) != .SUCCESS)
+        return error.EventFdFailed;
+    const source_command: std.posix.fd_t = @intCast(raw_source_command);
+    const target_command: std.posix.fd_t = @intCast(raw_target_command);
+    defer _ = linux.close(source_command);
+    defer _ = linux.close(target_command);
+    const fd_baseline = try countMatureDataDeviceFds();
+    var source: MatureDataDeviceClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = socket_name,
+        .command_fd = source_command,
+        .role = .source,
+    };
+    var target: MatureDataDeviceClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = socket_name,
+        .command_fd = target_command,
+        .role = .target,
+    };
+    const source_thread = try std.Thread.spawn(.{}, MatureDataDeviceClient.run, .{&source});
+    const target_thread = try std.Thread.spawn(.{}, MatureDataDeviceClient.run, .{&target});
+    var source_joined = false;
+    var target_joined = false;
+    defer if (!source_joined) {
+        source.shutdown();
+        source_thread.join();
+    };
+    defer if (!target_joined) {
+        target.shutdown();
+        target_thread.join();
+    };
+    try waitForMatureDataDeviceStage(server, &source, .ready);
+    try waitForMatureDataDeviceStage(server, &target, .ready);
+    try std.testing.expectEqual(@as(usize, 2), server.client_registry.len());
+
+    var source_surface: ?Surface.Id = null;
+    var target_surface: ?Surface.Id = null;
+    var surfaces = server.compositor.surfaceStore().iterator();
+    while (surfaces.next()) |entry| {
+        const state = server.surface_registry.renderState(entry.id) orelse continue;
+        if (state.buffer.pixels.len != 1) continue;
+        if (state.buffer.pixels[0] == 0xff22_4466) source_surface = entry.id;
+        if (state.buffer.pixels[0] == 0xff66_4422) target_surface = entry.id;
+    }
+    const source_id = source_surface orelse return error.SourceSurfaceMissing;
+    const target_id = target_surface orelse return error.TargetSurfaceMissing;
+    const source_scene = try server.scene.addShellSurface(source_id);
+    errdefer server.scene.removeShellSurface(source_scene);
+    const target_scene = try server.scene.addShellSurface(target_id);
+    errdefer server.scene.removeShellSurface(target_scene);
+    server.scene.setShellSurfacePosition(source_scene, .{ .x = 10, .y = 10 });
+    server.scene.setShellSurfacePosition(target_scene, .{ .x = 30, .y = 10 });
+    server.scene.setShellSurfaceMapped(source_scene, true);
+    server.scene.setShellSurfaceMapped(target_scene, true);
+
+    _ = server.seat.applyMatureKeyboardFocus(source_id);
+    try server.seat.parentKeyboardEnter(&.{});
+    pointerMotion(output, 10, 10.5, 10.5);
+    pointerFrame(output);
+    try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &source, .selection_set);
+    const selected = server.dataDeviceResourceSnapshot();
+    try std.testing.expect(selected.has_selection);
+    try std.testing.expect(target.offer == null);
+    try std.testing.expectEqual(@as(usize, 1), selected.neutral.sources);
+    try std.testing.expectEqual(@as(usize, 2), selected.neutral.devices);
+
+    _ = server.seat.applyMatureKeyboardFocus(target_id);
+    try server.seat.parentKeyboardEnter(&.{});
+    try signalWayringCommand(target_command);
+    try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &source, .selection_sent);
+    try waitForMatureDataDeviceStage(server, &target, .selection_received);
+    try std.testing.expect(source.eventIndex(.send).? < source.event_count);
+    try std.testing.expect(target.eventIndex(.data_offer).? < target.eventIndex(.offer_mime).?);
+    try std.testing.expect(target.eventIndex(.offer_mime).? < target.eventIndex(.selection).?);
+
+    try signalWayringCommand(target_command);
+    try waitForMatureDataDeviceStage(server, &target, .selection_replaced);
+    const replacement = server.dataDeviceResourceSnapshot();
+    try std.testing.expect(replacement.selection_generation > selected.selection_generation);
+    try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &source, .stale_clear_checked);
+    const after_stale_clear = server.dataDeviceResourceSnapshot();
+    try std.testing.expectEqual(replacement.selection_generation, after_stale_clear.selection_generation);
+    try std.testing.expect(after_stale_clear.has_selection);
+    try std.testing.expect(source.eventIndex(.send).? < source.eventIndex(.cancelled).?);
+
+    try signalWayringCommand(target_command);
+    try waitForMatureDataDeviceStage(server, &target, .selection_cleared);
+    try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &source, .selection_cleared);
+    const cleared = server.dataDeviceResourceSnapshot();
+    try std.testing.expect(!cleared.has_selection);
+    try std.testing.expect(cleared.selection_generation > replacement.selection_generation);
+
+    const source_drag_event_start = source.event_count;
+    const target_drag_event_start = target.event_count;
+    _ = server.seat.applyMatureKeyboardFocus(source_id);
+    try server.seat.parentKeyboardEnter(&.{});
+    pointerMotion(output, 20, 10.5, 10.5);
+    pointerButton(output, 21, linux_button_left, .pressed);
+    pointerFrame(output);
+    try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &source, .drag_started);
+    try std.testing.expect(server.dataDeviceResourceSnapshot().dragging);
+    try std.testing.expect(server.mature_data_device.iconInfo() != null);
+
+    pointerMotion(output, 22, 30.5, 10.5);
+    pointerFrame(output);
+    try signalWayringCommand(target_command);
+    try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &source, .drag_received);
+    try waitForMatureDataDeviceStage(server, &target, .drag_received);
+    const target_data_offer = target.eventIndexAfter(.data_offer, target_drag_event_start).?;
+    const target_offer_mime = target.eventIndexAfter(.offer_mime, target_drag_event_start).?;
+    const target_source_actions = target.eventIndexAfter(.source_actions, target_drag_event_start).?;
+    const target_enter = target.eventIndexAfter(.enter, target_drag_event_start).?;
+    const target_motion = target.eventIndexAfter(.motion, target_drag_event_start).?;
+    const target_action = target.eventIndexAfter(.action, target_drag_event_start).?;
+    try std.testing.expect(target_data_offer < target_offer_mime);
+    try std.testing.expect(target_offer_mime < target_source_actions);
+    try std.testing.expect(target_source_actions < target_action);
+    try std.testing.expect(target_action < target_enter);
+    try std.testing.expect(target_enter < target_motion);
+    const source_target = source.eventIndexAfter(.target, source_drag_event_start).?;
+    const source_action = source.eventIndexAfter(.action, source_drag_event_start).?;
+    const source_send = source.eventIndexAfter(.send, source_drag_event_start).?;
+    try std.testing.expect(source_action < source_target);
+    try std.testing.expect(source_target < source_send);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), target.enter_x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), target.enter_y, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), target.motion_x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), target.motion_y, 0.01);
+
+    const canonical_before_offender = server.dataDeviceResourceSnapshot();
+    const raw_offender_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_offender_command) != .SUCCESS) return error.EventFdFailed;
+    const offender_command: std.posix.fd_t = @intCast(raw_offender_command);
+    var offender_command_open = true;
+    defer if (offender_command_open) {
+        _ = linux.close(offender_command);
+    };
+    var offender: MatureDataDeviceClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = socket_name,
+        .command_fd = offender_command,
+        .role = .offender,
+    };
+    expectProtocolErrorForTest();
+    const offender_thread = try std.Thread.spawn(.{}, MatureDataDeviceClient.run, .{&offender});
+    try waitForMatureDataDeviceStage(server, &offender, .disconnected);
+    offender_thread.join();
+    try closeMatureTransferFd(offender_command);
+    offender_command_open = false;
+    for (0..1_000) |_| {
+        if (server.client_registry.len() == 2) break;
+        try server.eventLoop().dispatch(1);
+    } else return error.OffenderCleanupTimedOut;
+    try std.testing.expectEqual(canonical_before_offender, server.dataDeviceResourceSnapshot());
+
+    pointerButton(output, 23, linux_button_left, .released);
+    pointerFrame(output);
+    try signalWayringCommand(target_command);
+    try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &target, .drop_finished);
+    try waitForMatureDataDeviceStage(server, &source, .drop_finished);
+    try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &source, .source_finished);
+    const source_drop = source.eventIndexAfter(.drop_performed, source_drag_event_start).?;
+    const source_finished = source.eventIndexAfter(.finished, source_drag_event_start).?;
+    try std.testing.expect(source_send < source_drop);
+    try std.testing.expect(source_drop < source_finished);
+    try std.testing.expect(target.eventIndexAfter(.drop, target_drag_event_start).? <
+        target.eventIndexAfter(.leave, target_drag_event_start).?);
+
+    server.scene.setShellSurfaceMapped(target_scene, false);
+    server.scene.setShellSurfaceMapped(source_scene, false);
+    server.scene.removeShellSurface(target_scene);
+    server.scene.removeShellSurface(source_scene);
+    try signalWayringCommand(target_command);
+    try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &target, .disconnected);
+    try waitForMatureDataDeviceStage(server, &source, .disconnected);
+    target_thread.join();
+    target_joined = true;
+    source_thread.join();
+    source_joined = true;
+    for (0..2_000) |_| {
+        const snapshot = server.dataDeviceResourceSnapshot();
+        if (server.client_registry.len() == 0 and
+            server.compositor.surfaceStore().len() == surface_baseline and
+            snapshot.neutral.sources == 0 and snapshot.neutral.devices == 0 and
+            snapshot.neutral.offers == 0 and snapshot.mature.sources == 0 and
+            snapshot.mature.devices == 0 and snapshot.mature.offers == 0) break;
+        try server.eventLoop().dispatch(1);
+    } else return error.MatureDataDeviceCleanupTimedOut;
+    const final = server.dataDeviceResourceSnapshot();
+    try std.testing.expectEqual(resource_baseline.neutral, final.neutral);
+    try std.testing.expectEqual(resource_baseline.mature, final.mature);
+    try std.testing.expect(!final.has_selection and !final.dragging);
+    try std.testing.expect(final.selection_generation >= resource_baseline.selection_generation);
+    try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
+    try std.testing.expect(server.scene.topWindowSurface() == null);
+    try std.testing.expect(server.seat.matureKeyboardFocus() == null);
+    try std.testing.expect(server.mature_data_device.iconInfo() == null);
+    try std.testing.expectEqual(fd_baseline, try countMatureDataDeviceFds());
+}
+
 test "mature keyboard late bind reuses one logical enter serial and authority grant" {
     const KeyboardFocusProbe = struct {
         changes: usize = 0,
@@ -17242,6 +17572,428 @@ const WayringSeatClient = struct {
     }
 };
 
+const MatureDataDeviceClient = struct {
+    const client_wl = wayland.client.wl;
+    const Role = enum { source, target, offender };
+    const Stage = enum(u8) {
+        starting,
+        ready,
+        selection_set,
+        selection_sent,
+        selection_received,
+        selection_replaced,
+        stale_clear_checked,
+        selection_cleared,
+        drag_started,
+        drag_received,
+        drop_finished,
+        source_finished,
+        disconnected,
+        failed,
+    };
+    const EventTag = enum {
+        data_offer,
+        offer_mime,
+        source_actions,
+        action,
+        selection,
+        enter,
+        motion,
+        drop,
+        leave,
+        target,
+        send,
+        cancelled,
+        drop_performed,
+        finished,
+    };
+    const mime_type: [:0]const u8 = "text/plain;charset=utf-8";
+    const selection_bytes = "keywork mature clipboard\n";
+    const drag_bytes = "keywork mature drag\n";
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    role: Role,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    shm: ?*client_wl.Shm = null,
+    seat: ?*client_wl.Seat = null,
+    manager: ?*client_wl.DataDeviceManager = null,
+    surface_object_id: u32 = 0,
+    icon_object_id: u32 = 0,
+    keyboard_serial: u32 = 0,
+    pointer_serial: u32 = 0,
+    offer: ?*client_wl.DataOffer = null,
+    selection_source: ?*client_wl.DataSource = null,
+    drag_source: ?*client_wl.DataSource = null,
+    events: [48]EventTag = undefined,
+    event_count: usize = 0,
+    cancelled_count: usize = 0,
+    received: [64]u8 = undefined,
+    received_len: usize = 0,
+    enter_x: f64 = 0,
+    enter_y: f64 = 0,
+    motion_x: f64 = 0,
+    motion_y: f64 = 0,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}/{s}", .{ self.runtime_directory, self.display_name }, 0);
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        const manager = self.manager orelse return error.DataDeviceManagerMissing;
+        defer manager.release();
+        if (self.role == .offender) {
+            const source = try manager.createDataSource();
+            defer source.destroy();
+            source.setActions(@bitCast(@as(u32, 1 << 8)));
+            expectClientRoundtrip(display) catch return;
+            return error.ExpectedProtocolFailure;
+        }
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        defer compositor.destroy();
+        const shm = self.shm orelse return error.ShmMissing;
+        defer shm.release();
+        const seat = self.seat orelse return error.SeatMissing;
+        defer seat.release();
+        const pointer = try seat.getPointer();
+        defer pointer.release();
+        pointer.setListener(*@This(), pointerEvent, self);
+        const keyboard = try seat.getKeyboard();
+        defer keyboard.release();
+        keyboard.setListener(*@This(), keyboardEvent, self);
+        const device = try manager.getDataDevice(seat);
+        defer device.release();
+        device.setListener(*@This(), deviceEvent, self);
+        const surface = try compositor.createSurface();
+        self.surface_object_id = surface.getId();
+        defer surface.destroy();
+        const surface_buffer = try createMatureTestBuffer(shm, if (self.role == .source) 0xff22_4466 else 0xff66_4422);
+        defer surface_buffer.buffer.destroy();
+        defer surface_buffer.pool.destroy();
+        defer _ = std.os.linux.close(surface_buffer.fd);
+        surface.attach(surface_buffer.buffer, 0, 0);
+        surface.damageBuffer(0, 0, 1, 1);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        try self.pause(.ready);
+
+        switch (self.role) {
+            .source => try self.runSource(display, manager, device, compositor, shm, surface),
+            .target => try self.runTarget(display, manager, device),
+            .offender => unreachable,
+        }
+    }
+
+    fn runSource(
+        self: *@This(),
+        display: *client_wl.Display,
+        manager: *client_wl.DataDeviceManager,
+        device: *client_wl.DataDevice,
+        compositor: *client_wl.Compositor,
+        shm: *client_wl.Shm,
+        surface: *client_wl.Surface,
+    ) !void {
+        try expectClientRoundtrip(display);
+        if (self.keyboard_serial == 0) return error.SelectionSerialMissing;
+        const selection = try manager.createDataSource();
+        self.selection_source = selection;
+        defer selection.destroy();
+        selection.setListener(*@This(), sourceEvent, self);
+        selection.offer(mime_type);
+        device.setSelection(selection, self.keyboard_serial);
+        try expectClientRoundtrip(display);
+        try self.pause(.selection_set);
+
+        while (self.eventCount(.send) == 0) try expectClientRoundtrip(display);
+        try self.pause(.selection_sent);
+
+        try expectClientRoundtrip(display);
+        if (self.cancelled_count != 1) return error.SelectionCancellationMissing;
+        device.setSelection(null, self.keyboard_serial);
+        try expectClientRoundtrip(display);
+        try self.pause(.stale_clear_checked);
+
+        try expectClientRoundtrip(display);
+        try self.pause(.selection_cleared);
+
+        try expectClientRoundtrip(display);
+        if (self.pointer_serial == 0) return error.DragSerialMissing;
+        const drag = try manager.createDataSource();
+        self.drag_source = drag;
+        defer drag.destroy();
+        drag.setListener(*@This(), sourceEvent, self);
+        drag.offer(mime_type);
+        drag.setActions(.{ .copy = true });
+        const icon = try compositor.createSurface();
+        self.icon_object_id = icon.getId();
+        defer icon.destroy();
+        const icon_buffer = try createMatureTestBuffer(shm, 0xff33_aa55);
+        defer icon_buffer.buffer.destroy();
+        defer icon_buffer.pool.destroy();
+        defer _ = std.os.linux.close(icon_buffer.fd);
+        icon.attach(icon_buffer.buffer, 0, 0);
+        icon.damageBuffer(0, 0, 1, 1);
+        icon.commit();
+        device.startDrag(drag, surface, icon, self.pointer_serial);
+        try expectClientRoundtrip(display);
+        try self.pause(.drag_started);
+
+        while (self.eventCount(.send) < 2) try expectClientRoundtrip(display);
+        try self.pause(.drag_received);
+        try expectClientRoundtrip(display);
+        if (eventIndex(self, .drop_performed) == null) return error.DropPerformedMissing;
+        try self.pause(.drop_finished);
+        try expectClientRoundtrip(display);
+        if (eventIndex(self, .finished) == null) return error.FinishedMissing;
+        try self.pause(.source_finished);
+    }
+
+    fn runTarget(self: *@This(), display: *client_wl.Display, manager: *client_wl.DataDeviceManager, device: *client_wl.DataDevice) !void {
+        try expectClientRoundtrip(display);
+        const selection_offer = self.offer orelse return error.SelectionOfferMissing;
+        var pipe_fds: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
+        var read_open = true;
+        defer {
+            if (read_open) _ = std.os.linux.close(pipe_fds[0]);
+        }
+        selection_offer.receive(mime_type, pipe_fds[1]);
+        try closeMatureTransferFd(pipe_fds[1]);
+        try expectClientRoundtrip(display);
+        self.received_len = try readMatureTransfer(pipe_fds[0], &self.received);
+        try closeMatureTransferFd(pipe_fds[0]);
+        read_open = false;
+        if (!std.mem.eql(u8, self.received[0..self.received_len], selection_bytes)) return error.SelectionBytesMismatch;
+        try self.pause(.selection_received);
+
+        if (self.keyboard_serial == 0) return error.ReplacementSerialMissing;
+        const replacement = try manager.createDataSource();
+        defer replacement.destroy();
+        replacement.setListener(*@This(), sourceEvent, self);
+        replacement.offer(mime_type);
+        device.setSelection(replacement, self.keyboard_serial);
+        try expectClientRoundtrip(display);
+        try self.pause(.selection_replaced);
+        try expectClientRoundtrip(display);
+        device.setSelection(null, self.keyboard_serial);
+        try expectClientRoundtrip(display);
+        if (self.cancelled_count != 1) return error.ReplacementCancellationMissing;
+        try self.pause(.selection_cleared);
+
+        try expectClientRoundtrip(display);
+        const drag_offer = self.offer orelse return error.DragOfferMissing;
+        drag_offer.setActions(.{ .copy = true }, .{ .copy = true });
+        drag_offer.accept(self.pointer_serial, mime_type);
+        var drag_pipe: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&drag_pipe) != 0) return error.PipeFailed;
+        var drag_read_open = true;
+        defer {
+            if (drag_read_open) _ = std.os.linux.close(drag_pipe[0]);
+        }
+        drag_offer.receive(mime_type, drag_pipe[1]);
+        try closeMatureTransferFd(drag_pipe[1]);
+        try expectClientRoundtrip(display);
+        self.received_len = try readMatureTransfer(drag_pipe[0], &self.received);
+        try closeMatureTransferFd(drag_pipe[0]);
+        drag_read_open = false;
+        if (!std.mem.eql(u8, self.received[0..self.received_len], drag_bytes)) return error.DragBytesMismatch;
+        try self.pause(.drag_received);
+        try expectClientRoundtrip(display);
+        if (eventIndex(self, .drop) == null or eventIndex(self, .leave) == null) return error.DropChronologyMissing;
+        drag_offer.finish();
+        try expectClientRoundtrip(display);
+        try self.pause(.drop_finished);
+    }
+
+    const TestBuffer = struct {
+        fd: std.posix.fd_t,
+        pool: *client_wl.ShmPool,
+        buffer: *client_wl.Buffer,
+    };
+
+    fn createMatureTestBuffer(shm: *client_wl.Shm, pixel: u32) !TestBuffer {
+        const fd = try std.posix.memfd_create("keywork-mature-data-device", std.os.linux.MFD.CLOEXEC);
+        errdefer _ = std.os.linux.close(fd);
+        if (std.os.linux.errno(std.os.linux.ftruncate(fd, @sizeOf(u32))) != .SUCCESS) return error.ShmResizeFailed;
+        if (std.c.pwrite(fd, @ptrCast(&pixel), @sizeOf(u32), 0) != @sizeOf(u32)) return error.ShmWriteFailed;
+        const pool = try shm.createPool(fd, @sizeOf(u32));
+        errdefer pool.destroy();
+        return .{ .fd = fd, .pool = pool, .buffer = try pool.createBuffer(0, 1, 1, @sizeOf(u32), .argb8888) };
+    }
+
+    fn append(self: *@This(), tag: EventTag) void {
+        if (self.event_count == self.events.len) return;
+        self.events[self.event_count] = tag;
+        self.event_count += 1;
+    }
+    fn eventIndex(self: *const @This(), tag: EventTag) ?usize {
+        for (self.events[0..self.event_count], 0..) |event, index| if (event == tag) return index;
+        return null;
+    }
+    fn eventIndexAfter(self: *const @This(), tag: EventTag, start: usize) ?usize {
+        for (self.events[start..self.event_count], start..) |event, index| if (event == tag) return index;
+        return null;
+    }
+    fn eventCount(self: *const @This(), tag: EventTag) usize {
+        var count: usize = 0;
+        for (self.events[0..self.event_count]) |event| if (event == tag) {
+            count += 1;
+        };
+        return count;
+    }
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null else if (std.mem.eql(u8, interface, "wl_data_device_manager")) self.manager = registry.bind(global.name, client_wl.DataDeviceManager, 3) catch null;
+            },
+            .global_remove => {},
+        }
+    }
+    fn keyboardEvent(_: *client_wl.Keyboard, event: client_wl.Keyboard.Event, self: *@This()) void {
+        switch (event) {
+            .keymap => |keymap| _ = std.os.linux.close(keymap.fd),
+            .enter => |enter| self.keyboard_serial = enter.serial,
+            else => {},
+        }
+    }
+    fn pointerEvent(_: *client_wl.Pointer, event: client_wl.Pointer.Event, self: *@This()) void {
+        switch (event) {
+            .enter => |enter| self.pointer_serial = enter.serial,
+            .button => |button| if (button.state == .pressed) {
+                self.pointer_serial = button.serial;
+            },
+            else => {},
+        }
+    }
+    fn deviceEvent(_: *client_wl.DataDevice, event: client_wl.DataDevice.Event, self: *@This()) void {
+        switch (event) {
+            .data_offer => |data| {
+                self.append(.data_offer);
+                self.offer = data.id;
+                data.id.setListener(*@This(), offerEvent, self);
+            },
+            .selection => self.append(.selection),
+            .enter => |enter| {
+                self.pointer_serial = enter.serial;
+                self.offer = enter.id;
+                self.enter_x = enter.x.toDouble();
+                self.enter_y = enter.y.toDouble();
+                self.append(.enter);
+            },
+            .motion => |motion| {
+                self.motion_x = motion.x.toDouble();
+                self.motion_y = motion.y.toDouble();
+                self.append(.motion);
+            },
+            .drop => self.append(.drop),
+            .leave => self.append(.leave),
+        }
+    }
+    fn offerEvent(_: *client_wl.DataOffer, event: client_wl.DataOffer.Event, self: *@This()) void {
+        switch (event) {
+            .offer => self.append(.offer_mime),
+            .source_actions => self.append(.source_actions),
+            .action => self.append(.action),
+        }
+    }
+    fn sourceEvent(_: *client_wl.DataSource, event: client_wl.DataSource.Event, self: *@This()) void {
+        switch (event) {
+            .target => self.append(.target),
+            .send => |send| {
+                self.append(.send);
+                const bytes = if (self.drag_source != null) drag_bytes else selection_bytes;
+                std.debug.assert(std.c.write(send.fd, bytes.ptr, bytes.len) == bytes.len);
+                closeMatureTransferFd(send.fd) catch unreachable;
+            },
+            .cancelled => {
+                self.cancelled_count += 1;
+                self.append(.cancelled);
+            },
+            .dnd_drop_performed => self.append(.drop_performed),
+            .dnd_finished => self.append(.finished),
+            .action => self.append(.action),
+        }
+    }
+    fn pause(self: *@This(), stage_value: Stage) !void {
+        self.stage.store(@intFromEnum(stage_value), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+    fn closeWake(self: *@This(), shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(-2, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+    fn shutdown(self: *@This()) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
+fn readMatureTransfer(fd: std.posix.fd_t, buffer: []u8) !usize {
+    var offset: usize = 0;
+    while (offset < buffer.len) {
+        const result = std.c.read(fd, buffer.ptr + offset, buffer.len - offset);
+        if (result > 0) {
+            offset += @intCast(result);
+            continue;
+        }
+        if (result == 0) return offset;
+        if (std.posix.errno(result) == .INTR) continue;
+        return error.TransferReadFailed;
+    }
+    return error.TransferTooLarge;
+}
+
+fn closeMatureTransferFd(fd: std.posix.fd_t) !void {
+    if (std.os.linux.errno(std.os.linux.close(fd)) != .SUCCESS) return error.TransferCloseFailed;
+    const result = std.c.fcntl(fd, std.posix.F.GETFD);
+    if (result != -1 or std.posix.errno(result) != .BADF)
+        return error.TransferFdStillOpen;
+}
+
+fn countMatureDataDeviceFds() !usize {
+    var directory = try std.Io.Dir.openDirAbsolute(std.testing.io, "/proc/self/fd", .{ .iterate = true });
+    defer directory.close(std.testing.io);
+    var iterator = directory.iterate();
+    var count: usize = 0;
+    while (try iterator.next(std.testing.io)) |_| count += 1;
+    return count;
+}
+
 const MatureKeyboardClient = struct {
     const client_wl = wayland.client.wl;
     const Stage = enum(u8) {
@@ -17644,6 +18396,21 @@ fn waitForMatureKeyboardStage(
         server.display.flushClients();
     }
     return error.MatureKeyboardClientTimedOut;
+}
+
+fn waitForMatureDataDeviceStage(
+    server: *Self,
+    client: *MatureDataDeviceClient,
+    expected: MatureDataDeviceClient.Stage,
+) !void {
+    for (0..2_000) |_| {
+        const stage: MatureDataDeviceClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure.?;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+    }
+    return error.MatureDataDeviceClientTimedOut;
 }
 
 fn wayringSurfaceWithPixel(server: *Self, pixel: u32) ?SurfaceRegistry.Id {
