@@ -127,23 +127,61 @@ const c = @cImport({
 });
 const wl = wayland.server.wl;
 const log = std.log.scoped(.server);
-var expected_protocol_errors: if (builtin.is_test) std.atomic.Value(usize) else void =
-    if (builtin.is_test) .init(0) else {};
+const ExpectedProtocolError = struct {
+    client: *wl.Client,
+    interface: []const u8,
+    object_id: u32,
+    code: u32,
+    matches: usize = 0,
+    wrong_identity: bool = false,
+};
+var expected_protocol_error: if (builtin.is_test) ?ExpectedProtocolError else void =
+    if (builtin.is_test) null else {};
 
-fn expectProtocolErrorForTest() void {
+fn expectProtocolErrorForTest(client: *wl.Client, interface: []const u8, object_id: u32, code: u32) void {
     if (!builtin.is_test) unreachable;
-    _ = expected_protocol_errors.fetchAdd(1, .acq_rel);
+    std.debug.assert(expected_protocol_error == null);
+    expected_protocol_error = .{
+        .client = client,
+        .interface = interface,
+        .object_id = object_id,
+        .code = code,
+    };
 }
 
-fn takeExpectedProtocolError() bool {
+fn matchExpectedProtocolError(client: *wl.Client, object: ?*wl.Resource, code: u32) bool {
     if (!builtin.is_test) return false;
-    var count = expected_protocol_errors.load(.acquire);
-    while (count != 0) {
-        if (expected_protocol_errors.cmpxchgWeak(count, count - 1, .acq_rel, .acquire)) |actual| {
-            count = actual;
-        } else return true;
+    const expected = &(expected_protocol_error orelse return false);
+    if (client != expected.client) {
+        expected.wrong_identity = true;
+        return false;
     }
-    return false;
+    const resource = object orelse {
+        expected.wrong_identity = true;
+        return false;
+    };
+    if (resource.getClient() != expected.client or resource.getId() != expected.object_id or
+        code != expected.code or !std.mem.eql(u8, std.mem.span(resource.getClass()), expected.interface))
+    {
+        expected.wrong_identity = true;
+        return false;
+    }
+    expected.matches += 1;
+    return expected.matches == 1;
+}
+
+fn finishExpectedProtocolErrorForTest() !void {
+    if (!builtin.is_test) unreachable;
+    const expected = expected_protocol_error orelse return error.ExpectedProtocolErrorMissing;
+    expected_protocol_error = null;
+    if (expected.wrong_identity) return error.ExpectedProtocolErrorIdentityMismatch;
+    if (expected.matches == 0) return error.ExpectedProtocolErrorMissing;
+    if (expected.matches != 1) return error.ExpectedProtocolErrorDuplicated;
+}
+
+fn clearExpectedProtocolErrorForTest() void {
+    if (!builtin.is_test) unreachable;
+    expected_protocol_error = null;
 }
 
 fn logProtocolError(
@@ -159,10 +197,11 @@ fn logProtocolError(
         return;
     }
     const arguments = message.arguments orelse return;
-    const credentials = message.resource.getClient().getCredentials();
+    const client = message.resource.getClient();
+    const credentials = client.getCredentials();
     const description = arguments[2].s orelse "unknown protocol error";
     const object: ?*wl.Resource = @ptrCast(arguments[0].o);
-    const expected = takeExpectedProtocolError();
+    const expected = matchExpectedProtocolError(client, object, arguments[1].u);
     if (object) |resource| {
         if (expected)
             log.warn("Wayland protocol error for pid {d}: {s}@{d} code {d}: {s}", .{
@@ -1546,6 +1585,7 @@ pub fn createWithVirtualOutput(
             .selection_changed = dataDeviceSelectionChanged,
             .drag_changed = dataDeviceDragChanged,
             .mime_offered = dataDeviceMimeOffered,
+            .offer_rolled_back = dataDeviceOfferRolledBack,
             .offer_mime_offered = dataDeviceOfferMimeOffered,
             .offer_source_actions_changed = dataDeviceOfferSourceActionsChanged,
             .offer_action_changed = dataDeviceOfferActionChanged,
@@ -7572,6 +7612,11 @@ fn dataDeviceMimeOffered(context: *anyopaque, source: NeutralDataDevice.SourceId
     self.data_control.neutralMimeOffered(source, mime_type);
 }
 
+fn dataDeviceOfferRolledBack(context: *anyopaque, offer: NeutralDataDevice.OfferId) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.mature_data_device.neutralOfferRolledBack(offer);
+}
+
 fn dataDeviceOfferMimeOffered(context: *anyopaque, offer: NeutralDataDevice.OfferId, mime_type: []const u8) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.mature_data_device.neutralOfferMime(offer, mime_type);
@@ -13393,6 +13438,16 @@ test "production mature data device v3 serves two canonical socket clients" {
     try std.testing.expect(target.offer == null);
     try std.testing.expectEqual(@as(usize, 1), selected.neutral.sources);
     try std.testing.expectEqual(@as(usize, 2), selected.neutral.devices);
+    try signalWayringCommand(target_command);
+    try waitForMatureDataDeviceStage(server, &target, .control_selection_ready);
+    try std.testing.expect(target.offer == null);
+    try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &source, .late_mime_offered);
+    try signalWayringCommand(target_command);
+    try waitForMatureDataDeviceStage(server, &target, .late_mime_received);
+    try std.testing.expect(target.controlEventIndex(.data_offer).? < target.controlEventIndex(.initial_mime).?);
+    try std.testing.expect(target.controlEventIndex(.initial_mime).? < target.controlEventIndex(.selection).?);
+    try std.testing.expect(target.controlEventIndex(.selection).? < target.controlEventIndex(.late_mime).?);
 
     _ = server.seat.applyMatureKeyboardFocus(target_id);
     try server.seat.parentKeyboardEnter(&.{});
@@ -13408,6 +13463,11 @@ test "production mature data device v3 serves two canonical socket clients" {
     try waitForMatureDataDeviceStage(server, &target, .selection_replaced);
     const replacement = server.dataDeviceResourceSnapshot();
     try std.testing.expect(replacement.selection_generation > selected.selection_generation);
+    try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &source, .stale_mime_offered);
+    try signalWayringCommand(target_command);
+    try waitForMatureDataDeviceStage(server, &target, .stale_mime_checked);
+    try std.testing.expect(!target.control_stale_mime_seen);
     try signalWayringCommand(source_command);
     try waitForMatureDataDeviceStage(server, &source, .stale_clear_checked);
     const after_stale_clear = server.dataDeviceResourceSnapshot();
@@ -13431,9 +13491,17 @@ test "production mature data device v3 serves two canonical socket clients" {
     pointerButton(output, 21, linux_button_left, .pressed);
     pointerFrame(output);
     try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &source, .drag_rejected);
+    try std.testing.expect(!server.dataDeviceResourceSnapshot().dragging);
+    try std.testing.expect(server.mature_data_device.iconInfo() == null);
+    try signalWayringCommand(source_command);
     try waitForMatureDataDeviceStage(server, &source, .drag_started);
     try std.testing.expect(server.dataDeviceResourceSnapshot().dragging);
     try std.testing.expect(server.mature_data_device.iconInfo() != null);
+    try signalWayringCommand(source_command);
+    try waitForMatureDataDeviceStage(server, &source, .icon_destroyed);
+    try std.testing.expect(server.dataDeviceResourceSnapshot().dragging);
+    try std.testing.expect(server.mature_data_device.iconInfo() == null);
 
     pointerMotion(output, 22, 30.5, 10.5);
     pointerFrame(output);
@@ -13476,8 +13544,13 @@ test "production mature data device v3 serves two canonical socket clients" {
         .command_fd = offender_command,
         .role = .offender,
     };
-    expectProtocolErrorForTest();
     const offender_thread = try std.Thread.spawn(.{}, MatureDataDeviceClient.run, .{&offender});
+    try waitForMatureDataDeviceStage(server, &offender, .offender_ready);
+    const offender_identity = server.mature_data_device.uniqueUnboundProtocolSourceIdentity(offender.source_object_id) orelse
+        return error.OffenderSourceIdentityMissing;
+    expectProtocolErrorForTest(offender_identity.client, "wl_data_source", offender_identity.object_id, 0);
+    defer clearExpectedProtocolErrorForTest();
+    try signalWayringCommand(offender_command);
     try waitForMatureDataDeviceStage(server, &offender, .disconnected);
     offender_thread.join();
     try closeMatureTransferFd(offender_command);
@@ -13486,6 +13559,7 @@ test "production mature data device v3 serves two canonical socket clients" {
         if (server.client_registry.len() == 2) break;
         try server.eventLoop().dispatch(1);
     } else return error.OffenderCleanupTimedOut;
+    try finishExpectedProtocolErrorForTest();
     try std.testing.expectEqual(canonical_before_offender, server.dataDeviceResourceSnapshot());
 
     pointerButton(output, 23, linux_button_left, .released);
@@ -17574,20 +17648,29 @@ const WayringSeatClient = struct {
 
 const MatureDataDeviceClient = struct {
     const client_wl = wayland.client.wl;
+    const client_ext = wayland.client.ext;
     const Role = enum { source, target, offender };
     const Stage = enum(u8) {
         starting,
         ready,
         selection_set,
+        control_selection_ready,
+        late_mime_offered,
+        late_mime_received,
         selection_sent,
         selection_received,
         selection_replaced,
+        stale_mime_offered,
+        stale_mime_checked,
         stale_clear_checked,
         selection_cleared,
+        drag_rejected,
         drag_started,
+        icon_destroyed,
         drag_received,
         drop_finished,
         source_finished,
+        offender_ready,
         disconnected,
         failed,
     };
@@ -17607,7 +17690,10 @@ const MatureDataDeviceClient = struct {
         drop_performed,
         finished,
     };
+    const ControlEventTag = enum { data_offer, initial_mime, selection, late_mime };
     const mime_type: [:0]const u8 = "text/plain;charset=utf-8";
+    const late_mime_type: [:0]const u8 = "text/html";
+    const stale_mime_type: [:0]const u8 = "application/x-keywork-stale";
     const selection_bytes = "keywork mature clipboard\n";
     const drag_bytes = "keywork mature drag\n";
 
@@ -17622,10 +17708,16 @@ const MatureDataDeviceClient = struct {
     shm: ?*client_wl.Shm = null,
     seat: ?*client_wl.Seat = null,
     manager: ?*client_wl.DataDeviceManager = null,
+    control_manager: ?*client_ext.DataControlManagerV1 = null,
+    control_device: ?*client_ext.DataControlDeviceV1 = null,
+    control_pending_offer: ?*client_ext.DataControlOfferV1 = null,
+    control_selection_offer: ?*client_ext.DataControlOfferV1 = null,
     surface_object_id: u32 = 0,
     icon_object_id: u32 = 0,
+    source_object_id: u32 = 0,
     keyboard_serial: u32 = 0,
     pointer_serial: u32 = 0,
+    pointer_enter_serial: u32 = 0,
     offer: ?*client_wl.DataOffer = null,
     selection_source: ?*client_wl.DataSource = null,
     drag_source: ?*client_wl.DataSource = null,
@@ -17638,6 +17730,9 @@ const MatureDataDeviceClient = struct {
     enter_y: f64 = 0,
     motion_x: f64 = 0,
     motion_y: f64 = 0,
+    control_events: [16]ControlEventTag = undefined,
+    control_event_count: usize = 0,
+    control_stale_mime_seen: bool = false,
 
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
@@ -17674,9 +17769,14 @@ const MatureDataDeviceClient = struct {
         try expectClientRoundtrip(display);
         const manager = self.manager orelse return error.DataDeviceManagerMissing;
         defer manager.release();
+        const control_manager = self.control_manager;
+        defer if (control_manager) |value| value.destroy();
         if (self.role == .offender) {
             const source = try manager.createDataSource();
             defer source.destroy();
+            self.source_object_id = source.getId();
+            try expectClientRoundtrip(display);
+            try self.pause(.offender_ready);
             source.setActions(@bitCast(@as(u32, 1 << 8)));
             expectClientRoundtrip(display) catch return;
             return error.ExpectedProtocolFailure;
@@ -17687,6 +17787,13 @@ const MatureDataDeviceClient = struct {
         defer shm.release();
         const seat = self.seat orelse return error.SeatMissing;
         defer seat.release();
+        defer if (self.control_device) |device| device.destroy();
+        if (self.role == .target) {
+            const control = control_manager orelse return error.DataControlManagerMissing;
+            const device = try control.getDataDevice(seat);
+            self.control_device = device;
+            device.setListener(*@This(), controlDeviceEvent, self);
+        }
         const pointer = try seat.getPointer();
         defer pointer.release();
         pointer.setListener(*@This(), pointerEvent, self);
@@ -17694,7 +17801,8 @@ const MatureDataDeviceClient = struct {
         defer keyboard.release();
         keyboard.setListener(*@This(), keyboardEvent, self);
         const device = try manager.getDataDevice(seat);
-        defer device.release();
+        var device_live = true;
+        defer if (device_live) device.release();
         device.setListener(*@This(), deviceEvent, self);
         const surface = try compositor.createSurface();
         self.surface_object_id = surface.getId();
@@ -17710,8 +17818,8 @@ const MatureDataDeviceClient = struct {
         try self.pause(.ready);
 
         switch (self.role) {
-            .source => try self.runSource(display, manager, device, compositor, shm, surface),
-            .target => try self.runTarget(display, manager, device),
+            .source => try self.runSource(display, manager, device, pointer, compositor, shm, surface),
+            .target => try self.runTarget(display, manager, seat, device, &device_live),
             .offender => unreachable,
         }
     }
@@ -17721,6 +17829,7 @@ const MatureDataDeviceClient = struct {
         display: *client_wl.Display,
         manager: *client_wl.DataDeviceManager,
         device: *client_wl.DataDevice,
+        pointer: *client_wl.Pointer,
         compositor: *client_wl.Compositor,
         shm: *client_wl.Shm,
         surface: *client_wl.Surface,
@@ -17735,12 +17844,18 @@ const MatureDataDeviceClient = struct {
         device.setSelection(selection, self.keyboard_serial);
         try expectClientRoundtrip(display);
         try self.pause(.selection_set);
+        selection.offer(late_mime_type);
+        try expectClientRoundtrip(display);
+        try self.pause(.late_mime_offered);
 
         while (self.eventCount(.send) == 0) try expectClientRoundtrip(display);
         try self.pause(.selection_sent);
 
         try expectClientRoundtrip(display);
         if (self.cancelled_count != 1) return error.SelectionCancellationMissing;
+        selection.offer(stale_mime_type);
+        try expectClientRoundtrip(display);
+        try self.pause(.stale_mime_offered);
         device.setSelection(null, self.keyboard_serial);
         try expectClientRoundtrip(display);
         try self.pause(.stale_clear_checked);
@@ -17756,9 +17871,17 @@ const MatureDataDeviceClient = struct {
         drag.setListener(*@This(), sourceEvent, self);
         drag.offer(mime_type);
         drag.setActions(.{ .copy = true });
+        const conflicting_icon = try compositor.createSurface();
+        defer conflicting_icon.destroy();
+        pointer.setCursor(self.pointer_enter_serial, conflicting_icon, 0, 0);
+        try expectClientRoundtrip(display);
+        device.startDrag(drag, surface, conflicting_icon, self.pointer_serial +% 1);
+        try expectClientRoundtrip(display);
+        try self.pause(.drag_rejected);
         const icon = try compositor.createSurface();
         self.icon_object_id = icon.getId();
-        defer icon.destroy();
+        var icon_live = true;
+        defer if (icon_live) icon.destroy();
         const icon_buffer = try createMatureTestBuffer(shm, 0xff33_aa55);
         defer icon_buffer.buffer.destroy();
         defer icon_buffer.pool.destroy();
@@ -17769,6 +17892,10 @@ const MatureDataDeviceClient = struct {
         device.startDrag(drag, surface, icon, self.pointer_serial);
         try expectClientRoundtrip(display);
         try self.pause(.drag_started);
+        icon.destroy();
+        icon_live = false;
+        try expectClientRoundtrip(display);
+        try self.pause(.icon_destroyed);
 
         while (self.eventCount(.send) < 2) try expectClientRoundtrip(display);
         try self.pause(.drag_received);
@@ -17780,9 +17907,26 @@ const MatureDataDeviceClient = struct {
         try self.pause(.source_finished);
     }
 
-    fn runTarget(self: *@This(), display: *client_wl.Display, manager: *client_wl.DataDeviceManager, device: *client_wl.DataDevice) !void {
+    fn runTarget(
+        self: *@This(),
+        display: *client_wl.Display,
+        manager: *client_wl.DataDeviceManager,
+        seat: *client_wl.Seat,
+        selection_device: *client_wl.DataDevice,
+        selection_device_live: *bool,
+    ) !void {
+        try expectClientRoundtrip(display);
+        if (self.controlEventIndex(.data_offer) == null or self.controlEventIndex(.initial_mime) == null or
+            self.controlEventIndex(.selection) == null) return error.ControlSelectionChronologyMissing;
+        try self.pause(.control_selection_ready);
+        try expectClientRoundtrip(display);
+        if (self.controlEventIndex(.late_mime) == null) return error.ControlLateMimeMissing;
+        try self.pause(.late_mime_received);
         try expectClientRoundtrip(display);
         const selection_offer = self.offer orelse return error.SelectionOfferMissing;
+        selection_device.release();
+        selection_device_live.* = false;
+        try expectClientRoundtrip(display);
         var pipe_fds: [2]std.posix.fd_t = undefined;
         if (std.c.pipe(&pipe_fds) != 0) return error.PipeFailed;
         var read_open = true;
@@ -17798,6 +17942,11 @@ const MatureDataDeviceClient = struct {
         if (!std.mem.eql(u8, self.received[0..self.received_len], selection_bytes)) return error.SelectionBytesMismatch;
         try self.pause(.selection_received);
 
+        const device = try manager.getDataDevice(seat);
+        var device_live = true;
+        defer if (device_live) device.release();
+        device.setListener(*@This(), deviceEvent, self);
+        try expectClientRoundtrip(display);
         if (self.keyboard_serial == 0) return error.ReplacementSerialMissing;
         const replacement = try manager.createDataSource();
         defer replacement.destroy();
@@ -17807,6 +17956,8 @@ const MatureDataDeviceClient = struct {
         try expectClientRoundtrip(display);
         try self.pause(.selection_replaced);
         try expectClientRoundtrip(display);
+        if (self.control_stale_mime_seen) return error.ControlStaleMimeForwarded;
+        try self.pause(.stale_mime_checked);
         device.setSelection(null, self.keyboard_serial);
         try expectClientRoundtrip(display);
         if (self.cancelled_count != 1) return error.ReplacementCancellationMissing;
@@ -17832,6 +17983,9 @@ const MatureDataDeviceClient = struct {
         try self.pause(.drag_received);
         try expectClientRoundtrip(display);
         if (eventIndex(self, .drop) == null or eventIndex(self, .leave) == null) return error.DropChronologyMissing;
+        device.release();
+        device_live = false;
+        try expectClientRoundtrip(display);
         drag_offer.finish();
         try expectClientRoundtrip(display);
         try self.pause(.drop_finished);
@@ -17873,11 +18027,20 @@ const MatureDataDeviceClient = struct {
         };
         return count;
     }
+    fn appendControl(self: *@This(), tag: ControlEventTag) void {
+        if (self.control_event_count == self.control_events.len) return;
+        self.control_events[self.control_event_count] = tag;
+        self.control_event_count += 1;
+    }
+    fn controlEventIndex(self: *const @This(), tag: ControlEventTag) ?usize {
+        for (self.control_events[0..self.control_event_count], 0..) |event, index| if (event == tag) return index;
+        return null;
+    }
     fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
         switch (event) {
             .global => |global| {
                 const interface = std.mem.span(global.interface);
-                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null else if (std.mem.eql(u8, interface, "wl_data_device_manager")) self.manager = registry.bind(global.name, client_wl.DataDeviceManager, 3) catch null;
+                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null else if (std.mem.eql(u8, interface, "wl_data_device_manager")) self.manager = registry.bind(global.name, client_wl.DataDeviceManager, 3) catch null else if (std.mem.eql(u8, interface, "ext_data_control_manager_v1")) self.control_manager = registry.bind(global.name, client_ext.DataControlManagerV1, 1) catch null;
             },
             .global_remove => {},
         }
@@ -17891,7 +18054,10 @@ const MatureDataDeviceClient = struct {
     }
     fn pointerEvent(_: *client_wl.Pointer, event: client_wl.Pointer.Event, self: *@This()) void {
         switch (event) {
-            .enter => |enter| self.pointer_serial = enter.serial,
+            .enter => |enter| {
+                self.pointer_serial = enter.serial;
+                self.pointer_enter_serial = enter.serial;
+            },
             .button => |button| if (button.state == .pressed) {
                 self.pointer_serial = button.serial;
             },
@@ -17945,6 +18111,31 @@ const MatureDataDeviceClient = struct {
             .dnd_drop_performed => self.append(.drop_performed),
             .dnd_finished => self.append(.finished),
             .action => self.append(.action),
+        }
+    }
+    fn controlDeviceEvent(_: *client_ext.DataControlDeviceV1, event: client_ext.DataControlDeviceV1.Event, self: *@This()) void {
+        switch (event) {
+            .data_offer => |data| {
+                self.control_pending_offer = data.id;
+                data.id.setListener(*@This(), controlOfferEvent, self);
+                self.appendControl(.data_offer);
+            },
+            .selection => |selection| {
+                self.control_selection_offer = selection.id;
+                self.control_pending_offer = null;
+                if (selection.id != null) self.appendControl(.selection);
+            },
+            .primary_selection, .finished => {},
+        }
+    }
+    fn controlOfferEvent(_: *client_ext.DataControlOfferV1, event: client_ext.DataControlOfferV1.Event, self: *@This()) void {
+        switch (event) {
+            .offer => |offer| {
+                const mime = std.mem.span(offer.mime_type);
+                if (std.mem.eql(u8, mime, mime_type)) self.appendControl(.initial_mime);
+                if (std.mem.eql(u8, mime, late_mime_type)) self.appendControl(.late_mime);
+                if (std.mem.eql(u8, mime, stale_mime_type)) self.control_stale_mime_seen = true;
+            },
         }
     }
     fn pause(self: *@This(), stage_value: Stage) !void {

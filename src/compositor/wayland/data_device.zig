@@ -28,6 +28,7 @@ sources: std.AutoHashMapUnmanaged(SourceId, *SourceResource) = .empty,
 devices: std.AutoHashMapUnmanaged(DeviceId, *DeviceResource) = .empty,
 offers: std.AutoHashMapUnmanaged(OfferId, *OfferResource) = .empty,
 drag_icon: ?*DragIcon = null,
+drag_origin: ?*DragOrigin = null,
 drag_was_active: bool = false,
 enter_serial: u32 = 0,
 
@@ -81,6 +82,7 @@ pub fn init(
 pub fn deinit(self: *Self) void {
     self.seat.removeKeyboardFocusListener(self);
     self.global.destroy();
+    self.clearDragOrigin();
     self.clearDragIcon();
     std.debug.assert(self.sources.count() == 0);
     std.debug.assert(self.devices.count() == 0);
@@ -108,7 +110,10 @@ fn managerRequest(resource: *wl.DataDeviceManager, request: wl.DataDeviceManager
                 createInertDevice(resource.getClient(), resource.getVersion(), get.id) catch resource.postNoMemory();
                 return;
             }
-            DeviceResource.create(self, resource.getClient(), resource.getVersion(), get.id) catch resource.postNoMemory();
+            DeviceResource.create(self, resource.getClient(), resource.getVersion(), get.id) catch |err| switch (err) {
+                error.NoMemoryPosted => {},
+                else => resource.postNoMemory(),
+            };
         },
     }
 }
@@ -186,15 +191,18 @@ const DeviceResource = struct {
         errdefer manager.allocator.destroy(self);
         self.* = .{ .manager = manager, .resource = resource };
         const client_id = manager.seat.matureClientId(client) orelse return error.OutOfMemory;
-        self.id = try manager.owner.createDevice(client_id, .{
+        self.id = manager.owner.createDevice(client_id, .{
             .context = self,
             .selection = deviceSelection,
             .drag_enter = deviceEnter,
             .drag_motion = deviceMotion,
             .drag_leave = deviceLeave,
             .drag_drop = deviceDrop,
-        });
-        errdefer manager.owner.destroyDevice(self.id);
+        }) catch {
+            resource.postNoMemory();
+            return error.NoMemoryPosted;
+        };
+        errdefer manager.rollbackDeviceCreation(self.id);
         try manager.devices.put(manager.allocator, self.id, self);
         resource.setHandler(*DeviceResource, request, destroyed, self);
     }
@@ -210,6 +218,7 @@ const DeviceResource = struct {
     fn setSelection(self: *DeviceResource, source_resource: ?*wl.DataSource, serial: u32) void {
         const source_id = self.manager.sourceId(source_resource) orelse if (source_resource != null) return else null;
         self.manager.owner.setSelection(self.id, source_id, matureSerial(serial)) catch |err| switch (err) {
+            error.OutOfMemory => self.resource.postNoMemory(),
             error.SourceAlreadyUsed => self.resource.postError(.used_source, "data source was already used"),
             error.InvalidSource => if (source_resource) |source| source.postError(.invalid_source, "drag-and-drop source used for selection"),
             else => {},
@@ -220,33 +229,60 @@ const DeviceResource = struct {
         const manager = self.manager;
         if (origin_resource.getClient() != self.resource.getClient()) return;
         const source_id = manager.sourceId(source_resource) orelse if (source_resource != null) return else null;
-        const origin = Surface.fromResource(origin_resource).handle();
-        var icon: ?NeutralDataDevice.DragIcon = null;
-        var adapter_icon: ?*DragIcon = null;
-        if (icon_resource) |wire_icon| {
+        const origin_surface = Surface.fromResource(origin_resource);
+        const origin = origin_surface.handle();
+        const icon_surface = if (icon_resource) |wire_icon| blk: {
             if (wire_icon.getClient() != self.resource.getClient()) return;
-            adapter_icon = DragIcon.create(manager, Surface.fromResource(wire_icon)) catch |err| {
+            break :blk Surface.fromResource(wire_icon);
+        } else null;
+        const icon: ?NeutralDataDevice.DragIcon = if (icon_surface) |surface| .{ .surface = surface.handle() } else null;
+        manager.owner.validateDragStart(
+            self.id,
+            source_id,
+            origin,
+            icon,
+            matureSerial(serial),
+            source_resource != null and source_resource.?.getVersion() >= 3,
+        ) catch |err| {
+            self.handleStartError(source_resource, err);
+            return;
+        };
+        var adapter_icon: ?*DragIcon = null;
+        if (icon_surface) |surface| {
+            adapter_icon = DragIcon.create(manager, surface) catch |err| {
                 if (err == error.OutOfMemory) self.resource.postNoMemory() else self.resource.postError(.role, "drag icon surface already has another role");
                 return;
             };
-            icon = .{ .surface = adapter_icon.?.surface_id };
         }
+        const adapter_origin = DragOrigin.create(manager, origin_surface) catch {
+            if (adapter_icon) |value| value.destroy();
+            self.resource.postNoMemory();
+            return;
+        };
         manager.drag_icon = adapter_icon;
+        manager.drag_origin = adapter_origin;
         manager.seat.setDragCursorController(self.resource.getClient());
         _ = manager.owner.startDrag(self.id, source_id, origin, icon, matureSerial(serial), source_resource != null and source_resource.?.getVersion() >= 3) catch |err| {
             manager.drag_icon = null;
+            manager.drag_origin = null;
             manager.seat.setDragCursorController(null);
+            adapter_origin.destroy();
             if (adapter_icon) |value| value.destroy();
-            switch (err) {
-                error.MissingActions, error.InvalidSource => if (source_resource) |source| source.postError(.invalid_source, "drag-and-drop actions were not set"),
-                error.SourceAlreadyUsed => self.resource.postError(.used_source, "data source was already used"),
-                else => {},
-            }
+            self.handleStartError(source_resource, err);
             return;
         };
     }
 
+    fn handleStartError(self: *DeviceResource, source_resource: ?*wl.DataSource, err: NeutralDataDevice.Error) void {
+        switch (err) {
+            error.MissingActions, error.InvalidSource => if (source_resource) |source| source.postError(.invalid_source, "drag-and-drop actions were not set"),
+            error.SourceAlreadyUsed => self.resource.postError(.used_source, "data source was already used"),
+            else => {},
+        }
+    }
+
     fn destroyed(_: *wl.DataDevice, self: *DeviceResource) void {
+        self.manager.detachOffersFromDevice(self);
         _ = self.manager.devices.remove(self.id);
         self.manager.owner.destroyDevice(self.id);
         self.manager.allocator.destroy(self);
@@ -257,6 +293,7 @@ const OfferResource = struct {
     manager: *Self,
     resource: *wl.DataOffer,
     id: OfferId,
+    device: ?*DeviceResource,
     enter_serial: u32,
 
     fn materialize(manager: *Self, id: OfferId, device: *DeviceResource) !*OfferResource {
@@ -272,7 +309,7 @@ const OfferResource = struct {
         errdefer resource.destroy();
         const self = manager.allocator.create(OfferResource) catch return error.OutOfMemory;
         errdefer manager.allocator.destroy(self);
-        self.* = .{ .manager = manager, .resource = resource, .id = id, .enter_serial = manager.enter_serial };
+        self.* = .{ .manager = manager, .resource = resource, .id = id, .device = device, .enter_serial = manager.enter_serial };
         try manager.offers.put(manager.allocator, id, self);
         resource.setHandler(*OfferResource, request, destroyed, self);
         device.resource.sendDataOffer(resource);
@@ -324,29 +361,24 @@ const OfferResource = struct {
     }
 };
 
-fn deviceSelection(context: *anyopaque, offer_id: ?OfferId) void {
+fn deviceSelection(context: *anyopaque, offer_id: ?OfferId) error{OutOfMemory}!void {
     const device: *DeviceResource = @ptrCast(@alignCast(context));
-    const offer = materializeForDevice(device, offer_id) orelse {
+    const offer_id_value = offer_id orelse {
         device.resource.sendSelection(null);
         return;
     };
+    const offer = OfferResource.materialize(device.manager, offer_id_value, device) catch return error.OutOfMemory;
     device.resource.sendSelection(offer.resource);
 }
 
-fn deviceEnter(context: *anyopaque, surface_id: SurfaceRegistry.Id, x: f64, y: f64, offer_id: ?OfferId) void {
+fn deviceEnter(context: *anyopaque, surface_id: SurfaceRegistry.Id, x: f64, y: f64, offer_id: ?OfferId) error{OutOfMemory}!void {
     const device: *DeviceResource = @ptrCast(@alignCast(context));
     const surface = Surface.resourceFor(device.manager.surface_store, surface_id) orelse return;
-    const offer = materializeForDevice(device, offer_id);
+    const offer = if (offer_id) |id| OfferResource.materialize(device.manager, id, device) catch {
+        device.manager.rollbackEndpointMaterialization(device);
+        return error.OutOfMemory;
+    } else null;
     device.resource.sendEnter(device.manager.enter_serial, surface, fixed(x), fixed(y), if (offer) |value| value.resource else null);
-}
-
-fn materializeForDevice(device: *DeviceResource, id: ?OfferId) ?*OfferResource {
-    const offer_id = id orelse return null;
-    return OfferResource.materialize(device.manager, offer_id, device) catch {
-        device.resource.postNoMemory();
-        device.manager.owner.destroyOffer(offer_id);
-        return null;
-    };
 }
 
 fn deviceMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
@@ -393,12 +425,16 @@ fn sourceFinished(context: *anyopaque) void {
 
 fn keyboardFocusChanged(context: *anyopaque, client: ?*wl.Client) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.owner.setFocus(if (client) |value| self.seat.matureClientId(value) else null) catch {};
+    self.owner.setFocus(if (client) |value| self.seat.matureClientId(value) else null) catch |err| switch (err) {
+        error.OutOfMemory => if (client) |value| value.postNoMemory(),
+        else => {},
+    };
 }
 pub fn neutralDragChanged(self: *Self) void {
     const active = self.owner.isDragging();
     if (active and !self.drag_was_active) self.listener.started(self.listener.context);
     if (!active and self.drag_was_active) {
+        self.clearDragOrigin();
         self.clearDragIcon();
         self.seat.setDragCursorController(null);
         self.listener.ended(self.listener.context);
@@ -433,12 +469,19 @@ fn updateTarget(self: *Self, focus: ?Seat.PointerFocus) void {
         return;
     };
     self.enter_serial = MatureSerials.issueWire(self.display);
-    self.owner.enter(.{ .surface = target.surface_id, .client = client, .x = target.x, .y = target.y }) catch {};
+    self.owner.enter(.{ .surface = target.surface_id, .client = client, .x = target.x, .y = target.y }) catch |err| switch (err) {
+        error.OutOfMemory => if (Surface.resourceFor(self.surface_store, target.surface_id)) |surface| surface.getClient().postNoMemory(),
+        else => {},
+    };
 }
 
 pub fn neutralOfferMime(self: *Self, id: OfferId, mime: []const u8) void {
     const offer = self.offers.get(id) orelse return;
     offer.resource.sendOffer(@ptrCast(mime.ptr));
+}
+pub fn neutralOfferRolledBack(self: *Self, id: OfferId) void {
+    const offer = self.offers.get(id) orelse return;
+    offer.resource.destroy();
 }
 pub fn neutralOfferSourceActions(self: *Self, id: OfferId, actions: NeutralDataDevice.Actions) void {
     const offer = self.offers.get(id) orelse return;
@@ -483,6 +526,30 @@ pub fn sourceId(self: *Self, resource: ?*wl.DataSource) ?SourceId {
     return adapter.id;
 }
 
+pub const ProtocolSourceIdentity = struct {
+    client: *wl.Client,
+    object_id: u32,
+};
+
+pub fn uniqueUnboundProtocolSourceIdentity(self: *const Self, object_id: u32) ?ProtocolSourceIdentity {
+    var found: ?ProtocolSourceIdentity = null;
+    var sources = self.sources.valueIterator();
+    while (sources.next()) |entry| {
+        const source = entry.*;
+        if (source.resource.getId() != object_id) continue;
+        var has_device = false;
+        var devices = self.devices.valueIterator();
+        while (devices.next()) |device| if (device.*.resource.getClient() == source.resource.getClient()) {
+            has_device = true;
+            break;
+        };
+        if (has_device) continue;
+        if (found != null) return null;
+        found = .{ .client = source.resource.getClient(), .object_id = object_id };
+    }
+    return found;
+}
+
 pub fn setToplevelDragHandler(self: *Self, resource: *wl.DataSource, handler: ToplevelDragHandler) error{InvalidSource}!void {
     const id = self.sourceId(resource) orelse return error.InvalidSource;
     self.owner.setToplevelDragHandler(id, handler) catch return error.InvalidSource;
@@ -524,15 +591,100 @@ const DragIcon = struct {
     }
     fn surfaceDestroyed(context: *anyopaque) void {
         const self: *DragIcon = @ptrCast(@alignCast(context));
+        self.manager.owner.surfaceDestroyed(self.surface_id);
         self.manager.drag_icon = null;
         self.manager.allocator.destroy(self);
-        self.manager.listener.repaint(self.manager.listener.context);
     }
 };
 fn clearDragIcon(self: *Self) void {
     const icon = self.drag_icon orelse return;
     self.drag_icon = null;
     icon.destroy();
+}
+
+const DragOrigin = struct {
+    manager: *Self,
+    surface: *Surface,
+    surface_id: Surface.Id,
+    listener: Surface.CommitListener,
+
+    fn create(manager: *Self, surface: *Surface) !*DragOrigin {
+        const self = manager.allocator.create(DragOrigin) catch return error.OutOfMemory;
+        errdefer manager.allocator.destroy(self);
+        self.* = .{
+            .manager = manager,
+            .surface = surface,
+            .surface_id = surface.handle(),
+            .listener = .{
+                .context = self,
+                .applied = applied,
+                .surface_destroyed = surfaceDestroyed,
+            },
+        };
+        try surface.addCommitListener(&self.listener);
+        return self;
+    }
+
+    fn destroy(self: *DragOrigin) void {
+        self.surface.removeCommitListener(&self.listener);
+        self.manager.allocator.destroy(self);
+    }
+
+    fn applied(_: *anyopaque) void {}
+
+    fn surfaceDestroyed(context: *anyopaque) void {
+        const self: *DragOrigin = @ptrCast(@alignCast(context));
+        const manager = self.manager;
+        const surface_id = self.surface_id;
+        self.surface.removeCommitListener(&self.listener);
+        manager.drag_origin = null;
+        manager.allocator.destroy(self);
+        manager.owner.surfaceDestroyed(surface_id);
+    }
+};
+
+fn clearDragOrigin(self: *Self) void {
+    const origin = self.drag_origin orelse return;
+    self.drag_origin = null;
+    origin.destroy();
+}
+
+fn rollbackDeviceCreation(self: *Self, id: DeviceId) void {
+    while (true) {
+        var doomed: ?*OfferResource = null;
+        var offers = self.offers.valueIterator();
+        while (offers.next()) |entry| {
+            const offer = entry.*;
+            const info = self.owner.offerInfo(offer.id) orelse continue;
+            if (info.device != null and std.meta.eql(info.device.?, id)) {
+                doomed = offer;
+                break;
+            }
+        }
+        const offer = doomed orelse break;
+        offer.resource.destroy();
+    }
+    self.owner.destroyDevice(id);
+}
+
+fn detachOffersFromDevice(self: *Self, device: *DeviceResource) void {
+    var offers = self.offers.valueIterator();
+    while (offers.next()) |entry| {
+        if (entry.*.device == device) entry.*.device = null;
+    }
+}
+
+fn rollbackEndpointMaterialization(self: *Self, device: *DeviceResource) void {
+    while (true) {
+        var doomed: ?*OfferResource = null;
+        var offers = self.offers.valueIterator();
+        while (offers.next()) |entry| if (entry.*.device == device) {
+            doomed = entry.*;
+            break;
+        };
+        const offer = doomed orelse return;
+        offer.resource.destroy();
+    }
 }
 
 fn matureSerial(value: u32) ClientRegistry.Serial {
