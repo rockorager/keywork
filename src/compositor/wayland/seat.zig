@@ -806,6 +806,22 @@ pub fn activationSurfaceFocused(self: *const Self, surface_id: Surface.Id) bool 
     return false;
 }
 
+/// Generated counterpart to activationSurfaceFocused. The two frontends keep
+/// distinct resource identity while consulting the same canonical focus state.
+pub fn generatedActivationSurfaceFocused(self: *const Self, surface_id: Surface.Id) bool {
+    if (self.generated_keyboard_focus) |focus| {
+        if (std.meta.eql(focus.surface, surface_id)) return true;
+    }
+    if (self.pointer_focus) |focus| {
+        if (focus.generated != null and std.meta.eql(focus.surface_id, surface_id)) return true;
+    }
+    for (self.touch_points.items) |point| {
+        const target = point.target orelse continue;
+        if (target.generated_root != null and std.meta.eql(target.surface_id, surface_id)) return true;
+    }
+    return false;
+}
+
 pub fn acceptsClientUserActionSerial(self: *const Self, client: *wl.Client, serial: u32) bool {
     const client_id = self.matureClient(client) orelse return false;
     return self.authority.acceptsAction(client_id, MatureSerials.fromWire(serial));
@@ -3602,6 +3618,8 @@ test "generated focus cannot prove mature focus for an equal surface id" {
     try std.testing.expect(seat.maturePointerFocus() == null);
     try std.testing.expect(seat.keyboardDeliverySurfaceId() == null);
     try std.testing.expect(!seat.activationSurfaceFocused(surface_id));
+    try std.testing.expect(seat.generatedActivationSurfaceFocused(surface_id));
+    try std.testing.expect(!seat.generatedActivationSurfaceFocused(.{ .index = 9, .generation = 9 }));
     try std.testing.expect(seat.warpPointer(surface_id, 1, 2) == null);
     const unused_handle: PointerHandle = .{ .resource = undefined, .generation = 1 };
     try std.testing.expect(!seat.acceptsPointerEnterSerial(unused_handle, surface_id, 7));

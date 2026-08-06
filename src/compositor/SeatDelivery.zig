@@ -79,6 +79,12 @@ pub const RequestSink = struct {
         ClientRegistry.Id,
         ClientRegistry.Serial,
     ) bool = rejectsAction,
+    accepts_activation: *const fn (
+        *anyopaque,
+        ClientRegistry.Id,
+        ClientRegistry.Serial,
+    ) bool = rejectsAction,
+    activation_surface_focused: *const fn (*anyopaque, SurfaceRegistry.Id) bool = rejectsFocused,
     set_cursor: *const fn (*anyopaque, CursorRequest) CursorRequestResult,
     set_shape: *const fn (*anyopaque, ShapeRequest) bool = rejectsShape,
     cursor_committed: *const fn (*anyopaque, SurfaceRegistry.Id, i32, i32) void,
@@ -87,6 +93,10 @@ pub const RequestSink = struct {
 };
 
 fn rejectsShape(_: *anyopaque, _: ShapeRequest) bool {
+    return false;
+}
+
+fn rejectsFocused(_: *anyopaque, _: SurfaceRegistry.Id) bool {
     return false;
 }
 

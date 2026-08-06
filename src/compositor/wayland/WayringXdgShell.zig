@@ -182,6 +182,12 @@ pub fn identityIsCurrent(self: *WayringXdgShell, identity: ToplevelIdentity) boo
     return current.generation == identity.generation and std.meta.eql(current.core_id, identity.core_id);
 }
 
+/// Resolves an exact live same-client generated wl_surface to its canonical,
+/// generation-checked compositor identity.
+pub fn surfaceIdentity(self: *WayringXdgShell, client: *server.Client, surface_object_id: u32) ?SurfaceRegistry.Id {
+    return self.compositor.surfaceId(client, surface_object_id);
+}
+
 pub fn toplevelContentState(
     self: *WayringXdgShell,
     identity: ToplevelIdentity,
