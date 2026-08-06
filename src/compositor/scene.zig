@@ -763,6 +763,18 @@ pub fn placeBottom(self: *Self, id: Id) void {
     self.placeNodeBottom(.{ .window = id });
 }
 
+/// Quarantines an unpresented window below the visible stack without damage.
+/// Because the node is unmapped, changing its relative order cannot alter the
+/// current frame; callers must establish the unmapped invariant first.
+pub fn placeUnmappedWindowBottom(self: *Self, id: Id) void {
+    const window = self.windows.get(id) orelse return;
+    std.debug.assert(!window.mapped);
+    const index = self.nodeIndex(.{ .window = id }) orelse return;
+    if (index == 0) return;
+    const moved = self.stack.orderedRemove(index);
+    self.stack.insertAssumeCapacity(0, moved);
+}
+
 pub fn placeAbove(self: *Self, id: Id, other: Id) void {
     self.placeNodeAbove(.{ .window = id }, .{ .window = other });
 }
@@ -1600,6 +1612,31 @@ test "scene stack updates only repaint for a different final order" {
     scene.removeWindow(first);
     scene.removeWindow(second);
     scene.removeWindow(third);
+}
+
+test "unmapped window quarantine preserves visible stacking without repaint" {
+    var scene: Self = undefined;
+    scene.init(std.testing.allocator);
+    defer scene.deinit();
+
+    const first = try scene.addWindow(.{ .index = 1, .generation = 1 });
+    const second = try scene.addWindow(.{ .index = 2, .generation = 1 });
+    scene.setMapped(first, true);
+    scene.setMapped(second, true);
+    var repaint: RepaintCounter = .{};
+    scene.setRepaintListener(repaint.listener());
+    defer scene.clearRepaintListener();
+
+    const hidden = try scene.addWindow(.{ .index = 3, .generation = 1 });
+    try std.testing.expect(scene.windowAbove(second, first));
+    scene.placeUnmappedWindowBottom(hidden);
+    try std.testing.expect(scene.windowAbove(second, first));
+    try std.testing.expect(scene.windowAbove(first, hidden));
+    try std.testing.expectEqual(@as(usize, 0), repaint.count);
+
+    scene.removeWindow(hidden);
+    scene.removeWindow(first);
+    scene.removeWindow(second);
 }
 
 test "scene interleaves shell surfaces and windows through node handles" {

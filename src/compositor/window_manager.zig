@@ -217,6 +217,7 @@ const Window = struct {
     scene_id: Scene.Id,
     surface_id: Surface.Id,
     workspace: usize,
+    workspace_enrolled: bool = true,
     fixed_size_floating: bool = false,
     floating_override: ?bool = null,
     floating_restore_size: ?types.Size = null,
@@ -230,6 +231,7 @@ const Window = struct {
     transition_prepared: bool = false,
     closing_prepared: bool = false,
     mapped: bool = false,
+    presentation_enabled: bool = true,
     minimized: bool = false,
     maximized: bool = false,
     fullscreen_output: ?OutputLayout.Id = null,
@@ -408,7 +410,7 @@ pub fn windowSnapshots(
     var windows = self.windows.iterator();
     while (windows.next()) |entry| {
         const window = entry.value;
-        if (!window.mapped) continue;
+        if (!window.presentation_enabled or !window.mapped) continue;
         const metadata: struct {
             protocol: WindowProtocol,
             title: ?[]const u8,
@@ -553,6 +555,11 @@ fn syncTransientWorkspaces(self: *Self) error{OutOfMemory}!void {
             const source = entry.value.workspace;
             const target = parent.workspace;
             if (source == target) continue;
+            if (!entry.value.workspace_enrolled) {
+                entry.value.workspace = target;
+                changed = true;
+                continue;
+            }
             const moved = try workspace_mod.Workspace.moveWindow(
                 self.allocator,
                 &self.workspaces.items[source].workspace,
@@ -602,6 +609,8 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
         else
             null,
         .floating_position = if (restore) |state| state.position else null,
+        .workspace_enrolled = info.scene_presentation_enabled,
+        .presentation_enabled = info.scene_presentation_enabled,
         .minimized = if (restore) |state| state.minimized else info.requested_state.minimized,
         .maximized = if (restore) |state| state.maximized else info.requested_state.maximized,
         .fullscreen_output = if (restore) |state|
@@ -615,19 +624,23 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
             null,
     });
     errdefer _ = self.windows.remove(id);
-    _ = try self.workspaces.items[workspace].workspace.insert(self.allocator, neutral(id));
-    _ = self.workspaces.items[workspace].workspace.focus(neutral(id));
+    if (info.scene_presentation_enabled) {
+        _ = try self.workspaces.items[workspace].workspace.insert(self.allocator, neutral(id));
+        _ = self.workspaces.items[workspace].workspace.focus(neutral(id));
+        self.reportWorkspaceOccupancy(workspace);
+    }
     // Keep compositor commands on the output selected for a new window. A
     // restored window must not change the user's current output selection.
-    if (restore == null) self.default_output = self.workspaces.items[workspace].output;
-    self.reportWorkspaceOccupancy(workspace);
+    if (restore == null and info.scene_presentation_enabled)
+        self.default_output = self.workspaces.items[workspace].output;
     if (restore != null) std.debug.assert(self.pending_session_restores.remove(xdg_id));
     return id;
 }
 
 fn prepareClosing(self: *Self, id: WindowId) void {
     const window = self.windows.get(id) orelse return;
-    if (window.closing_prepared or !window.mapped or window.minimized or
+    if (window.closing_prepared or !window.presentation_enabled or
+        !window.mapped or window.minimized or
         window.fullscreen_output != null or self.transientParent(window) != null) return;
     const workspace = self.workspaces.items[window.workspace];
     if (!workspace.active) return;
@@ -648,9 +661,11 @@ fn removeId(self: *Self, id: WindowId) void {
     self.removeWindowPointerInteractions(id);
     var window = self.windows.remove(id).?;
     if (self.geometry_listener) |listener| listener.removed(listener.context, window.scene_id);
-    _ = self.workspaces.items[window.workspace].workspace.remove(neutral(id));
-    self.reportWorkspaceOccupancy(window.workspace);
-    self.reportWorkspaceUrgency(window.workspace);
+    if (window.workspace_enrolled) {
+        _ = self.workspaces.items[window.workspace].workspace.remove(neutral(id));
+        self.reportWorkspaceOccupancy(window.workspace);
+        self.reportWorkspaceUrgency(window.workspace);
+    }
     window.tags.deinit(self.allocator);
     if (self.transaction.removed(pending)) self.publish();
     self.relayout();
@@ -821,7 +836,9 @@ pub fn outputRemoved(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!vo
     var migration_count: usize = 0;
     var it = self.windows.iterator();
     while (it.next()) |entry| {
-        if (std.meta.eql(self.workspaces.items[entry.value.workspace].output, output)) {
+        if (entry.value.workspace_enrolled and
+            std.meta.eql(self.workspaces.items[entry.value.workspace].output, output))
+        {
             migration_count += 1;
         }
     }
@@ -833,16 +850,18 @@ pub fn outputRemoved(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!vo
     while (it.next()) |entry| {
         const source_index = entry.value.workspace;
         if (std.meta.eql(self.workspaces.items[source_index].output, output)) {
-            const moved = try workspace_mod.Workspace.moveWindow(
-                self.allocator,
-                &self.workspaces.items[source_index].workspace,
-                &self.workspaces.items[replacement_index].workspace,
-                neutral(entry.id),
-            );
-            std.debug.assert(moved);
+            if (entry.value.workspace_enrolled) {
+                const moved = try workspace_mod.Workspace.moveWindow(
+                    self.allocator,
+                    &self.workspaces.items[source_index].workspace,
+                    &self.workspaces.items[replacement_index].workspace,
+                    neutral(entry.id),
+                );
+                std.debug.assert(moved);
+                self.reportWorkspaceOccupancy(source_index);
+                self.reportWorkspaceOccupancy(replacement_index);
+            }
             entry.value.workspace = replacement_index;
-            self.reportWorkspaceOccupancy(source_index);
-            self.reportWorkspaceOccupancy(replacement_index);
         }
         if (entry.value.fullscreen_output) |fullscreen_output| {
             if (std.meta.eql(fullscreen_output, output)) {
@@ -926,7 +945,7 @@ pub fn setWindowBorders(
 
 fn windowFocused(self: *Self, id: WindowId, window: *const Window) bool {
     const focused = self.workspaces.items[window.workspace].workspace.focused orelse return false;
-    return !window.minimized and neutral(id).eql(focused);
+    return window.presentation_enabled and !window.minimized and neutral(id).eql(focused);
 }
 
 fn effectsForWindow(self: *Self, window: *const Window, focused: bool) Scene.Effects {
@@ -973,7 +992,7 @@ pub fn focusedSurface(self: *Self) ?Surface.Id {
     const workspace_index = self.workspaceFor(self.default_output) orelse return null;
     const focused = self.workspaces.items[workspace_index].workspace.focused orelse return null;
     const window = self.windows.get(internal(focused)) orelse return null;
-    if (window.minimized or !window.mapped) return null;
+    if (!window.presentation_enabled or window.minimized or !window.mapped) return null;
     return window.surface_id;
 }
 
@@ -985,11 +1004,12 @@ pub fn activationRequested(
     proven_interaction: bool,
 ) bool {
     const id = self.windowForSurface(surface_id) orelse return false;
+    const window = self.windows.get(id) orelse return false;
+    if (!window.presentation_enabled) return false;
     if (!proven_interaction or self.layer_focus == .exclusive) {
         _ = self.setWindowUrgent(id, true);
         return false;
     }
-    const window = self.windows.get(id) orelse return false;
     if (!window.mapped) {
         window.pending_activation = true;
         return false;
@@ -1003,6 +1023,7 @@ fn activateWindow(self: *Self, id: WindowId) bool {
         return false;
     }
     const window = self.windows.get(id) orelse return false;
+    if (!window.presentation_enabled) return false;
     std.debug.assert(window.mapped);
     const was_minimized = window.minimized;
     window.minimized = false;
@@ -1113,6 +1134,7 @@ fn windowForSurface(self: *Self, surface_id: Surface.Id) ?WindowId {
 
 fn focusWindow(self: *Self, id: WindowId) bool {
     const window = self.windows.get(id) orelse return false;
+    if (!window.presentation_enabled or !window.mapped or window.minimized) return false;
     const workspace = &self.workspaces.items[window.workspace];
     if (!workspace.active) return false;
     const target = neutral(id);
@@ -1359,7 +1381,8 @@ fn interactiveResizeForWindow(
     pointer_y: f64,
 ) ?InteractiveResize {
     const window = self.windows.get(id) orelse return null;
-    if (!window.mapped or window.minimized or window.fullscreen_output != null) return null;
+    if (!window.presentation_enabled or !window.mapped or window.minimized or
+        window.fullscreen_output != null) return null;
     const workspace = &self.workspaces.items[window.workspace];
     if (!workspace.active) return null;
     if (self.isFloating(window)) {
@@ -1561,7 +1584,8 @@ fn beginWindowMove(
 ) bool {
     if (self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
     const window = self.windows.get(id) orelse return false;
-    if (!window.mapped or window.minimized or window.fullscreen_output != null) return false;
+    if (!window.presentation_enabled or !window.mapped or window.minimized or
+        window.fullscreen_output != null) return false;
     if (!allow_tiled and !self.isFloating(window)) return false;
     const current = self.scene.windowPosition(window.scene_id) orelse return false;
     const grab_x = if (use_offset_hint)
@@ -1643,7 +1667,8 @@ fn updateFloatingResize(
         self.interactive_resize = null;
         return false;
     };
-    if (!window.mapped or window.minimized or window.fullscreen_output != null or
+    if (!window.presentation_enabled or !window.mapped or window.minimized or
+        window.fullscreen_output != null or
         !self.isFloating(window))
     {
         self.interactive_resize = null;
@@ -1742,7 +1767,8 @@ fn windowSizeConstraints(self: *Self, window: *const Window) types.SizeConstrain
 }
 
 fn isDraggableTiledWindow(self: *Self, window: *const Window) bool {
-    return window.mapped and !window.minimized and window.fullscreen_output == null and
+    return window.presentation_enabled and window.mapped and !window.minimized and
+        window.fullscreen_output == null and
         !self.isFloating(window) and self.transientParent(window) == null and
         window.placement != null and window.placement.?.visible;
 }
@@ -1826,7 +1852,7 @@ pub fn moveFocusedDirection(self: *Self, direction: Direction) void {
     const workspace = &self.workspaces.items[index].workspace;
     const focused = workspace.focused orelse return;
     const focused_window = self.windows.get(internal(focused)) orelse return;
-    if (self.isFloating(focused_window)) return;
+    if (!focused_window.presentation_enabled or self.isFloating(focused_window)) return;
     const candidate = self.directionalNeighbor(workspace, direction, false, false) orelse return;
     const changed = workspace.swapWindows(focused, candidate);
     std.debug.assert(changed);
@@ -1953,13 +1979,17 @@ pub fn removeTagFromFocused(self: *Self, tag: types.TagId) void {
 
 fn focusedWindow(self: *Self) ?*Window {
     const index = self.workspaceFor(self.default_output) orelse return null;
-    return self.windows.get(internal(self.workspaces.items[index].workspace.focused orelse return null));
+    const window = self.windows.get(internal(
+        self.workspaces.items[index].workspace.focused orelse return null,
+    )) orelse return null;
+    return if (window.presentation_enabled) window else null;
 }
 fn focusRelative(self: *Self, reverse: bool) void {
     const index = self.workspaceFor(self.default_output) orelse return;
     const ws = &self.workspaces.items[index].workspace;
     const focused = ws.focused orelse return;
     const window = self.windows.get(internal(focused)) orelse return;
+    if (!window.presentation_enabled) return;
     if (self.isFloating(window)) {
         // Unlike Sway, Keywork has no explicit focus-layer toggle yet. Keep
         // next/previous able to leave the floating layer.
@@ -1980,7 +2010,8 @@ fn cycleFocus(
     for (0..workspace.members.items.len) |_| {
         candidate = workspace.nextWindow(candidate, reverse) orelse return;
         const window = self.windows.get(internal(candidate)) orelse continue;
-        if (window.minimized or !self.transientIsVisible(window)) continue;
+        if (!window.presentation_enabled or window.minimized or
+            !self.transientIsVisible(window)) continue;
         const changed = workspace.focus(candidate);
         std.debug.assert(changed);
         self.relayout();
@@ -2007,6 +2038,7 @@ fn directionalNeighbor(
 ) ?types.WindowId {
     const focused = workspace.focused orelse return null;
     const focused_window = self.windows.get(internal(focused)) orelse return null;
+    if (!focused_window.presentation_enabled) return null;
     if (self.isFloating(focused_window)) {
         if (self.geometricDirectionalNeighbor(workspace, focused, direction, true, false)) |candidate| {
             return candidate;
@@ -2029,7 +2061,8 @@ fn directionalNeighbor(
     defer eligible.deinit(self.allocator);
     for (workspace.members.items) |id| {
         const window = self.windows.get(internal(id)) orelse continue;
-        if (window.minimized or self.isFloating(window) or !self.transientIsVisible(window)) continue;
+        if (!window.presentation_enabled or window.minimized or self.isFloating(window) or
+            !self.transientIsVisible(window)) continue;
         eligible.append(self.allocator, id) catch return null;
     }
     if (workspace.layout.directionalWindow(
@@ -2069,7 +2102,8 @@ fn mostRecentLayerWindow(
         index -= 1;
         const id = workspace.focus_history.items[index];
         const window = self.windows.get(internal(id)) orelse continue;
-        if (window.minimized or self.isFloating(window) != floating or
+        if (!window.presentation_enabled or window.minimized or
+            self.isFloating(window) != floating or
             !self.transientIsVisible(window) or window.placement == null) continue;
         return id;
     }
@@ -2085,6 +2119,7 @@ fn geometricDirectionalNeighbor(
     wrap: bool,
 ) ?types.WindowId {
     const focused_window = self.windows.get(internal(focused)) orelse return null;
+    if (!focused_window.presentation_enabled) return null;
     const origin = if (focused_window.placement) |plan| plan.rect else return null;
     var best_id: ?types.WindowId = null;
     var best_delta: ?i64 = null;
@@ -2093,7 +2128,8 @@ fn geometricDirectionalNeighbor(
     for (workspace.members.items) |id| {
         if (id.eql(focused)) continue;
         const window = self.windows.get(internal(id)) orelse continue;
-        if (window.minimized or self.isFloating(window) != floating_candidates or
+        if (!window.presentation_enabled or window.minimized or
+            self.isFloating(window) != floating_candidates or
             !self.transientIsVisible(window)) continue;
         const candidate = if (window.placement) |plan| plan.rect else continue;
         const delta = directionalDelta(origin, candidate, direction);
@@ -2120,7 +2156,8 @@ fn relayout(self: *Self) void {
         defer inputs.deinit(self.allocator);
         for (entry.workspace.members.items) |member| {
             const window = self.windows.get(internal(member)) orelse continue;
-            if (window.minimized or window.fullscreen_output != null or
+            if (!window.presentation_enabled or window.minimized or
+                window.fullscreen_output != null or
                 self.isFloating(window)) continue;
             const current = self.currentDimensions(window);
             inputs.append(self.allocator, .{
@@ -2232,117 +2269,154 @@ fn relayout(self: *Self) void {
         }
         if (!changed) break;
     }
+    // Presentation-disabled windows remain private WM participants: they get
+    // policy-derived configures without entering public workspace topology.
+    windows = self.windows.iterator();
+    while (windows.next()) |entry| {
+        const window = entry.value;
+        if (window.presentation_enabled) continue;
+        const workspace = &self.workspaces.items[window.workspace];
+        const rect: types.Rect = if (window.fullscreen_output) |output_id| fullscreen: {
+            const output = self.outputs.get(output_id) orelse
+                self.outputs.get(workspace.output) orelse continue;
+            const position = output.logicalPosition();
+            const size = output.logicalSize();
+            break :fullscreen .{
+                .x = position.x,
+                .y = position.y,
+                .size = types.Size.init(size.width, size.height),
+            };
+        } else normal: {
+            const area = self.layer_shell.usableAreaFor(workspace.output) orelse continue;
+            if (area.width <= 0 or area.height <= 0) continue;
+            break :normal .{
+                .x = area.x,
+                .y = area.y,
+                .size = types.Size.init(@intCast(area.width), @intCast(area.height)),
+            };
+        };
+        window.placement = .{
+            .id = neutral(entry.id),
+            .rect = rect,
+            .visible = true,
+        };
+    }
     for (self.workspaces.items) |*entry| {
         if (entry.active) self.normalizeFocus(entry);
-        for (entry.workspace.members.items) |member| {
-            const window = self.windows.get(internal(member)) orelse continue;
-            const output = self.outputs.get(entry.output) orelse continue;
-            const floating = self.isFloating(window);
-            const plan = window.placement;
-            const repaint_suspended = repaintSuspended(window.minimized, entry.active, plan);
-            const current_dimensions = self.currentDimensions(window);
-            const dimensions: XdgShell.Dimensions = if (plan) |placement| .{
-                .width = @intCast(placement.rect.size.width),
-                .height = @intCast(placement.rect.size.height),
-            } else .{
-                .width = @max(1, current_dimensions.width),
-                .height = @max(1, current_dimensions.height),
-            };
-            if (!window.mapped) switch (window.backend) {
-                .xdg => |id| self.xdg_shell.setWindowVisible(id, false),
-                .xwayland => {},
-            };
-            window.transition_prepared = false;
-            if (self.geometry_listener) |listener| if (plan) |placement| {
-                if (window.published_rect) |old_rect| {
-                    const entering_fullscreen = window.fullscreen_output != null and
-                        !window.published_fullscreen and
-                        std.meta.eql(window.fullscreen_output.?, entry.output);
-                    const eligible = window.mapped and entry.active and placement.visible and
-                        !window.minimized and
-                        (window.fullscreen_output == null or entering_fullscreen) and
-                        !floating and self.transientParent(window) == null and
-                        self.interactive_resize == null and self.tiling_drag == null and
-                        self.toplevel_drag == null and !std.meta.eql(old_rect, placement.rect);
-                    if (eligible) {
-                        listener.prepare(listener.context, .{
-                            .scene_id = window.scene_id,
-                            .surface_id = window.surface_id,
-                            .output = entry.output,
-                            .old_rect = old_rect,
-                            .target_rect = placement.rect,
-                        });
-                        window.transition_prepared = true;
-                    }
+    }
+    windows = self.windows.iterator();
+    while (windows.next()) |window_entry| {
+        const member = neutral(window_entry.id);
+        const window = window_entry.value;
+        const workspace = &self.workspaces.items[window.workspace];
+        const output = self.outputs.get(workspace.output) orelse continue;
+        const floating = self.isFloating(window);
+        const plan = window.placement;
+        const repaint_suspended = repaintSuspended(window.minimized, workspace.active, plan);
+        const current_dimensions = self.currentDimensions(window);
+        const dimensions: XdgShell.Dimensions = if (plan) |placement| .{
+            .width = @intCast(placement.rect.size.width),
+            .height = @intCast(placement.rect.size.height),
+        } else .{
+            .width = @max(1, current_dimensions.width),
+            .height = @max(1, current_dimensions.height),
+        };
+        if (!window.mapped) switch (window.backend) {
+            .xdg => |id| self.xdg_shell.setWindowVisible(id, false),
+            .xwayland => {},
+        };
+        window.transition_prepared = false;
+        if (self.geometry_listener) |listener| if (plan) |placement| {
+            if (window.published_rect) |old_rect| {
+                const entering_fullscreen = window.fullscreen_output != null and
+                    !window.published_fullscreen and
+                    std.meta.eql(window.fullscreen_output.?, workspace.output);
+                const eligible = window.presentation_enabled and window.mapped and
+                    workspace.active and placement.visible and
+                    !window.minimized and
+                    (window.fullscreen_output == null or entering_fullscreen) and
+                    !floating and self.transientParent(window) == null and
+                    self.interactive_resize == null and self.tiling_drag == null and
+                    self.toplevel_drag == null and !std.meta.eql(old_rect, placement.rect);
+                if (eligible) {
+                    listener.prepare(listener.context, .{
+                        .scene_id = window.scene_id,
+                        .surface_id = window.surface_id,
+                        .output = workspace.output,
+                        .old_rect = old_rect,
+                        .target_rect = placement.rect,
+                    });
+                    window.transition_prepared = true;
                 }
-            };
-            const tiled: XdgShell.TiledEdges = if (plan) |placement| .{
-                .top = placement.tiled_edges.top,
-                .right = placement.tiled_edges.right,
-                .bottom = placement.tiled_edges.bottom,
-                .left = placement.tiled_edges.left,
-            } else .{};
-            const serial = switch (window.backend) {
-                .xwayland => |id| serial: {
-                    const current = self.currentDimensions(window);
-                    if (!std.meta.eql(current, dimensions)) {
-                        _ = self.xwayland.resize(
-                            self.xwayland.context,
-                            id,
-                            @intCast(@min(dimensions.width, std.math.maxInt(u16))),
-                            @intCast(@min(dimensions.height, std.math.maxInt(u16))),
-                        );
-                    }
-                    break :serial null;
-                },
-                .xdg => |id| configure: {
-                    const info = self.xdg_shell.windowInfo(id) orelse break :configure null;
-                    const bounds_output = if (window.fullscreen_output) |fullscreen_output|
-                        self.outputs.get(fullscreen_output) orelse output
-                    else
-                        output;
-                    const configure_dimensions = requestedXdgDimensions(
-                        info.dimensions,
-                        dimensions,
-                        floating,
-                        window.fullscreen_output != null,
-                    );
-                    const configuration: XdgShell.ToplevelConfigure = .{
-                        .activated = !repaint_suspended and entry.workspace.focused != null and
-                            member.eql(entry.workspace.focused.?),
-                        .resizing = !repaint_suspended and
-                            self.interactivelyResizing(internal(member)),
-                        .maximized = window.maximized,
-                        .fullscreen = window.fullscreen_output != null,
-                        .tiled = tiled,
-                        .decoration_mode = if (info.decoration_preference == .only_csd)
-                            .client_side
-                        else
-                            .server_side,
-                        .bounds = .{
-                            .width = @intCast(bounds_output.logicalSize().width),
-                            .height = @intCast(bounds_output.logicalSize().height),
-                        },
-                        .suspended = repaint_suspended,
-                    };
-                    if (!needsXdgConfigure(
-                        info.dimensions,
-                        info.configuration,
-                        info.decoration_configure_requested,
-                        configure_dimensions,
-                        configuration,
-                    )) break :configure null;
-                    break :configure self.xdg_shell.configureWindowState(
+            }
+        };
+        const tiled: XdgShell.TiledEdges = if (plan) |placement| .{
+            .top = placement.tiled_edges.top,
+            .right = placement.tiled_edges.right,
+            .bottom = placement.tiled_edges.bottom,
+            .left = placement.tiled_edges.left,
+        } else .{};
+        const serial = switch (window.backend) {
+            .xwayland => |id| serial: {
+                const current = self.currentDimensions(window);
+                if (!std.meta.eql(current, dimensions)) {
+                    _ = self.xwayland.resize(
+                        self.xwayland.context,
                         id,
-                        configure_dimensions,
-                        configuration,
-                    ) catch null;
-                },
-            };
-            // Suspended windows do not gate publishing because clients may stop repainting them.
-            window.serial = if (repaint_suspended) null else serial;
-            if (window.serial != null) pending += 1;
-        }
+                        @intCast(@min(dimensions.width, std.math.maxInt(u16))),
+                        @intCast(@min(dimensions.height, std.math.maxInt(u16))),
+                    );
+                }
+                break :serial null;
+            },
+            .xdg => |id| configure: {
+                const info = self.xdg_shell.windowInfo(id) orelse break :configure null;
+                const bounds_output = if (window.fullscreen_output) |fullscreen_output|
+                    self.outputs.get(fullscreen_output) orelse output
+                else
+                    output;
+                const configure_dimensions = requestedXdgDimensions(
+                    info.dimensions,
+                    dimensions,
+                    floating,
+                    window.fullscreen_output != null,
+                );
+                const configuration: XdgShell.ToplevelConfigure = .{
+                    .activated = window.presentation_enabled and !repaint_suspended and
+                        workspace.workspace.focused != null and
+                        member.eql(workspace.workspace.focused.?),
+                    .resizing = !repaint_suspended and
+                        self.interactivelyResizing(internal(member)),
+                    .maximized = window.maximized,
+                    .fullscreen = window.fullscreen_output != null,
+                    .tiled = tiled,
+                    .decoration_mode = if (info.decoration_preference == .only_csd)
+                        .client_side
+                    else
+                        .server_side,
+                    .bounds = .{
+                        .width = @intCast(bounds_output.logicalSize().width),
+                        .height = @intCast(bounds_output.logicalSize().height),
+                    },
+                    .suspended = repaint_suspended,
+                };
+                if (!needsXdgConfigure(
+                    info.dimensions,
+                    info.configuration,
+                    info.decoration_configure_requested,
+                    configure_dimensions,
+                    configuration,
+                )) break :configure null;
+                break :configure self.xdg_shell.configureWindowState(
+                    id,
+                    configure_dimensions,
+                    configuration,
+                ) catch null;
+            },
+        };
+        // Suspended windows do not gate publishing because clients may stop repainting them.
+        window.serial = if (repaint_suspended) null else serial;
+        if (window.serial != null) pending += 1;
     }
     beginPendingWorkspaceTransitions(self.workspaces.items);
     self.transaction.begin(pending);
@@ -2375,7 +2449,9 @@ fn normalizeFocus(self: *Self, entry: *OutputWorkspace) void {
         index -= 1;
         const candidate = workspace.focus_history.items[index];
         if (self.windows.get(internal(candidate))) |window| {
-            if (!window.minimized and self.transientIsVisible(window)) {
+            if (window.presentation_enabled and !window.minimized and
+                self.transientIsVisible(window))
+            {
                 const changed = workspace.focus(candidate);
                 std.debug.assert(changed);
                 return;
@@ -2391,7 +2467,7 @@ fn publish(self: *Self) void {
     while (it.next()) |entry| {
         const window = entry.value;
         const plan = window.placement;
-        const visible = displayed(
+        const visible = window.presentation_enabled and displayed(
             window.mapped,
             window.minimized,
             self.workspaces.items[window.workspace].active,
@@ -2518,7 +2594,8 @@ fn publishStacking(self: *Self) void {
             while (index > 0) {
                 index -= 1;
                 const window = self.windows.get(internal(workspace.workspace.members.items[index])) orelse continue;
-                if (window.placement == null or window.fullscreen_output != null or
+                if (!window.presentation_enabled or window.placement == null or
+                    window.fullscreen_output != null or
                     self.transientDepth(window) != depth) continue;
                 const parent = self.windows.get(self.transientParent(window) orelse continue) orelse continue;
                 if (parent.placement != null and
@@ -2547,7 +2624,7 @@ fn placeWorkspaceStackTier(
     for (workspace.workspace.members.items) |member| {
         const id = internal(member);
         const window = self.windows.get(id) orelse continue;
-        if (window.placement == null) continue;
+        if (!window.presentation_enabled or window.placement == null) continue;
         const window_tier = stackTier(
             self.isFloating(window),
             self.windowFocused(id, window),
@@ -2683,9 +2760,24 @@ fn windowDestroyed(context: *anyopaque, id: XdgShell.WindowId) void {
 }
 fn windowMetadataChanged(context: *anyopaque, id: XdgShell.WindowId) bool {
     const self: *Self = @ptrCast(@alignCast(context));
-    const window = self.windows.get(self.findXdg(id) orelse return false) orelse return false;
+    const managed_id = self.findXdg(id) orelse return false;
+    const window = self.windows.get(managed_id) orelse return false;
+    const info = self.xdg_shell.windowInfo(id) orelse return false;
+    if (info.scene_presentation_enabled and !window.workspace_enrolled) {
+        _ = self.workspaces.items[window.workspace].workspace.insert(
+            self.allocator,
+            neutral(managed_id),
+        ) catch return false;
+        window.workspace_enrolled = true;
+        self.reportWorkspaceOccupancy(window.workspace);
+    } else if (!info.scene_presentation_enabled and window.workspace_enrolled) {
+        _ = self.workspaces.items[window.workspace].workspace.remove(neutral(managed_id));
+        window.workspace_enrolled = false;
+        self.reportWorkspaceOccupancy(window.workspace);
+        self.reportWorkspaceUrgency(window.workspace);
+    }
+    window.presentation_enabled = info.scene_presentation_enabled;
     if (!window.mapped) {
-        const info = self.xdg_shell.windowInfo(id) orelse return false;
         window.fixed_size_floating = fixedSizeWantsFloating(info.min_size, info.max_size);
     }
     self.relayout();

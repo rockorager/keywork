@@ -83,7 +83,7 @@ pub fn attachedScene(self: *Self) ?Scene.Id {
         if (!drag.active) continue;
         const window_id = drag.attached_window orelse continue;
         const info = self.core.windowInfo(window_id) orelse continue;
-        if (info.mapped) return info.scene_id;
+        if (info.mapped and info.scene_presentation_enabled) return info.scene_id;
     }
     return null;
 }
@@ -229,7 +229,7 @@ const Drag = struct {
         if (!self.active or self.moving) return;
         const window_id = self.attached_window orelse return;
         const info = self.manager.core.windowInfo(window_id) orelse return;
-        if (!info.mapped) return;
+        if (!info.mapped or !info.scene_presentation_enabled) return;
         self.moving = self.manager.listener.begin(
             self.manager.listener.context,
             window_id,

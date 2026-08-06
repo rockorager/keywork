@@ -105,6 +105,25 @@ pub fn destroyClientResources(self: *WayringOutput, client: *server.Client) void
     }
 }
 
+/// Resolves only the identity of a currently live generated wl_output owned by
+/// `client`. Object ids from another client or retired/released resources do
+/// not name an output.
+pub fn outputIdForResource(
+    self: *WayringOutput,
+    client: *server.Client,
+    object_id: u32,
+) ?OutputLayout.Id {
+    for (self.adapters.items) |adapter| {
+        if (adapter.retired) continue;
+        for (adapter.bindings.items) |binding| {
+            if (binding.client == client and binding.resource.state() == .live and
+                client.lookup(object_id) == &binding.resource.runtime)
+                return adapter.id;
+        }
+    }
+    return null;
+}
+
 fn publish(self: *WayringOutput, id: OutputLayout.Id, output: *Output) !void {
     // Nothing may fail after addGlobal publishes to existing registries.
     try self.adapters.ensureUnusedCapacity(self.allocator, 1);
@@ -503,6 +522,46 @@ test "wl_output globals and negotiated bind bursts are exact from v1 through v4"
         managed.destroy();
         log.clear();
     }
+}
+
+test "wl_output identity lookup rejects cross-client released and retired resources" {
+    var setup: TestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+
+    const first = try server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    defer first.destroy();
+    const second = try server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    defer second.destroy();
+    try setup.prepareClient(first.client(), 3, 4);
+    try setup.prepareRegistry(second.client());
+
+    try std.testing.expectEqual(
+        setup.output_id,
+        setup.outputs.outputIdForResource(first.client(), 3).?,
+    );
+    try std.testing.expect(setup.outputs.outputIdForResource(second.client(), 3) == null);
+    try testSend(first.client(), 3, 0, &core.wl_output.request_messages[0], &.{});
+    try std.testing.expect(setup.outputs.outputIdForResource(first.client(), 3) == null);
+
+    try setup.bindOutput(first.client(), 4, 4);
+    try std.testing.expect(setup.outputs.outputIdForResource(first.client(), 4) != null);
+    try std.testing.expect(setup.layout.remove(setup.output_id));
+    try std.testing.expect(setup.outputs.outputIdForResource(first.client(), 4) == null);
+    setup.output_id = try setup.layout.add(.{
+        .size = .{ .width = 1, .height = 1 },
+        .mode_size = .{ .width = 1, .height = 1 },
+        .physical_size = .{ .width = 1, .height = 1 },
+        .scale = 1,
+        .name = "replacement",
+        .description = "replacement",
+        .make = "keywork",
+        .model = "test",
+    });
+    setup.outputs.destroyClientResources(first.client());
+    setup.outputs.destroyClientResources(second.client());
+    setup.compositor.destroyClientResources(first.client());
+    setup.compositor.destroyClientResources(second.client());
 }
 
 test "hotplug publication failures roll back without exposing an output" {

@@ -17,6 +17,7 @@ const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const XdgShell = @import("../XdgShell.zig");
 const WayringClients = @import("WayringClients.zig");
 const WayringCompositor = @import("WayringCompositor.zig");
+const WayringOutput = @import("WayringOutput.zig");
 
 const server = wayring.server;
 const wire = wayring.wire;
@@ -28,6 +29,7 @@ protocol_server: *server.Server,
 core_shell: *XdgShell,
 clients: *WayringClients,
 compositor: *WayringCompositor,
+outputs: ?*WayringOutput,
 managers: std.ArrayList(*Manager) = .empty,
 positioners: std.ArrayList(*Positioner) = .empty,
 surfaces: std.ArrayList(*Surface) = .empty,
@@ -115,6 +117,7 @@ pub fn init(
     core_shell: *XdgShell,
     clients: *WayringClients,
     compositor: *WayringCompositor,
+    outputs: ?*WayringOutput,
 ) void {
     self.* = .{
         .allocator = allocator,
@@ -122,6 +125,7 @@ pub fn init(
         .core_shell = core_shell,
         .clients = clients,
         .compositor = compositor,
+        .outputs = outputs,
     };
 }
 
@@ -537,6 +541,9 @@ fn createToplevel(
     };
     var core_owned = true;
     errdefer if (core_owned) self.core_shell.destroyToplevel(toplevel.core_id);
+    // Generated toplevels become semantically managed by the mature policy,
+    // but remain absent from presentation until a later wave owns it.
+    self.core_shell.setWindowScenePresentationEnabled(toplevel.core_id, false);
     _ = self.compositor.assignXdgRole(surface.reservation, .toplevel) catch unreachable;
 
     surface.active_role = .{ .toplevel = toplevel };
@@ -587,8 +594,6 @@ fn handleToplevel(
             .width = set.width,
             .height = set.height,
         }),
-        // WindowManager and input policy begin in Wave 3/5. These requests are
-        // intentionally inert while the generated global remains unpublished.
         .resize => |set| if (!validResizeEdge(set.edges)) {
             toplevel.surface.client.postProtocolError(
                 &resource.runtime,
@@ -598,13 +603,37 @@ fn handleToplevel(
         },
         .show_window_menu,
         .move,
-        .set_maximized,
-        .unset_maximized,
-        .set_fullscreen,
-        .unset_fullscreen,
-        .set_minimized,
         => {},
+        .set_maximized => forwardStateRequest(toplevel, .maximize),
+        .unset_maximized => forwardStateRequest(toplevel, .unmaximize),
+        .set_fullscreen => |set| {
+            const output: ?OutputLayout.Id = if (set.output) |object_id|
+                (toplevel.adapter.outputs orelse return).outputIdForResource(
+                    toplevel.surface.client,
+                    object_id,
+                ) orelse return
+            else
+                null;
+            shell.requestFullscreen(toplevel.core_id, true, output);
+            if ((shell.windowInfo(toplevel.core_id) orelse return).ready)
+                shell.requestWindow(toplevel.core_id, .{ .fullscreen = output });
+        },
+        .unset_fullscreen => forwardStateRequest(toplevel, .exit_fullscreen),
+        .set_minimized => forwardStateRequest(toplevel, .minimize),
     }
+}
+
+fn forwardStateRequest(toplevel: *Toplevel, request: XdgShell.WindowRequest) void {
+    const shell = toplevel.adapter.core_shell;
+    switch (request) {
+        .maximize => shell.requestMaximized(toplevel.core_id, true),
+        .unmaximize => shell.requestMaximized(toplevel.core_id, false),
+        .exit_fullscreen => shell.requestFullscreen(toplevel.core_id, false, null),
+        .minimize => shell.requestMinimized(toplevel.core_id, true),
+        else => unreachable,
+    }
+    if ((shell.windowInfo(toplevel.core_id) orelse return).ready)
+        shell.requestWindow(toplevel.core_id, request);
 }
 
 fn createPopup(
@@ -1403,6 +1432,7 @@ const TestHarness = struct {
             &self.core_shell,
             &self.generated_clients,
             &self.compositor,
+            null,
         );
     }
 
@@ -1779,6 +1809,8 @@ test "toplevel configure ack map unmap and remap retain exact snapshots" {
     try std.testing.expect(adapter_surface.accepted_configure == null);
     try std.testing.expect(harness.core_shell.surfaceConfigured(adapter_surface.core_id));
     try std.testing.expect(harness.core_shell.windowInfo(toplevel.core_id).?.mapped);
+    var scene_windows = harness.scene.iterator();
+    try std.testing.expect(!scene_windows.next().?.window.mapped);
     const first_release = try drainTest(harness.client());
     std.testing.allocator.free(first_release);
 
@@ -1815,6 +1847,35 @@ test "toplevel configure ack map unmap and remap retain exact snapshots" {
     try commitTestSurface(harness.client());
     try std.testing.expect(harness.core_shell.surfaceConfigured(adapter_surface.core_id));
     try std.testing.expect(adapter_surface.accepted_configure == null);
+    scene_windows = harness.scene.iterator();
+    try std.testing.expect(!scene_windows.next().?.window.mapped);
+}
+
+test "pre-ready non-input state requests are retained without policy" {
+    var harness: TestHarness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    try harness.createSurface();
+    try harness.installManager(7);
+    try harness.createToplevel();
+    const toplevel = harness.adapter.toplevels.items[0];
+
+    try sendTest(harness.client(), 7, 9, &core.xdg_toplevel.request_messages[9], &.{});
+    try sendTest(harness.client(), 7, 11, &core.xdg_toplevel.request_messages[11], &.{.{ .object = null }});
+    try sendTest(harness.client(), 7, 13, &core.xdg_toplevel.request_messages[13], &.{});
+    var info = harness.core_shell.windowInfo(toplevel.core_id).?;
+    try std.testing.expect(!info.ready);
+    try std.testing.expect(info.requested_state.maximized);
+    try std.testing.expect(info.requested_state.fullscreen);
+    try std.testing.expect(info.requested_state.fullscreen_output == null);
+    try std.testing.expect(info.requested_state.minimized);
+
+    try sendTest(harness.client(), 7, 10, &core.xdg_toplevel.request_messages[10], &.{});
+    try sendTest(harness.client(), 7, 12, &core.xdg_toplevel.request_messages[12], &.{});
+    info = harness.core_shell.windowInfo(toplevel.core_id).?;
+    try std.testing.expect(!info.requested_state.maximized);
+    try std.testing.expect(!info.requested_state.fullscreen);
+    try std.testing.expect(info.requested_state.minimized);
 }
 
 test "initial buffer commit before configure ack is rejected without content publication" {

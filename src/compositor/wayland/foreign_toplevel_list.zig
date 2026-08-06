@@ -536,7 +536,8 @@ fn syncMappedWindows(self: *Self) void {
     var windows = self.xdg_shell.windowIterator();
     while (windows.next()) |window_id| {
         const info = self.xdg_shell.windowInfo(window_id) orelse continue;
-        if (!info.mapped or self.mappingForXdg(window_id) != null) continue;
+        if (!info.mapped or !info.scene_presentation_enabled or
+            self.mappingForXdg(window_id) != null) continue;
         const surface_id = self.xdg_shell.windowSurface(window_id) orelse continue;
         self.addMapping(.{ .xdg = window_id }, surface_id) catch self.postNoMemory();
     }
@@ -743,7 +744,8 @@ fn clearWlrChildParents(self: *Self, parent_mapping: *Mapping) void {
 fn windowCommitted(context: *anyopaque, window_id: XdgShell.WindowId) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const info = self.xdg_shell.windowInfo(window_id) orelse return;
-    if (!info.mapped or self.mappingForXdg(window_id) != null) return;
+    if (!info.mapped or !info.scene_presentation_enabled or
+        self.mappingForXdg(window_id) != null) return;
     const surface_id = self.xdg_shell.windowSurface(window_id) orelse return;
     self.addMapping(.{ .xdg = window_id }, surface_id) catch self.postNoMemory();
 }
@@ -760,8 +762,17 @@ fn windowDestroyed(context: *anyopaque, window_id: XdgShell.WindowId) void {
 
 fn windowMetadataChanged(context: *anyopaque, window_id: XdgShell.WindowId) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    const mapping = self.mappingForXdg(window_id) orelse return;
-    self.sendMetadata(mapping);
+    const info = self.xdg_shell.windowInfo(window_id) orelse return;
+    if (!info.mapped or !info.scene_presentation_enabled) {
+        self.removeMapping(self.mappingForXdg(window_id) orelse return);
+        return;
+    }
+    if (self.mappingForXdg(window_id)) |mapping| {
+        self.sendMetadata(mapping);
+    } else {
+        const surface_id = self.xdg_shell.windowSurface(window_id) orelse return;
+        self.addMapping(.{ .xdg = window_id }, surface_id) catch self.postNoMemory();
+    }
 }
 
 fn sendMetadata(self: *Self, mapping: *Mapping) void {
