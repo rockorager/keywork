@@ -3774,11 +3774,21 @@ pub fn generatedSeatRequestSink(self: *Self) SeatDelivery.RequestSink {
         .pointer_enter_snapshot = generatedPointerEnterSnapshot,
         .keyboard_resource_snapshot = generatedKeyboardResourceSnapshot,
         .accepts_pointer_grab = generatedAcceptsPointerGrab,
+        .accepts_action = generatedAcceptsAction,
         .set_cursor = generatedSetCursor,
         .cursor_committed = generatedCursorCommitted,
         .cursor_removed = generatedCursorRemoved,
         .client_retiring = generatedClientRetiring,
     };
+}
+
+fn generatedAcceptsAction(
+    context: *anyopaque,
+    client: ClientRegistry.Id,
+    serial: ClientRegistry.Serial,
+) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.seat.authority.acceptsAction(client, serial);
 }
 
 fn generatedAcceptsPointerGrab(
@@ -4103,11 +4113,14 @@ fn repairGeneratedFocus(self: *Self) void {
         self.refreshKeyboardFocusReplacingGenerated();
         return;
     };
-    if (state.presentation_class == .managed and
-        !self.generatedManagedRootEligible(root, client))
-    {
-        self.refreshKeyboardFocusReplacingGenerated();
-        return;
+    if (state.presentation_class == .managed) {
+        const grabbed_popup = self.xdg_shell_core.popupKeyboardFocus();
+        const popup_focus_valid = grabbed_popup != null and std.meta.eql(grabbed_popup.?, root) and
+            self.managedGeneratedPopup(root) != null;
+        if (!popup_focus_valid and !self.generatedManagedRootEligible(root, client)) {
+            self.refreshKeyboardFocusReplacingGenerated();
+            return;
+        }
     }
     if (state.presentation_class != .background and state.presentation_class != .managed) {
         self.refreshKeyboardFocusReplacingGenerated();
@@ -4418,7 +4431,8 @@ fn scheduleCursorFallbackAfterColorChange(self: *Self, output: *RenderOutput) vo
 
 fn surfaceChanged(context: *anyopaque, surface_id: Surface.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (self.managedGeneratedWindow(surface_id) != null) return;
+    if (self.managedGeneratedWindow(surface_id) != null or
+        self.managedGeneratedPopup(surface_id) != null) return;
     const surfaces = self.compositor.surfaceStore();
     const root = self.subcompositor.rootSurface(surface_id);
     markWindowTransitionTargetDirty(self, root);
@@ -4648,8 +4662,15 @@ fn popupTreeBounds(
         geometry.offset
     else
         Scene.Position{};
-    const tree = self.subcompositor.treeBounds(popup.surface_id) orelse return null;
-    return treeBoundsRect(tree).translated(
+    const tree_rect: render.Rect = if (self.managedGeneratedPopup(popup.surface_id) != null)
+        switch (self.headless_surface_forest.subtreeDamageBounds(popup.surface_id)) {
+            .hidden => return null,
+            .rect => |rect| rect,
+            .full_damage => return null,
+        }
+    else
+        treeBoundsRect(self.subcompositor.treeBounds(popup.surface_id) orelse return null);
+    return tree_rect.translated(
         position.x -| offset.x,
         position.y -| offset.y,
     );
@@ -5649,6 +5670,11 @@ fn damageHeadlessCompound(self: *Self, id: SurfaceRegistry.Id) void {
         sceneNodeDamage(self, .{ .window = window.scene_id });
         return;
     }
+    if (self.managedGeneratedPopupOwner(root)) |popup| {
+        if (self.managedGeneratedPopup(root) != null and self.scene.surfaceMapped(root))
+            sceneNodeDamage(self, .{ .popup = popup.scene_id });
+        return;
+    }
     switch (self.headless_surface_forest.compoundBounds(id)) {
         .hidden => {},
         .rect => |rectangle| self.damageHeadlessSurfaceBounds(rectangle, id),
@@ -5674,6 +5700,46 @@ fn managedGeneratedWindow(
     const info = self.xdg_shell_core.windowInfo(window_id) orelse return null;
     if (!std.meta.eql(self.scene.windowSurface(info.scene_id) orelse return null, root)) return null;
     return info;
+}
+
+fn managedGeneratedPopup(
+    self: *Self,
+    surface_id: SurfaceRegistry.Id,
+) ?NeutralXdgShell.PopupPresentationInfo {
+    const info = self.managedGeneratedPopupOwner(surface_id) orelse return null;
+    const popup_id = self.xdg_shell_core.popupForSurface(surface_id) orelse return null;
+    if (!info.mapped or !info.scene_presentation_enabled or
+        !self.xdg_shell_core.popupParentChainInteractive(popup_id)) return null;
+    return info;
+}
+
+fn managedGeneratedPopupOwner(
+    self: *Self,
+    surface_id: SurfaceRegistry.Id,
+) ?NeutralXdgShell.PopupPresentationInfo {
+    const root = self.headless_surface_forest.compoundRoot(surface_id) orelse return null;
+    if (!std.meta.eql(root, surface_id) or
+        self.headless_surface_forest.presentationClass(root) != .managed) return null;
+    const popup_id = self.xdg_shell_core.popupForSurface(root) orelse return null;
+    const info = self.xdg_shell_core.popupPresentationInfo(popup_id) orelse return null;
+    const scene_popup = self.scene.popupFor(info.scene_id) orelse return null;
+    if (!std.meta.eql(scene_popup.surface_id, root)) return null;
+    const owner = self.seat.generatedSurfaceOwner(root) orelse return null;
+    if (!std.meta.eql(owner, info.client)) return null;
+    return info;
+}
+
+fn exactEligibleGeneratedRoot(self: *Self, root: SurfaceRegistry.Id) bool {
+    if (self.managedGeneratedWindow(root)) |info|
+        return info.mapped and info.scene_presentation_enabled and
+            self.headless_surface_forest.state(root).?.mapped_size != null;
+    return false;
+}
+
+fn exactEligibleGeneratedPopupRoot(self: *Self, root: SurfaceRegistry.Id) bool {
+    if (self.managedGeneratedPopup(root) != null)
+        return self.headless_surface_forest.state(root).?.mapped_size != null;
+    return false;
 }
 
 fn expandHeadlessSurfaceBlurDamage(
@@ -6692,7 +6758,8 @@ fn routeTouchDown(
         {
             self.window_manager.pointerButton(null, .pressed);
             self.layer_shell.pointerPressed(null);
-            if (first_touch) _ = self.focusGeneratedSurface(generated_root);
+            if (first_touch and self.managedGeneratedPopup(generated_root) == null)
+                _ = self.focusGeneratedSurface(generated_root);
             requestRepaint(self);
         } else {
             self.window_manager.pointerButton(null, .pressed);
@@ -7312,7 +7379,11 @@ fn pointerButtonForSeat(
     }
     const replace_generated = seat == &self.seat and state == .pressed and
         route.generated == null and root != null and self.seat.generatedKeyboardFocus() != null;
-    self.window_manager.pointerButton(root, state);
+    const generated_popup = if (route.generated) |generated|
+        self.managedGeneratedPopup(generated.root) != null
+    else
+        false;
+    self.window_manager.pointerButton(if (generated_popup) null else root, state);
     if (replace_generated) self.refreshKeyboardFocusReplacingGenerated();
     if (state == .pressed) {
         const focused = if (seat.pointerFocusedSurface()) |surface_id|
@@ -7323,12 +7394,15 @@ fn pointerButtonForSeat(
         if (seat == &self.seat and button == linux_button_left and
             !seat.hasPressedPointerButtons())
         {
-            if (route.generated) |generated| _ = self.focusGeneratedSurface(generated.root);
+            if (route.generated) |generated| {
+                if (self.managedGeneratedPopup(generated.root) == null)
+                    _ = self.focusGeneratedSurface(generated.root);
+            }
         }
         requestRepaint(self);
     }
     if (seat == &self.seat and state == .pressed and self.xdg_shell_core.hasPopupGrab() and
-        seat.pointerFocusedSurface() == null)
+        route.focus == null)
     {
         self.xdg_shell_core.dismissPopupGrab();
         return;
@@ -7541,7 +7615,8 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     } else if (route.generated) |generated| {
         self.window_manager.pointerButton(null, .pressed);
         self.layer_shell.pointerPressed(null);
-        if (first_touch) _ = self.focusGeneratedSurface(generated.root);
+        if (first_touch and self.managedGeneratedPopup(generated.root) == null)
+            _ = self.focusGeneratedSurface(generated.root);
         requestRepaint(self);
     } else {
         self.window_manager.pointerButton(null, .pressed);
@@ -7655,8 +7730,15 @@ fn pointerRouteExcluding(
             route.root = null;
         }
     } else if (route.generated != null and self.xdg_shell_core.hasPopupGrab()) {
-        route.generated = null;
-        route.focus = null;
+        const generated = route.generated.?;
+        const grabbed_root = self.xdg_shell_core.popupKeyboardFocus();
+        if (grabbed_root == null or !std.meta.eql(generated.root, grabbed_root.?) or
+            self.managedGeneratedPopup(generated.root) == null or
+            !self.xdg_shell_core.popupGrabOwnsClient(generated.client))
+        {
+            route.generated = null;
+            route.focus = null;
+        }
     } else if (route.generated != null) {
         // Mature window chrome paints above the headless plane and keeps its
         // existing resize/move policy even where generated content overlaps.
@@ -7676,6 +7758,21 @@ fn maturePointerRoute(self: *Self, focus: Seat.PointerFocus) PointerRoute {
         .focus = focus,
         .root = self.subcompositor.rootSurface(focus.surface_id),
     };
+}
+
+fn pointerRouteForFocus(self: *Self, focus: Seat.PointerFocus) PointerRoute {
+    if (focus.generated) |generated| {
+        var route = generatedPointerRoute(.{
+            .surface_id = focus.surface_id,
+            .root = generated.root,
+            .client = generated.client,
+            .x = focus.x,
+            .y = focus.y,
+        });
+        if (self.managedGeneratedPopup(generated.root) != null) route.root = null;
+        return route;
+    }
+    return self.maturePointerRoute(focus);
 }
 
 fn borderRoot(self: *Self, x: f64, y: f64, excluded_window: ?Scene.Id) ?Surface.Id {
@@ -7749,12 +7846,12 @@ fn scenePointerRoute(
                     return generatedPointerRoute(focus);
                 const focus = self.hitTestWindow(window_entry.id, window_entry.window, x, y) orelse
                     return null;
-                return self.maturePointerRoute(focus);
+                return self.pointerRouteForFocus(focus);
             }
             if (self.hitTestGeneratedWindow(window_entry.window, x, y)) |focus|
                 return generatedPointerRoute(focus);
             if (self.hitTestWindow(window_entry.id, window_entry.window, x, y)) |focus|
-                return self.maturePointerRoute(focus);
+                return self.pointerRouteForFocus(focus);
         },
         .shell_surface => |shell_entry| {
             const shell_surface = shell_entry.shell_surface;
@@ -7965,6 +8062,26 @@ fn hitTestWindow(
     while (popups.next()) |entry| {
         const popup = entry.popup;
         if (!popup.mapped) continue;
+        if (self.managedGeneratedPopup(popup.surface_id)) |info| {
+            const geometry = popup.content_geometry orelse Scene.ContentGeometry{
+                .size = (self.headless_surface_forest.state(popup.surface_id) orelse continue)
+                    .mapped_size orelse continue,
+            };
+            var filter: GeneratedInputFilter = .{ .server = self, .root = popup.surface_id };
+            const hit = self.headless_surface_forest.inputHit(
+                x - @as(f64, @floatFromInt(entry.position.x -| geometry.offset.x)),
+                y - @as(f64, @floatFromInt(entry.position.y -| geometry.offset.y)),
+                .{ .context = &filter, .accepts = generatedSurfaceAcceptsInput },
+            ) orelse continue;
+            if (!std.meta.eql(self.headless_surface_forest.compoundRoot(hit.id) orelse continue, popup.surface_id))
+                continue;
+            return .{
+                .surface_id = hit.id,
+                .x = hit.x,
+                .y = hit.y,
+                .generated = .{ .root = popup.surface_id, .client = info.client },
+            };
+        }
         const buffer = Surface.currentBuffer(
             self.compositor.surfaceStore(),
             popup.surface_id,
@@ -9281,7 +9398,9 @@ fn addSurfaceTreeBounds(
     y: i32,
     bounds: *?render.Rect,
 ) error{Overflow}!void {
-    if (self.managedGeneratedWindow(surface_id) != null) {
+    if (self.managedGeneratedWindow(surface_id) != null or
+        self.managedGeneratedPopup(surface_id) != null)
+    {
         const subtree = self.headless_surface_forest.subtreeBounds(surface_id) orelse return;
         const rect = subtree.translated(x, y);
         bounds.* = if (bounds.*) |current|
@@ -9352,8 +9471,7 @@ fn completeGeneratedCallbackOnlyFrames(
     while (iterator.next()) |node| {
         if (!node.frame_demand or !output.containsSurface(node.id)) continue;
         const root = self.headless_surface_forest.compoundRoot(node.id) orelse continue;
-        const info = self.managedGeneratedWindow(root) orelse continue;
-        if (!info.mapped or !info.scene_presentation_enabled or
+        if ((!self.exactEligibleGeneratedRoot(root) and !self.exactEligibleGeneratedPopupRoot(root)) or
             !self.headless_surface_forest.mappedInCompound(node.id, root)) continue;
         completed = self.headless_surface_forest.completeCallbackOnlyFrame(node.id, timestamp_ms) or completed;
     }
@@ -9367,8 +9485,7 @@ fn scheduleGeneratedCallbackOnlyFrames(self: *Self, render_output: *RenderOutput
         if (!node.frame_demand or !output.containsSurface(node.id) or
             !self.headless_surface_forest.hasCallbackOnlyFrameDemand(node.id)) continue;
         const root = self.headless_surface_forest.compoundRoot(node.id) orelse continue;
-        const info = self.managedGeneratedWindow(root) orelse continue;
-        if (!info.mapped or !info.scene_presentation_enabled or
+        if ((!self.exactEligibleGeneratedRoot(root) and !self.exactEligibleGeneratedPopupRoot(root)) or
             !self.headless_surface_forest.mappedInCompound(node.id, root)) continue;
         self.scheduleFrameCallback(render_output);
         return;
@@ -10192,6 +10309,13 @@ fn refreshKeyboardFocusWithGeneratedRetention(self: *Self, retain_generated: boo
         self.applyMatureKeyboardFocus(focus);
         self.syncXwaylandFocus(null);
         return;
+    }
+    if (self.xdg_shell_core.popupKeyboardFocus()) |root| {
+        if (self.managedGeneratedPopup(root)) |popup| {
+            _ = self.seat.applyGeneratedKeyboardFocus(.{ .surface = root, .client = popup.client }, null);
+            self.syncXwaylandFocus(null);
+            return;
+        }
     }
     const default_focus = self.maturePolicyKeyboardFocus();
     if (retain_generated and generatedFocusPolicyAllows(
@@ -11078,6 +11202,21 @@ fn renderWindowPopups(
     while (popups.next()) |entry| {
         const popup = entry.popup;
         if (!popup.mapped) continue;
+        if (self.managedGeneratedPopup(popup.surface_id) != null) {
+            const state = self.headless_surface_forest.state(popup.surface_id) orelse continue;
+            const content_geometry = popup.content_geometry orelse Scene.ContentGeometry{
+                .size = state.mapped_size orelse continue,
+            };
+            try self.renderSurfaceTree(
+                frame,
+                popup.surface_id,
+                entry.position.x -| content_geometry.offset.x,
+                entry.position.y -| content_geometry.offset.y,
+                null,
+                null,
+            );
+            continue;
+        }
         const buffer = Surface.currentBuffer(
             self.compositor.surfaceStore(),
             popup.surface_id,
@@ -11118,7 +11257,9 @@ fn renderSurfaceTreeCapture(
     rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
 ) Renderer.Error!?u32 {
-    if (self.managedGeneratedWindow(surface_id) != null) {
+    if (self.managedGeneratedWindow(surface_id) != null or
+        self.managedGeneratedPopup(surface_id) != null)
+    {
         if (self.generatedManagedBlurBounds(
             frame,
             surface_id,
@@ -11167,7 +11308,9 @@ fn renderSurfaceTreeContents(
     clip: ?render.Rect,
     capture_id: ?u32,
 ) Renderer.Error!void {
-    if (self.managedGeneratedWindow(surface_id) != null) {
+    if (self.managedGeneratedWindow(surface_id) != null or
+        self.managedGeneratedPopup(surface_id) != null)
+    {
         var iterator = self.headless_surface_forest.subtreeRenderIterator(surface_id);
         while (iterator.next()) |entry| {
             const render_state = self.surface_registry.renderState(entry.id) orelse continue;
@@ -11799,6 +11942,10 @@ fn renderWindowDecorations(
 }
 
 fn submitSurfaceTree(self: *Self, output: *Output, surface_id: Surface.Id) void {
+    // Generated popup presentation and frame completion are owned by the
+    // accepted sampled-headless path; they intentionally have no mature
+    // Surface buffer or presentation feedback to submit here.
+    if (self.exactEligibleGeneratedPopupRoot(surface_id)) return;
     if (Surface.currentBuffer(self.compositor.surfaceStore(), surface_id) == null) return;
 
     var stack = self.subcompositor.stackIterator(surface_id);
@@ -14832,8 +14979,7 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     server.pointerButtonForSeat(&server.seat, 40, linux_button_left, .released);
     pointerAvailable(server.primaryRenderOutput(), true);
 
-    // Generated popup protocol state may map, but Wave 4 keeps the popup out
-    // of Scene policy and every presentation path until Wave 6.
+    // A generated popup remains private before its configured buffer handoff.
     try T.send(client, 3, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 13 } }});
     const popup_surface_id = compositor.surfaceId(client, 13).?;
     try std.testing.expectEqual(
@@ -14861,6 +15007,7 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     });
     const popup_id = server.xdg_shell_core.popupForSurface(popup_surface_id).?;
     try std.testing.expect(!server.xdg_shell_core.popupScenePresentationEnabled(popup_id));
+    try std.testing.expect(!server.scene.surfaceMapped(popup_surface_id));
     try T.send(client, 13, 6, &core.wl_surface.request_messages[6], &.{});
     const popup_configure = try T.drain(client);
     defer std.testing.allocator.free(popup_configure);
@@ -14869,26 +15016,35 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     try T.send(client, 13, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = 10 }, .{ .int = 0 }, .{ .int = 0 } });
     try T.send(client, 13, 6, &core.wl_surface.request_messages[6], &.{});
     try std.testing.expect(server.xdg_shell_core.popupMapped(popup_id));
-    try std.testing.expect(!server.scene.surfaceMapped(popup_surface_id));
+    try std.testing.expect(server.xdg_shell_core.popupScenePresentationEnabled(popup_id));
+    try std.testing.expect(server.scene.surfaceMapped(popup_surface_id));
     try std.testing.expectEqual(HeadlessSurfaceForest.PresentationClass.managed, server.headless_surface_forest.presentationClass(popup_surface_id).?);
+    // Managed generated roots are rendered exactly once through Scene, never
+    // duplicated by the global headless forest plane.
     rendered_surfaces = server.headless_surface_forest.renderIterator();
     try std.testing.expect(rendered_surfaces.next() == null);
     const popup_render_output = server.primaryRenderOutput();
+    try std.testing.expect(!popup_render_output.damage.isEmpty());
     try renderPendingTestOutput(server, popup_render_output);
     const popup_output = server.outputs.get(popup_render_output.protocol_id).?;
-    try std.testing.expect(!popup_output.containsSurface(popup_surface_id));
+    try std.testing.expect(popup_output.containsSurface(popup_surface_id));
     try std.testing.expect(popup_render_output.damage.isEmpty());
     try T.send(client, 13, 6, &core.wl_surface.request_messages[6], &.{});
-    try std.testing.expect(popup_render_output.damage.isEmpty());
+    try std.testing.expect(!popup_render_output.damage.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), server.window_transitions.items.len);
 
-    // Null-buffer unmap and role reconstruction both preserve private popup
-    // presentation; reconstruction disables the fresh neutral role before
-    // the permanent generated role is republished.
+    // Null-buffer unmap hides and resets presentation. Reconstruction starts
+    // private again before the permanent generated role is republished.
     try T.send(client, 13, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = null }, .{ .int = 0 }, .{ .int = 0 } });
     try T.send(client, 13, 6, &core.wl_surface.request_messages[6], &.{});
     try std.testing.expect(!server.xdg_shell_core.popupMapped(popup_id));
     try std.testing.expect(!server.xdg_shell_core.popupScenePresentationEnabled(popup_id));
+    try std.testing.expect(!server.scene.surfaceMapped(popup_surface_id));
+    try std.testing.expect(popup_output.containsSurface(popup_surface_id));
+    try std.testing.expect(!popup_render_output.damage.isEmpty());
+    try renderPendingTestOutput(server, popup_render_output);
+    try std.testing.expect(!popup_output.containsSurface(popup_surface_id));
+    try std.testing.expect(popup_render_output.damage.isEmpty());
     try T.send(client, 16, 0, &core.xdg_popup.request_messages[0], &.{});
     try T.send(client, 14, 0, &core.xdg_surface.request_messages[0], &.{});
     try T.send(client, 5, 2, &core.xdg_wm_base.request_messages[2], &.{ .{ .new_id = .{ .typed = 17 } }, .{ .object = 13 } });

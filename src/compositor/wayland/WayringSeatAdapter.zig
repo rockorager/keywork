@@ -246,6 +246,27 @@ pub fn acceptsXdgPointerGrab(
     return client_id;
 }
 
+/// Validates an XDG user action against the exact live generated wl_seat and
+/// the canonical serial authority, without imposing pointer-grab purpose.
+pub fn acceptsXdgUserAction(
+    self: *WayringSeatAdapter,
+    client: *wayring.server.Client,
+    seat_object_id: u32,
+    serial: u32,
+) ?ClientRegistry.Id {
+    if (client.fatal() != null) return null;
+    const installed = client.lookup(seat_object_id) orelse return null;
+    for (self.seats.items) |seat| {
+        if (seat.client != client or seat.resource.id() != seat_object_id or
+            installed != &seat.resource.runtime or seat.resource.runtime.state() != .live) continue;
+        const client_id = self.clients.id(client) orelse return null;
+        const typed_serial: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = serial };
+        if (!self.request_sink.accepts_action(self.request_sink.context, client_id, typed_serial)) return null;
+        return client_id;
+    }
+    return null;
+}
+
 fn seatRequest(_: *core.wl_seat.Resource, request: core.wl_seat.Request, seat: *SeatResource) !void {
     switch (request) {
         .get_pointer => |args| {
@@ -1110,6 +1131,7 @@ const TestRequestProbe = struct {
             .pointer_enter_snapshot = pointerEnterSnapshot,
             .keyboard_resource_snapshot = keyboardResourceSnapshot,
             .accepts_pointer_grab = acceptsPointerGrab,
+            .accepts_action = acceptsAction,
             .set_cursor = setCursor,
             .cursor_committed = recordCursorCommitted,
             .cursor_removed = recordCursorRemoved,
@@ -1128,6 +1150,13 @@ const TestRequestProbe = struct {
             self.pointer_grab_surface != null and std.meta.eql(self.pointer_grab_client.?, client) and
             std.meta.eql(self.pointer_grab_serial.?, serial) and
             std.meta.eql(self.pointer_grab_surface.?, surface);
+    }
+
+    fn acceptsAction(context: *anyopaque, client: ClientRegistry.Id, serial: ClientRegistry.Serial) bool {
+        const self: *TestRequestProbe = @ptrCast(@alignCast(context));
+        return self.pointer_grab_client != null and self.pointer_grab_serial != null and
+            std.meta.eql(self.pointer_grab_client.?, client) and
+            std.meta.eql(self.pointer_grab_serial.?, serial);
     }
 
     fn pointerEnterSnapshot(
@@ -1668,6 +1697,27 @@ test "XDG pointer grabs require the exact live generated seat client and serial"
     other_live = false;
     setup.destroyClient(managed);
     client_live = false;
+}
+
+test "XDG user actions require the exact live generated seat client and serial" {
+    var setup: AdapterTestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+    const managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client = managed.client();
+    defer setup.destroyClient(managed);
+    const client_id = try setup.registerClient(client);
+    try setup.adapter.publish();
+    defer setup.adapter.unpublish();
+    try testPrepareRegistry(client);
+    try testBindGlobal(client, setup.adapter.global.?, 7, 3);
+    setup.probe.pointer_grab_client = client_id;
+    setup.probe.pointer_grab_serial = .{ .domain = .wayring_server, .value = 19 };
+    try std.testing.expectEqual(client_id, setup.adapter.acceptsXdgUserAction(client, 3, 19).?);
+    try std.testing.expect(setup.adapter.acceptsXdgUserAction(client, 2, 19) == null);
+    try std.testing.expect(setup.adapter.acceptsXdgUserAction(client, 3, 20) == null);
+    try testSend(client, 3, 3, &core.wl_seat.request_messages[3], &.{});
+    try std.testing.expect(setup.adapter.acceptsXdgUserAction(client, 3, 19) == null);
 }
 
 test "seat publication failure leaves no seat or stale bind context and outer rollback is exact" {
