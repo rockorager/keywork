@@ -134,6 +134,7 @@ pub const WindowInfo = struct {
     ready: bool,
     mapped: bool,
     scene_presentation_enabled: bool,
+    interaction_enabled: bool,
     requested_state: WindowRequestState,
 };
 
@@ -185,6 +186,7 @@ pub const WindowListener = struct {
         WindowId,
         bool,
     ) error{OutOfMemory}!void,
+    interaction_changed: *const fn (*anyopaque, WindowId, bool) void,
     request: *const fn (*anyopaque, WindowId, WindowRequest) void,
 };
 pub const WindowObserver = struct {
@@ -253,6 +255,7 @@ const WindowState = struct {
     ready: bool = false,
     requested_scene_visibility: bool = true,
     scene_presentation_enabled: bool = true,
+    interaction_enabled: bool = true,
     requested_state: WindowRequestState = .{},
     fn deinit(self: *WindowState, a: std.mem.Allocator) void {
         if (self.title) |v| a.free(v);
@@ -858,6 +861,7 @@ pub fn windowInfo(self: *XdgShell, id: WindowId) ?WindowInfo {
         .ready = window.ready,
         .mapped = window.mapped,
         .scene_presentation_enabled = window.scene_presentation_enabled,
+        .interaction_enabled = window.interaction_enabled,
         .requested_state = window.requested_state,
     };
 }
@@ -1053,6 +1057,15 @@ pub fn setWindowScenePresentationEnabled(
     self.notify(.metadata_changed, id);
     self.applyWindowSceneMapping(window);
     if (!enabled) self.scene.placeUnmappedWindowBottom(window.scene_id);
+}
+
+pub fn setWindowInteractionEnabled(self: *XdgShell, id: WindowId, enabled: bool) void {
+    const window = self.windows.get(id) orelse return;
+    if (window.interaction_enabled == enabled) return;
+    window.interaction_enabled = enabled;
+    if (self.window_listener) |listener| {
+        listener.interaction_changed(listener.context, id, enabled);
+    }
 }
 
 fn applyWindowSceneMapping(self: *XdgShell, window: *WindowState) void {
@@ -1756,12 +1769,12 @@ pub fn requestMinimized(self: *XdgShell, id: WindowId, minimized: bool) void {
 }
 
 pub fn requestWindow(self: *XdgShell, id: WindowId, request: WindowRequest) void {
-    if (self.windows.get(id) == null) return;
+    const window = self.windows.get(id) orelse return;
     switch (request) {
-        .pointer_move => |a| if (!a.granted) return,
-        .pointer_resize => |v| if (!v.action.granted) return,
-        .show_window_menu => |v| if (!v.action.granted) return,
-        .activate => |a| if (!a.granted) return,
+        .pointer_move => |a| if (!window.interaction_enabled or !a.granted) return,
+        .pointer_resize => |v| if (!window.interaction_enabled or !v.action.granted) return,
+        .show_window_menu => |v| if (!window.interaction_enabled or !v.action.granted) return,
+        .activate => |a| if (!window.interaction_enabled or !a.granted) return,
         else => {},
     }
     if (self.window_listener) |l| l.request(l.context, id, request);
@@ -2079,6 +2092,7 @@ test "presentation handoff is atomic across listener failure and retry" {
         fn metadataChanged(_: *anyopaque, _: WindowId) bool {
             return true;
         }
+        fn interactionChanged(_: *anyopaque, _: WindowId, _: bool) void {}
         fn presentationChanged(
             context: *anyopaque,
             id: WindowId,
@@ -2112,6 +2126,7 @@ test "presentation handoff is atomic across listener failure and retry" {
         .destroyed = Context.ignored,
         .metadata_changed = Context.metadataChanged,
         .presentation_changed = Context.presentationChanged,
+        .interaction_changed = Context.interactionChanged,
         .request = Context.request,
     });
     defer shell.clearWindowListener();

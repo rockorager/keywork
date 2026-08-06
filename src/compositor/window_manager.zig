@@ -132,6 +132,7 @@ pub const GeometryTransitionListener = struct {
     appeared: *const fn (*anyopaque, GeometryAppearance) void,
     closing: *const fn (*anyopaque, GeometryAppearance) void,
     removed: *const fn (*anyopaque, Scene.Id) void,
+    presentation_disabled: *const fn (*anyopaque, Scene.Id) void,
     workspace_switching: *const fn (*anyopaque, OutputLayout.Id) void,
     workspace_published: *const fn (*anyopaque, OutputLayout.Id) void,
 };
@@ -232,6 +233,7 @@ const Window = struct {
     closing_prepared: bool = false,
     mapped: bool = false,
     presentation_enabled: bool = true,
+    interaction_enabled: bool = true,
     minimized: bool = false,
     maximized: bool = false,
     fullscreen_output: ?OutputLayout.Id = null,
@@ -304,6 +306,7 @@ pub fn init(
         .destroyed = windowDestroyed,
         .metadata_changed = windowMetadataChanged,
         .presentation_changed = windowPresentationChanged,
+        .interaction_changed = windowInteractionChanged,
         .request = windowRequest,
     });
     layer_shell.setPolicyListener(.{ .context = self, .supported = layerSupported, .changed = layerChanged });
@@ -612,6 +615,7 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
         .floating_position = if (restore) |state| state.position else null,
         .workspace_enrolled = info.scene_presentation_enabled,
         .presentation_enabled = info.scene_presentation_enabled,
+        .interaction_enabled = info.interaction_enabled,
         .minimized = if (restore) |state| state.minimized else info.requested_state.minimized,
         .maximized = if (restore) |state| state.maximized else info.requested_state.maximized,
         .fullscreen_output = if (restore) |state|
@@ -627,12 +631,13 @@ fn addXdg(self: *Self, xdg_id: XdgShell.WindowId) !WindowId {
     errdefer _ = self.windows.remove(id);
     if (info.scene_presentation_enabled) {
         _ = try self.workspaces.items[workspace].workspace.insert(self.allocator, neutral(id));
-        _ = self.workspaces.items[workspace].workspace.focus(neutral(id));
+        if (info.interaction_enabled)
+            _ = self.workspaces.items[workspace].workspace.focus(neutral(id));
         self.reportWorkspaceOccupancy(workspace);
     }
     // Keep compositor commands on the output selected for a new window. A
     // restored window must not change the user's current output selection.
-    if (restore == null and info.scene_presentation_enabled)
+    if (restore == null and info.scene_presentation_enabled and info.interaction_enabled)
         self.default_output = self.workspaces.items[workspace].output;
     if (restore != null) std.debug.assert(self.pending_session_restores.remove(xdg_id));
     return id;
@@ -946,7 +951,8 @@ pub fn setWindowBorders(
 
 fn windowFocused(self: *Self, id: WindowId, window: *const Window) bool {
     const focused = self.workspaces.items[window.workspace].workspace.focused orelse return false;
-    return window.presentation_enabled and !window.minimized and neutral(id).eql(focused);
+    return window.presentation_enabled and window.interaction_enabled and
+        !window.minimized and neutral(id).eql(focused);
 }
 
 fn effectsForWindow(self: *Self, window: *const Window, focused: bool) Scene.Effects {
@@ -993,7 +999,8 @@ pub fn focusedSurface(self: *Self) ?Surface.Id {
     const workspace_index = self.workspaceFor(self.default_output) orelse return null;
     const focused = self.workspaces.items[workspace_index].workspace.focused orelse return null;
     const window = self.windows.get(internal(focused)) orelse return null;
-    if (!window.presentation_enabled or window.minimized or !window.mapped) return null;
+    if (!window.presentation_enabled or !window.interaction_enabled or
+        window.minimized or !window.mapped) return null;
     return window.surface_id;
 }
 
@@ -1006,7 +1013,7 @@ pub fn activationRequested(
 ) bool {
     const id = self.windowForSurface(surface_id) orelse return false;
     const window = self.windows.get(id) orelse return false;
-    if (!window.presentation_enabled) return false;
+    if (!window.presentation_enabled or !window.interaction_enabled) return false;
     if (!proven_interaction or self.layer_focus == .exclusive) {
         _ = self.setWindowUrgent(id, true);
         return false;
@@ -1024,7 +1031,7 @@ fn activateWindow(self: *Self, id: WindowId) bool {
         return false;
     }
     const window = self.windows.get(id) orelse return false;
-    if (!window.presentation_enabled) return false;
+    if (!window.presentation_enabled or !window.interaction_enabled) return false;
     std.debug.assert(window.mapped);
     const was_minimized = window.minimized;
     window.minimized = false;
@@ -1135,7 +1142,8 @@ fn windowForSurface(self: *Self, surface_id: Surface.Id) ?WindowId {
 
 fn focusWindow(self: *Self, id: WindowId) bool {
     const window = self.windows.get(id) orelse return false;
-    if (!window.presentation_enabled or !window.mapped or window.minimized) return false;
+    if (!window.presentation_enabled or !window.interaction_enabled or
+        !window.mapped or window.minimized) return false;
     const workspace = &self.workspaces.items[window.workspace];
     if (!workspace.active) return false;
     const target = neutral(id);
@@ -1382,7 +1390,8 @@ fn interactiveResizeForWindow(
     pointer_y: f64,
 ) ?InteractiveResize {
     const window = self.windows.get(id) orelse return null;
-    if (!window.presentation_enabled or !window.mapped or window.minimized or
+    if (!window.presentation_enabled or !window.interaction_enabled or
+        !window.mapped or window.minimized or
         window.fullscreen_output != null) return null;
     const workspace = &self.workspaces.items[window.workspace];
     if (!workspace.active) return null;
@@ -1585,7 +1594,8 @@ fn beginWindowMove(
 ) bool {
     if (self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
     const window = self.windows.get(id) orelse return false;
-    if (!window.presentation_enabled or !window.mapped or window.minimized or
+    if (!window.presentation_enabled or !window.interaction_enabled or
+        !window.mapped or window.minimized or
         window.fullscreen_output != null) return false;
     if (!allow_tiled and !self.isFloating(window)) return false;
     const current = self.scene.windowPosition(window.scene_id) orelse return false;
@@ -1768,7 +1778,8 @@ fn windowSizeConstraints(self: *Self, window: *const Window) types.SizeConstrain
 }
 
 fn isDraggableTiledWindow(self: *Self, window: *const Window) bool {
-    return window.presentation_enabled and window.mapped and !window.minimized and
+    return window.presentation_enabled and window.interaction_enabled and
+        window.mapped and !window.minimized and
         window.fullscreen_output == null and
         !self.isFloating(window) and self.transientParent(window) == null and
         window.placement != null and window.placement.?.visible;
@@ -1853,7 +1864,8 @@ pub fn moveFocusedDirection(self: *Self, direction: Direction) void {
     const workspace = &self.workspaces.items[index].workspace;
     const focused = workspace.focused orelse return;
     const focused_window = self.windows.get(internal(focused)) orelse return;
-    if (!focused_window.presentation_enabled or self.isFloating(focused_window)) return;
+    if (!focused_window.presentation_enabled or !focused_window.interaction_enabled or
+        self.isFloating(focused_window)) return;
     const candidate = self.directionalNeighbor(workspace, direction, false, false) orelse return;
     const changed = workspace.swapWindows(focused, candidate);
     std.debug.assert(changed);
@@ -1983,14 +1995,14 @@ fn focusedWindow(self: *Self) ?*Window {
     const window = self.windows.get(internal(
         self.workspaces.items[index].workspace.focused orelse return null,
     )) orelse return null;
-    return if (window.presentation_enabled) window else null;
+    return if (window.presentation_enabled and window.interaction_enabled) window else null;
 }
 fn focusRelative(self: *Self, reverse: bool) void {
     const index = self.workspaceFor(self.default_output) orelse return;
     const ws = &self.workspaces.items[index].workspace;
     const focused = ws.focused orelse return;
     const window = self.windows.get(internal(focused)) orelse return;
-    if (!window.presentation_enabled) return;
+    if (!window.presentation_enabled or !window.interaction_enabled) return;
     if (self.isFloating(window)) {
         // Unlike Sway, Keywork has no explicit focus-layer toggle yet. Keep
         // next/previous able to leave the floating layer.
@@ -2011,7 +2023,7 @@ fn cycleFocus(
     for (0..workspace.members.items.len) |_| {
         candidate = workspace.nextWindow(candidate, reverse) orelse return;
         const window = self.windows.get(internal(candidate)) orelse continue;
-        if (!window.presentation_enabled or window.minimized or
+        if (!window.presentation_enabled or !window.interaction_enabled or window.minimized or
             !self.transientIsVisible(window)) continue;
         const changed = workspace.focus(candidate);
         std.debug.assert(changed);
@@ -2039,7 +2051,7 @@ fn directionalNeighbor(
 ) ?types.WindowId {
     const focused = workspace.focused orelse return null;
     const focused_window = self.windows.get(internal(focused)) orelse return null;
-    if (!focused_window.presentation_enabled) return null;
+    if (!focused_window.presentation_enabled or !focused_window.interaction_enabled) return null;
     if (self.isFloating(focused_window)) {
         if (self.geometricDirectionalNeighbor(workspace, focused, direction, true, false)) |candidate| {
             return candidate;
@@ -2062,7 +2074,8 @@ fn directionalNeighbor(
     defer eligible.deinit(self.allocator);
     for (workspace.members.items) |id| {
         const window = self.windows.get(internal(id)) orelse continue;
-        if (!window.presentation_enabled or window.minimized or self.isFloating(window) or
+        if (!window.presentation_enabled or !window.interaction_enabled or
+            window.minimized or self.isFloating(window) or
             !self.transientIsVisible(window)) continue;
         eligible.append(self.allocator, id) catch return null;
     }
@@ -2103,7 +2116,7 @@ fn mostRecentLayerWindow(
         index -= 1;
         const id = workspace.focus_history.items[index];
         const window = self.windows.get(internal(id)) orelse continue;
-        if (!window.presentation_enabled or window.minimized or
+        if (!window.presentation_enabled or !window.interaction_enabled or window.minimized or
             self.isFloating(window) != floating or
             !self.transientIsVisible(window) or window.placement == null) continue;
         return id;
@@ -2120,7 +2133,7 @@ fn geometricDirectionalNeighbor(
     wrap: bool,
 ) ?types.WindowId {
     const focused_window = self.windows.get(internal(focused)) orelse return null;
-    if (!focused_window.presentation_enabled) return null;
+    if (!focused_window.presentation_enabled or !focused_window.interaction_enabled) return null;
     const origin = if (focused_window.placement) |plan| plan.rect else return null;
     var best_id: ?types.WindowId = null;
     var best_delta: ?i64 = null;
@@ -2129,7 +2142,7 @@ fn geometricDirectionalNeighbor(
     for (workspace.members.items) |id| {
         if (id.eql(focused)) continue;
         const window = self.windows.get(internal(id)) orelse continue;
-        if (!window.presentation_enabled or window.minimized or
+        if (!window.presentation_enabled or !window.interaction_enabled or window.minimized or
             self.isFloating(window) != floating_candidates or
             !self.transientIsVisible(window)) continue;
         const candidate = if (window.placement) |plan| plan.rect else continue;
@@ -2383,7 +2396,8 @@ fn relayout(self: *Self) void {
                     window.fullscreen_output != null,
                 );
                 const configuration: XdgShell.ToplevelConfigure = .{
-                    .activated = window.presentation_enabled and !repaint_suspended and
+                    .activated = window.presentation_enabled and window.interaction_enabled and
+                        !repaint_suspended and
                         workspace.workspace.focused != null and
                         member.eql(workspace.workspace.focused.?),
                     .resizing = !repaint_suspended and
@@ -2450,7 +2464,8 @@ fn normalizeFocus(self: *Self, entry: *OutputWorkspace) void {
         index -= 1;
         const candidate = workspace.focus_history.items[index];
         if (self.windows.get(internal(candidate))) |window| {
-            if (window.presentation_enabled and !window.minimized and
+            if (window.presentation_enabled and window.interaction_enabled and
+                !window.minimized and
                 self.transientIsVisible(window))
             {
                 const changed = workspace.focus(candidate);
@@ -2787,6 +2802,9 @@ fn windowPresentationChanged(
         window.workspace_enrolled = true;
         self.reportWorkspaceOccupancy(window.workspace);
     } else if (window.workspace_enrolled) {
+        if (self.geometry_listener) |listener|
+            listener.presentation_disabled(listener.context, window.scene_id);
+        window.transition_prepared = false;
         const removed = self.workspaces.items[window.workspace].workspace.remove(neutral(managed_id));
         std.debug.assert(removed);
         window.workspace_enrolled = false;
@@ -2796,12 +2814,21 @@ fn windowPresentationChanged(
     window.presentation_enabled = enabled;
     self.relayout();
 }
+fn windowInteractionChanged(context: *anyopaque, id: XdgShell.WindowId, enabled: bool) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const managed_id = self.findXdg(id) orelse return;
+    const window = self.windows.get(managed_id) orelse return;
+    if (window.interaction_enabled == enabled) return;
+    window.interaction_enabled = enabled;
+    if (!enabled) self.removeWindowPointerInteractions(managed_id);
+    self.relayout();
+}
 fn windowRequest(context: *anyopaque, id: XdgShell.WindowId, request: XdgShell.WindowRequest) void {
     const self: *Self = @ptrCast(@alignCast(context));
     const window = self.windows.get(self.findXdg(id) orelse return) orelse return;
     switch (request) {
         .activate => |action| {
-            if (!action.granted) return;
+            if (!window.interaction_enabled or !action.granted) return;
             if (self.layer_focus == .exclusive) return;
             window.minimized = false;
             _ = self.layer_shell.relinquishNonExclusiveFocus();
@@ -2809,7 +2836,8 @@ fn windowRequest(context: *anyopaque, id: XdgShell.WindowId, request: XdgShell.W
         },
         .unminimize => {
             window.minimized = false;
-            _ = self.workspaces.items[window.workspace].workspace.focus(neutral(self.findXdg(id).?));
+            if (window.interaction_enabled)
+                _ = self.workspaces.items[window.workspace].workspace.focus(neutral(self.findXdg(id).?));
         },
         .minimize => window.minimized = true,
         .maximize => window.maximized = true,

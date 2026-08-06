@@ -280,6 +280,39 @@ pub fn takeFrameCompletion(
     return completion;
 }
 
+pub fn hasCallbackOnlyFrameDemand(
+    self: *const HeadlessSurfaceForest,
+    id: SurfaceRegistry.Id,
+) bool {
+    const target = self.nodeConst(id) orelse return false;
+    if (!target.frame_demand) return false;
+    const completion = target.frame_completion orelse unreachable;
+    const has_callback_only = completion.has_callback_only orelse return false;
+    return has_callback_only(completion.context, id);
+}
+
+/// Completes only the leading callback-only prefix without consuming later
+/// repaint-dependent demand committed for the same surface.
+pub fn completeCallbackOnlyFrame(
+    self: *HeadlessSurfaceForest,
+    id: SurfaceRegistry.Id,
+    timestamp_ms: u32,
+) bool {
+    const target = self.node(id) orelse return false;
+    if (!target.frame_demand) return false;
+    const completion = target.frame_completion orelse unreachable;
+    const complete_callback_only = completion.complete_callback_only orelse return false;
+    return switch (complete_callback_only(completion.context, id, timestamp_ms)) {
+        .none => false,
+        .remaining => true,
+        .drained => drained: {
+            target.frame_demand = false;
+            self.validateAfterMutation();
+            break :drained true;
+        },
+    };
+}
+
 /// Applies one allocation-free root presentation transition. Detached and
 /// child nodes are rejected. Managed and cursor roots cannot regress.
 pub fn setRootPresentationClass(
@@ -373,6 +406,19 @@ pub fn presentedInCompound(
     if (self.exactGeometry(id) == null) return false;
     const current_root = self.compoundRoot(id) orelse return false;
     if (self.nodeConst(current_root).?.presentation_class != .background) return false;
+    return sameId(current_root, root);
+}
+
+/// Reports mapped ancestry under an exact attached root without applying the
+/// root's presentation-class policy. Scene-owned managed compounds use this
+/// for callback-only pacing after their Scene presentation is established.
+pub fn mappedInCompound(
+    self: *const HeadlessSurfaceForest,
+    id: SurfaceRegistry.Id,
+    root: SurfaceRegistry.Id,
+) bool {
+    if (self.exactGeometry(id) == null) return false;
+    const current_root = self.compoundRoot(id) orelse return false;
     return sameId(current_root, root);
 }
 
@@ -566,6 +612,15 @@ pub fn subtreeBounds(
         .rect => |rect| rect,
         .hidden, .full_damage => null,
     };
+}
+
+/// Presentation-policy-independent subtree bounds for Scene-owned generated
+/// compounds. Callers must preserve the full-damage result.
+pub fn subtreeDamageBounds(
+    self: *const HeadlessSurfaceForest,
+    id: SurfaceRegistry.Id,
+) CompoundBounds {
+    return self.geometryBounds(id);
 }
 
 fn geometryBounds(
@@ -1360,6 +1415,9 @@ test "coordinate overflow requests full damage" {
     };
     forest.apply(.{ .surfaces = &.{}, .parents = &parents });
     try std.testing.expectEqual(CompoundBounds.full_damage, forest.compoundBounds(root));
+    try std.testing.expect(forest.setRootPresentationClass(root, .managed));
+    try std.testing.expectEqual(CompoundBounds.hidden, forest.compoundBounds(root));
+    try std.testing.expectEqual(CompoundBounds.full_damage, forest.subtreeDamageBounds(root));
     forest.remove(root);
     forest.remove(child);
     forest.remove(grandchild);
