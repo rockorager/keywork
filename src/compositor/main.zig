@@ -13,6 +13,7 @@ const Server = @import("server.zig");
 const Systemd = @import("systemd.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
+const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
 const WayringHost = @import("wayland/WayringHost.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
@@ -189,6 +190,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_viewporter: WayringViewporter = undefined;
     var wayring_viewporter_initialized = false;
     var wayring_viewporter_published = false;
+    var wayring_fractional_scale: WayringFractionalScale = undefined;
+    var wayring_fractional_scale_initialized = false;
+    var wayring_fractional_scale_published = false;
     var wayring_seat_adapter: WayringSeatAdapter = undefined;
     var wayring_seat_adapter_initialized = false;
     var wayring_seat_published = false;
@@ -197,6 +201,7 @@ pub fn main(init: std.process.Init) !void {
         outputs: ?*WayringOutput,
         xdg_shell: *WayringXdgShell,
         viewporter: *WayringViewporter,
+        fractional_scale: ?*WayringFractionalScale,
         compositor: *WayringCompositor,
         seat: *WayringSeatAdapter,
 
@@ -210,6 +215,8 @@ pub fn main(init: std.process.Init) !void {
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
             self.seat.destroyClientResources(client);
+            if (self.fractional_scale) |fractional_scale|
+                fractional_scale.destroyClientResources(client);
             self.viewporter.destroyClientResources(client);
             self.xdg_shell.destroyClientResources(client);
             if (self.outputs) |outputs| outputs.destroyClientResources(client);
@@ -223,6 +230,11 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_fractional_scale_initialized) {
+            server.clearWayringDefaultOutputListener(&wayring_fractional_scale);
+            if (wayring_fractional_scale_published) wayring_fractional_scale.unpublish();
+            wayring_fractional_scale.deinit();
+        }
         if (wayring_viewporter_initialized) {
             if (wayring_viewporter_published) wayring_viewporter.unpublish();
             wayring_viewporter.deinit();
@@ -291,6 +303,21 @@ pub fn main(init: std.process.Init) !void {
         wayring_xdg_shell_initialized = true;
         wayring_viewporter.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
         wayring_viewporter_initialized = true;
+        if (wayring_outputs_initialized) {
+            try wayring_fractional_scale.init(
+                init.gpa,
+                &wayring_protocol_server.?,
+                &wayring_compositor,
+                &wayring_outputs,
+                server.wayringOutputLayout().?,
+                server.wayringDefaultOutputId().?,
+            );
+            wayring_fractional_scale_initialized = true;
+            server.setWayringDefaultOutputListener(.{
+                .context = &wayring_fractional_scale,
+                .changed = WayringFractionalScale.defaultOutputChanged,
+            });
+        }
         // Stable generated XDG is authoritative only on the headless path
         // where generated output/presentation policy is available. Outputs
         // and the seat are deliberately published before this shell global.
@@ -299,12 +326,15 @@ pub fn main(init: std.process.Init) !void {
             wayring_xdg_shell_published = true;
             try wayring_viewporter.publish();
             wayring_viewporter_published = true;
+            try wayring_fractional_scale.publish();
+            wayring_fractional_scale_published = true;
         }
         wayring_lifecycle = .{
             .clients = &wayring_clients,
             .outputs = if (wayring_outputs_initialized) &wayring_outputs else null,
             .xdg_shell = &wayring_xdg_shell,
             .viewporter = &wayring_viewporter,
+            .fractional_scale = if (wayring_fractional_scale_initialized) &wayring_fractional_scale else null,
             .compositor = &wayring_compositor,
             .seat = &wayring_seat_adapter,
         };
@@ -736,6 +766,7 @@ test {
     _ = @import("wayland/virtual_pointer.zig");
     _ = @import("wayland/presentation.zig");
     _ = @import("wayland/fractional_scale.zig");
+    _ = @import("wayland/WayringFractionalScale.zig");
     _ = @import("wayland/fixes.zig");
     _ = @import("wayland/linux_dmabuf.zig");
     _ = @import("wayland/linux_drm_syncobj.zig");

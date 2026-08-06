@@ -95,6 +95,7 @@ pub const Changes = packed struct {
     geometry: bool = false,
     mode: bool = false,
     scale: bool = false,
+    preferred_scale: bool = false,
 };
 
 /// Synchronous frontend fanout seam. Callbacks receive canonical surface IDs
@@ -272,6 +273,7 @@ pub fn configure(
         self.refresh_millihertz != refresh_millihertz or
         self.mode_preferred != preferred;
     const client_scale_changed = self.scale != scale;
+    const preferred_scale_changed = self.preferred_scale.numerator != preferred_scale.numerator;
     self.position = position;
     self.size = size;
     self.mode_size = mode_size;
@@ -279,7 +281,7 @@ pub fn configure(
     self.mode_preferred = preferred;
     self.scale = @intCast(scale);
     self.preferred_scale = preferred_scale;
-    if (!position_changed and !mode_changed and !client_scale_changed) return false;
+    if (!position_changed and !mode_changed and !client_scale_changed and !preferred_scale_changed) return false;
     for (self.resources.items) |resource| {
         if (position_changed) self.sendGeometry(resource);
         if (mode_changed) self.sendMode(resource);
@@ -291,6 +293,7 @@ pub fn configure(
         .geometry = position_changed,
         .mode = mode_changed,
         .scale = client_scale_changed,
+        .preferred_scale = preferred_scale_changed,
     });
     return mode_changed;
 }
@@ -444,9 +447,9 @@ pub fn endFrame(self: *Self) void {
                     if (resource.getClient() == surface.getClient()) surface.sendLeave(resource);
                 }
             }
-            self.notifyMembership(membership.surface_id, false);
         }
-        _ = self.memberships.orderedRemove(index);
+        const removed = self.memberships.orderedRemove(index);
+        if (removed.announced) self.notifyMembership(removed.surface_id, false);
     }
     self.frame_active = false;
     for (self.memberships.items, 0..) |membership, membership_index| {
@@ -851,7 +854,7 @@ test "canonical membership and delivery are independent of mature resources" {
         .refresh_nanoseconds = 20_000_000,
     });
     try std.testing.expectEqual(@as(usize, 2), probe.change_count);
-    try std.testing.expectEqual(Changes{ .geometry = true, .mode = true, .scale = true }, probe.changes[0]);
+    try std.testing.expectEqual(Changes{ .geometry = true, .mode = true, .scale = true, .preferred_scale = true }, probe.changes[0]);
     try std.testing.expectEqual(Changes{ .mode = true }, probe.changes[1]);
 
     output.beginFrame();
