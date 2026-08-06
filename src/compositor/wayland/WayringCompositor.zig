@@ -19,6 +19,7 @@ const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const SurfaceFrameCompletion = @import("../SurfaceFrameCompletion.zig");
 const WayringClients = @import("WayringClients.zig");
 const render = @import("../render/types.zig");
+const surface_geometry = @import("surface_geometry.zig");
 
 const server = wayring.server;
 const wire = wayring.wire;
@@ -28,6 +29,21 @@ const preferred_buffer_scale_event_opcode = 2;
 const preferred_buffer_transform_event_opcode = 3;
 
 pub const SurfaceId = SurfaceRegistry.Id;
+pub const ViewportState = surface_geometry.ViewportState;
+pub const ViewportSource = surface_geometry.ViewportSource;
+pub const ViewportDestination = surface_geometry.ViewportDestination;
+pub const ViewportError = enum { bad_size, out_of_buffer };
+pub const ViewportHandler = struct {
+    context: *anyopaque,
+    post_error: *const fn (*anyopaque, ViewportError) void,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+pub const ViewportAttachResult = union(enum) {
+    attached: SurfaceId,
+    viewport_exists,
+    not_live,
+    wrong_client,
+};
 
 /// Frontend-local delivery endpoint borrowed for one synchronous event fanout.
 /// Callers must not retain either pointer or use it after returning to the
@@ -182,6 +198,10 @@ const Surface = struct {
     current_transform: render.BufferTransform = .normal,
     current: ?CopiedBufferSnapshot = null,
     current_logical_size: ?render.Size = null,
+    pending_viewport: ViewportState = .{},
+    current_viewport: ViewportState = .{},
+    viewport_handler: ?ViewportHandler = null,
+    current_source: ?render.SourceRect = null,
     source_cache_id: u64,
     next_source_version: u64 = 1,
     /// Content-update serials never wrap: aliasing an old dependency is worse
@@ -330,6 +350,8 @@ const PreparedCommit = struct {
     publishes_snapshot: bool = false,
     physical_size: ?render.Size = null,
     logical_size: ?render.Size,
+    viewport: ViewportState,
+    source: ?render.SourceRect = null,
     scale: i32,
     transform: render.BufferTransform,
     offset_x: i32,
@@ -341,6 +363,7 @@ const PreparedCommit = struct {
             .pending_frame_callback_count = pendingFrameCallbackCount(surface),
             .attachment_changed = surface.has_pending_attachment,
             .logical_size = surface.current_logical_size,
+            .viewport = surface.pending_viewport,
             .scale = surface.pending_scale,
             .transform = surface.pending_transform,
             .offset_x = surface.pending_offset_x,
@@ -589,6 +612,51 @@ pub fn surfaceId(self: *const WayringCompositor, client: *const server.Client, o
         return null;
     }
     return null;
+}
+
+pub fn attachViewport(self: *WayringCompositor, client: *server.Client, object_id: u32, handler: ViewportHandler) ViewportAttachResult {
+    const objects = self.findClient(client) orelse return .not_live;
+    for (objects.surfaces.items) |surface| if (surface.resource.id() == object_id and !surface.destroying) {
+        if (surface.viewport_handler != null) return .viewport_exists;
+        surface.viewport_handler = handler;
+        return .{ .attached = surface.id };
+    };
+    if (client.lookup(object_id)) |resource| if (resource.interface() == &core.wl_surface.interface) return .wrong_client;
+    return .not_live;
+}
+
+pub fn setViewportSource(
+    self: *WayringCompositor,
+    id: SurfaceId,
+    handler_context: *anyopaque,
+    source: ?ViewportSource,
+) bool {
+    const surface = self.surfaceForId(id) orelse return false;
+    const handler = surface.viewport_handler orelse return false;
+    if (handler.context != handler_context) return false;
+    surface.pending_viewport.source = source;
+    return true;
+}
+
+pub fn setViewportDestination(
+    self: *WayringCompositor,
+    id: SurfaceId,
+    handler_context: *anyopaque,
+    destination: ?ViewportDestination,
+) bool {
+    const surface = self.surfaceForId(id) orelse return false;
+    const handler = surface.viewport_handler orelse return false;
+    if (handler.context != handler_context) return false;
+    surface.pending_viewport.destination = destination;
+    return true;
+}
+
+pub fn detachViewport(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque) void {
+    const surface = self.surfaceForId(id) orelse return;
+    const handler = surface.viewport_handler orelse return;
+    if (handler.context != handler_context) return;
+    surface.viewport_handler = null;
+    surface.pending_viewport = .{};
 }
 
 pub fn setCursorListener(self: *WayringCompositor, listener: CursorListener) void {
@@ -1347,7 +1415,7 @@ fn surfaceRenderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
     return .{
         .buffer = current.pixelBuffer(.{}, .{}),
         .logical_size = surface.current_logical_size.?,
-        .source = null,
+        .source = surface.current_source,
         .transform = surface.current_transform,
         .force_opaque = current.forceOpaque(),
         .alpha_multiplier = std.math.maxInt(u32),
@@ -1621,6 +1689,14 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
                 &surface.resource.runtime,
                 "preparing wl_surface commit",
             ),
+            error.BadViewportSize, error.ViewportOutOfBuffer => if (surface.viewport_handler) |handler|
+                handler.post_error(handler.context, if (err == error.BadViewportSize) .bad_size else .out_of_buffer)
+            else
+                client.postProtocolError(
+                    &surface.resource.runtime,
+                    @intCast(core.wl_surface.@"error".invalid_size),
+                    "buffer dimensions are incompatible with surface state",
+                ),
             error.InvalidSize => client.postProtocolError(
                 &surface.resource.runtime,
                 @intCast(core.wl_surface.@"error".invalid_size),
@@ -2034,6 +2110,7 @@ fn prepareCommit(self: *WayringCompositor, surface: *Surface) !PreparedCommit {
         prepared.input == null and
         prepared.scale == surface.current_scale and
         prepared.transform == surface.current_transform and
+        std.meta.eql(prepared.viewport, surface.current_viewport) and
         prepared.offset_x == 0 and prepared.offset_y == 0 and
         !surface.topology_dirty;
 
@@ -2045,7 +2122,9 @@ fn prepareCommit(self: *WayringCompositor, surface: *Surface) !PreparedCommit {
             prepared.logical_size = null;
         }
     } else if (prepared.physical_size) |physical_size| {
-        prepared.logical_size = try logicalSize(physical_size, prepared.scale, prepared.transform);
+        const geometry = try surface_geometry.calculate(physical_size, prepared.scale, prepared.transform, prepared.viewport, surface.role == .cursor);
+        prepared.logical_size = geometry.logical_size;
+        prepared.source = geometry.source;
     } else {
         prepared.logical_size = null;
     }
@@ -2070,7 +2149,9 @@ fn preparePendingBuffer(
         .height = @intCast(geometry.height),
     };
     prepared.physical_size = physical_size;
-    prepared.logical_size = try logicalSize(physical_size, prepared.scale, prepared.transform);
+    const surface_geometry_value = try surface_geometry.calculate(physical_size, prepared.scale, prepared.transform, prepared.viewport, surface.role == .cursor);
+    prepared.logical_size = surface_geometry_value.logical_size;
+    prepared.source = surface_geometry_value.source;
     const source_cache: render.SourceCache = .{
         .id = surface.source_cache_id,
         .version = surface.next_source_version,
@@ -2133,6 +2214,8 @@ fn publishPreparedCommit(
     if (prepared.opaque_region) |*opaque_region| std.mem.swap(Region, &surface.current_opaque, opaque_region);
     if (prepared.input) |*input| std.mem.swap(InputRegion, &surface.current_input, input);
     surface.current_logical_size = prepared.logical_size;
+    surface.current_viewport = prepared.viewport;
+    surface.current_source = prepared.source;
     surface.current_scale = prepared.scale;
     surface.current_transform = prepared.transform;
     surface.current_offset_x = prepared.offset_x;
@@ -2285,6 +2368,10 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     const objects = self.findClient(client) orelse unreachable;
     std.debug.assert(!surface.destroying);
     surface.destroying = true;
+    if (surface.viewport_handler) |handler| {
+        surface.viewport_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
     if (surface.xdg_association) |association| {
         const handler = association.handler;
         surface.xdg_association = null;
@@ -7637,4 +7724,132 @@ test "direct XDG root hooks bracket the full atomic batch and exclude child scra
     try compositor.detachXdgCommitHandler(reservation, &probe);
     try compositor.releaseXdgRoot(reservation);
     try std.testing.expect(client.fatal() == null);
+}
+
+test "viewport state commits atomically persists through null buffers and validates retained content" {
+    const Recorder = struct {
+        errors: std.ArrayList(ViewportError) = .empty,
+        surface_destroyed: bool = false,
+
+        fn handler(self: *@This()) ViewportHandler {
+            return .{
+                .context = self,
+                .post_error = postError,
+                .surface_destroyed = surfaceDestroyed,
+            };
+        }
+
+        fn postError(context: *anyopaque, err: ViewportError) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.errors.append(std.testing.allocator, err) catch unreachable;
+        }
+
+        fn surfaceDestroyed(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.surface_destroyed = true;
+        }
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var listener_state: TestPresentationListener = .{ .registry = &registry };
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, listener_state.listener());
+    defer compositor.deinit();
+    listener_state.compositor = &compositor;
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try bindShm(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    const surface_id = compositor.surfaceId(client, 5).?;
+    const surface = compositor.surfaceForId(surface_id).?;
+    var recorder: Recorder = .{};
+    defer recorder.errors.deinit(std.testing.allocator);
+    const attached_id = switch (compositor.attachViewport(client, 5, recorder.handler())) {
+        .attached => |id| id,
+        else => return error.Unexpected,
+    };
+    try std.testing.expectEqual(surface_id, attached_id);
+    try std.testing.expectEqual(
+        ViewportAttachResult.viewport_exists,
+        compositor.attachViewport(client, 5, recorder.handler()),
+    );
+
+    const pixels = [_]u32{
+        0xff00_0001, 0xff00_0002, 0xff00_0003, 0xff00_0004,
+        0xff00_0011, 0xff00_0012, 0xff00_0013, 0xff00_0014,
+        0xff00_0021, 0xff00_0022, 0xff00_0023, 0xff00_0024,
+        0xff00_0031, 0xff00_0032, 0xff00_0033, 0xff00_0034,
+    };
+    const fd = try memfdWithPixels(&pixels);
+    defer _ = std.c.close(fd);
+    try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
+    try createShmBuffer(client, 6, 7, 0, .{ .width = 4, .height = 4 }, 4 * @sizeOf(u32), .argb8888);
+
+    const source: ViewportSource = .{ .x = 256, .y = 256, .width = 512, .height = 512 };
+    try std.testing.expect(compositor.setViewportSource(surface_id, &recorder, source));
+    try std.testing.expect(compositor.setViewportDestination(surface_id, &recorder, .{ .width = 8, .height = 6 }));
+    try attachBuffer(client, 5, 7);
+    try commitSurfaceResource(client, 5);
+    const first_release = try drain(client);
+    defer std.testing.allocator.free(first_release);
+    try std.testing.expectEqual(@as(usize, 8), first_release.len);
+    try std.testing.expectEqual(source, surface.current_viewport.source.?);
+    try std.testing.expectEqual(render.Size{ .width = 8, .height = 6 }, surface.current_logical_size.?);
+    try std.testing.expectEqual(@as(f64, 1), registry.renderState(surface_id).?.source.?.x);
+    try std.testing.expectEqual(@as(f64, 2), registry.renderState(surface_id).?.source.?.width);
+
+    try requestFrame(client, 5, 8);
+    try std.testing.expect(compositor.setViewportDestination(surface_id, &recorder, .{ .width = 7, .height = 5 }));
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(render.Size{ .width = 7, .height = 5 }, surface.current_logical_size.?);
+    try std.testing.expectEqual(FrameCallback.State.committed, surface.frame_callbacks.items[0].state);
+    try std.testing.expect(!surface.frame_callbacks.items[0].callback_only);
+
+    try attachBuffer(client, 5, null);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expect(registry.renderState(surface_id) == null);
+    try std.testing.expectEqual(render.Size{ .width = 7, .height = 5 }, surface.current_viewport.destination.?);
+    try attachBuffer(client, 5, 7);
+    try commitSurfaceResource(client, 5);
+    const remap_release = try drain(client);
+    defer std.testing.allocator.free(remap_release);
+    try std.testing.expectEqual(@as(usize, 8), remap_release.len);
+    try std.testing.expectEqual(render.Size{ .width = 7, .height = 5 }, registry.renderState(surface_id).?.logical_size);
+
+    compositor.detachViewport(surface_id, &recorder);
+    try std.testing.expectEqual(ViewportState{}, surface.pending_viewport);
+    try std.testing.expectEqual(render.Size{ .width = 7, .height = 5 }, surface.current_viewport.destination.?);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(ViewportState{}, surface.current_viewport);
+    try std.testing.expectEqual(render.Size{ .width = 4, .height = 4 }, registry.renderState(surface_id).?.logical_size);
+
+    _ = switch (compositor.attachViewport(client, 5, recorder.handler())) {
+        .attached => |id| id,
+        else => return error.Unexpected,
+    };
+    try std.testing.expect(compositor.setViewportSource(surface_id, &recorder, .{
+        .x = 0,
+        .y = 0,
+        .width = 5 * 256,
+        .height = 4 * 256,
+    }));
+    const committed_count = listener_state.committed_count;
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqualSlices(ViewportError, &.{.out_of_buffer}, recorder.errors.items);
+    try std.testing.expectEqual(committed_count, listener_state.committed_count);
+    try std.testing.expectEqual(ViewportState{}, surface.current_viewport);
+    try std.testing.expectEqual(render.Size{ .width = 4, .height = 4 }, registry.renderState(surface_id).?.logical_size);
+
+    try send(client, 5, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expect(recorder.surface_destroyed);
+    try std.testing.expect(!compositor.containsSurface(surface_id));
 }

@@ -113,6 +113,7 @@ pub fn build(b: *std.Build) void {
     const generate_xdg_protocol = b.addRunArtifact(wayring_scanner);
     generate_xdg_protocol.addFileArg(b.dependency("wayland_source", .{}).path("protocol/wayland.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/xdg-shell/xdg-shell.xml"));
+    generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/viewporter/viewporter.xml"));
     const generated_xdg_source = generate_xdg_protocol.captureStdOut(.{ .basename = "wayring_xdg_protocol.zig" });
     const xdg_protocol = b.createModule(.{
         .root_source_file = generated_xdg_source,
