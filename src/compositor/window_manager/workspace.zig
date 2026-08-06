@@ -221,6 +221,28 @@ test "tag set prevents duplicates and removes tags" {
     try std.testing.expect(!tags.remove(42));
 }
 
+fn insertionFailureIsAtomic(allocator: std.mem.Allocator) !void {
+    var workspace: Workspace = .{};
+    defer workspace.deinit(allocator);
+    const id: types.WindowId = .{ .index = 7, .generation = 3 };
+    const inserted = workspace.insert(allocator, id) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), workspace.members.items.len);
+        try std.testing.expectEqual(@as(usize, 0), workspace.focus_history.items.len);
+        try std.testing.expect(workspace.focused == null);
+        return err;
+    };
+    try std.testing.expect(inserted);
+    try std.testing.expect(workspace.contains(id));
+}
+
+test "workspace insertion failure leaves no public topology" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        insertionFailureIsAtomic,
+        .{},
+    );
+}
+
 test "workspace membership move focus and order have single ownership" {
     var first: Workspace = .{};
     defer first.deinit(std.testing.allocator);

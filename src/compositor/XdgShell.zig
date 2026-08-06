@@ -180,6 +180,11 @@ pub const WindowListener = struct {
     unmapped: *const fn (*anyopaque, WindowId) void,
     destroyed: *const fn (*anyopaque, WindowId) void,
     metadata_changed: *const fn (*anyopaque, WindowId) bool,
+    presentation_changed: *const fn (
+        *anyopaque,
+        WindowId,
+        bool,
+    ) error{OutOfMemory}!void,
     request: *const fn (*anyopaque, WindowId, WindowRequest) void,
 };
 pub const WindowObserver = struct {
@@ -1034,11 +1039,18 @@ pub fn setWindowVisible(self: *XdgShell, id: WindowId, visible: bool) void {
     self.applyWindowSceneMapping(w);
 }
 
-pub fn setWindowScenePresentationEnabled(self: *XdgShell, id: WindowId, enabled: bool) void {
+pub fn setWindowScenePresentationEnabled(
+    self: *XdgShell,
+    id: WindowId,
+    enabled: bool,
+) error{OutOfMemory}!void {
     const window = self.windows.get(id) orelse return;
     if (window.scene_presentation_enabled == enabled) return;
+    if (self.window_listener) |listener| {
+        try listener.presentation_changed(listener.context, id, enabled);
+    }
     window.scene_presentation_enabled = enabled;
-    _ = self.notifyMetadata(id);
+    self.notify(.metadata_changed, id);
     self.applyWindowSceneMapping(window);
     if (!enabled) self.scene.placeUnmappedWindowBottom(window.scene_id);
 }
@@ -2022,6 +2034,129 @@ test "window Scene presentation gate retains policy visibility and resets on unm
         .mapped = true,
     };
     try std.testing.expect(windowSceneMapped(&mature_default));
+}
+
+test "presentation handoff is atomic across listener failure and retry" {
+    const allocator = std.testing.allocator;
+    var scene: Scene = undefined;
+    scene.init(allocator);
+    defer scene.deinit();
+
+    var shell = XdgShell.init(allocator, &scene, undefined, undefined);
+    defer shell.deinit();
+    const scene_id = try scene.addWindow(.{ .index = 1, .generation = 1 });
+    defer scene.removeWindow(scene_id);
+    const window_id = try shell.windows.insert(allocator, .{
+        .xdg_surface_id = undefined,
+        .scene_id = scene_id,
+        .unreliable_pid = 0,
+        .mapped = true,
+        .requested_scene_visibility = true,
+        .scene_presentation_enabled = false,
+    });
+    defer {
+        shell.windows.get(window_id).?.deinit(allocator);
+        _ = shell.windows.remove(window_id);
+    }
+
+    const Context = struct {
+        shell: *XdgShell,
+        window_id: WindowId,
+        fail_enable: bool = true,
+        transition_count: usize = 0,
+        workspace_enrolled: bool = false,
+        wm_presentation_enabled: bool = false,
+        metadata_notifications: usize = 0,
+        observer_saw_enabled: bool = false,
+
+        fn ready(_: *anyopaque, _: WindowId) bool {
+            return true;
+        }
+        fn listenerCommitted(_: *anyopaque, _: WindowId, _: ?ConfigureToken) bool {
+            return true;
+        }
+        fn ignored(_: *anyopaque, _: WindowId) void {}
+        fn metadataChanged(_: *anyopaque, _: WindowId) bool {
+            return true;
+        }
+        fn presentationChanged(
+            context: *anyopaque,
+            id: WindowId,
+            enabled: bool,
+        ) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(std.meta.eql(id, self.window_id));
+            std.debug.assert(
+                self.shell.windows.get(id).?.scene_presentation_enabled != enabled,
+            );
+            self.transition_count += 1;
+            if (enabled and self.fail_enable) return error.OutOfMemory;
+            self.workspace_enrolled = enabled;
+            self.wm_presentation_enabled = enabled;
+        }
+        fn request(_: *anyopaque, _: WindowId, _: WindowRequest) void {}
+        fn observerCommitted(_: *anyopaque, _: WindowId) void {}
+        fn observerMetadataChanged(context: *anyopaque, id: WindowId) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.metadata_notifications += 1;
+            self.observer_saw_enabled = self.shell.windows.get(id).?.scene_presentation_enabled;
+        }
+    };
+    var context: Context = .{ .shell = &shell, .window_id = window_id };
+    shell.setWindowListener(.{
+        .context = &context,
+        .ready = Context.ready,
+        .committed = Context.listenerCommitted,
+        .unmapping = Context.ignored,
+        .unmapped = Context.ignored,
+        .destroyed = Context.ignored,
+        .metadata_changed = Context.metadataChanged,
+        .presentation_changed = Context.presentationChanged,
+        .request = Context.request,
+    });
+    defer shell.clearWindowListener();
+    try shell.addWindowObserver(.{
+        .context = &context,
+        .committed = Context.observerCommitted,
+        .unmapped = Context.ignored,
+        .destroyed = Context.ignored,
+        .metadata_changed = Context.observerMetadataChanged,
+        .state_changed = Context.ignored,
+    });
+    defer shell.removeWindowObserver(&context);
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        shell.setWindowScenePresentationEnabled(window_id, true),
+    );
+    try std.testing.expectEqual(@as(usize, 1), context.transition_count);
+    try std.testing.expect(!context.workspace_enrolled);
+    try std.testing.expect(!context.wm_presentation_enabled);
+    try std.testing.expect(!shell.windows.get(window_id).?.scene_presentation_enabled);
+    try std.testing.expectEqual(@as(usize, 0), context.metadata_notifications);
+    var scene_windows = scene.iterator();
+    try std.testing.expect(!scene_windows.next().?.window.mapped);
+
+    context.fail_enable = false;
+    try shell.setWindowScenePresentationEnabled(window_id, true);
+    try std.testing.expectEqual(@as(usize, 2), context.transition_count);
+    try std.testing.expect(context.workspace_enrolled);
+    try std.testing.expect(context.wm_presentation_enabled);
+    try std.testing.expect(shell.windows.get(window_id).?.scene_presentation_enabled);
+    try std.testing.expectEqual(@as(usize, 1), context.metadata_notifications);
+    try std.testing.expect(context.observer_saw_enabled);
+    scene_windows = scene.iterator();
+    try std.testing.expect(scene_windows.next().?.window.mapped);
+
+    try shell.setWindowScenePresentationEnabled(window_id, false);
+    try std.testing.expectEqual(@as(usize, 3), context.transition_count);
+    try std.testing.expect(!context.workspace_enrolled);
+    try std.testing.expect(!context.wm_presentation_enabled);
+    try std.testing.expect(!shell.windows.get(window_id).?.scene_presentation_enabled);
+    try std.testing.expectEqual(@as(usize, 2), context.metadata_notifications);
+    try std.testing.expect(!context.observer_saw_enabled);
+    scene_windows = scene.iterator();
+    try std.testing.expect(!scene_windows.next().?.window.mapped);
 }
 
 test "unmapping a toplevel reparents only its direct children" {
