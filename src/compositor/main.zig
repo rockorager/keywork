@@ -15,6 +15,7 @@ const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCursorShape = @import("wayland/WayringCursorShape.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
+const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
 const WayringHost = @import("wayland/WayringHost.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
@@ -201,6 +202,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_xdg_decoration: WayringXdgDecoration = undefined;
     var wayring_xdg_decoration_initialized = false;
     var wayring_xdg_decoration_published = false;
+    var wayring_xdg_activation: WayringXdgActivation = undefined;
+    var wayring_xdg_activation_initialized = false;
+    var wayring_xdg_activation_published = false;
     var wayring_seat_adapter: WayringSeatAdapter = undefined;
     var wayring_seat_adapter_initialized = false;
     var wayring_seat_published = false;
@@ -212,6 +216,7 @@ pub fn main(init: std.process.Init) !void {
         fractional_scale: ?*WayringFractionalScale,
         cursor_shape: ?*WayringCursorShape,
         xdg_decoration: ?*WayringXdgDecoration,
+        xdg_activation: ?*WayringXdgActivation,
         compositor: *WayringCompositor,
         seat: *WayringSeatAdapter,
 
@@ -224,6 +229,7 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            if (self.xdg_activation) |activation| activation.destroyClientResources(client);
             if (self.xdg_decoration) |decoration| decoration.destroyClientResources(client);
             if (self.cursor_shape) |cursor_shape| cursor_shape.destroyClientResources(client);
             self.seat.destroyClientResources(client);
@@ -242,6 +248,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_xdg_activation_initialized) {
+            if (wayring_xdg_activation_published) wayring_xdg_activation.unpublish();
+            wayring_xdg_activation.deinit();
+        }
         if (wayring_xdg_decoration_initialized) {
             if (wayring_xdg_decoration_published) wayring_xdg_decoration.unpublish();
             wayring_xdg_decoration.deinit();
@@ -331,6 +341,8 @@ pub fn main(init: std.process.Init) !void {
         wayring_xdg_shell_initialized = true;
         wayring_xdg_decoration.init(init.gpa, &wayring_protocol_server.?, &wayring_xdg_shell, server.neutralXdgShell());
         wayring_xdg_decoration_initialized = true;
+        wayring_xdg_activation.init(init.gpa, &wayring_protocol_server.?, &wayring_seat_adapter, &wayring_xdg_shell, server.xdgActivationOwner());
+        wayring_xdg_activation_initialized = true;
         wayring_viewporter.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
         wayring_viewporter_initialized = true;
         if (wayring_outputs_initialized) {
@@ -362,6 +374,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_cursor_shape_published = true;
             try wayring_xdg_decoration.publish();
             wayring_xdg_decoration_published = true;
+            try wayring_xdg_activation.publish();
+            wayring_xdg_activation_published = true;
         }
         wayring_lifecycle = .{
             .clients = &wayring_clients,
@@ -371,6 +385,7 @@ pub fn main(init: std.process.Init) !void {
             .fractional_scale = if (wayring_fractional_scale_initialized) &wayring_fractional_scale else null,
             .cursor_shape = if (wayring_cursor_shape_initialized) &wayring_cursor_shape else null,
             .xdg_decoration = if (wayring_xdg_decoration_initialized) &wayring_xdg_decoration else null,
+            .xdg_activation = if (wayring_xdg_activation_initialized) &wayring_xdg_activation else null,
             .compositor = &wayring_compositor,
             .seat = &wayring_seat_adapter,
         };
@@ -827,6 +842,7 @@ test {
     _ = @import("wayland/cursor_shape.zig");
     _ = @import("wayland/WayringCursorShape.zig");
     _ = @import("wayland/WayringXdgDecoration.zig");
+    _ = @import("wayland/WayringXdgActivation.zig");
     _ = @import("wayland/tablet.zig");
     _ = @import("wayland/pointer_gestures.zig");
     _ = @import("wayland/relative_pointer.zig");

@@ -11,7 +11,7 @@ const wl = wayland.server.wl;
 const xdg = wayland.server.xdg;
 
 const token_byte_count = 16;
-const token_character_count = token_byte_count * 2;
+pub const token_character_count = token_byte_count * 2;
 const token_lifetime_nanoseconds: i96 = 30 * std.time.ns_per_s;
 const expiry_check_milliseconds = 1000;
 
@@ -98,19 +98,26 @@ fn handleRequest(
             resource,
             get.id,
         ) catch resource.postNoMemory(),
-        .activate => |request_activate| self.activate(
-            request_activate.token,
+        .activate => |request_activate| self.activateToken(
+            std.mem.span(request_activate.token),
             Surface.fromResource(request_activate.surface).handle(),
         ),
     }
 }
 
-fn activate(self: *Self, token_z: [*:0]const u8, surface_id: Surface.Id) void {
-    const removed = self.tokens.fetchRemove(std.mem.span(token_z)) orelse return;
+pub fn activateToken(self: *Self, token: []const u8, surface_id: Surface.Id) void {
+    const removed = self.tokens.fetchRemove(token) orelse return;
     defer self.allocator.free(removed.key);
     if (removed.value.expires_at <= now(self.io)) return;
     const listener = self.activation_listener orelse return;
     listener.requested(listener.context, surface_id, removed.value.proven_interaction);
+}
+
+/// Revokes a token whose delivery failed before the requesting client could
+/// observe it. Unknown and intentionally invalid tokens are harmless no-ops.
+pub fn revokeToken(self: *Self, token: []const u8) void {
+    const removed = self.tokens.fetchRemove(token) orelse return;
+    self.allocator.free(removed.key);
 }
 
 fn issueToken(
@@ -119,15 +126,37 @@ fn issueToken(
     valid: bool,
     proven_interaction: bool,
 ) void {
-    const token = self.generateToken() catch {
-        resource.getClient().postImplementationError("secure token generation failed");
-        return;
-    };
-    if (valid) self.registerToken(&token, proven_interaction) catch {
-        resource.postNoMemory();
-        return;
+    const token = self.issue(valid, proven_interaction) catch |err| switch (err) {
+        error.Canceled, error.EntropyUnavailable => {
+            resource.getClient().postImplementationError("secure token generation failed");
+            return;
+        },
+        error.OutOfMemory => {
+            resource.postNoMemory();
+            return;
+        },
+        else => {
+            resource.getClient().postImplementationError("activation token expiry scheduling failed");
+            return;
+        },
     };
     resource.sendDone(&token);
+}
+
+/// Issues an opaque token using the shared mature/generated security store.
+/// Invalid requests still receive an indistinguishable token, but it is not
+/// registered and therefore can never authorize activation.
+pub fn issue(
+    self: *Self,
+    valid: bool,
+    proven_interaction: bool,
+) (std.Io.RandomSecureError || std.mem.Allocator.Error || error{TimerUpdateFailed})![token_character_count:0]u8 {
+    const token = try self.generateToken();
+    if (valid) self.registerToken(&token, proven_interaction) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.TimerUpdateFailed,
+    };
+    return token;
 }
 
 fn generateToken(self: *Self) std.Io.RandomSecureError![token_character_count:0]u8 {
@@ -333,12 +362,12 @@ test "valid activation tokens forward their target and interaction provenance on
     });
     const target: Surface.Id = .{ .index = 7, .generation = 3 };
 
-    manager.activate(token, target);
+    manager.activateToken(token, target);
     try std.testing.expectEqual(@as(usize, 1), capture.count);
     try std.testing.expectEqual(target, capture.surface_id.?);
     try std.testing.expect(capture.proven_interaction);
     try std.testing.expectEqual(@as(usize, 0), manager.tokens.count());
 
-    manager.activate(token, target);
+    manager.activateToken(token, target);
     try std.testing.expectEqual(@as(usize, 1), capture.count);
 }

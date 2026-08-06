@@ -316,6 +316,31 @@ pub fn acceptsXdgUserAction(
     return null;
 }
 
+/// Validates an activation serial against an exact live generated wl_seat and
+/// the canonical Seat activation domain (input actions and focus events).
+pub fn acceptsXdgActivation(
+    self: *WayringSeatAdapter,
+    client: *wayring.server.Client,
+    seat_object_id: u32,
+    serial: u32,
+) ?ClientRegistry.Id {
+    if (client.fatal() != null) return null;
+    const installed = client.lookup(seat_object_id) orelse return null;
+    for (self.seats.items) |seat| {
+        if (seat.client != client or seat.resource.id() != seat_object_id or
+            installed != &seat.resource.runtime or seat.resource.runtime.state() != .live) continue;
+        const client_id = self.clients.id(client) orelse return null;
+        const typed_serial: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = serial };
+        if (!self.request_sink.accepts_activation(self.request_sink.context, client_id, typed_serial)) return null;
+        return client_id;
+    }
+    return null;
+}
+
+pub fn activationSurfaceFocused(self: *const WayringSeatAdapter, surface: SurfaceRegistry.Id) bool {
+    return self.request_sink.activation_surface_focused(self.request_sink.context, surface);
+}
+
 fn seatRequest(_: *core.wl_seat.Resource, request: core.wl_seat.Request, seat: *SeatResource) !void {
     switch (request) {
         .get_pointer => |args| {

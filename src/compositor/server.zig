@@ -3771,6 +3771,11 @@ pub fn neutralXdgShell(self: *Self) *NeutralXdgShell {
     return &self.xdg_shell_core;
 }
 
+/// Frontend-neutral activation token and expiry owner.
+pub fn xdgActivationOwner(self: *Self) *XdgActivation {
+    return &self.xdg_activation;
+}
+
 /// Installs the single resource-free generated frontend query/delivery sink.
 /// Canonical seat policy and state remain owned by `Seat`.
 pub fn setGeneratedSeatDeliverySink(self: *Self, sink: SeatDelivery.Sink) void {
@@ -3788,6 +3793,8 @@ pub fn generatedSeatRequestSink(self: *Self) SeatDelivery.RequestSink {
         .keyboard_resource_snapshot = generatedKeyboardResourceSnapshot,
         .accepts_pointer_grab = generatedAcceptsPointerGrab,
         .accepts_action = generatedAcceptsAction,
+        .accepts_activation = generatedAcceptsActivation,
+        .activation_surface_focused = generatedActivationSurfaceFocused,
         .set_cursor = generatedSetCursor,
         .set_shape = generatedSetShape,
         .cursor_committed = generatedCursorCommitted,
@@ -3803,6 +3810,20 @@ fn generatedAcceptsAction(
 ) bool {
     const self: *Self = @ptrCast(@alignCast(context));
     return self.seat.authority.acceptsAction(client, serial);
+}
+
+fn generatedAcceptsActivation(
+    context: *anyopaque,
+    client: ClientRegistry.Id,
+    serial: ClientRegistry.Serial,
+) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.seat.authority.acceptsActivation(client, serial);
+}
+
+fn generatedActivationSurfaceFocused(context: *anyopaque, surface: SurfaceRegistry.Id) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.seat.generatedActivationSurfaceFocused(surface);
 }
 
 fn generatedAcceptsPointerGrab(
