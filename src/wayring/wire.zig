@@ -66,12 +66,12 @@ pub const Value = union(enum) {
     fd: ?std.posix.fd_t,
 };
 
-/// Storage reserved before an atomic descriptor-free event sequence is
-/// encoded. The caller must either publish or cancel it.
+/// Copyable identity for Output-owned prepared storage. The originating
+/// Output validates both fields before exposing, publishing, or canceling the
+/// active reservation; the handle itself never owns storage.
 pub const PreparedBatch = struct {
-    storage: []u8,
-    batch_count: usize,
-    active: bool = true,
+    owner: *anyopaque,
+    token: u64,
 };
 
 pub const FrameHeader = struct {
@@ -273,11 +273,19 @@ const QueuedBatch = struct {
     kind: Kind,
 };
 
+const PreparedReservation = struct {
+    token: u64,
+    storage: []u8,
+    batch_count: usize,
+};
+
 /// Ordered output queue. Consecutive descriptor-free messages share one
 /// growable tail batch. A batch is frozen while a send attempt borrows it, so
 /// concurrently produced output starts a new tail instead of invalidating the
 /// in-flight pointer. Enqueue duplicates borrowed descriptors before the
-/// message becomes visible, making ownership transfer transactional.
+/// message becomes visible, making ownership transfer transactional. Output's
+/// address must remain stable while a PreparedBatch handle is live; all such
+/// handles become invalid when Output is deinitialized.
 pub const Output = struct {
     /// Large enough for the bounded terminal diagnostic reserved by the
     /// server, while keeping terminal delivery independent of the allocator.
@@ -289,7 +297,8 @@ pub const Output = struct {
     next_token: u64 = 1,
     in_flight: ?BatchToken = null,
     in_flight_target: ?AttemptTarget = null,
-    prepared_batch_active: bool = false,
+    next_preparation_token: ?u64 = 1,
+    prepared_batch: ?PreparedReservation = null,
     sealed: bool = false,
     terminal: [terminal_capacity]u8 = undefined,
     terminal_len: u16 = 0,
@@ -300,6 +309,7 @@ pub const Output = struct {
     }
 
     pub fn deinit(self: *Output) void {
+        if (self.prepared_batch) |prepared| self.allocator.free(prepared.storage);
         for (self.batches.items) |batch| self.freeBatch(batch);
         self.batches.deinit(self.allocator);
         self.* = undefined;
@@ -313,7 +323,7 @@ pub const Output = struct {
         values: []const Value,
     ) !void {
         if (self.sealed) return error.OutputSealed;
-        if (self.prepared_batch_active) return error.PreparedBatchActive;
+        if (self.prepared_batch != null) return error.PreparedBatchActive;
         if (values.len != descriptor.arguments.len) return error.ArgumentCountMismatch;
 
         var writer: std.Io.Writer.Allocating = .init(self.allocator);
@@ -363,52 +373,71 @@ pub const Output = struct {
     /// batch to be appended between prepare and publish.
     pub fn prepareBatch(self: *Output, maximum_bytes: usize) !PreparedBatch {
         if (self.sealed) return error.OutputSealed;
-        if (self.prepared_batch_active) return error.PreparedBatchActive;
+        if (self.prepared_batch != null) return error.PreparedBatchActive;
         if (maximum_bytes == 0) return error.EmptyPreparedBatch;
+        const token = self.next_preparation_token orelse
+            return error.PreparedBatchTokenExhausted;
         try self.batches.ensureUnusedCapacity(self.allocator, 1);
-        const prepared: PreparedBatch = .{
-            .storage = try self.allocator.alloc(u8, maximum_bytes),
+        const storage = try self.allocator.alloc(u8, maximum_bytes);
+        self.prepared_batch = .{
+            .token = token,
+            .storage = storage,
             .batch_count = self.batches.items.len,
         };
-        self.prepared_batch_active = true;
-        return prepared;
+        self.next_preparation_token = if (token == std.math.maxInt(u64)) null else token + 1;
+        return .{ .owner = self, .token = token };
     }
 
-    pub fn cancelPreparedBatch(self: *Output, prepared: *PreparedBatch) void {
-        if (!prepared.active) return;
-        std.debug.assert(self.prepared_batch_active);
-        self.allocator.free(prepared.storage);
-        prepared.active = false;
-        self.prepared_batch_active = false;
+    /// Returns the fixed storage owned by an exact live reservation.
+    pub fn preparedBatchStorage(self: *Output, prepared: PreparedBatch) ![]u8 {
+        return (try self.preparedReservation(prepared)).storage;
+    }
+
+    /// Cancels only an exact live reservation. Foreign and stale copied
+    /// handles are harmless no-ops and never touch Output-owned storage.
+    pub fn cancelPreparedBatch(self: *Output, prepared: PreparedBatch) void {
+        const active = self.preparedReservation(prepared) catch return;
+        self.allocator.free(active.storage);
+        self.prepared_batch = null;
     }
 
     /// Publishes one already encoded sequence as a single ordered batch.
     /// Ownership of its storage transfers to Output on success.
     pub fn publishPreparedBatch(
         self: *Output,
-        prepared: *PreparedBatch,
+        prepared: PreparedBatch,
         encoded_length: usize,
     ) !void {
-        if (!prepared.active) return error.PreparedBatchConsumed;
-        if (!self.prepared_batch_active) return error.PreparedBatchConsumed;
+        const active = try self.preparedReservation(prepared);
         if (self.sealed) return error.OutputSealed;
-        if (self.batches.items.len != prepared.batch_count) {
+        if (self.batches.items.len != active.batch_count) {
             return error.PreparedBatchInterleaved;
         }
-        if (encoded_length == 0 or encoded_length > prepared.storage.len) {
+        if (encoded_length == 0 or encoded_length > active.storage.len) {
             return error.InvalidPreparedBatchLength;
         }
         std.debug.assert(self.batches.capacity - self.batches.items.len >= 1);
         self.batches.appendAssumeCapacity(.{
             .bytes = .{
-                .items = prepared.storage[0..encoded_length],
-                .capacity = prepared.storage.len,
+                .items = active.storage[0..encoded_length],
+                .capacity = active.storage.len,
             },
             .fds = &.{},
             .kind = .coalesced,
         });
-        prepared.active = false;
-        self.prepared_batch_active = false;
+        self.prepared_batch = null;
+    }
+
+    fn preparedReservation(
+        self: *Output,
+        prepared: PreparedBatch,
+    ) !*PreparedReservation {
+        if (prepared.owner != @as(*anyopaque, @ptrCast(self))) {
+            return error.InvalidPreparedBatchOwner;
+        }
+        const active = if (self.prepared_batch) |*reservation| reservation else return error.PreparedBatchConsumed;
+        if (active.token != prepared.token) return error.StalePreparedBatch;
+        return active;
     }
 
     fn appendableTail(self: *Output) ?*QueuedBatch {
@@ -1160,15 +1189,15 @@ test "prepared output publishes one complete batch or cancels without output" {
     var output = Output.init(std.testing.allocator);
     defer output.deinit();
 
-    var canceled = try output.prepareBatch(12);
-    output.cancelPreparedBatch(&canceled);
+    const canceled = try output.prepareBatch(12);
+    output.cancelPreparedBatch(canceled);
     try std.testing.expect((try output.beginSend()) == null);
 
-    var prepared = try output.prepareBatch(24);
-    var writer = std.Io.Writer.fixed(prepared.storage);
+    const prepared = try output.prepareBatch(24);
+    var writer = std.Io.Writer.fixed(try output.preparedBatchStorage(prepared));
     try encodePreparedMessage(&writer, 7, 1, &descriptor, &.{.{ .uint = 11 }});
     try encodePreparedMessage(&writer, 8, 2, &descriptor, &.{.{ .uint = 12 }});
-    try output.publishPreparedBatch(&prepared, writer.buffered().len);
+    try output.publishPreparedBatch(prepared, writer.buffered().len);
 
     const batch = (try output.beginSend()).?;
     try std.testing.expectEqual(@as(usize, 24), batch.bytes.len);
@@ -1184,8 +1213,8 @@ test "prepared output encoding failure and interleaving rejection remain atomic"
     var output = Output.init(std.testing.allocator);
     defer output.deinit();
 
-    var too_small = try output.prepareBatch(8);
-    var short_writer = std.Io.Writer.fixed(too_small.storage);
+    const too_small = try output.prepareBatch(8);
+    var short_writer = std.Io.Writer.fixed(try output.preparedBatchStorage(too_small));
     try std.testing.expectError(error.WriteFailed, encodePreparedMessage(
         &short_writer,
         7,
@@ -1193,18 +1222,18 @@ test "prepared output encoding failure and interleaving rejection remain atomic"
         &descriptor,
         &.{.{ .uint = 11 }},
     ));
-    output.cancelPreparedBatch(&too_small);
+    output.cancelPreparedBatch(too_small);
     try std.testing.expect((try output.beginSend()) == null);
 
     try output.enqueue(9, 3, &descriptor, &.{.{ .uint = 13 }});
-    var interleaved = try output.prepareBatch(12);
-    var writer = std.Io.Writer.fixed(interleaved.storage);
+    const interleaved = try output.prepareBatch(12);
+    var writer = std.Io.Writer.fixed(try output.preparedBatchStorage(interleaved));
     try encodePreparedMessage(&writer, 7, 1, &descriptor, &.{.{ .uint = 11 }});
     try std.testing.expectError(
         error.PreparedBatchActive,
         output.enqueue(8, 2, &descriptor, &.{.{ .uint = 12 }}),
     );
-    try output.publishPreparedBatch(&interleaved, writer.buffered().len);
+    try output.publishPreparedBatch(interleaved, writer.buffered().len);
 
     const prior = (try output.beginSend()).?;
     try std.testing.expectEqual(@as(usize, 12), prior.bytes.len);
@@ -1215,6 +1244,100 @@ test "prepared output encoding failure and interleaving rejection remain atomic"
     try std.testing.expectEqual(@as(u32, 7), readU32(prepared.bytes[0..4]));
     try output.completeSend(prepared.token, prepared.bytes.len);
     try std.testing.expect((try output.beginSend()) == null);
+}
+
+test "prepared output rejects foreign handles without canceling either owner" {
+    const descriptor: MessageDescriptor = .{ .name = "empty", .arguments = &.{} };
+    var first = Output.init(std.testing.allocator);
+    defer first.deinit();
+    var second = Output.init(std.testing.allocator);
+    defer second.deinit();
+
+    const first_prepared = try first.prepareBatch(8);
+    const second_prepared = try second.prepareBatch(8);
+    var first_writer = std.Io.Writer.fixed(try first.preparedBatchStorage(first_prepared));
+    try encodePreparedMessage(&first_writer, 1, 0, &descriptor, &.{});
+    var second_writer = std.Io.Writer.fixed(try second.preparedBatchStorage(second_prepared));
+    try encodePreparedMessage(&second_writer, 2, 0, &descriptor, &.{});
+
+    second.cancelPreparedBatch(first_prepared);
+    try std.testing.expectError(
+        error.InvalidPreparedBatchOwner,
+        second.preparedBatchStorage(first_prepared),
+    );
+    try std.testing.expectError(
+        error.InvalidPreparedBatchOwner,
+        second.publishPreparedBatch(first_prepared, first_writer.buffered().len),
+    );
+    try second.publishPreparedBatch(second_prepared, second_writer.buffered().len);
+    first.cancelPreparedBatch(first_prepared);
+
+    const batch = (try second.beginSend()).?;
+    try std.testing.expectEqual(@as(u32, 2), readU32(batch.bytes[0..4]));
+    try second.completeSend(batch.token, batch.bytes.len);
+    try std.testing.expect((try first.beginSend()) == null);
+}
+
+test "copied prepared handles are stale after exact publish or cancel" {
+    const descriptor: MessageDescriptor = .{ .name = "empty", .arguments = &.{} };
+    var output = Output.init(std.testing.allocator);
+    defer output.deinit();
+
+    const published = try output.prepareBatch(8);
+    const published_copy = published;
+    var writer = std.Io.Writer.fixed(try output.preparedBatchStorage(published));
+    try encodePreparedMessage(&writer, 1, 0, &descriptor, &.{});
+    try output.publishPreparedBatch(published, writer.buffered().len);
+    output.cancelPreparedBatch(published_copy);
+    try std.testing.expectError(
+        error.PreparedBatchConsumed,
+        output.publishPreparedBatch(published_copy, writer.buffered().len),
+    );
+
+    const live = try output.prepareBatch(8);
+    output.cancelPreparedBatch(published_copy);
+    try std.testing.expectError(
+        error.StalePreparedBatch,
+        output.publishPreparedBatch(published_copy, 8),
+    );
+    _ = try output.preparedBatchStorage(live);
+    const canceled_copy = live;
+    output.cancelPreparedBatch(live);
+    output.cancelPreparedBatch(canceled_copy);
+    try std.testing.expectError(
+        error.PreparedBatchConsumed,
+        output.publishPreparedBatch(canceled_copy, 8),
+    );
+
+    const batch = (try output.beginSend()).?;
+    try output.completeSend(batch.token, batch.bytes.len);
+}
+
+test "prepared output token exhaustion never wraps and deinit reclaims active storage" {
+    var output = Output.init(std.testing.allocator);
+    output.next_preparation_token = std.math.maxInt(u64);
+    const final = try output.prepareBatch(8);
+    try std.testing.expectEqual(std.math.maxInt(u64), final.token);
+    output.cancelPreparedBatch(final);
+    try std.testing.expectError(error.PreparedBatchTokenExhausted, output.prepareBatch(8));
+    try std.testing.expectError(error.PreparedBatchTokenExhausted, output.prepareBatch(8));
+    output.deinit();
+
+    var active = Output.init(std.testing.allocator);
+    _ = try active.prepareBatch(8);
+    active.deinit();
+}
+
+test "terminal sealing leaves prepared storage cancelable" {
+    var output = Output.init(std.testing.allocator);
+    defer output.deinit();
+    const prepared = try output.prepareBatch(8);
+    try output.sealWithTerminal("fatal");
+    try std.testing.expectError(error.OutputSealed, output.publishPreparedBatch(prepared, 8));
+    output.cancelPreparedBatch(prepared);
+    const terminal = (try output.beginSend()).?;
+    try std.testing.expectEqualStrings("fatal", terminal.bytes);
+    try output.completeSend(terminal.token, terminal.bytes.len);
 }
 
 test "sealed terminal output follows ordinary bytes and has independent attempts" {
