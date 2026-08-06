@@ -116,6 +116,7 @@ pub const ToplevelTagField = enum { tag, description };
 
 pub const WindowInfo = struct {
     scene_id: Scene.Id,
+    client: ClientRegistry.Id,
     unreliable_pid: i32,
     title: ?[:0]const u8,
     app_id: ?[:0]const u8,
@@ -845,6 +846,7 @@ pub fn windowInfo(self: *XdgShell, id: WindowId) ?WindowInfo {
     } else null;
     return .{
         .scene_id = window.scene_id,
+        .client = state.client,
         .unreliable_pid = window.unreliable_pid,
         .title = window.title,
         .app_id = window.app_id,
@@ -1786,14 +1788,25 @@ pub fn requestMinimized(self: *XdgShell, id: WindowId, minimized: bool) void {
 
 pub fn requestWindow(self: *XdgShell, id: WindowId, request: WindowRequest) void {
     const window = self.windows.get(id) orelse return;
+    const state = self.xdg_surfaces.get(window.xdg_surface_id) orelse return;
     switch (request) {
-        .pointer_move => |a| if (!window.interaction_enabled or !a.granted) return,
-        .pointer_resize => |v| if (!window.interaction_enabled or !v.action.granted) return,
-        .show_window_menu => |v| if (!window.interaction_enabled or !v.action.granted) return,
-        .activate => |a| if (!window.interaction_enabled or !a.granted) return,
+        .pointer_move => |a| if (!windowAcceptsAction(window, state, a)) return,
+        .pointer_resize => |v| if (!windowAcceptsAction(window, state, v.action)) return,
+        .show_window_menu => |v| if (!windowAcceptsAction(window, state, v.action)) return,
+        .activate => |a| if (!windowAcceptsAction(window, state, a)) return,
         else => {},
     }
     if (self.window_listener) |l| l.request(l.context, id, request);
+}
+
+fn windowAcceptsAction(
+    window: *const WindowState,
+    state: *const XdgSurfaceState,
+    action: UserAction,
+) bool {
+    return window.mapped and window.scene_presentation_enabled and
+        window.interaction_enabled and action.granted and
+        std.meta.eql(state.client, action.client) and action.serial != null;
 }
 pub fn windowSurface(self: *XdgShell, id: WindowId) ?SurfaceRegistry.Id {
     const w = self.windows.get(id) orelse return null;

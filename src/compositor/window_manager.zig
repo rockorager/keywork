@@ -158,7 +158,14 @@ const TilingDrag = struct {
     source: WindowId,
     initial_x: f64,
     initial_y: f64,
+    origin: DirectManipulationOrigin = .server_modifier,
     target: ?TilingDragTarget = null,
+};
+
+pub const DirectManipulationOrigin = enum {
+    server_modifier,
+    client_xdg_pointer,
+    toplevel_drag,
 };
 
 const TilingDragTarget = union(enum) {
@@ -180,7 +187,7 @@ const ToplevelDrag = struct {
     window: WindowId,
     grab_x: f64,
     grab_y: f64,
-    modifier: bool = false,
+    origin: DirectManipulationOrigin,
     initial_position: Scene.Position,
     original_floating_override: ?bool,
     original_floating_position: ?Scene.Position,
@@ -199,6 +206,7 @@ const FloatingResize = struct {
     initial_pointer_y: f64,
     edges: floating_resize.Edges,
     constraints: types.SizeConstraints,
+    origin: DirectManipulationOrigin = .server_modifier,
 };
 
 const TiledResize = struct {
@@ -206,6 +214,7 @@ const TiledResize = struct {
     output: OutputLayout.Id,
     workspace_number: u8,
     resize: layout_mod.Layout.Resize,
+    origin: DirectManipulationOrigin = .server_modifier,
 };
 
 const KnownXwaylandWindow = struct {
@@ -664,7 +673,8 @@ fn prepareClosing(self: *Self, id: WindowId) void {
 fn removeId(self: *Self, id: WindowId) void {
     self.prepareClosing(id);
     const pending = self.windows.get(id).?.serial != null;
-    self.removeWindowPointerInteractions(id);
+    self.discardWindowPointerInteractions(id);
+    self.clearGeneratedEndpointsForWindow(id);
     var window = self.windows.remove(id).?;
     if (self.geometry_listener) |listener| listener.removed(listener.context, window.scene_id);
     if (window.workspace_enrolled) {
@@ -677,21 +687,57 @@ fn removeId(self: *Self, id: WindowId) void {
     self.relayout();
 }
 
-fn removeWindowPointerInteractions(self: *Self, id: WindowId) void {
-    if (self.tiling_drag) |*drag| {
-        if (std.meta.eql(drag.source, id)) {
-            self.tiling_drag = null;
-        } else if (drag.target) |target| switch (target) {
-            .window => |window_target| if (std.meta.eql(window_target.window, id)) {
-                drag.target = null;
-            },
-            .workspace => {},
-        };
+/// Drops interaction state for an endpoint that is about to disappear. No
+/// final configure may be generated because its wire configure state is also
+/// retired by the unmap/destroy path.
+fn discardWindowPointerInteractions(self: *Self, id: WindowId) void {
+    if (self.tiling_drag) |drag| {
+        if (std.meta.eql(drag.source, id)) self.tiling_drag = null;
     }
     if (self.toplevel_drag) |drag| {
         if (std.meta.eql(drag.window, id)) self.toplevel_drag = null;
     }
     if (self.interactivelyResizing(id)) self.cancelInteractiveResize();
+}
+
+fn removeWindowPointerInteractions(self: *Self, id: WindowId) void {
+    if (self.tiling_drag) |drag| {
+        if (std.meta.eql(drag.source, id)) {
+            _ = self.endCompositorPointerGrab(false);
+            return;
+        } else if (drag.target) |target| switch (target) {
+            .window => |window_target| if (std.meta.eql(window_target.window, id)) {
+                self.tiling_drag.?.target = null;
+            },
+            .workspace => {},
+        };
+    }
+    if (self.toplevel_drag) |drag| {
+        if (std.meta.eql(drag.window, id)) {
+            if (drag.origin == .toplevel_drag) {
+                self.toplevel_drag = null;
+            } else {
+                _ = self.endCompositorPointerGrab(false);
+            }
+            return;
+        }
+    }
+    if (self.interactivelyResizing(id)) {
+        _ = self.endCompositorPointerGrab(false);
+        return;
+    }
+}
+
+fn clearGeneratedEndpointsForWindow(self: *Self, id: WindowId) void {
+    const window = self.windows.get(id) orelse return;
+    if (self.seat.pointerFocus()) |focus| if (focus.generated) |generated| {
+        if (std.meta.eql(generated.root, window.surface_id))
+            self.seat.reconcileGeneratedPointerFocus(null);
+    };
+    if (self.seat.generatedKeyboardFocus()) |focus| {
+        if (std.meta.eql(focus.surface, window.surface_id))
+            _ = self.seat.clearGeneratedKeyboardFocus();
+    }
 }
 
 fn removeXdg(self: *Self, xdg_id: XdgShell.WindowId) void {
@@ -821,6 +867,10 @@ pub fn outputAdded(self: *Self, output: OutputLayout.Id) !void {
 
 pub fn outputRemoved(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!void {
     _ = self.workspaceFor(output) orelse return;
+    if (self.pointerInteractionWindow()) |id| if (self.windows.get(id)) |window| {
+        if (std.meta.eql(self.workspaces.items[window.workspace].output, output))
+            self.removeWindowPointerInteractions(id);
+    };
     var replacement: ?usize = null;
     for (self.workspaces.items, 0..) |entry, index| {
         if (!entry.active or std.meta.eql(entry.output, output)) continue;
@@ -1077,6 +1127,11 @@ fn setWindowUrgent(self: *Self, id: WindowId, urgent: bool) bool {
 
 pub fn setSessionLocked(self: *Self, locked: bool) void {
     self.session_locked = locked;
+    if (locked) {
+        _ = self.endCompositorPointerGrab(false);
+        _ = self.seat.clearGeneratedKeyboardFocus();
+        self.seat.reconcileGeneratedPointerFocus(null);
+    }
     if (!locked) self.clearFocusedUrgency();
 }
 
@@ -1334,7 +1389,16 @@ pub fn beginModifierMove(
     const id = self.windowForSurface(root orelse return false) orelse return false;
     const window = self.windows.get(id) orelse return false;
     if (!self.isFloating(window)) return false;
-    return self.beginWindowMove(id, pointer_x, pointer_y, 0, 0, false, true, false);
+    return self.beginWindowMove(
+        id,
+        pointer_x,
+        pointer_y,
+        0,
+        0,
+        false,
+        .server_modifier,
+        false,
+    );
 }
 
 pub fn beginInteractiveResize(
@@ -1429,7 +1493,17 @@ fn interactiveResizeForWindow(
 
 pub fn compositorPointerGrabActive(self: *const Self) bool {
     return self.tiling_drag != null or self.interactive_resize != null or
-        if (self.toplevel_drag) |drag| drag.modifier else false;
+        if (self.toplevel_drag) |drag| drag.origin != .toplevel_drag else false;
+}
+
+pub fn clientXdgPointerGrabActive(self: *const Self) bool {
+    if (self.tiling_drag) |drag| return drag.origin == .client_xdg_pointer;
+    if (self.interactive_resize) |resize| return switch (resize) {
+        .floating => |value| value.origin == .client_xdg_pointer,
+        .tiled => |value| value.origin == .client_xdg_pointer,
+    };
+    if (self.toplevel_drag) |drag| return drag.origin == .client_xdg_pointer;
+    return false;
 }
 
 pub fn directManipulationActive(self: *const Self) bool {
@@ -1481,7 +1555,7 @@ fn cursorShapeForInteractiveResize(resize: InteractiveResize) PointerShape {
 pub fn updateCompositorPointerGrab(self: *Self, pointer_x: f64, pointer_y: f64) bool {
     if (self.tiling_drag != null) return self.updateTilingDrag(pointer_x, pointer_y);
     if (self.toplevel_drag) |drag| {
-        if (drag.modifier) {
+        if (drag.origin != .toplevel_drag) {
             self.updateToplevelDrag(pointer_x, pointer_y);
             return true;
         }
@@ -1490,7 +1564,19 @@ pub fn updateCompositorPointerGrab(self: *Self, pointer_x: f64, pointer_y: f64) 
     return switch (resize) {
         .floating => |value| self.updateFloatingResize(value, pointer_x, pointer_y),
         .tiled => |value| update: {
-            const layout = self.tiledResizeLayout(value) orelse break :update false;
+            const window = self.windows.get(value.window) orelse {
+                self.cancelInteractiveResize();
+                self.relayout();
+                break :update false;
+            };
+            if (!self.isDraggableTiledWindow(window) or self.layer_focus == .exclusive) {
+                _ = self.endCompositorPointerGrab(false);
+                break :update false;
+            }
+            const layout = self.tiledResizeLayout(value) orelse {
+                _ = self.endCompositorPointerGrab(false);
+                break :update false;
+            };
             const changed = layout.updateResize(
                 value.resize,
                 pointer_x,
@@ -1505,7 +1591,7 @@ pub fn updateCompositorPointerGrab(self: *Self, pointer_x: f64, pointer_y: f64) 
 pub fn endCompositorPointerGrab(self: *Self, commit: bool) bool {
     if (self.tiling_drag != null) return self.endTilingDrag(commit);
     if (self.toplevel_drag) |drag| {
-        if (drag.modifier) {
+        if (drag.origin != .toplevel_drag) {
             self.toplevel_drag = null;
             if (!commit) if (self.windows.get(drag.window)) |window| {
                 window.floating_override = drag.original_floating_override;
@@ -1576,9 +1662,81 @@ pub fn beginToplevelDrag(
         x_offset,
         y_offset,
         use_offset_hint,
-        false,
+        .toplevel_drag,
         true,
     );
+}
+
+fn beginClientPointerMove(self: *Self, xdg_id: XdgShell.WindowId) bool {
+    const point = self.seat.pointerPosition() orelse return false;
+    const id = self.findXdg(xdg_id) orelse return false;
+    return self.beginWindowMove(
+        id,
+        point.x,
+        point.y,
+        0,
+        0,
+        false,
+        .client_xdg_pointer,
+        true,
+    );
+}
+
+fn beginClientPointerResize(
+    self: *Self,
+    xdg_id: XdgShell.WindowId,
+    requested: XdgShell.ResizeEdges,
+) bool {
+    if (self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
+    const point = self.seat.pointerPosition() orelse return false;
+    const id = self.findXdg(xdg_id) orelse return false;
+    const candidate = self.windows.get(id) orelse return false;
+    var resize: InteractiveResize = if (self.isFloating(candidate)) floating: {
+        if (!candidate.presentation_enabled or !candidate.interaction_enabled or
+            !candidate.mapped or candidate.minimized or candidate.fullscreen_output != null or
+            !self.workspaces.items[candidate.workspace].active) return false;
+        break :floating .{ .floating = .{
+            .window = id,
+            .initial_rect = (candidate.placement orelse return false).rect,
+            .initial_pointer_x = point.x,
+            .initial_pointer_y = point.y,
+            .edges = .{
+                .top = requested.top,
+                .right = requested.right,
+                .bottom = requested.bottom,
+                .left = requested.left,
+            },
+            .constraints = self.windowSizeConstraints(candidate),
+            .origin = .client_xdg_pointer,
+        } };
+    } else self.interactiveResizeForWindow(id, point.x, point.y) orelse return false;
+    switch (resize) {
+        .floating => {},
+        .tiled => |*value| {
+            const compatible = switch (value.resize) {
+                .tiled => |tiled| switch (tiled.axis) {
+                    .horizontal => requested.left or requested.right,
+                    .vertical => requested.top or requested.bottom,
+                },
+            };
+            if (!compatible) return false;
+            value.origin = .client_xdg_pointer;
+        },
+    }
+    self.interactive_resize = resize;
+    const window = self.windows.get(id).?;
+    const workspace = &self.workspaces.items[window.workspace];
+    switch (resize) {
+        .floating => {
+            _ = workspace.workspace.raise(neutral(id));
+            self.scene.placeTop(window.scene_id);
+        },
+        .tiled => {},
+    }
+    _ = workspace.workspace.focus(neutral(id));
+    self.default_output = workspace.output;
+    self.relayout();
+    return true;
 }
 
 fn beginWindowMove(
@@ -1589,7 +1747,7 @@ fn beginWindowMove(
     x_offset: i32,
     y_offset: i32,
     use_offset_hint: bool,
-    modifier: bool,
+    origin: DirectManipulationOrigin,
     allow_tiled: bool,
 ) bool {
     if (self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
@@ -1628,7 +1786,7 @@ fn beginWindowMove(
         .window = id,
         .grab_x = grab_x,
         .grab_y = grab_y,
-        .modifier = modifier,
+        .origin = origin,
         .initial_position = current,
         .original_floating_override = original_floating_override,
         .original_floating_position = original_floating_position,
@@ -1646,6 +1804,13 @@ pub fn updateToplevelDrag(self: *Self, pointer_x: f64, pointer_y: f64) void {
         self.toplevel_drag = null;
         return;
     };
+    if (!window.presentation_enabled or !window.interaction_enabled or !window.mapped or
+        window.minimized or window.fullscreen_output != null or self.layer_focus == .exclusive or
+        !self.workspaces.items[window.workspace].active)
+    {
+        _ = self.endCompositorPointerGrab(false);
+        return;
+    }
     const position = drag_geometry.toplevelPosition(pointer_x, pointer_y, drag.grab_x, drag.grab_y);
     window.floating_position = position;
     if (window.placement) |*placement| {
@@ -1658,7 +1823,7 @@ pub fn updateToplevelDrag(self: *Self, pointer_x: f64, pointer_y: f64) void {
 
 pub fn endToplevelDrag(self: *Self) void {
     const drag = self.toplevel_drag orelse return;
-    if (drag.modifier) return;
+    if (drag.origin != .toplevel_drag) return;
     self.toplevel_drag = null;
     self.relayout();
 }
@@ -1666,6 +1831,16 @@ pub fn endToplevelDrag(self: *Self) void {
 fn pointerInteractionActive(self: *const Self) bool {
     return self.tiling_drag != null or self.toplevel_drag != null or
         self.interactive_resize != null;
+}
+
+fn pointerInteractionWindow(self: *const Self) ?WindowId {
+    if (self.tiling_drag) |drag| return drag.source;
+    if (self.toplevel_drag) |drag| return drag.window;
+    if (self.interactive_resize) |resize| return switch (resize) {
+        .floating => |floating| floating.window,
+        .tiled => |tiled| tiled.window,
+    };
+    return null;
 }
 
 fn updateFloatingResize(
@@ -1678,11 +1853,11 @@ fn updateFloatingResize(
         self.interactive_resize = null;
         return false;
     };
-    if (!window.presentation_enabled or !window.mapped or window.minimized or
-        window.fullscreen_output != null or
+    if (!window.presentation_enabled or !window.interaction_enabled or !window.mapped or window.minimized or
+        window.fullscreen_output != null or !self.workspaces.items[window.workspace].active or
         !self.isFloating(window))
     {
-        self.interactive_resize = null;
+        _ = self.endCompositorPointerGrab(false);
         return false;
     }
     const rect = floating_resize.resizedRect(
@@ -1880,8 +2055,12 @@ pub fn closeFocused(self: *Self) void {
     }
 }
 pub fn toggleFocusedFullscreen(self: *Self) void {
-    const window = self.focusedWindow() orelse return;
+    const workspace_index = self.workspaceFor(self.default_output) orelse return;
+    const id = internal(self.workspaces.items[workspace_index].workspace.focused orelse return);
+    const window = self.windows.get(id) orelse return;
+    if (!window.presentation_enabled or !window.interaction_enabled) return;
     if (!window.mapped or window.minimized) return;
+    self.removeWindowPointerInteractions(id);
     self.setFullscreen(window, if (window.fullscreen_output == null)
         self.workspaces.items[window.workspace].output
     else
@@ -1889,8 +2068,12 @@ pub fn toggleFocusedFullscreen(self: *Self) void {
     self.relayout();
 }
 pub fn toggleFocusedFloating(self: *Self) void {
-    const window = self.focusedWindow() orelse return;
+    const workspace_index = self.workspaceFor(self.default_output) orelse return;
+    const id = internal(self.workspaces.items[workspace_index].workspace.focused orelse return);
+    const window = self.windows.get(id) orelse return;
+    if (!window.presentation_enabled or !window.interaction_enabled) return;
     if (!window.mapped or window.minimized) return;
+    self.removeWindowPointerInteractions(id);
     window.floating_override = !self.isFloating(window);
     if (!self.isFloating(window)) {
         window.floating_restore_size = null;
@@ -1937,6 +2120,9 @@ fn activateWorkspace(
         if (output_changed) self.relayout();
         return true;
     }
+    if (self.pointerInteractionWindow()) |id| if (self.windows.get(id)) |window| {
+        if (window.workspace == current) self.removeWindowPointerInteractions(id);
+    };
     if (self.geometry_listener) |listener| {
         listener.workspace_switching(listener.context, output);
         queueWorkspaceTransition(self.workspaces.items, output, target);
@@ -2793,6 +2979,10 @@ fn windowPresentationChanged(
     const managed_id = self.findXdg(id) orelse return;
     const window = self.windows.get(managed_id) orelse return;
     if (enabled == window.presentation_enabled) return;
+    if (!enabled) {
+        self.removeWindowPointerInteractions(managed_id);
+        self.clearGeneratedEndpointsForWindow(managed_id);
+    }
     if (enabled) {
         const inserted = try self.workspaces.items[window.workspace].workspace.insert(
             self.allocator,
@@ -2819,14 +3009,31 @@ fn windowInteractionChanged(context: *anyopaque, id: XdgShell.WindowId, enabled:
     const managed_id = self.findXdg(id) orelse return;
     const window = self.windows.get(managed_id) orelse return;
     if (window.interaction_enabled == enabled) return;
+    if (!enabled) {
+        self.removeWindowPointerInteractions(managed_id);
+        self.clearGeneratedEndpointsForWindow(managed_id);
+    }
     window.interaction_enabled = enabled;
-    if (!enabled) self.removeWindowPointerInteractions(managed_id);
     self.relayout();
 }
 fn windowRequest(context: *anyopaque, id: XdgShell.WindowId, request: XdgShell.WindowRequest) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    const window = self.windows.get(self.findXdg(id) orelse return) orelse return;
+    const managed_id = self.findXdg(id) orelse return;
+    const window = self.windows.get(managed_id) orelse return;
     switch (request) {
+        .pointer_move => |action| {
+            if (!window.interaction_enabled or !action.granted) return;
+            _ = self.beginClientPointerMove(id);
+            return;
+        },
+        .pointer_resize => |value| {
+            if (!window.interaction_enabled or !value.action.granted) return;
+            _ = self.beginClientPointerResize(id, value.edges);
+            return;
+        },
+        // No menu UI owner exists. Authorization is completed by the neutral
+        // shell, but policy intentionally remains inert.
+        .show_window_menu => return,
         .activate => |action| {
             if (!window.interaction_enabled or !action.granted) return;
             if (self.layer_focus == .exclusive) return;
@@ -2839,15 +3046,23 @@ fn windowRequest(context: *anyopaque, id: XdgShell.WindowId, request: XdgShell.W
             if (window.interaction_enabled)
                 _ = self.workspaces.items[window.workspace].workspace.focus(neutral(self.findXdg(id).?));
         },
-        .minimize => window.minimized = true,
+        .minimize => {
+            self.removeWindowPointerInteractions(managed_id);
+            window.minimized = true;
+        },
         .maximize => window.maximized = true,
         .unmaximize => window.maximized = false,
-        .fullscreen => |output| self.setFullscreen(
-            window,
-            output orelse self.workspaces.items[window.workspace].output,
-        ),
-        .exit_fullscreen => self.setFullscreen(window, null),
-        else => {},
+        .fullscreen => |output| {
+            self.removeWindowPointerInteractions(managed_id);
+            self.setFullscreen(
+                window,
+                output orelse self.workspaces.items[window.workspace].output,
+            );
+        },
+        .exit_fullscreen => {
+            self.removeWindowPointerInteractions(managed_id);
+            self.setFullscreen(window, null);
+        },
     }
     self.relayout();
 }
@@ -2857,6 +3072,11 @@ fn layerSupported(_: *anyopaque) bool {
 fn layerChanged(context: *anyopaque, _: LayerShell.Rect, focus: LayerShell.FocusClass) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.layer_focus = focus;
+    if (focus == .exclusive) {
+        _ = self.endCompositorPointerGrab(false);
+        _ = self.seat.clearGeneratedKeyboardFocus();
+        self.seat.reconcileGeneratedPointerFocus(null);
+    }
     self.relayout();
 }
 
@@ -3203,28 +3423,25 @@ test "removed windows release owned pointer interactions and drop targets" {
     const other: WindowId = .{ .index = 2, .generation = 1 };
     var manager: Self = undefined;
     manager.tiling_drag = .{ .source = removed, .initial_x = 0, .initial_y = 0 };
+    manager.toplevel_drag = null;
+    manager.interactive_resize = null;
+    manager.removeWindowPointerInteractions(removed);
+    try std.testing.expect(manager.tiling_drag == null);
+
+    manager.tiling_drag = null;
     manager.toplevel_drag = .{
         .window = removed,
         .grab_x = 0,
         .grab_y = 0,
+        .origin = .toplevel_drag,
         .initial_position = .{},
         .original_floating_override = null,
         .original_floating_position = null,
         .original_floating_restore_size = null,
     };
-    manager.interactive_resize = .{ .floating = .{
-        .window = removed,
-        .initial_rect = .{ .x = 0, .y = 0, .size = types.Size.init(1, 1) },
-        .initial_pointer_x = 0,
-        .initial_pointer_y = 0,
-        .edges = .{ .right = true },
-        .constraints = .{},
-    } };
-
+    manager.interactive_resize = null;
     manager.removeWindowPointerInteractions(removed);
-    try std.testing.expect(manager.tiling_drag == null);
     try std.testing.expect(manager.toplevel_drag == null);
-    try std.testing.expect(manager.interactive_resize == null);
 
     manager.tiling_drag = .{
         .source = other,

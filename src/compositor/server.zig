@@ -1458,6 +1458,7 @@ pub fn createWithVirtualOutput(
         &self.xdg_shell_core,
         &self.mature_clients,
         self.compositor.surfaceStore(),
+        &self.subcompositor,
         &self.seat,
         &self.outputs,
         &self.gtk_shell,
@@ -2242,6 +2243,8 @@ fn refreshSeatCapabilities(self: *Self) void {
     if (!pointer and !self.seat.hasVirtualPointers()) {
         self.pointer_constraints.deactivateAll();
         self.data_device.cancel();
+        if (self.window_manager_initialized and self.window_manager.clientXdgPointerGrabActive())
+            _ = self.endCompositorPointerGrab(false);
     }
     self.seat.setKeyboardAvailable(keyboard);
     self.seat.setPointerAvailable(pointer);
@@ -3770,11 +3773,24 @@ pub fn generatedSeatRequestSink(self: *Self) SeatDelivery.RequestSink {
         .context = self,
         .pointer_enter_snapshot = generatedPointerEnterSnapshot,
         .keyboard_resource_snapshot = generatedKeyboardResourceSnapshot,
+        .accepts_pointer_grab = generatedAcceptsPointerGrab,
         .set_cursor = generatedSetCursor,
         .cursor_committed = generatedCursorCommitted,
         .cursor_removed = generatedCursorRemoved,
         .client_retiring = generatedClientRetiring,
     };
+}
+
+fn generatedAcceptsPointerGrab(
+    context: *anyopaque,
+    client: ClientRegistry.Id,
+    serial: ClientRegistry.Serial,
+    surface: SurfaceRegistry.Id,
+) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const pressed = self.seat.authority.pointerGrabSurface(client, serial) orelse return false;
+    const root = self.headless_surface_forest.compoundRoot(pressed) orelse return false;
+    return std.meta.eql(root, surface);
 }
 
 fn generatedPointerEnterSnapshot(
@@ -4005,12 +4021,21 @@ fn reconcileGeneratedPointerTopology(self: *Self) void {
     const focus = self.seat.pointerFocus() orelse return;
     const generated = focus.generated orelse return;
     const owner = self.seat.generatedSurfaceOwner(focus.surface_id);
-    const valid = self.headless_surface_forest.presentedInCompound(focus.surface_id, generated.root) and
-        owner != null and std.meta.eql(owner.?, generated.client);
+    const valid = if (owner == null or !std.meta.eql(owner.?, generated.client))
+        false
+    else if (self.headless_surface_forest.presentationClass(generated.root)) |class|
+        switch (class) {
+            .background => self.headless_surface_forest.presentedInCompound(focus.surface_id, generated.root),
+            .managed => self.headless_surface_forest.mappedInCompound(focus.surface_id, generated.root) and
+                self.generatedManagedRootEligible(generated.root, generated.client),
+            .xdg_reserved, .cursor => false,
+        }
+    else
+        false;
     const position = self.seat.pointerPosition();
-    const replacement = if (position) |point| self.pointerRoute(point.x, point.y).focus else null;
     if (valid) {
         if (self.seat.implicitPointerGrabActive()) return;
+        const replacement = if (position) |point| self.pointerRoute(point.x, point.y).focus else null;
         if (replacement) |next| {
             if (std.meta.eql(next.surface_id, focus.surface_id) and
                 std.meta.eql(next.generated, focus.generated))
@@ -4020,6 +4045,12 @@ fn reconcileGeneratedPointerTopology(self: *Self) void {
             }
         }
     }
+    if (self.seat.implicitPointerGrabActive() and
+        self.window_manager.clientXdgPointerGrabActive())
+    {
+        _ = self.endCompositorPointerGrab(false);
+    }
+    const replacement = if (position) |point| self.pointerRoute(point.x, point.y).focus else null;
     self.seat.reconcileGeneratedPointerFocus(replacement);
 }
 
@@ -4037,7 +4068,7 @@ fn repairGeneratedFocus(self: *Self) void {
         self.refreshKeyboardFocusReplacingGenerated();
         return;
     };
-    if (state.presentation_class != .background or state.mapped_size == null) {
+    if (state.mapped_size == null) {
         self.refreshKeyboardFocusReplacingGenerated();
         return;
     }
@@ -4045,6 +4076,16 @@ fn repairGeneratedFocus(self: *Self) void {
         self.refreshKeyboardFocusReplacingGenerated();
         return;
     };
+    if (state.presentation_class == .managed and
+        !self.generatedManagedRootEligible(root, client))
+    {
+        self.refreshKeyboardFocusReplacingGenerated();
+        return;
+    }
+    if (state.presentation_class != .background and state.presentation_class != .managed) {
+        self.refreshKeyboardFocusReplacingGenerated();
+        return;
+    }
     _ = self.seat.repairGeneratedKeyboardFocus(target.surface, .{
         .surface = root,
         .client = client,
@@ -6773,6 +6814,8 @@ fn pointerAvailable(context: *anyopaque, available: bool) void {
     if (!available and self.window_manager_initialized) {
         self.pointer_constraints.deactivateAll();
         self.data_device.cancel();
+        if (self.window_manager.clientXdgPointerGrabActive())
+            _ = self.endCompositorPointerGrab(false);
     }
     self.seat.setPointerAvailable(available);
 }
@@ -7174,7 +7217,18 @@ fn pointerButtonForSeat(
         return;
     }
     if (seat == &self.seat and self.window_manager.compositorPointerGrabActive()) {
-        if (button == linux_button_left and state == .released) {
+        const client_xdg = self.window_manager.clientXdgPointerGrabActive();
+        const grab_ended = if (client_xdg)
+            seat.pointerButton(time, button, state) catch {
+                log.err("failed to store pointer button state", .{});
+                self.terminate();
+                return;
+            }
+        else
+            false;
+        if (state == .released and ((client_xdg and grab_ended) or
+            (!client_xdg and button == linux_button_left)))
+        {
             const position = seat.pointerPosition();
             if (position) |point| {
                 _ = self.window_manager.updateCompositorPointerGrab(point.x, point.y);
@@ -7187,7 +7241,7 @@ fn pointerButtonForSeat(
                 self.pointer_constraints.syncFocus();
             }
             requestRepaint(self);
-        } else {
+        } else if (!client_xdg) {
             _ = seat.pointerButton(time, button, state) catch {
                 log.err("failed to store pointer button state", .{});
                 self.terminate();
@@ -7664,10 +7718,14 @@ fn scenePointerRoute(
             }
             if (fullscreen) |fullscreen_id| {
                 if (!std.meta.eql(window_entry.id, fullscreen_id)) continue;
+                if (self.hitTestGeneratedWindow(window_entry.window, x, y)) |focus|
+                    return generatedPointerRoute(focus);
                 const focus = self.hitTestWindow(window_entry.id, window_entry.window, x, y) orelse
                     return null;
                 return self.maturePointerRoute(focus);
             }
+            if (self.hitTestGeneratedWindow(window_entry.window, x, y)) |focus|
+                return generatedPointerRoute(focus);
             if (self.hitTestWindow(window_entry.id, window_entry.window, x, y)) |focus|
                 return self.maturePointerRoute(focus);
         },
@@ -7683,29 +7741,69 @@ fn scenePointerRoute(
         },
     };
     if (fullscreen != null) return null;
-    if (self.headlessPointerFocus(x, y)) |focus| return .{
+    if (self.headlessPointerFocus(x, y)) |focus| return generatedPointerRoute(focus);
+    if (self.hitTestLayer(.bottom, x, y)) |focus| return self.maturePointerRoute(focus);
+    if (self.hitTestLayer(.background, x, y)) |focus| return self.maturePointerRoute(focus);
+    return null;
+}
+
+fn generatedPointerRoute(focus: GeneratedPointerFocus) PointerRoute {
+    return .{
         .focus = .{
             .surface_id = focus.surface_id,
             .x = focus.x,
             .y = focus.y,
             .generated = .{ .root = focus.root, .client = focus.client },
         },
-        .root = null,
+        .root = focus.root,
         .generated = focus,
     };
-    if (self.hitTestLayer(.bottom, x, y)) |focus| return self.maturePointerRoute(focus);
-    if (self.hitTestLayer(.background, x, y)) |focus| return self.maturePointerRoute(focus);
-    return null;
+}
+
+const GeneratedInputFilter = struct {
+    server: *Self,
+    root: ?SurfaceRegistry.Id,
+};
+
+fn hitTestGeneratedWindow(
+    self: *Self,
+    window: *const Scene.Window,
+    x: f64,
+    y: f64,
+) ?GeneratedPointerFocus {
+    if (!window.mapped) return null;
+    _ = self.managedGeneratedWindow(window.surface_id) orelse return null;
+    const client = self.seat.generatedSurfaceOwner(window.surface_id) orelse return null;
+    if (!self.generatedManagedRootEligible(window.surface_id, client)) return null;
+    const mapped_size = self.headless_surface_forest.state(window.surface_id).?.mapped_size orelse return null;
+    const content_geometry = window.content_geometry orelse Scene.ContentGeometry{ .size = mapped_size };
+    if (!windowContentPointVisible(window, content_geometry, x, y)) return null;
+    const content_offset = if (window.content_geometry) |content| content.offset else Scene.Position{};
+    var filter: GeneratedInputFilter = .{ .server = self, .root = window.surface_id };
+    const hit = self.headless_surface_forest.inputHit(
+        x - @as(f64, @floatFromInt(window.position.x -| content_offset.x)),
+        y - @as(f64, @floatFromInt(window.position.y -| content_offset.y)),
+        .{ .context = &filter, .accepts = generatedSurfaceAcceptsInput },
+    ) orelse return null;
+    if (!std.meta.eql(self.headless_surface_forest.compoundRoot(hit.id) orelse return null, window.surface_id))
+        return null;
+    return .{ .surface_id = hit.id, .root = window.surface_id, .client = client, .x = hit.x, .y = hit.y };
 }
 
 fn headlessPointerFocus(self: *Self, x: f64, y: f64) ?GeneratedPointerFocus {
     if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return null;
+    var filter: GeneratedInputFilter = .{ .server = self, .root = null };
     const hit = self.headless_surface_forest.inputHit(x, y, .{
-        .context = self,
+        .context = &filter,
         .accepts = generatedSurfaceAcceptsInput,
     }) orelse return null;
     const root = self.headless_surface_forest.compoundRoot(hit.id) orelse return null;
     const client = self.seat.generatedSurfaceOwner(hit.id) orelse return null;
+    switch (self.headless_surface_forest.presentationClass(root) orelse return null) {
+        .background => {},
+        .managed => if (!self.generatedManagedRootEligible(root, client)) return null,
+        .xdg_reserved, .cursor => return null,
+    }
     return .{
         .surface_id = hit.id,
         .root = root,
@@ -7715,14 +7813,36 @@ fn headlessPointerFocus(self: *Self, x: f64, y: f64) ?GeneratedPointerFocus {
     };
 }
 
+fn generatedManagedRootEligible(
+    self: *Self,
+    root: SurfaceRegistry.Id,
+    expected_client: ClientRegistry.Id,
+) bool {
+    if ((self.headless_surface_forest.presentationClass(root) orelse return false) != .managed) return false;
+    const xdg_id = self.xdg_shell_core.toplevelForSurface(root) orelse return false;
+    const info = self.xdg_shell_core.windowInfo(xdg_id) orelse return false;
+    if (!std.meta.eql(info.client, expected_client) or !info.mapped or
+        !info.scene_presentation_enabled or !info.interaction_enabled) return false;
+    if (!std.meta.eql(self.scene.windowSurface(info.scene_id) orelse return false, root)) return false;
+    if (!self.scene.surfaceMapped(root)) return false;
+    const live_owner = self.seat.generatedSurfaceOwner(root) orelse return false;
+    return std.meta.eql(live_owner, expected_client);
+}
+
 fn generatedSurfaceAcceptsInput(
     context: *anyopaque,
     surface: SurfaceRegistry.Id,
     x: f64,
     y: f64,
 ) bool {
-    const self: *Self = @ptrCast(@alignCast(context));
-    return self.seat.generatedSurfaceAcceptsInput(surface, x, y);
+    const filter: *GeneratedInputFilter = @ptrCast(@alignCast(context));
+    const root = filter.server.headless_surface_forest.compoundRoot(surface) orelse return false;
+    if (filter.root) |expected| {
+        if (!std.meta.eql(root, expected)) return false;
+    } else if (filter.server.headless_surface_forest.presentationClass(root) == .managed) {
+        return false;
+    }
+    return filter.server.seat.generatedSurfaceAcceptsInput(surface, x, y);
 }
 
 fn excludeScene(candidate: ?Scene.Id, excluded: ?Scene.Id) ?Scene.Id {
@@ -7852,23 +7972,7 @@ fn hitTestWindow(
     const content_geometry = window.content_geometry orelse Scene.ContentGeometry{
         .size = root_buffer.logical_size,
     };
-    var test_content = true;
-    if (window.content_clip_box) |clip_box| {
-        const content_rect: render.Rect = .{
-            .x = window.position.x,
-            .y = window.position.y,
-            .width = content_geometry.size.width,
-            .height = content_geometry.size.height,
-        };
-        const visible = content_rect.intersection(
-            clip_box.translated(window.position.x, window.position.y),
-        );
-        test_content = test_content and if (visible) |rect| window_geometry.pointInRect(x, y, rect) else false;
-    }
-    if (test_content and window.effects.corner_radius > 0) {
-        const visible = window_geometry.windowContentRect(window, content_geometry.size) orelse return null;
-        test_content = window_geometry.pointInRoundedRect(x, y, visible, window.effects.corner_radius);
-    }
+    const test_content = windowContentPointVisible(window, content_geometry, x, y);
     if (test_content) if (self.hitTestSurface(
         window.surface_id,
         .{
@@ -7886,6 +7990,35 @@ fn hitTestWindow(
         }, x, y)) |focus| return focus;
     };
     return null;
+}
+
+fn windowContentPointVisible(
+    window: *const Scene.Window,
+    content_geometry: Scene.ContentGeometry,
+    x: f64,
+    y: f64,
+) bool {
+    if (window.clip_box) |clip_box| {
+        if (!window_geometry.pointInRect(x, y, clip_box.translated(window.position.x, window.position.y)))
+            return false;
+    }
+    if (window.content_clip_box) |clip_box| {
+        const content_rect: render.Rect = .{
+            .x = window.position.x,
+            .y = window.position.y,
+            .width = content_geometry.size.width,
+            .height = content_geometry.size.height,
+        };
+        const visible = content_rect.intersection(
+            clip_box.translated(window.position.x, window.position.y),
+        ) orelse return false;
+        if (!window_geometry.pointInRect(x, y, visible)) return false;
+    }
+    if (window.effects.corner_radius > 0) {
+        const visible = window_geometry.windowContentRect(window, content_geometry.size) orelse return false;
+        if (!window_geometry.pointInRoundedRect(x, y, visible, window.effects.corner_radius)) return false;
+    }
+    return true;
 }
 
 fn hitTestSurface(
@@ -10033,6 +10166,23 @@ fn refreshKeyboardFocusWithGeneratedRetention(self: *Self, retain_generated: boo
         self.syncXwaylandFocus(null);
         return;
     }
+    if (generatedFocusPolicyAllows(
+        false,
+        self.xdg_shell_core.hasPopupGrab(),
+        self.layer_shell.keyboardFocus(self.xdg_shell_core.popupKeyboardFocus()) != null,
+        self.xwayland_override_redirect_focus != null,
+    )) if (self.window_manager.focusedSurface()) |root| {
+        if (self.seat.generatedSurfaceOwner(root)) |client| {
+            if (self.generatedManagedRootEligible(root, client)) {
+                _ = self.seat.applyGeneratedKeyboardFocus(
+                    .{ .surface = root, .client = client },
+                    null,
+                );
+                self.syncXwaylandFocus(null);
+                return;
+            }
+        }
+    };
     const default_focus = self.maturePolicyKeyboardFocus();
     if (retain_generated and self.seat.retainGeneratedKeyboardFocus(default_focus) != null) {
         if (generatedFocusPolicyAllows(
@@ -14144,10 +14294,30 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     var xdg: WayringXdgShell = undefined;
     xdg.init(std.testing.allocator, &host, server.neutralXdgShell(), &clients, &compositor, &output);
     defer xdg.deinit();
+    server.seat.setPointerAvailable(true);
+    defer server.seat.setPointerAvailable(false);
+    var seat_adapter: WayringSeatAdapter = .init(
+        std.testing.allocator,
+        &host,
+        &clients,
+        &compositor,
+        server.generatedSeatRequestSink(),
+        server.generatedSeatName(),
+    );
+    defer {
+        seat_adapter.unpublish();
+        server.clearGeneratedSeatDeliverySink(&seat_adapter);
+        seat_adapter.deinit();
+    }
+    server.setGeneratedSeatDeliverySink(seat_adapter.sink());
+    try seat_adapter.publish();
+    xdg.setSeatAdapter(&seat_adapter);
     const managed = try wayring.server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
     _ = try clients.register(client);
+    try seat_adapter.trackClient(client);
     defer {
+        seat_adapter.destroyClientResources(client);
         xdg.destroyClientResources(client);
         output.destroyClientResources(client);
         compositor.destroyClientResources(client);
@@ -14215,18 +14385,18 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     std.testing.allocator.free(formats);
     const fd = try std.posix.memfd_create("keywork-xdg-wave3", std.os.linux.MFD.CLOEXEC);
     defer _ = std.c.close(fd);
-    if (std.os.linux.errno(std.os.linux.ftruncate(fd, 4)) != .SUCCESS)
+    if (std.os.linux.errno(std.os.linux.ftruncate(fd, 1600)) != .SUCCESS)
         return error.Unexpected;
     const pixel: u32 = 0xff11_2233;
     if (std.c.write(fd, std.mem.asBytes(&pixel).ptr, 4) != 4) return error.Unexpected;
-    try T.sendWithFds(client, 8, 0, &core.wl_shm.request_messages[0], &.{ .{ .new_id = .{ .typed = 9 } }, .{ .fd = fd }, .{ .int = 4 } });
-    try T.send(client, 9, 0, &core.wl_shm_pool.request_messages[0], &.{ .{ .new_id = .{ .typed = 10 } }, .{ .int = 0 }, .{ .int = 1 }, .{ .int = 1 }, .{ .int = 4 }, .{ .uint = @intFromEnum(wayring.server.shm.Format.argb8888) } });
+    try T.sendWithFds(client, 8, 0, &core.wl_shm.request_messages[0], &.{ .{ .new_id = .{ .typed = 9 } }, .{ .fd = fd }, .{ .int = 1600 } });
+    try T.send(client, 9, 0, &core.wl_shm_pool.request_messages[0], &.{ .{ .new_id = .{ .typed = 10 } }, .{ .int = 0 }, .{ .int = 20 }, .{ .int = 20 }, .{ .int = 80 }, .{ .uint = @intFromEnum(wayring.server.shm.Format.argb8888) } });
     try T.send(client, 4, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = 10 }, .{ .int = 0 }, .{ .int = 0 } });
     try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
     info = server.xdg_shell_core.windowInfo(window_id).?;
     try std.testing.expect(info.ready and info.mapped);
     try std.testing.expect(info.scene_presentation_enabled);
-    try std.testing.expect(!info.interaction_enabled);
+    try std.testing.expect(info.interaction_enabled);
     const snapshots = try server.window_manager.windowSnapshots(std.testing.allocator);
     defer std.testing.allocator.free(snapshots);
     try std.testing.expectEqual(@as(usize, 1), snapshots.len);
@@ -14238,26 +14408,50 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     var rendered_surfaces = server.headless_surface_forest.renderIterator();
     try std.testing.expect(rendered_surfaces.next() == null);
     const capture_bounds = server.toplevelCaptureBounds(window_id).?;
-    try std.testing.expectEqual(@as(u32, 1), capture_bounds.width);
-    try std.testing.expectEqual(@as(u32, 1), capture_bounds.height);
-    var captured_pixel: [1]u32 = undefined;
+    try std.testing.expectEqual(@as(u32, 20), capture_bounds.width);
+    try std.testing.expectEqual(@as(u32, 20), capture_bounds.height);
+    var captured_pixels: [400]u32 = undefined;
     const capture_fd = try server.captureToplevel(window_id, .{
-        .size = .{ .width = 1, .height = 1 },
-        .stride_pixels = 1,
-        .pixels = &captured_pixel,
+        .size = .{ .width = 20, .height = 20 },
+        .stride_pixels = 20,
+        .pixels = &captured_pixels,
     });
     if (capture_fd) |value| _ = std.c.close(value);
-    try std.testing.expectEqual(pixel, captured_pixel[0]);
+    try std.testing.expectEqual(pixel, captured_pixels[0]);
     const initial_release = try T.drain(client);
     std.testing.allocator.free(initial_release);
 
+    // Generated content obeys the same Scene clipping and rounded-corner
+    // visibility as mature content before its exact forest target is picked.
+    const scene_id = info.scene_id;
+    server.scene.setClipBox(scene_id, .{ .x = 0, .y = 0, .width = 5, .height = 5 });
+    var clipped_windows = server.scene.iterator();
+    const clipped_window = clipped_windows.next().?.window;
+    try std.testing.expect(server.hitTestGeneratedWindow(
+        clipped_window,
+        @floatFromInt(clipped_window.position.x + 10),
+        @floatFromInt(clipped_window.position.y + 10),
+    ) == null);
+    server.scene.setClipBox(scene_id, null);
+    const original_effects = clipped_window.effects;
+    var rounded_effects = original_effects;
+    rounded_effects.corner_radius = 12;
+    server.scene.setEffects(scene_id, rounded_effects);
+    var rounded_windows = server.scene.iterator();
+    const rounded_window = rounded_windows.next().?.window;
+    try std.testing.expect(server.hitTestGeneratedWindow(
+        rounded_window,
+        @floatFromInt(rounded_window.position.x),
+        @floatFromInt(rounded_window.position.y),
+    ) == null);
+    server.scene.setEffects(scene_id, original_effects);
+
     try T.send(client, 7, 10, &core.xdg_toplevel.request_messages[10], &.{});
     try T.send(client, 7, 12, &core.xdg_toplevel.request_messages[12], &.{});
-    try T.send(client, 7, 13, &core.xdg_toplevel.request_messages[13], &.{});
     info = server.xdg_shell_core.windowInfo(window_id).?;
     try std.testing.expect(!info.requested_state.maximized);
     try std.testing.expect(!info.requested_state.fullscreen);
-    try std.testing.expect(info.requested_state.minimized);
+    try std.testing.expect(!info.requested_state.minimized);
     const policy_configure = try T.drain(client);
     defer std.testing.allocator.free(policy_configure);
     try T.send(client, 4, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = null }, .{ .int = 0 }, .{ .int = 0 } });
@@ -14279,31 +14473,208 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     const remapped = try server.window_manager.windowSnapshots(std.testing.allocator);
     defer std.testing.allocator.free(remapped);
     try std.testing.expectEqual(@as(usize, 1), remapped.len);
-    try std.testing.expect(server.window_manager.focusedSurface() == null);
+    try std.testing.expectEqual(surface_id, server.window_manager.focusedSurface().?);
     try std.testing.expectEqual(@as(usize, 0), server.window_transitions.items.len);
+
+    // A real generated wl_pointer press serial authorizes direct manipulation
+    // through the unpublished XDG adapter. The physical release still flows
+    // through Seat and ends the client-owned grab.
+    const seat_name = T.globalName(&host, "wl_seat").?;
+    try T.send(client, 2, 0, &core.wl_registry.request_messages[0], &.{ .{ .uint = seat_name }, .{ .new_id = .{ .generic = .{ .interface = "wl_seat", .version = 7, .id = 11 } } } });
+    try T.send(client, 11, 0, &core.wl_seat.request_messages[0], &.{.{ .new_id = .{ .typed = 12 } }});
+    const seat_events = try T.drain(client);
+    std.testing.allocator.free(seat_events);
+    var interaction_windows = server.scene.iterator();
+    const interaction_window = interaction_windows.next().?.window;
+    const content_offset = interaction_window.content_geometry.?.offset;
+    const pointer_x: f64 = @as(f64, @floatFromInt(interaction_window.position.x - content_offset.x)) + 10;
+    const pointer_y: f64 = @as(f64, @floatFromInt(interaction_window.position.y - content_offset.y)) + 10;
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 10, pointer_x, pointer_y);
+    const enter_events = try T.drain(client);
+    defer std.testing.allocator.free(enter_events);
+    try std.testing.expect(T.eventWord(enter_events, 12, 0, 0) != null);
+    server.pointerButtonForSeat(&server.seat, 11, linux_button_left, .pressed);
+    const move_press = try T.drain(client);
+    defer std.testing.allocator.free(move_press);
+    const move_serial = T.eventWord(move_press, 12, 3, 0) orelse return error.Unexpected;
+    try T.send(client, 7, 5, &core.xdg_toplevel.request_messages[5], &.{
+        .{ .object = 11 }, .{ .uint = move_serial },
+    });
+    try std.testing.expect(server.window_manager.clientXdgPointerGrabActive());
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 12, pointer_x + 10, pointer_y + 10);
+    server.pointerButtonForSeat(&server.seat, 13, linux_button_left, .released);
+    try std.testing.expect(!server.window_manager.directManipulationActive());
+    try std.testing.expect(!server.seat.hasPressedPointerButtons());
+    const move_configures = try T.drain(client);
+    defer std.testing.allocator.free(move_configures);
+
+    var moved_windows = server.scene.iterator();
+    const moved_window = moved_windows.next().?.window;
+    const moved_offset = moved_window.content_geometry.?.offset;
+    try std.testing.expect(server.hitTestGeneratedWindow(
+        moved_window,
+        @as(f64, @floatFromInt(moved_window.position.x - moved_offset.x)) + 10,
+        @as(f64, @floatFromInt(moved_window.position.y - moved_offset.y)) + 10,
+    ) != null);
+    server.pointerMotionGlobalForSeat(
+        server.primaryRenderOutput(),
+        &server.seat,
+        14,
+        @as(f64, @floatFromInt(moved_window.position.x - moved_offset.x)) + 10,
+        @as(f64, @floatFromInt(moved_window.position.y - moved_offset.y)) + 10,
+    );
+    const resize_enter = try T.drain(client);
+    defer std.testing.allocator.free(resize_enter);
+    server.pointerButtonForSeat(&server.seat, 14, linux_button_left, .pressed);
+    const resize_press = try T.drain(client);
+    defer std.testing.allocator.free(resize_press);
+    const resize_serial = T.eventWord(resize_press, 12, 3, 0) orelse return error.Unexpected;
+    try std.testing.expect(seat_adapter.acceptsXdgPointerGrab(client, 11, resize_serial, surface_id) != null);
+    try T.send(client, 7, 6, &core.xdg_toplevel.request_messages[6], &.{
+        .{ .object = 11 }, .{ .uint = resize_serial }, .{ .uint = 10 },
+    });
+    try std.testing.expect(server.window_manager.clientXdgPointerGrabActive());
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 15, pointer_x + 20, pointer_y + 20);
+    server.pointerButtonForSeat(&server.seat, 16, linux_button_left, .released);
+    try std.testing.expect(!server.window_manager.directManipulationActive());
+    try std.testing.expect(!server.xdg_shell_core.windowInfo(window_id).?.configuration.resizing);
+    const resize_configures = try T.drain(client);
+    defer std.testing.allocator.free(resize_configures);
+    try std.testing.expect(resize_configures.len != 0);
+
+    var resized_windows = server.scene.iterator();
+    const resized_window = resized_windows.next().?.window;
+    const resized_offset = resized_window.content_geometry.?.offset;
+    server.pointerMotionGlobalForSeat(
+        server.primaryRenderOutput(),
+        &server.seat,
+        17,
+        @as(f64, @floatFromInt(resized_window.position.x - resized_offset.x)) + 10,
+        @as(f64, @floatFromInt(resized_window.position.y - resized_offset.y)) + 10,
+    );
+    const menu_enter = try T.drain(client);
+    defer std.testing.allocator.free(menu_enter);
+    server.pointerButtonForSeat(&server.seat, 17, linux_button_left, .pressed);
+    const menu_press = try T.drain(client);
+    defer std.testing.allocator.free(menu_press);
+    const menu_serial = T.eventWord(menu_press, 12, 3, 0) orelse return error.Unexpected;
+    try T.send(client, 7, 4, &core.xdg_toplevel.request_messages[4], &.{
+        .{ .object = 11 }, .{ .uint = menu_serial }, .{ .int = 0 }, .{ .int = 0 },
+    });
+    try std.testing.expect(!server.window_manager.directManipulationActive());
+    server.pointerButtonForSeat(&server.seat, 18, linux_button_left, .released);
+    const menu_release = try T.drain(client);
+    defer std.testing.allocator.free(menu_release);
+
+    // Topology loss cancels a client-XDG manipulation before invalidating its
+    // exact press grant. A later physical release is harmless bookkeeping.
+    var final_windows = server.scene.iterator();
+    const final_window = final_windows.next().?.window;
+    const final_offset = final_window.content_geometry.?.offset;
+    const final_x: f64 = @as(f64, @floatFromInt(final_window.position.x - final_offset.x)) + 10;
+    const final_y: f64 = @as(f64, @floatFromInt(final_window.position.y - final_offset.y)) + 10;
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 19, final_x, final_y);
+    const topology_enter = try T.drain(client);
+    defer std.testing.allocator.free(topology_enter);
+    server.pointerButtonForSeat(&server.seat, 20, linux_button_left, .pressed);
+    const topology_press = try T.drain(client);
+    defer std.testing.allocator.free(topology_press);
+    const topology_serial = T.eventWord(topology_press, 12, 3, 0) orelse return error.Unexpected;
+    try T.send(client, 7, 5, &core.xdg_toplevel.request_messages[5], &.{
+        .{ .object = 11 }, .{ .uint = topology_serial },
+    });
+    try std.testing.expect(server.window_manager.clientXdgPointerGrabActive());
+    server.commitHeadlessSurface(surface_id, null, false);
+    try std.testing.expect(!server.window_manager.directManipulationActive());
+    try std.testing.expect(!server.seat.hasPressedPointerButtons());
+    try std.testing.expect(!server.seat.authority.acceptsAction(clients.id(client).?, .{
+        .domain = .wayring_server,
+        .value = topology_serial,
+    }));
+    server.pointerButtonForSeat(&server.seat, 21, linux_button_left, .released);
+    server.commitHeadlessSurface(surface_id, .{ .width = 20, .height = 20 }, false);
+
+    // Null-buffer unmap during an active resize discards the disappearing
+    // endpoint without publishing an unacknowledgeable final configure.
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 22, final_x, final_y);
+    const unmap_enter = try T.drain(client);
+    defer std.testing.allocator.free(unmap_enter);
+    server.pointerButtonForSeat(&server.seat, 23, linux_button_left, .pressed);
+    const unmap_press = try T.drain(client);
+    defer std.testing.allocator.free(unmap_press);
+    const unmap_serial = T.eventWord(unmap_press, 12, 3, 0) orelse return error.Unexpected;
+    try T.send(client, 7, 6, &core.xdg_toplevel.request_messages[6], &.{
+        .{ .object = 11 }, .{ .uint = unmap_serial }, .{ .uint = 10 },
+    });
+    try std.testing.expect(server.window_manager.clientXdgPointerGrabActive());
+    const active_resize = try T.drain(client);
+    defer std.testing.allocator.free(active_resize);
+    try T.send(client, 4, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = null }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
+    try std.testing.expect(!server.window_manager.directManipulationActive());
+    try std.testing.expect(!server.window_manager.transaction.isInflight());
+    const unmap_events = try T.drain(client);
+    defer std.testing.allocator.free(unmap_events);
+    try std.testing.expect(T.eventWord(unmap_events, 6, 0, 0) == null);
+    server.pointerButtonForSeat(&server.seat, 24, linux_button_left, .released);
+    try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
+    const final_remap = try T.drain(client);
+    defer std.testing.allocator.free(final_remap);
+    const final_remap_serial = T.word(final_remap, final_remap.len - 4);
+    try T.send(client, 6, 4, &core.xdg_surface.request_messages[4], &.{.{ .uint = final_remap_serial }});
+    try T.send(client, 4, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = 10 }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
+
+    // Losing the final pointer capability performs the same ordered cancel
+    // and revokes grants before the device can disappear.
+    var capability_windows = server.scene.iterator();
+    const capability_window = capability_windows.next().?.window;
+    const capability_offset = capability_window.content_geometry.?.offset;
+    const capability_x: f64 = @as(f64, @floatFromInt(capability_window.position.x - capability_offset.x)) + 10;
+    const capability_y: f64 = @as(f64, @floatFromInt(capability_window.position.y - capability_offset.y)) + 10;
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 25, capability_x, capability_y);
+    const capability_enter = try T.drain(client);
+    defer std.testing.allocator.free(capability_enter);
+    server.pointerButtonForSeat(&server.seat, 26, linux_button_left, .pressed);
+    const capability_press = try T.drain(client);
+    defer std.testing.allocator.free(capability_press);
+    const capability_serial = T.eventWord(capability_press, 12, 3, 0) orelse return error.Unexpected;
+    try T.send(client, 7, 5, &core.xdg_toplevel.request_messages[5], &.{
+        .{ .object = 11 }, .{ .uint = capability_serial },
+    });
+    try std.testing.expect(server.window_manager.clientXdgPointerGrabActive());
+    pointerAvailable(server.primaryRenderOutput(), false);
+    try std.testing.expect(!server.window_manager.directManipulationActive());
+    try std.testing.expect(!server.seat.hasPressedPointerButtons());
+    try std.testing.expect(!server.seat.authority.acceptsAction(clients.id(client).?, .{
+        .domain = .wayring_server,
+        .value = capability_serial,
+    }));
+    server.pointerButtonForSeat(&server.seat, 27, linux_button_left, .released);
+    pointerAvailable(server.primaryRenderOutput(), true);
 
     // Generated popup protocol state may map, but Wave 4 keeps the popup out
     // of Scene policy and every presentation path until Wave 6.
-    try T.send(client, 3, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 11 } }});
-    const popup_surface_id = compositor.surfaceId(client, 11).?;
-    try T.send(client, 5, 2, &core.xdg_wm_base.request_messages[2], &.{ .{ .new_id = .{ .typed = 12 } }, .{ .object = 11 } });
-    try T.send(client, 5, 1, &core.xdg_wm_base.request_messages[1], &.{.{ .new_id = .{ .typed = 13 } }});
-    try T.send(client, 13, 1, &core.xdg_positioner.request_messages[1], &.{ .{ .int = 1 }, .{ .int = 1 } });
-    try T.send(client, 13, 2, &core.xdg_positioner.request_messages[2], &.{
+    try T.send(client, 3, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 13 } }});
+    const popup_surface_id = compositor.surfaceId(client, 13).?;
+    try T.send(client, 5, 2, &core.xdg_wm_base.request_messages[2], &.{ .{ .new_id = .{ .typed = 14 } }, .{ .object = 13 } });
+    try T.send(client, 5, 1, &core.xdg_wm_base.request_messages[1], &.{.{ .new_id = .{ .typed = 15 } }});
+    try T.send(client, 15, 1, &core.xdg_positioner.request_messages[1], &.{ .{ .int = 1 }, .{ .int = 1 } });
+    try T.send(client, 15, 2, &core.xdg_positioner.request_messages[2], &.{
         .{ .int = 0 }, .{ .int = 0 }, .{ .int = 1 }, .{ .int = 1 },
     });
-    try T.send(client, 12, 2, &core.xdg_surface.request_messages[2], &.{
-        .{ .new_id = .{ .typed = 14 } }, .{ .object = 6 }, .{ .object = 13 },
+    try T.send(client, 14, 2, &core.xdg_surface.request_messages[2], &.{
+        .{ .new_id = .{ .typed = 16 } }, .{ .object = 6 }, .{ .object = 15 },
     });
     const popup_id = server.xdg_shell_core.popupForSurface(popup_surface_id).?;
     try std.testing.expect(!server.xdg_shell_core.popupScenePresentationEnabled(popup_id));
-    try T.send(client, 11, 6, &core.wl_surface.request_messages[6], &.{});
+    try T.send(client, 13, 6, &core.wl_surface.request_messages[6], &.{});
     const popup_configure = try T.drain(client);
     defer std.testing.allocator.free(popup_configure);
     const popup_serial = T.word(popup_configure, popup_configure.len - 4);
-    try T.send(client, 12, 4, &core.xdg_surface.request_messages[4], &.{.{ .uint = popup_serial }});
-    try T.send(client, 11, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = 10 }, .{ .int = 0 }, .{ .int = 0 } });
-    try T.send(client, 11, 6, &core.wl_surface.request_messages[6], &.{});
+    try T.send(client, 14, 4, &core.xdg_surface.request_messages[4], &.{.{ .uint = popup_serial }});
+    try T.send(client, 13, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = 10 }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(client, 13, 6, &core.wl_surface.request_messages[6], &.{});
     try std.testing.expect(server.xdg_shell_core.popupMapped(popup_id));
     try std.testing.expect(!server.scene.surfaceMapped(popup_surface_id));
     try std.testing.expectEqual(HeadlessSurfaceForest.PresentationClass.managed, server.headless_surface_forest.presentationClass(popup_surface_id).?);
@@ -14314,56 +14685,46 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     const popup_output = server.outputs.get(popup_render_output.protocol_id).?;
     try std.testing.expect(!popup_output.containsSurface(popup_surface_id));
     try std.testing.expect(popup_render_output.damage.isEmpty());
-    try T.send(client, 11, 6, &core.wl_surface.request_messages[6], &.{});
+    try T.send(client, 13, 6, &core.wl_surface.request_messages[6], &.{});
     try std.testing.expect(popup_render_output.damage.isEmpty());
     try std.testing.expectEqual(@as(usize, 0), server.window_transitions.items.len);
 
     // Null-buffer unmap and role reconstruction both preserve private popup
     // presentation; reconstruction disables the fresh neutral role before
     // the permanent generated role is republished.
-    try T.send(client, 11, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = null }, .{ .int = 0 }, .{ .int = 0 } });
-    try T.send(client, 11, 6, &core.wl_surface.request_messages[6], &.{});
+    try T.send(client, 13, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = null }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(client, 13, 6, &core.wl_surface.request_messages[6], &.{});
     try std.testing.expect(!server.xdg_shell_core.popupMapped(popup_id));
     try std.testing.expect(!server.xdg_shell_core.popupScenePresentationEnabled(popup_id));
-    try T.send(client, 14, 0, &core.xdg_popup.request_messages[0], &.{});
-    try T.send(client, 12, 0, &core.xdg_surface.request_messages[0], &.{});
-    try T.send(client, 5, 2, &core.xdg_wm_base.request_messages[2], &.{ .{ .new_id = .{ .typed = 15 } }, .{ .object = 11 } });
-    try T.send(client, 5, 1, &core.xdg_wm_base.request_messages[1], &.{.{ .new_id = .{ .typed = 16 } }});
-    try T.send(client, 16, 1, &core.xdg_positioner.request_messages[1], &.{ .{ .int = 1 }, .{ .int = 1 } });
-    try T.send(client, 16, 2, &core.xdg_positioner.request_messages[2], &.{
+    try T.send(client, 16, 0, &core.xdg_popup.request_messages[0], &.{});
+    try T.send(client, 14, 0, &core.xdg_surface.request_messages[0], &.{});
+    try T.send(client, 5, 2, &core.xdg_wm_base.request_messages[2], &.{ .{ .new_id = .{ .typed = 17 } }, .{ .object = 13 } });
+    try T.send(client, 5, 1, &core.xdg_wm_base.request_messages[1], &.{.{ .new_id = .{ .typed = 18 } }});
+    try T.send(client, 18, 1, &core.xdg_positioner.request_messages[1], &.{ .{ .int = 1 }, .{ .int = 1 } });
+    try T.send(client, 18, 2, &core.xdg_positioner.request_messages[2], &.{
         .{ .int = 0 }, .{ .int = 0 }, .{ .int = 1 }, .{ .int = 1 },
     });
-    try T.send(client, 15, 2, &core.xdg_surface.request_messages[2], &.{
-        .{ .new_id = .{ .typed = 17 } }, .{ .object = 6 }, .{ .object = 16 },
+    try T.send(client, 17, 2, &core.xdg_surface.request_messages[2], &.{
+        .{ .new_id = .{ .typed = 19 } }, .{ .object = 6 }, .{ .object = 18 },
     });
     const reconstructed_popup = server.xdg_shell_core.popupForSurface(popup_surface_id).?;
     try std.testing.expect(!server.xdg_shell_core.popupScenePresentationEnabled(reconstructed_popup));
-    try T.send(client, 17, 0, &core.xdg_popup.request_messages[0], &.{});
-    try T.send(client, 15, 0, &core.xdg_surface.request_messages[0], &.{});
-    try T.send(client, 11, 0, &core.wl_surface.request_messages[0], &.{});
-    try T.send(client, 13, 0, &core.xdg_positioner.request_messages[0], &.{});
-    try T.send(client, 16, 0, &core.xdg_positioner.request_messages[0], &.{});
+    try T.send(client, 19, 0, &core.xdg_popup.request_messages[0], &.{});
+    try T.send(client, 17, 0, &core.xdg_surface.request_messages[0], &.{});
+    try T.send(client, 13, 0, &core.wl_surface.request_messages[0], &.{});
+    try T.send(client, 15, 0, &core.xdg_positioner.request_messages[0], &.{});
+    try T.send(client, 18, 0, &core.xdg_positioner.request_messages[0], &.{});
 
-    // A presented, non-interactive window migrates output ownership through
+    // A presented, interactive window migrates output ownership through
     // the same public workspace topology as a mature toplevel.
     server.primary_render_output = replacement_output;
     try std.testing.expect(server.removeRenderOutput(initial_output));
     const migrated_configure = try T.drain(client);
     defer std.testing.allocator.free(migrated_configure);
-    const migrated_serial = T.eventWord(migrated_configure, 6, 0, 0) orelse
-        return error.Unexpected;
-    try std.testing.expectEqual(
-        NeutralXdgShell.Dimensions{ .width = 1024, .height = 768 },
-        server.xdg_shell_core.windowInfo(window_id).?.configuration.bounds,
-    );
     const migrated = try server.window_manager.windowSnapshots(std.testing.allocator);
     defer std.testing.allocator.free(migrated);
     try std.testing.expectEqual(@as(usize, 1), migrated.len);
-    try std.testing.expect(server.window_manager.focusedSurface() == null);
-    try T.send(client, 6, 4, &core.xdg_surface.request_messages[4], &.{.{ .uint = migrated_serial }});
-    try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
-    const migrated_commit = try T.drain(client);
-    defer std.testing.allocator.free(migrated_commit);
+    try std.testing.expectEqual(surface_id, server.window_manager.focusedSurface().?);
 
     // Leave a real WM configure transaction outstanding; role destruction
     // must remove its participant rather than waiting for an acknowledgement.

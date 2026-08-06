@@ -211,6 +211,41 @@ pub fn destroyClientResources(self: *WayringSeatAdapter, client: *wayring.server
     }
 }
 
+/// Validates an XDG direct-manipulation request against this adapter's exact
+/// live wl_seat resource and the canonical live pointer-press authority.
+pub fn acceptsXdgPointerGrab(
+    self: *WayringSeatAdapter,
+    client: *wayring.server.Client,
+    seat_object_id: u32,
+    serial: u32,
+    surface: SurfaceRegistry.Id,
+) ?ClientRegistry.Id {
+    if (client.fatal() != null) return null;
+    const installed = client.lookup(seat_object_id) orelse return null;
+    var owns_seat = false;
+    for (self.seats.items) |seat| {
+        if (seat.client == client and seat.resource.id() == seat_object_id and
+            installed == &seat.resource.runtime and seat.resource.runtime.state() == .live)
+        {
+            owns_seat = true;
+            break;
+        }
+    }
+    if (!owns_seat) return null;
+    const client_id = self.clients.id(client) orelse return null;
+    const typed_serial: ClientRegistry.Serial = .{
+        .domain = .wayring_server,
+        .value = serial,
+    };
+    if (!self.request_sink.accepts_pointer_grab(
+        self.request_sink.context,
+        client_id,
+        typed_serial,
+        surface,
+    )) return null;
+    return client_id;
+}
+
 fn seatRequest(_: *core.wl_seat.Resource, request: core.wl_seat.Request, seat: *SeatResource) !void {
     switch (request) {
         .get_pointer => |args| {
@@ -1050,6 +1085,9 @@ test "capability bits and generations gate generated seat child resources" {
 }
 
 const TestRequestProbe = struct {
+    pointer_grab_client: ?ClientRegistry.Id = null,
+    pointer_grab_serial: ?ClientRegistry.Serial = null,
+    pointer_grab_surface: ?SurfaceRegistry.Id = null,
     pointer_enter_snapshot: ?SeatDelivery.PointerEnterSnapshot = null,
     pointer_enter_client: ?ClientRegistry.Id = null,
     pointer_enter_generation: SeatDelivery.ResourceGeneration = 0,
@@ -1071,11 +1109,25 @@ const TestRequestProbe = struct {
             .context = self,
             .pointer_enter_snapshot = pointerEnterSnapshot,
             .keyboard_resource_snapshot = keyboardResourceSnapshot,
+            .accepts_pointer_grab = acceptsPointerGrab,
             .set_cursor = setCursor,
             .cursor_committed = recordCursorCommitted,
             .cursor_removed = recordCursorRemoved,
             .client_retiring = recordClientRetiring,
         };
+    }
+
+    fn acceptsPointerGrab(
+        context: *anyopaque,
+        client: ClientRegistry.Id,
+        serial: ClientRegistry.Serial,
+        surface: SurfaceRegistry.Id,
+    ) bool {
+        const self: *TestRequestProbe = @ptrCast(@alignCast(context));
+        return self.pointer_grab_client != null and self.pointer_grab_serial != null and
+            self.pointer_grab_surface != null and std.meta.eql(self.pointer_grab_client.?, client) and
+            std.meta.eql(self.pointer_grab_serial.?, serial) and
+            std.meta.eql(self.pointer_grab_surface.?, surface);
     }
 
     fn pointerEnterSnapshot(
@@ -1572,6 +1624,48 @@ test "production seat publication follows core globals and negotiates and releas
     setup.adapter.unpublish();
     published = false;
     try std.testing.expectEqual(@as(usize, 0), countPublished(&setup.protocol_server, "wl_seat"));
+    setup.destroyClient(managed);
+    client_live = false;
+}
+
+test "XDG pointer grabs require the exact live generated seat client and serial" {
+    var setup: AdapterTestSetup = undefined;
+    try setup.init();
+    defer setup.deinit();
+
+    const managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const client = managed.client();
+    var client_live = true;
+    defer if (client_live) setup.destroyClient(managed);
+    const client_id = try setup.registerClient(client);
+    try setup.adapter.publish();
+    var published = true;
+    defer if (published) setup.adapter.unpublish();
+    try testPrepareRegistry(client);
+    try testBindGlobal(client, setup.adapter.global.?, 7, 3);
+
+    const surface: SurfaceRegistry.Id = .{ .index = 4, .generation = 2 };
+    setup.probe.pointer_grab_client = client_id;
+    setup.probe.pointer_grab_serial = .{ .domain = .wayring_server, .value = 17 };
+    setup.probe.pointer_grab_surface = surface;
+    try std.testing.expectEqual(client_id, setup.adapter.acceptsXdgPointerGrab(client, 3, 17, surface).?);
+
+    const other_managed = try wayring.server.CoreClient.create(std.testing.allocator, &setup.protocol_server, .{});
+    const other_client = other_managed.client();
+    var other_live = true;
+    defer if (other_live) setup.destroyClient(other_managed);
+    _ = try setup.registerClient(other_client);
+    try std.testing.expect(setup.adapter.acceptsXdgPointerGrab(other_client, 3, 17, surface) == null);
+    try std.testing.expect(setup.adapter.acceptsXdgPointerGrab(client, 2, 17, surface) == null);
+    try std.testing.expect(setup.adapter.acceptsXdgPointerGrab(client, 3, 18, surface) == null);
+    try std.testing.expect(setup.adapter.acceptsXdgPointerGrab(client, 3, 17, .{ .index = 5, .generation = 2 }) == null);
+
+    try testSend(client, 3, 3, &core.wl_seat.request_messages[3], &.{});
+    try std.testing.expect(setup.adapter.acceptsXdgPointerGrab(client, 3, 17, surface) == null);
+    setup.adapter.unpublish();
+    published = false;
+    setup.destroyClient(other_managed);
+    other_live = false;
     setup.destroyClient(managed);
     client_live = false;
 }

@@ -224,6 +224,19 @@ pub fn acceptsPointerGrab(self: *const SeatAuthority, client: ClientRegistry.Id,
     return false;
 }
 
+pub fn pointerGrabSurface(
+    self: *const SeatAuthority,
+    client: ClientRegistry.Id,
+    serial: ClientRegistry.Serial,
+) ?SurfaceRegistry.Id {
+    if (!self.valid(client, serial)) return null;
+    for (self.presses.items) |press| {
+        if (same(press.grant, client, serial) and self.surfaces.contains(press.surface))
+            return press.surface;
+    }
+    return null;
+}
+
 /// Purges all weak records. Returns true when a final retained press was removed.
 pub fn clientDisconnected(self: *SeatAuthority, client: ClientRegistry.Id) bool {
     if (self.latest_action) |grant| {
@@ -397,7 +410,9 @@ test "pointer grants require exact live client serial button and canonical surfa
     try std.testing.expect(authority.hasPointerButtonForSurface(1, first));
     try std.testing.expect(!authority.hasPointerButtonForSurface(2, removed));
     try std.testing.expect(authority.acceptsPointerGrab(client, serial, first));
+    try std.testing.expectEqual(first, authority.pointerGrabSurface(client, serial).?);
     try std.testing.expect(!authority.acceptsPointerGrab(other, serial, first));
+    try std.testing.expect(authority.pointerGrabSurface(other, serial) == null);
     try std.testing.expect(authority.acceptsPointerGrab(client, serial, current));
     try std.testing.expect(!authority.acceptsPointerGrab(
         client,
@@ -405,6 +420,7 @@ test "pointer grants require exact live client serial button and canonical surfa
         current,
     ));
     try std.testing.expect(authority.releasePointerPress(client, serial, 1));
+    try std.testing.expectEqual(current, authority.pointerGrabSurface(client, serial).?);
     try std.testing.expect(!authority.hasPointerButton(1));
     try std.testing.expect(authority.forgetPointerPress(2));
     try std.testing.expect(!authority.hasPointerButtons());

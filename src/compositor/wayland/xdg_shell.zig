@@ -9,6 +9,7 @@ const Scene = @import("../scene.zig");
 const Seat = @import("seat.zig");
 const slot_map = @import("../slot_map.zig");
 const Surface = @import("surface.zig");
+const Subcompositor = @import("subcompositor.zig");
 const OutputLayout = @import("output_layout.zig");
 const GtkShell = @import("gtk_shell.zig");
 const XdgPositioner = @import("XdgPositioner.zig");
@@ -24,6 +25,7 @@ display: *wl.Server,
 core: *NeutralXdgShell,
 mature_clients: *MatureClients,
 surface_store: *Surface.Store,
+subcompositor: *Subcompositor,
 seat: *Seat,
 outputs: *OutputLayout,
 gtk_shell: *GtkShell,
@@ -91,6 +93,7 @@ pub fn init(
     core: *NeutralXdgShell,
     mature_clients: *MatureClients,
     surface_store: *Surface.Store,
+    subcompositor: *Subcompositor,
     seat: *Seat,
     outputs: *OutputLayout,
     gtk_shell: *GtkShell,
@@ -101,6 +104,7 @@ pub fn init(
         .core = core,
         .mature_clients = mature_clients,
         .surface_store = surface_store,
+        .subcompositor = subcompositor,
         .seat = seat,
         .outputs = outputs,
         .gtk_shell = gtk_shell,
@@ -1113,7 +1117,7 @@ const ToplevelResource = struct {
                 } });
             },
             .move => |move| {
-                const action = self.userAction(resource, move.seat, move.serial) orelse return;
+                const action = self.pointerAction(resource, move.seat, move.serial) orelse return;
                 self.forwardRequest(.{ .pointer_move = action });
             },
             .resize => |resize| {
@@ -1123,7 +1127,7 @@ const ToplevelResource = struct {
                 }
                 const edges = resizeEdges(resize.edges);
                 if (@as(u4, @bitCast(edges)) == 0) return;
-                const action = self.userAction(resource, resize.seat, resize.serial) orelse return;
+                const action = self.pointerAction(resource, resize.seat, resize.serial) orelse return;
                 self.forwardRequest(.{ .pointer_resize = .{ .action = action, .edges = edges } });
             },
             .set_maximized => {
@@ -1170,6 +1174,23 @@ const ToplevelResource = struct {
             .client = client,
             .serial = MatureSerials.fromWire(serial),
             .granted = self.shell.seat.acceptsUserActionSerial(seat, resource.getClient(), serial),
+        };
+    }
+
+    fn pointerAction(
+        self: *ToplevelResource,
+        resource: *xdg.Toplevel,
+        seat: *wl.Seat,
+        serial: u32,
+    ) ?NeutralXdgShell.UserAction {
+        const client = self.shell.mature_clients.id(resource.getClient()) orelse return null;
+        const surface = self.shell.core.windowSurface(self.id) orelse return null;
+        const pressed = self.shell.seat.pointerGrabSurface(resource.getClient(), serial);
+        return .{
+            .client = client,
+            .serial = MatureSerials.fromWire(serial),
+            .granted = self.shell.seat.ownsResource(seat) and
+                pressed != null and std.meta.eql(self.shell.subcompositor.rootSurface(pressed.?), surface),
         };
     }
 

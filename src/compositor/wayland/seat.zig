@@ -819,6 +819,15 @@ pub fn acceptsPointerGrabSerial(
     );
 }
 
+pub fn pointerGrabSurface(
+    self: *const Self,
+    client: *wl.Client,
+    serial: u32,
+) ?Surface.Id {
+    const client_id = self.matureClient(client) orelse return null;
+    return self.authority.pointerGrabSurface(client_id, MatureSerials.fromWire(serial));
+}
+
 pub fn hasPressedPointerButton(self: *const Self, button: u32) bool {
     return self.authority.hasPointerButton(button);
 }
@@ -1099,8 +1108,8 @@ pub fn setPointerAvailable(self: *Self, available: bool) void {
     const changed = self.delivery.setCapability(.pointer, new_capability);
     std.debug.assert(changed == (old_capability != new_capability));
     if (old_capability and !new_capability) {
+        self.authority.cancelPointerPressesAndGrants();
         self.pointerLeave();
-        self.authority.clearPointerPresses();
     }
     if (changed) self.broadcastCapabilities();
 }
@@ -1121,8 +1130,8 @@ pub fn removeVirtualPointer(self: *Self) void {
     const new_capability = self.pointerCapabilityAvailable();
     if (old_capability == new_capability) return;
     std.debug.assert(self.delivery.setCapability(.pointer, new_capability));
+    self.authority.cancelPointerPressesAndGrants();
     self.pointerLeave();
-    self.authority.clearPointerPresses();
     self.broadcastCapabilities();
 }
 

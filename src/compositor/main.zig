@@ -273,6 +273,7 @@ pub fn main(init: std.process.Init) !void {
             &wayring_compositor,
             if (wayring_outputs_initialized) &wayring_outputs else null,
         );
+        wayring_xdg_shell.setSeatAdapter(&wayring_seat_adapter);
         wayring_xdg_shell_initialized = true;
         wayring_lifecycle = .{
             .clients = &wayring_clients,

@@ -453,6 +453,7 @@ pub fn nodeIterator(self: *const HeadlessSurfaceForest) NodeIterator {
 pub const RenderIterator = struct {
     forest: *const HeadlessSurfaceForest,
     next_root: ?SurfaceRegistry.Id,
+    include_managed: bool = false,
     owner: ?SurfaceRegistry.Id = null,
     entry: ?StackEntry = null,
     steps_remaining: usize,
@@ -464,7 +465,7 @@ pub const RenderIterator = struct {
                 const root_node = self.forest.nodeConst(root) orelse return null;
                 self.next_root = root_node.root_next;
                 if (root_node.presentation_class == .xdg_reserved or
-                    root_node.presentation_class == .managed) continue;
+                    (root_node.presentation_class == .managed and !self.include_managed)) continue;
                 self.owner = root;
                 self.entry = root_node.stack_head;
             }
@@ -575,7 +576,12 @@ pub fn inputHit(
 ) ?InputHit {
     if (!std.math.isFinite(x) or !std.math.isFinite(y)) return null;
     var hit: ?InputHit = null;
-    var iterator = self.renderIterator();
+    var iterator: RenderIterator = .{
+        .forest = self,
+        .next_root = self.root_head,
+        .include_managed = true,
+        .steps_remaining = self.node_count *| 2 +| self.root_count,
+    };
     while (iterator.next()) |entry| {
         if (self.isCursorRole(entry.id)) continue;
         const surface_x = x - @as(f64, @floatFromInt(entry.position.x));
