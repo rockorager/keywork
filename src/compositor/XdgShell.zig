@@ -133,6 +133,7 @@ pub const WindowInfo = struct {
     dimensions: ?Dimensions,
     ready: bool,
     mapped: bool,
+    scene_presentation_enabled: bool,
     requested_state: WindowRequestState,
 };
 
@@ -245,6 +246,8 @@ const WindowState = struct {
     committed_dimensions: ?Dimensions = null,
     mapped: bool = false,
     ready: bool = false,
+    requested_scene_visibility: bool = true,
+    scene_presentation_enabled: bool = true,
     requested_state: WindowRequestState = .{},
     fn deinit(self: *WindowState, a: std.mem.Allocator) void {
         if (self.title) |v| a.free(v);
@@ -285,6 +288,7 @@ const WindowState = struct {
         self.committed_dimensions = null;
         self.mapped = false;
         self.ready = false;
+        self.requested_scene_visibility = false;
         self.requested_state = .{};
     }
 
@@ -727,7 +731,8 @@ fn commitToplevelBuffer(
             window_id,
             configure_token,
         );
-        if (!externally_managed) self.scene.setMapped(window.scene_id, state.mapped);
+        if (!externally_managed) window.requested_scene_visibility = state.mapped;
+        self.applyWindowSceneMapping(window);
     }
     if (was_mapped and state.mapped) self.scene.surfaceCommitted(window.scene_id);
 }
@@ -745,7 +750,8 @@ fn unmapToplevel(
     state.mapped = false;
     state.configured = false;
     state.initial_configure_sent = false;
-    self.scene.setMapped(window.scene_id, false);
+    window.requested_scene_visibility = false;
+    self.applyWindowSceneMapping(window);
     self.scene.setContentGeometry(window.scene_id, null);
     window.reset(self.allocator);
 }
@@ -846,6 +852,7 @@ pub fn windowInfo(self: *XdgShell, id: WindowId) ?WindowInfo {
         .dimensions = dimensions,
         .ready = window.ready,
         .mapped = window.mapped,
+        .scene_presentation_enabled = window.scene_presentation_enabled,
         .requested_state = window.requested_state,
     };
 }
@@ -1017,12 +1024,35 @@ pub fn restoreStandaloneWindow(self: *XdgShell, id: WindowId, deactivate: bool, 
             error.InvalidWindow, error.ConfigureSequenceExhausted => {},
         };
     }
-    if (window.mapped) self.scene.setMapped(window.scene_id, true);
+    if (window.mapped) window.requested_scene_visibility = true;
+    self.applyWindowSceneMapping(window);
 }
 
 pub fn setWindowVisible(self: *XdgShell, id: WindowId, visible: bool) void {
     const w = self.windows.get(id) orelse return;
-    self.scene.setMapped(w.scene_id, visible and w.mapped);
+    w.requested_scene_visibility = visible;
+    self.applyWindowSceneMapping(w);
+}
+
+pub fn setWindowScenePresentationEnabled(self: *XdgShell, id: WindowId, enabled: bool) void {
+    const window = self.windows.get(id) orelse return;
+    if (window.scene_presentation_enabled == enabled) return;
+    window.scene_presentation_enabled = enabled;
+    _ = self.notifyMetadata(id);
+    self.applyWindowSceneMapping(window);
+    if (!enabled) self.scene.placeUnmappedWindowBottom(window.scene_id);
+}
+
+fn applyWindowSceneMapping(self: *XdgShell, window: *WindowState) void {
+    self.scene.setMapped(
+        window.scene_id,
+        windowSceneMapped(window),
+    );
+}
+
+fn windowSceneMapped(window: *const WindowState) bool {
+    return window.mapped and window.requested_scene_visibility and
+        window.scene_presentation_enabled;
 }
 pub fn setWindowPosition(self: *XdgShell, id: WindowId, position: Scene.Position) void {
     const window = self.windows.get(id) orelse return;
@@ -1572,7 +1602,8 @@ pub fn surfaceDestroyed(self: *XdgShell, id: XdgSurfaceId) void {
                 if (window.ready) self.notifyWindowUnmapped(window_id);
                 window.mapped = false;
                 window.ready = false;
-                self.scene.setMapped(window.scene_id, false);
+                window.requested_scene_visibility = false;
+                self.applyWindowSceneMapping(window);
                 self.scene.setContentGeometry(window.scene_id, null);
             }
         },
@@ -1960,6 +1991,37 @@ test "xdg state requests survive initial setup and reset on unmap" {
 
     window.reset(allocator);
     try std.testing.expectEqual(WindowRequestState{}, window.requested_state);
+}
+
+test "window Scene presentation gate retains policy visibility and resets on unmap" {
+    const allocator = std.testing.allocator;
+    var window: WindowState = .{
+        .xdg_surface_id = undefined,
+        .scene_id = undefined,
+        .unreliable_pid = 0,
+        .mapped = true,
+        .requested_scene_visibility = true,
+        .scene_presentation_enabled = false,
+    };
+    defer window.deinit(allocator);
+
+    try std.testing.expect(!windowSceneMapped(&window));
+    window.scene_presentation_enabled = true;
+    try std.testing.expect(windowSceneMapped(&window));
+    window.scene_presentation_enabled = false;
+    window.reset(allocator);
+    try std.testing.expect(!window.requested_scene_visibility);
+    window.mapped = true;
+    window.scene_presentation_enabled = true;
+    try std.testing.expect(!windowSceneMapped(&window));
+
+    const mature_default: WindowState = .{
+        .xdg_surface_id = undefined,
+        .scene_id = undefined,
+        .unreliable_pid = 0,
+        .mapped = true,
+    };
+    try std.testing.expect(windowSceneMapped(&mature_default));
 }
 
 test "unmapping a toplevel reparents only its direct children" {

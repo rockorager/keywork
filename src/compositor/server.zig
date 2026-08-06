@@ -91,6 +91,7 @@ const MatureClients = @import("wayland/MatureClients.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
+const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const Viewporter = @import("wayland/viewporter.zig");
 const InputManager = @import("input_manager.zig");
@@ -3746,6 +3747,11 @@ pub fn clientRegistry(self: *Self) *ClientRegistry {
 
 pub fn surfaceRegistry(self: *Self) *SurfaceRegistry {
     return &self.surface_registry;
+}
+
+/// Neutral XDG semantic owner used by unpublished generated adapters.
+pub fn neutralXdgShell(self: *Self) *NeutralXdgShell {
+    return &self.xdg_shell_core;
 }
 
 /// Installs the single resource-free generated frontend query/delivery sink.
@@ -8985,7 +8991,7 @@ fn captureToplevelTarget(
     render_target: render.Target,
 ) ToplevelCaptureError!Renderer.FrameCompletion {
     const info = self.xdg_shell_core.windowInfo(window_id) orelse return error.Stopped;
-    if (!info.mapped) return error.Stopped;
+    if (!info.mapped or !info.scene_presentation_enabled) return error.Stopped;
     const surface_id = self.xdg_shell_core.windowSurface(window_id) orelse return error.Stopped;
     const position = self.scene.surfacePosition(surface_id) orelse return error.Stopped;
     const bounds = self.toplevelCaptureBounds(window_id) orelse return error.Stopped;
@@ -9043,7 +9049,7 @@ fn firstRenderOutput(self: *Self) ?*RenderOutput {
 
 fn toplevelCaptureBounds(self: *Self, window_id: NeutralXdgShell.WindowId) ?render.Rect {
     const info = self.xdg_shell_core.windowInfo(window_id) orelse return null;
-    if (!info.mapped) return null;
+    if (!info.mapped or !info.scene_presentation_enabled) return null;
     const surface_id = self.xdg_shell_core.windowSurface(window_id) orelse return null;
     const position = self.scene.surfacePosition(surface_id) orelse return null;
     var bounds: ?render.Rect = null;
@@ -13691,6 +13697,279 @@ test "Wayring listener applies XDG presentation progression without detaching ma
         HeadlessSurfaceForest.Placement.root,
         server.headless_surface_forest.state(id).?.placement,
     );
+}
+
+const WayringXdgServerTest = struct {
+    const wayring = @import("wayring");
+    const core = @import("wayring-protocol");
+    const wire = wayring.wire;
+
+    fn globalCount(host: *const wayring.server.Server) usize {
+        var count: usize = 0;
+        var iterator = host.iterator();
+        while (iterator.next() != null) count += 1;
+        return count;
+    }
+
+    fn globalName(host: *const wayring.server.Server, name: []const u8) ?u32 {
+        var iterator = host.iterator();
+        while (iterator.next()) |global| {
+            if (std.mem.eql(u8, global.interface().name, name)) return global.name();
+        }
+        return null;
+    }
+
+    fn send(client: *wayring.server.Client, id: u32, opcode: u16, descriptor: *const wire.MessageDescriptor, values: []const wire.Value) !void {
+        var output: wire.Output = .init(std.testing.allocator);
+        defer output.deinit();
+        try output.enqueue(id, opcode, descriptor, values);
+        const batch = (try output.beginSend()).?;
+        try client.receive(batch.bytes, &.{});
+        try output.completeSend(batch.token, batch.bytes.len);
+        try client.dispatch();
+    }
+
+    fn sendWithFds(client: *wayring.server.Client, id: u32, opcode: u16, descriptor: *const wire.MessageDescriptor, values: []const wire.Value) !void {
+        var output: wire.Output = .init(std.testing.allocator);
+        defer output.deinit();
+        try output.enqueue(id, opcode, descriptor, values);
+        const batch = (try output.beginSend()).?;
+        var fds: std.ArrayList(wire.FileDescriptor) = .empty;
+        defer fds.deinit(std.testing.allocator);
+        for (batch.fds) |fd| {
+            const duplicate = std.c.fcntl(fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
+            if (duplicate < 0) return error.Unexpected;
+            try fds.append(std.testing.allocator, duplicate);
+        }
+        try client.receive(batch.bytes, fds.items);
+        fds.clearRetainingCapacity();
+        try output.completeSend(batch.token, batch.bytes.len);
+        try client.dispatch();
+    }
+
+    fn drain(client: *wayring.server.Client) ![]u8 {
+        var bytes: std.ArrayList(u8) = .empty;
+        errdefer bytes.deinit(std.testing.allocator);
+        while (try client.beginSend()) |batch| {
+            try bytes.appendSlice(std.testing.allocator, batch.bytes);
+            try client.completeSend(batch.token, batch.bytes.len);
+        }
+        return bytes.toOwnedSlice(std.testing.allocator);
+    }
+
+    fn word(bytes: []const u8, offset: usize) u32 {
+        return std.mem.readInt(u32, bytes[offset..][0..4], .native);
+    }
+
+    fn eventWord(
+        bytes: []const u8,
+        object_id: u32,
+        opcode: u16,
+        argument_offset: usize,
+    ) ?u32 {
+        var offset: usize = 0;
+        while (offset + 8 <= bytes.len) {
+            const id = word(bytes, offset);
+            const size_opcode = word(bytes, offset + 4);
+            const size: usize = @intCast(size_opcode >> 16);
+            if (size < 8 or offset + size > bytes.len) return null;
+            if (id == object_id and @as(u16, @truncate(size_opcode)) == opcode and
+                argument_offset + 4 <= size - 8)
+            {
+                return word(bytes, offset + 8 + argument_offset);
+            }
+            offset += size;
+        }
+        return null;
+    }
+};
+
+test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
+    const T = WayringXdgServerTest;
+    const wayring = T.wayring;
+    const core = T.core;
+    const server = try Self.create(std.testing.allocator, std.testing.io, .cpu, .headless, null);
+    defer server.destroy();
+    const initial_output = server.primary_render_output;
+    const replacement_output = try server.addRenderOutput(std.testing.io, .{
+        .kind = .headless,
+        .size = .{ .width = 1024, .height = 768 },
+        .position = .{ .x = 1920 },
+        .name = "HEADLESS-WAVE3-SECOND",
+        .description = "Keywork Wave 3 migration test output",
+        .model = "headless",
+    });
+    var host: wayring.server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var clients: WayringClients = undefined;
+    clients.init(std.testing.allocator, &server.client_registry);
+    defer clients.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &server.surface_registry, server.wayringPresentationListener());
+    defer compositor.deinit();
+    var output: WayringOutput = undefined;
+    try output.init(std.testing.allocator, &host, &server.outputs, &compositor);
+    defer output.deinit();
+    var xdg: WayringXdgShell = undefined;
+    xdg.init(std.testing.allocator, &host, server.neutralXdgShell(), &clients, &compositor, &output);
+    defer xdg.deinit();
+    const managed = try wayring.server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    _ = try clients.register(client);
+    defer {
+        xdg.destroyClientResources(client);
+        output.destroyClientResources(client);
+        compositor.destroyClientResources(client);
+        clients.unregister(client);
+        managed.destroy();
+    }
+
+    try T.send(client, 1, 1, &core.wl_display.request_messages[1], &.{.{ .new_id = .{ .typed = 2 } }});
+    const announced = try T.drain(client);
+    std.testing.allocator.free(announced);
+    const globals = T.globalCount(&host);
+    try std.testing.expect(T.globalName(&host, "xdg_wm_base") == null);
+
+    const compositor_name = T.globalName(&host, "wl_compositor").?;
+    try T.send(client, 2, 0, &core.wl_registry.request_messages[0], &.{ .{ .uint = compositor_name }, .{ .new_id = .{ .generic = .{ .interface = "wl_compositor", .version = 1, .id = 3 } } } });
+    try T.send(client, 3, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 4 } }});
+    const surface_id = compositor.surfaceId(client, 4).?;
+    try std.testing.expectEqual(HeadlessSurfaceForest.PresentationClass.background, server.headless_surface_forest.presentationClass(surface_id).?);
+    try xdg.installUnpublishedForTest(client, 5, 7);
+    try std.testing.expectEqual(globals, T.globalCount(&host));
+    try std.testing.expect(T.globalName(&host, "xdg_wm_base") == null);
+    try T.send(client, 5, 2, &core.xdg_wm_base.request_messages[2], &.{ .{ .new_id = .{ .typed = 6 } }, .{ .object = 4 } });
+    try std.testing.expectEqual(HeadlessSurfaceForest.PresentationClass.xdg_reserved, server.headless_surface_forest.presentationClass(surface_id).?);
+    try T.send(client, 6, 1, &core.xdg_surface.request_messages[1], &.{.{ .new_id = .{ .typed = 7 } }});
+    try std.testing.expectEqual(WayringCompositor.XdgRole.toplevel, compositor.permanentXdgRole(surface_id).?);
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement.root, server.headless_surface_forest.state(surface_id).?.placement);
+
+    try T.send(client, 7, 2, &core.xdg_toplevel.request_messages[2], &.{.{ .string = "Wave 3" }});
+    try T.send(client, 7, 3, &core.xdg_toplevel.request_messages[3], &.{.{ .string = "dev.keywork.wave3" }});
+    try T.send(client, 7, 7, &core.xdg_toplevel.request_messages[7], &.{ .{ .int = 640 }, .{ .int = 480 } });
+    try T.send(client, 7, 8, &core.xdg_toplevel.request_messages[8], &.{ .{ .int = 100 }, .{ .int = 80 } });
+    try T.send(client, 7, 9, &core.xdg_toplevel.request_messages[9], &.{});
+    try T.send(client, 7, 11, &core.xdg_toplevel.request_messages[11], &.{.{ .object = null }});
+    var windows = server.xdg_shell_core.windowIterator();
+    const window_id = windows.next().?;
+    var info = server.xdg_shell_core.windowInfo(window_id).?;
+    try std.testing.expectEqualStrings("Wave 3", info.title.?);
+    try std.testing.expectEqualStrings("dev.keywork.wave3", info.app_id.?);
+    try std.testing.expect(!info.ready and !info.mapped);
+    try std.testing.expect(info.requested_state.maximized);
+    try std.testing.expect(info.requested_state.fullscreen);
+    try std.testing.expect(info.requested_state.fullscreen_output == null);
+    try std.testing.expect(!info.requested_state.minimized);
+
+    try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
+    const configure = try T.drain(client);
+    defer std.testing.allocator.free(configure);
+    const serial = T.word(configure, configure.len - 4);
+    try std.testing.expect(serial != 0);
+    info = server.xdg_shell_core.windowInfo(window_id).?;
+    try std.testing.expect(info.ready);
+    try std.testing.expectEqual(NeutralXdgShell.SizeHint{ .width = 100, .height = 80 }, info.min_size);
+    try std.testing.expectEqual(NeutralXdgShell.SizeHint{ .width = 640, .height = 480 }, info.max_size);
+    try std.testing.expect(info.configuration.maximized);
+    try std.testing.expect(info.configuration.fullscreen);
+    try std.testing.expect(info.configuration.bounds.width > 0);
+    try std.testing.expect(info.configuration.bounds.height > 0);
+    try std.testing.expect(!info.configuration.activated);
+    try std.testing.expect(server.window_manager.focusedSurface() == null);
+    try T.send(client, 6, 4, &core.xdg_surface.request_messages[4], &.{.{ .uint = serial }});
+
+    const shm_name = T.globalName(&host, "wl_shm").?;
+    try T.send(client, 2, 0, &core.wl_registry.request_messages[0], &.{ .{ .uint = shm_name }, .{ .new_id = .{ .generic = .{ .interface = "wl_shm", .version = 1, .id = 8 } } } });
+    const formats = try T.drain(client);
+    std.testing.allocator.free(formats);
+    const fd = try std.posix.memfd_create("keywork-xdg-wave3", std.os.linux.MFD.CLOEXEC);
+    defer _ = std.c.close(fd);
+    if (std.os.linux.errno(std.os.linux.ftruncate(fd, 4)) != .SUCCESS)
+        return error.Unexpected;
+    const pixel: u32 = 0xff11_2233;
+    if (std.c.write(fd, std.mem.asBytes(&pixel).ptr, 4) != 4) return error.Unexpected;
+    try T.sendWithFds(client, 8, 0, &core.wl_shm.request_messages[0], &.{ .{ .new_id = .{ .typed = 9 } }, .{ .fd = fd }, .{ .int = 4 } });
+    try T.send(client, 9, 0, &core.wl_shm_pool.request_messages[0], &.{ .{ .new_id = .{ .typed = 10 } }, .{ .int = 0 }, .{ .int = 1 }, .{ .int = 1 }, .{ .int = 4 }, .{ .uint = @intFromEnum(wayring.server.shm.Format.argb8888) } });
+    try T.send(client, 4, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = 10 }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
+    info = server.xdg_shell_core.windowInfo(window_id).?;
+    try std.testing.expect(info.ready and info.mapped);
+    const snapshots = try server.window_manager.windowSnapshots(std.testing.allocator);
+    defer std.testing.allocator.free(snapshots);
+    try std.testing.expectEqual(@as(usize, 0), snapshots.len);
+    var scene_windows = server.scene.iterator();
+    try std.testing.expect(!scene_windows.next().?.window.mapped);
+    try std.testing.expectEqual(HeadlessSurfaceForest.PresentationClass.managed, server.headless_surface_forest.presentationClass(surface_id).?);
+    try std.testing.expect(server.headless_surface_forest.subtreeBounds(surface_id) != null);
+    try std.testing.expectEqual(@as(usize, 0), server.window_transitions.items.len);
+    var rendered_surfaces = server.headless_surface_forest.renderIterator();
+    try std.testing.expect(rendered_surfaces.next() == null);
+    const initial_release = try T.drain(client);
+    std.testing.allocator.free(initial_release);
+
+    try T.send(client, 7, 10, &core.xdg_toplevel.request_messages[10], &.{});
+    try T.send(client, 7, 12, &core.xdg_toplevel.request_messages[12], &.{});
+    try T.send(client, 7, 13, &core.xdg_toplevel.request_messages[13], &.{});
+    info = server.xdg_shell_core.windowInfo(window_id).?;
+    try std.testing.expect(!info.requested_state.maximized);
+    try std.testing.expect(!info.requested_state.fullscreen);
+    try std.testing.expect(info.requested_state.minimized);
+    const policy_configure = try T.drain(client);
+    defer std.testing.allocator.free(policy_configure);
+    try std.testing.expect(policy_configure.len > 0);
+    try T.send(client, 4, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = null }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
+    const empty = try server.window_manager.windowSnapshots(std.testing.allocator);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expect(!server.xdg_shell_core.windowInfo(window_id).?.mapped);
+    try std.testing.expectEqual(HeadlessSurfaceForest.Placement.root, server.headless_surface_forest.state(surface_id).?.placement);
+
+    try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
+    const remap = try T.drain(client);
+    defer std.testing.allocator.free(remap);
+    const remap_serial = T.word(remap, remap.len - 4);
+    try std.testing.expect(remap_serial != serial);
+    try T.send(client, 6, 4, &core.xdg_surface.request_messages[4], &.{.{ .uint = remap_serial }});
+    try T.send(client, 4, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = 10 }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
+    const remapped = try server.window_manager.windowSnapshots(std.testing.allocator);
+    defer std.testing.allocator.free(remapped);
+    try std.testing.expectEqual(@as(usize, 0), remapped.len);
+    try std.testing.expect(server.window_manager.focusedSurface() == null);
+    try std.testing.expectEqual(@as(usize, 0), server.window_transitions.items.len);
+
+    // A private WM participant migrates output ownership without entering
+    // public workspace topology or tripping Workspace.moveWindow assertions.
+    server.primary_render_output = replacement_output;
+    try std.testing.expect(server.removeRenderOutput(initial_output));
+    const migrated_configure = try T.drain(client);
+    defer std.testing.allocator.free(migrated_configure);
+    const migrated_serial = T.eventWord(migrated_configure, 6, 0, 0) orelse
+        return error.Unexpected;
+    try std.testing.expectEqual(
+        NeutralXdgShell.Dimensions{ .width = 1024, .height = 768 },
+        server.xdg_shell_core.windowInfo(window_id).?.configuration.bounds,
+    );
+    const migrated = try server.window_manager.windowSnapshots(std.testing.allocator);
+    defer std.testing.allocator.free(migrated);
+    try std.testing.expectEqual(@as(usize, 0), migrated.len);
+    try std.testing.expect(server.window_manager.focusedSurface() == null);
+    try T.send(client, 6, 4, &core.xdg_surface.request_messages[4], &.{.{ .uint = migrated_serial }});
+    try T.send(client, 4, 6, &core.wl_surface.request_messages[6], &.{});
+    const migrated_commit = try T.drain(client);
+    defer std.testing.allocator.free(migrated_commit);
+
+    // Leave a real WM configure transaction outstanding; role destruction
+    // must remove its participant rather than waiting for an acknowledgement.
+    try T.send(client, 7, 9, &core.xdg_toplevel.request_messages[9], &.{});
+    try T.send(client, 7, 0, &core.xdg_toplevel.request_messages[0], &.{});
+    try T.send(client, 6, 0, &core.xdg_surface.request_messages[0], &.{});
+    try T.send(client, 4, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expectEqual(@as(usize, 0), compositor.surfaceCount());
+    try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
+    var remaining_windows = server.xdg_shell_core.windowIterator();
+    try std.testing.expect(remaining_windows.next() == null);
 }
 
 test "hidden XDG presentation classes synchronously clear generated keyboard focus" {

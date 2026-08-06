@@ -16,6 +16,7 @@ const WayringClients = @import("wayland/WayringClients.zig");
 const WayringHost = @import("wayland/WayringHost.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
+const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
 const wayring = @import("wayring");
 
 pub const std_options: std.Options = .{
@@ -181,12 +182,15 @@ pub fn main(init: std.process.Init) !void {
     var wayring_compositor_initialized = false;
     var wayring_outputs: WayringOutput = undefined;
     var wayring_outputs_initialized = false;
+    var wayring_xdg_shell: WayringXdgShell = undefined;
+    var wayring_xdg_shell_initialized = false;
     var wayring_seat_adapter: WayringSeatAdapter = undefined;
     var wayring_seat_adapter_initialized = false;
     var wayring_seat_published = false;
     const WayringLifecycle = struct {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
+        xdg_shell: *WayringXdgShell,
         compositor: *WayringCompositor,
         seat: *WayringSeatAdapter,
 
@@ -200,6 +204,7 @@ pub fn main(init: std.process.Init) !void {
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
             self.seat.destroyClientResources(client);
+            self.xdg_shell.destroyClientResources(client);
             if (self.outputs) |outputs| outputs.destroyClientResources(client);
             self.compositor.destroyClientResources(client);
             if (self.clients.id(client) != null) self.clients.unregister(client);
@@ -211,6 +216,7 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_xdg_shell_initialized) wayring_xdg_shell.deinit();
         if (wayring_outputs_initialized) wayring_outputs.deinit();
         if (wayring_seat_adapter_initialized) {
             if (wayring_seat_published) wayring_seat_adapter.unpublish();
@@ -259,9 +265,19 @@ pub fn main(init: std.process.Init) !void {
             );
             wayring_outputs_initialized = true;
         }
+        wayring_xdg_shell.init(
+            init.gpa,
+            &wayring_protocol_server.?,
+            server.neutralXdgShell(),
+            &wayring_clients,
+            &wayring_compositor,
+            if (wayring_outputs_initialized) &wayring_outputs else null,
+        );
+        wayring_xdg_shell_initialized = true;
         wayring_lifecycle = .{
             .clients = &wayring_clients,
             .outputs = if (wayring_outputs_initialized) &wayring_outputs else null,
+            .xdg_shell = &wayring_xdg_shell,
             .compositor = &wayring_compositor,
             .seat = &wayring_seat_adapter,
         };
