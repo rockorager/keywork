@@ -16202,12 +16202,14 @@ const WayringXdgClient = struct {
     const client_wl = wayland.client.wl;
     const client_xdg = wayland.client.xdg;
     const client_zxdg = wayland.client.zxdg;
-    const Stage = enum(u8) { starting, configured, mapped, frame_done, registry_ready, disconnected, failed };
+    const Stage = enum(u8) { starting, configured, mapped, mode_changed, frame_done, registry_ready, disconnected, failed };
+    const Offense = enum { duplicate_decoration, invalid_mode };
 
     runtime_directory: []const u8,
     display_name: []const u8,
     command_fd: std.posix.fd_t,
     registry_only: bool = false,
+    offense: ?Offense = null,
     stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
     wake_fd: std.atomic.Value(i32) = .init(-1),
     failure: ?anyerror = null,
@@ -16229,6 +16231,8 @@ const WayringXdgClient = struct {
     decoration_event_sequence: u8 = 0,
     toplevel_event_sequence: u8 = 0,
     surface_event_sequence: u8 = 0,
+    initial_configure_serial: u32 = 0,
+    later_configure_serial: u32 = 0,
     output_enter_count: std.atomic.Value(u8) = .init(0),
     frame_count: std.atomic.Value(u8) = .init(0),
 
@@ -16239,6 +16243,9 @@ const WayringXdgClient = struct {
         .{ .name = "wl_seat", .version = 11 },
         .{ .name = "wl_output", .version = 4 },
         .{ .name = "xdg_wm_base", .version = 7 },
+        .{ .name = "wp_viewporter", .version = 1 },
+        .{ .name = "wp_fractional_scale_manager_v1", .version = 1 },
+        .{ .name = "wp_cursor_shape_manager_v1", .version = 2 },
         .{ .name = "zxdg_decoration_manager_v1", .version = 2 },
     };
 
@@ -16323,6 +16330,14 @@ const WayringXdgClient = struct {
         const decoration = try decoration_manager.getToplevelDecoration(toplevel);
         var decoration_live = true;
         defer if (decoration_live) decoration.destroy();
+        if (self.offense) |offense| {
+            switch (offense) {
+                .duplicate_decoration => _ = try decoration_manager.getToplevelDecoration(toplevel),
+                .invalid_mode => decoration.setMode(@enumFromInt(99)),
+            }
+            expectClientRoundtrip(display) catch return;
+            return error.ExpectedDecorationProtocolFailure;
+        }
         decoration.setListener(*@This(), decorationEvent, self);
         decoration.setMode(.server_side);
         surface.commit();
@@ -16354,6 +16369,20 @@ const WayringXdgClient = struct {
         surface.commit();
         try expectClientRoundtrip(display);
         try self.pause(.mapped);
+
+        self.event_sequence = 0;
+        decoration.unsetMode();
+        try expectClientRoundtrip(display);
+        if (self.configure_count != 2 or self.toplevel_configure_count != 2 or
+            self.decoration_configure_count != 2 or
+            self.decoration_mode != @as(u32, @intCast(@intFromEnum(client_zxdg.ToplevelDecorationV1.Mode.server_side))) or
+            self.configure_serial == self.initial_configure_serial or
+            !(self.decoration_event_sequence < self.toplevel_event_sequence and
+                self.toplevel_event_sequence < self.surface_event_sequence))
+            return error.UnexpectedLaterConfigure;
+        self.later_configure_serial = self.configure_serial;
+        try self.pause(.mode_changed);
+
         try expectClientRoundtrip(display);
         if (self.output_enter_count.load(.acquire) != 1) return error.OutputEnterMissing;
         if (self.frame_count.load(.acquire) != 1) return error.FrameDoneMissing;
@@ -16410,6 +16439,7 @@ const WayringXdgClient = struct {
                 self.surface_event_sequence = self.event_sequence;
                 self.configure_serial = configure.serial;
                 self.configure_count += 1;
+                if (self.configure_count == 1) self.initial_configure_serial = configure.serial;
                 xdg_surface.ackConfigure(configure.serial);
             },
         }
@@ -18571,6 +18601,28 @@ test "production Wayring XDG publication accepts a real registry client and surv
     xdg.setSeatAdapter(&seat);
     try xdg.publish();
     defer xdg.unpublish();
+    var viewporter: WayringViewporter = undefined;
+    viewporter.init(std.testing.allocator, &protocol_server, &compositor);
+    defer viewporter.deinit();
+    try viewporter.publish();
+    defer viewporter.unpublish();
+    var fractional_scale: WayringFractionalScale = undefined;
+    try fractional_scale.init(
+        std.testing.allocator,
+        &protocol_server,
+        &compositor,
+        &outputs,
+        server.wayringOutputLayout().?,
+        server.wayringDefaultOutputId().?,
+    );
+    defer fractional_scale.deinit();
+    try fractional_scale.publish();
+    defer fractional_scale.unpublish();
+    var cursor_shape: WayringCursorShape = undefined;
+    cursor_shape.init(std.testing.allocator, &protocol_server, &seat, server.generatedCursorShape(), server.generatedSeatRequestSink());
+    defer cursor_shape.deinit();
+    try cursor_shape.publish();
+    defer cursor_shape.unpublish();
     var decoration: WayringXdgDecoration = undefined;
     decoration.init(std.testing.allocator, &protocol_server, &xdg, server.neutralXdgShell());
     defer decoration.deinit();
@@ -18583,6 +18635,9 @@ test "production Wayring XDG publication accepts a real registry client and surv
         outputs: *WayringOutput,
         seat: *WayringSeatAdapter,
         xdg: *WayringXdgShell,
+        viewporter: *WayringViewporter,
+        fractional_scale: *WayringFractionalScale,
+        cursor_shape: *WayringCursorShape,
         decoration: *WayringXdgDecoration,
         accepted_count: usize = 0,
 
@@ -18596,6 +18651,9 @@ test "production Wayring XDG publication accepts a real registry client and surv
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.decoration.destroyClientResources(client);
+            self.cursor_shape.destroyClientResources(client);
+            self.fractional_scale.destroyClientResources(client);
+            self.viewporter.destroyClientResources(client);
             self.xdg.destroyClientResources(client);
             self.seat.destroyClientResources(client);
             self.outputs.destroyClientResources(client);
@@ -18603,7 +18661,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
             if (self.clients.id(client) != null) self.clients.unregister(client);
         }
     };
-    var lifecycle: Lifecycle = .{ .clients = &clients, .compositor = &compositor, .outputs = &outputs, .seat = &seat, .xdg = &xdg, .decoration = &decoration };
+    var lifecycle: Lifecycle = .{ .clients = &clients, .compositor = &compositor, .outputs = &outputs, .seat = &seat, .xdg = &xdg, .viewporter = &viewporter, .fractional_scale = &fractional_scale, .cursor_shape = &cursor_shape, .decoration = &decoration };
     const host = try WayringHost.create(std.testing.allocator, server.eventLoop(), &protocol_server, runtime_directory, .{
         .context = &lifecycle,
         .accepted = Lifecycle.accepted,
@@ -18631,7 +18689,34 @@ test "production Wayring XDG publication accepts a real registry client and surv
     var neutral_windows = server.neutralXdgShell().windowIterator();
     const neutral_window = neutral_windows.next().?;
     try std.testing.expectEqual(NeutralXdgShell.DecorationPreference.prefers_ssd, server.neutralXdgShell().windowInfo(neutral_window).?.decoration_preference);
+    try std.testing.expectEqual(NeutralXdgShell.DecorationMode.server_side, server.neutralXdgShell().windowInfo(neutral_window).?.configuration.decoration_mode);
     try std.testing.expect(server.surface_registry.renderState(server.headless_surface_forest.rootAt(0).?.id) == null);
+
+    inline for (.{ WayringXdgClient.Offense.duplicate_decoration, WayringXdgClient.Offense.invalid_mode }) |offense| {
+        var offender: WayringXdgClient = .{
+            .runtime_directory = runtime_directory,
+            .display_name = host.displayName(),
+            .command_fd = command_fd,
+            .offense = offense,
+        };
+        const offender_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&offender});
+        var offender_joined = false;
+        defer if (!offender_joined) {
+            offender.shutdown();
+            offender_thread.join();
+        };
+        try waitForWayringXdgStage(server, host, &offender, .disconnected);
+        offender_thread.join();
+        offender_joined = true;
+        for (0..1_000) |_| {
+            if (host.connectionCount() == 1 and compositor.surfaceCount() == 1 and
+                server.client_registry.len() == 1) break;
+            try server.eventLoop().dispatch(1);
+            if (host.failure()) |err| return err;
+        } else return error.WayringOffenderCleanupTimedOut;
+        try std.testing.expectEqual(WayringXdgClient.Stage.configured, @as(WayringXdgClient.Stage, @enumFromInt(client.stage.load(.acquire))));
+        try std.testing.expectEqual(NeutralXdgShell.DecorationPreference.prefers_ssd, server.neutralXdgShell().windowInfo(neutral_window).?.decoration_preference);
+    }
 
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &client, .mapped);
@@ -18641,6 +18726,31 @@ test "production Wayring XDG publication accepts a real registry client and surv
     const previous_frames = server.primaryRenderOutput().frame_statistics.frames_presented;
     try renderPendingWayringFrame(server, host, previous_frames);
     try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(surface_id)));
+    const capture_bounds = server.toplevelCaptureBounds(neutral_window).?;
+    try std.testing.expectEqual(render.Rect{ .x = 0, .y = 0, .width = 1, .height = 1 }, capture_bounds);
+    var captured_pixel: [1]u32 = undefined;
+    const capture_fd = try server.captureToplevel(neutral_window, .{
+        .size = .{ .width = 1, .height = 1 },
+        .stride_pixels = 1,
+        .pixels = &captured_pixel,
+    });
+    if (capture_fd) |value| _ = std.c.close(value);
+    try std.testing.expectEqual(@as(u32, 0xff7a_a2f7), captured_pixel[0]);
+    try signalWayringCommand(command_fd);
+    try waitForWayringXdgStage(server, host, &client, .mode_changed);
+    try std.testing.expect(client.later_configure_serial != 0);
+    try std.testing.expect(client.later_configure_serial != client.initial_configure_serial);
+    try std.testing.expectEqual(NeutralXdgShell.DecorationPreference.no_preference, server.neutralXdgShell().windowInfo(neutral_window).?.decoration_preference);
+    try std.testing.expectEqual(NeutralXdgShell.DecorationMode.server_side, server.neutralXdgShell().windowInfo(neutral_window).?.configuration.decoration_mode);
+    try std.testing.expectEqual(capture_bounds, server.toplevelCaptureBounds(neutral_window).?);
+    captured_pixel[0] = 0;
+    const later_capture_fd = try server.captureToplevel(neutral_window, .{
+        .size = .{ .width = 1, .height = 1 },
+        .stride_pixels = 1,
+        .pixels = &captured_pixel,
+    });
+    if (later_capture_fd) |value| _ = std.c.close(value);
+    try std.testing.expectEqual(@as(u32, 0xff7a_a2f7), captured_pixel[0]);
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &client, .frame_done);
     try signalWayringCommand(command_fd);
@@ -18664,7 +18774,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
         rebind_thread.join();
     };
     try waitForWayringXdgStage(server, host, &rebind, .registry_ready);
-    try std.testing.expectEqual(@as(usize, 2), lifecycle.accepted_count);
+    try std.testing.expectEqual(@as(usize, 4), lifecycle.accepted_count);
     try signalWayringCommand(rebind_fd);
     try waitForWayringXdgStage(server, host, &rebind, .disconnected);
     rebind_thread.join();

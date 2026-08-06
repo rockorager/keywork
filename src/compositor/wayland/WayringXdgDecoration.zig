@@ -243,3 +243,123 @@ test "generated decoration descriptors preserve pinned version two and errors" {
     try std.testing.expectEqual(@as(i64, 3), protocol.zxdg_toplevel_decoration_v1.@"error".invalid_mode);
     try std.testing.expectEqualStrings("configure", protocol.zxdg_toplevel_decoration_v1.event_messages[0].name);
 }
+
+test "global publication allocation failure installs no decoration global" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    failing.fail_index = 0;
+    var host: wayring.server.Server = .init(failing.allocator());
+    defer host.deinit();
+    var adapter: WayringXdgDecoration = .{
+        .allocator = std.testing.allocator,
+        .protocol_server = &host,
+        .xdg = undefined,
+        .core_shell = undefined,
+    };
+    defer {
+        adapter.decorations.deinit(adapter.allocator);
+        adapter.managers.deinit(adapter.allocator);
+    }
+
+    try std.testing.expectError(error.OutOfMemory, adapter.publish());
+    try std.testing.expect(adapter.global == null);
+    var globals = host.iterator();
+    try std.testing.expect(globals.next() == null);
+    try std.testing.expect(failing.has_induced_failure);
+}
+
+test "manager and decoration allocation failures leave no half-owned resource" {
+    inline for (.{ false, true }) |fail_decoration| {
+        var harness: WayringXdgShell.TestHarness = undefined;
+        try harness.init();
+        defer harness.deinit();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var adapter: WayringXdgDecoration = undefined;
+        adapter.init(failing.allocator(), &harness.host, &harness.adapter, &harness.core_shell);
+        try adapter.publish();
+        defer {
+            adapter.destroyClientResources(harness.client());
+            adapter.unpublish();
+            adapter.deinit();
+        }
+        try harness.createSurface();
+        try harness.installManager(2);
+        try harness.createToplevel();
+
+        if (fail_decoration) {
+            try harness.bindGlobal("zxdg_decoration_manager_v1", 8, 2);
+            try std.testing.expectEqual(@as(usize, 1), adapter.managers.items.len);
+        }
+        failing.fail_index = failing.alloc_index;
+        if (fail_decoration) {
+            harness.send(8, 1, &protocol.zxdg_decoration_manager_v1.request_messages[1], &.{
+                .{ .new_id = .{ .typed = 9 } }, .{ .object = 7 },
+            }) catch {};
+            try std.testing.expectEqual(@as(usize, 0), adapter.decorations.items.len);
+            try std.testing.expect(harness.client().lookup(9) == null);
+        } else {
+            harness.bindGlobal("zxdg_decoration_manager_v1", 8, 2) catch {};
+            try std.testing.expectEqual(@as(usize, 0), adapter.managers.items.len);
+            try std.testing.expect(harness.client().lookup(8) == null);
+        }
+        try std.testing.expect(failing.has_induced_failure);
+    }
+}
+
+test "decoration request materializes before semantic ownership" {
+    var harness: WayringXdgShell.TestHarness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var adapter: WayringXdgDecoration = undefined;
+    adapter.init(std.testing.allocator, &harness.host, &harness.adapter, &harness.core_shell);
+    try adapter.publish();
+    defer {
+        adapter.unpublish();
+        adapter.deinit();
+    }
+    try harness.createSurface();
+    try harness.installManager(2);
+    try harness.createToplevel();
+    try harness.bindGlobal("zxdg_decoration_manager_v1", 8, 2);
+    defer adapter.destroyClientResources(harness.client());
+
+    try harness.send(8, 1, &protocol.zxdg_decoration_manager_v1.request_messages[1], &.{
+        .{ .new_id = .{ .typed = 9 } }, .{ .object = 7 },
+    });
+    try std.testing.expectEqual(@as(usize, 1), adapter.decorations.items.len);
+}
+
+test "reused toplevel object id receives a distinct decoration identity" {
+    var harness: WayringXdgShell.TestHarness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    var adapter: WayringXdgDecoration = undefined;
+    adapter.init(std.testing.allocator, &harness.host, &harness.adapter, &harness.core_shell);
+    try adapter.publish();
+    defer {
+        adapter.unpublish();
+        adapter.deinit();
+    }
+    try harness.createSurface();
+    try harness.installManager(2);
+    try harness.createToplevel();
+    try harness.bindGlobal("zxdg_decoration_manager_v1", 8, 2);
+    defer adapter.destroyClientResources(harness.client());
+
+    try harness.send(8, 1, &protocol.zxdg_decoration_manager_v1.request_messages[1], &.{
+        .{ .new_id = .{ .typed = 9 } }, .{ .object = 7 },
+    });
+    const old_identity = adapter.decorations.items[0].identity;
+    try harness.send(9, 0, &protocol.zxdg_toplevel_decoration_v1.request_messages[0], &.{});
+    try harness.destroyToplevel();
+    try harness.recreateToplevel();
+    try harness.send(8, 1, &protocol.zxdg_decoration_manager_v1.request_messages[1], &.{
+        .{ .new_id = .{ .typed = 9 } }, .{ .object = 7 },
+    });
+
+    const new_identity = adapter.decorations.items[0].identity;
+    try std.testing.expectEqual(old_identity.object_id, new_identity.object_id);
+    try std.testing.expect(old_identity.generation != new_identity.generation);
+    try std.testing.expect(!sameIdentity(old_identity, new_identity));
+    try std.testing.expect(!harness.adapter.identityIsCurrent(old_identity));
+    try std.testing.expect(harness.adapter.identityIsCurrent(new_identity));
+}

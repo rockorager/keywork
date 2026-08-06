@@ -1750,7 +1750,7 @@ fn removePointer(comptime T: type, items: *std.ArrayList(*T), value: *T) void {
     unreachable;
 }
 
-const TestHarness = struct {
+pub const TestHarness = struct {
     host: server.Server,
     surface_registry: SurfaceRegistry,
     scene: Scene,
@@ -1761,7 +1761,7 @@ const TestHarness = struct {
     adapter: WayringXdgShell,
     managed: *server.CoreClient,
 
-    fn init(self: *@This()) !void {
+    pub fn init(self: *@This()) !void {
         self.host = .init(std.testing.allocator);
         self.surface_registry = .init(std.testing.allocator);
         self.scene.init(std.testing.allocator);
@@ -1796,7 +1796,7 @@ const TestHarness = struct {
         );
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.adapter.destroyClientResources(self.client());
         self.compositor.destroyClientResources(self.client());
         self.generated_clients.unregister(self.client());
@@ -1811,11 +1811,11 @@ const TestHarness = struct {
         self.host.deinit();
     }
 
-    fn client(self: *@This()) *server.Client {
+    pub fn client(self: *@This()) *server.Client {
         return self.managed.client();
     }
 
-    fn createSurface(self: *@This()) !void {
+    pub fn createSurface(self: *@This()) !void {
         try sendTest(
             self.client(),
             1,
@@ -1844,11 +1844,11 @@ const TestHarness = struct {
         );
     }
 
-    fn installManager(self: *@This(), version: u32) !void {
+    pub fn installManager(self: *@This(), version: u32) !void {
         try self.adapter.installDirectForTest(self.client(), 5, version);
     }
 
-    fn createToplevel(self: *@This()) !void {
+    pub fn createToplevel(self: *@This()) !void {
         try sendTest(self.client(), 5, 2, &core.xdg_wm_base.request_messages[2], &.{
             .{ .new_id = .{ .typed = 6 } }, .{ .object = 4 },
         });
@@ -1859,6 +1859,36 @@ const TestHarness = struct {
             &core.xdg_surface.request_messages[1],
             &.{.{ .new_id = .{ .typed = 7 } }},
         );
+    }
+
+    pub fn destroyToplevel(self: *@This()) !void {
+        try sendTest(self.client(), 7, 0, &core.xdg_toplevel.request_messages[0], &.{});
+    }
+
+    pub fn recreateToplevel(self: *@This()) !void {
+        try sendTest(
+            self.client(),
+            6,
+            1,
+            &core.xdg_surface.request_messages[1],
+            &.{.{ .new_id = .{ .typed = 7 } }},
+        );
+    }
+
+    pub fn bindGlobal(self: *@This(), name: []const u8, object_id: u32, version: u32) !void {
+        const global_name = globalName(&self.host, name) orelse return error.MissingGlobal;
+        try sendTest(self.client(), 2, 0, &core.wl_registry.request_messages[0], &.{
+            .{ .uint = global_name },
+            .{ .new_id = .{ .generic = .{
+                .interface = name,
+                .version = version,
+                .id = object_id,
+            } } },
+        });
+    }
+
+    pub fn send(self: *@This(), object_id: u32, opcode: u16, descriptor: *const wire.MessageDescriptor, values: []const wire.Value) !void {
+        try sendTest(self.client(), object_id, opcode, descriptor, values);
     }
 
     fn bindShm(self: *@This(), object_id: u32) !void {
