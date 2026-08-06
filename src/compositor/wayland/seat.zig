@@ -193,6 +193,12 @@ pub const GeneratedPointerTarget = struct {
     client: ClientRegistry.Id,
 };
 
+pub const GeneratedPointerState = struct {
+    surface_id: Surface.Id,
+    target: GeneratedPointerTarget,
+    suppressed: bool,
+};
+
 pub const GeneratedKeyboardFocus = struct {
     surface: SurfaceRegistry.Id,
     client: ClientRegistry.Id,
@@ -988,6 +994,28 @@ pub fn suppressPointerFocus(self: *Self, suppress: bool) void {
     self.updatePointerFocus(null, null);
 }
 
+/// Suppresses delivery to one generated window while preserving its implicit
+/// grab and exact live presses until physical release consumes them.
+pub fn suppressGeneratedPointerFocus(self: *Self, root: SurfaceRegistry.Id) void {
+    const state = self.generatedPointerState() orelse return;
+    if (!std.meta.eql(state.target.root, root)) return;
+    self.suppressPointerFocus(true);
+}
+
+pub fn generatedPointerState(self: *const Self) ?GeneratedPointerState {
+    if (self.pointer_focus) |focus| if (focus.generated) |target| return .{
+        .surface_id = focus.surface_id,
+        .target = target,
+        .suppressed = false,
+    };
+    if (self.pointer_grab) |grab| if (grab.generated) |target| return .{
+        .surface_id = grab.surface_id,
+        .target = target,
+        .suppressed = grab.suppressed,
+    };
+    return null;
+}
+
 /// End implicit pointer routing while preserving button bookkeeping for a drag.
 pub fn dissolvePointerGrab(self: *Self) void {
     self.pointer_grab = null;
@@ -1671,11 +1699,12 @@ pub fn pointerLeave(self: *Self) void {
 /// while retaining the physical pointer position. The replacement is a fresh
 /// canonical focus transition, never a continuation of an invalid grab.
 pub fn reconcileGeneratedPointerFocus(self: *Self, replacement: ?PointerFocus) void {
-    const current = self.pointer_focus orelse return;
-    if (current.generated == null) return;
-    self.clearCursor();
-    self.sendPointerLeave();
-    self.pointer_focus = null;
+    if (self.generatedPointerState() == null) return;
+    if (self.pointer_focus != null and self.pointer_focus.?.generated != null) {
+        self.clearCursor();
+        self.sendPointerLeave();
+        self.pointer_focus = null;
+    }
     self.authority.clearPointerEnter();
     self.pointer_grab = null;
     self.authority.cancelPointerPressesAndGrants();
@@ -3196,7 +3225,7 @@ pub fn retireGeneratedClient(self: *Self, client: ClientRegistry.Id) bool {
             self.authority.clearPointerEnter();
         }
     };
-    _ = self.authority.clientDisconnected(client);
+    if (self.authority.clientDisconnected(client)) self.pointer_grab = null;
     if (self.active_cursor) |cursor| switch (cursor) {
         .generated => |generated| if (std.meta.eql(generated.client, client)) self.clearCursor(),
         .surface, .shape => {},

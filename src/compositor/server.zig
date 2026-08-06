@@ -4018,16 +4018,21 @@ fn headlessSurfaceDescendsFrom(
 }
 
 fn reconcileGeneratedPointerTopology(self: *Self) void {
-    const focus = self.seat.pointerFocus() orelse return;
-    const generated = focus.generated orelse return;
-    const owner = self.seat.generatedSurfaceOwner(focus.surface_id);
-    const valid = if (owner == null or !std.meta.eql(owner.?, generated.client))
+    const state = self.seat.generatedPointerState() orelse return;
+    const generated = state.target;
+    const focus = self.seat.pointerFocus();
+    const owner = self.seat.generatedSurfaceOwner(state.surface_id);
+    const valid = if ((!state.suppressed and (focus == null or focus.?.generated == null)) or
+        owner == null or !std.meta.eql(owner.?, generated.client))
         false
     else if (self.headless_surface_forest.presentationClass(generated.root)) |class|
         switch (class) {
-            .background => self.headless_surface_forest.presentedInCompound(focus.surface_id, generated.root),
-            .managed => self.headless_surface_forest.mappedInCompound(focus.surface_id, generated.root) and
-                self.generatedManagedRootEligible(generated.root, generated.client),
+            .background => self.headless_surface_forest.presentedInCompound(state.surface_id, generated.root),
+            .managed => self.headless_surface_forest.mappedInCompound(state.surface_id, generated.root) and
+                (if (state.suppressed)
+                    self.generatedManagedRootStructurallyLive(generated.root, generated.client)
+                else
+                    self.generatedManagedRootEligible(generated.root, generated.client)),
             .xdg_reserved, .cursor => false,
         }
     else
@@ -4037,8 +4042,8 @@ fn reconcileGeneratedPointerTopology(self: *Self) void {
         if (self.seat.implicitPointerGrabActive()) return;
         const replacement = if (position) |point| self.pointerRoute(point.x, point.y).focus else null;
         if (replacement) |next| {
-            if (std.meta.eql(next.surface_id, focus.surface_id) and
-                std.meta.eql(next.generated, focus.generated))
+            if (std.meta.eql(next.surface_id, state.surface_id) and
+                std.meta.eql(next.generated, focus.?.generated))
             {
                 self.seat.pointerEnter(position.?.x, position.?.y, next);
                 return;
@@ -4052,6 +4057,22 @@ fn reconcileGeneratedPointerTopology(self: *Self) void {
     }
     const replacement = if (position) |point| self.pointerRoute(point.x, point.y).focus else null;
     self.seat.reconcileGeneratedPointerFocus(replacement);
+}
+
+/// Structural liveness excludes reversible presentation and interaction
+/// policy so a suppressed implicit press survives until physical release.
+fn generatedManagedRootStructurallyLive(
+    self: *Self,
+    root: SurfaceRegistry.Id,
+    expected_client: ClientRegistry.Id,
+) bool {
+    if (self.headless_surface_forest.presentationClass(root) != .managed) return false;
+    const xdg_id = self.xdg_shell_core.toplevelForSurface(root) orelse return false;
+    const info = self.xdg_shell_core.windowInfo(xdg_id) orelse return false;
+    if (!std.meta.eql(info.client, expected_client) or !info.mapped) return false;
+    if (!std.meta.eql(self.scene.windowSurface(info.scene_id) orelse return false, root)) return false;
+    const live_owner = self.seat.generatedSurfaceOwner(root) orelse return false;
+    return std.meta.eql(live_owner, expected_client);
 }
 
 fn repairGeneratedFocus(self: *Self) void {
@@ -10166,6 +10187,24 @@ fn refreshKeyboardFocusWithGeneratedRetention(self: *Self, retain_generated: boo
         self.syncXwaylandFocus(null);
         return;
     }
+    const default_focus = self.maturePolicyKeyboardFocus();
+    if (retain_generated and generatedFocusPolicyAllows(
+        false,
+        self.xdg_shell_core.hasPopupGrab(),
+        self.layer_shell.keyboardFocus(self.xdg_shell_core.popupKeyboardFocus()) != null,
+        self.xwayland_override_redirect_focus != null,
+    )) if (self.seat.generatedKeyboardFocus()) |focus| {
+        const root = self.headless_surface_forest.compoundRoot(focus.surface);
+        if (root != null and std.meta.eql(root.?, focus.surface) and
+            self.headless_surface_forest.presentationClass(root.?) == .background and
+            self.headless_surface_forest.state(root.?).?.mapped_size != null and
+            std.meta.eql(self.seat.generatedSurfaceOwner(root.?), focus.client))
+        {
+            _ = self.seat.applyGeneratedKeyboardFocus(focus, default_focus);
+            self.syncXwaylandFocus(null);
+            return;
+        }
+    };
     if (generatedFocusPolicyAllows(
         false,
         self.xdg_shell_core.hasPopupGrab(),
@@ -10183,18 +10222,6 @@ fn refreshKeyboardFocusWithGeneratedRetention(self: *Self, retain_generated: boo
             }
         }
     };
-    const default_focus = self.maturePolicyKeyboardFocus();
-    if (retain_generated and self.seat.retainGeneratedKeyboardFocus(default_focus) != null) {
-        if (generatedFocusPolicyAllows(
-            false,
-            self.xdg_shell_core.hasPopupGrab(),
-            self.layer_shell.keyboardFocus(self.xdg_shell_core.popupKeyboardFocus()) != null,
-            self.xwayland_override_redirect_focus != null,
-        )) {
-            self.syncXwaylandFocus(null);
-            return;
-        }
-    }
     self.applyMatureKeyboardFocus(default_focus);
     self.syncXwaylandFocus(default_focus);
 }
@@ -13668,11 +13695,23 @@ test "generated topology mutation retargets hover and cancels invalid grabs" {
     server.surface_registry.remove(grabbed);
     grabbed_live = false;
 
+    pointerButton(output, 7, linux_button_left, .pressed);
+    const retiring_press = sink.last_button_serial.?;
+    server.seat.suppressGeneratedPointerFocus(root_a);
+    try std.testing.expect(server.seat.pointerFocus() == null);
+    try std.testing.expect(server.seat.implicitPointerGrabActive());
+    try std.testing.expect(server.seat.authority.acceptsPointerGrab(
+        generated_client,
+        retiring_press,
+        root_a,
+    ));
     try std.testing.expect(server.seat.generatedKeyboardFocus() != null);
     const request_sink = server.generatedSeatRequestSink();
     request_sink.client_retiring(request_sink.context, generated_client);
     try std.testing.expect(server.seat.pointerFocus() == null);
     try std.testing.expect(!server.seat.implicitPointerGrabActive());
+    try std.testing.expect(!server.seat.hasPressedPointerButtons());
+    try std.testing.expect(!server.seat.authority.acceptsAction(generated_client, retiring_press));
     try std.testing.expect(server.seat.generatedKeyboardFocus() == null);
     server.removeHeadlessSurface(root_b);
     server.surface_registry.remove(root_b);
@@ -14511,21 +14550,56 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     var moved_windows = server.scene.iterator();
     const moved_window = moved_windows.next().?.window;
     const moved_offset = moved_window.content_geometry.?.offset;
+    const moved_x: f64 = @as(f64, @floatFromInt(moved_window.position.x - moved_offset.x)) + 10;
+    const moved_y: f64 = @as(f64, @floatFromInt(moved_window.position.y - moved_offset.y)) + 10;
     try std.testing.expect(server.hitTestGeneratedWindow(
         moved_window,
-        @as(f64, @floatFromInt(moved_window.position.x - moved_offset.x)) + 10,
-        @as(f64, @floatFromInt(moved_window.position.y - moved_offset.y)) + 10,
+        moved_x,
+        moved_y,
     ) != null);
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 14, moved_x, moved_y);
+    const disable_move_enter = try T.drain(client);
+    defer std.testing.allocator.free(disable_move_enter);
+    server.pointerButtonForSeat(&server.seat, 14, linux_button_left, .pressed);
+    const disable_move_press = try T.drain(client);
+    defer std.testing.allocator.free(disable_move_press);
+    const disable_move_serial = T.eventWord(disable_move_press, 12, 3, 0) orelse return error.Unexpected;
+    try T.send(client, 7, 5, &core.xdg_toplevel.request_messages[5], &.{
+        .{ .object = 11 }, .{ .uint = disable_move_serial },
+    });
+    try std.testing.expect(server.window_manager.clientXdgPointerGrabActive());
+    server.xdg_shell_core.setWindowInteractionEnabled(window_id, false);
+    try std.testing.expect(!server.window_manager.directManipulationActive());
+    try std.testing.expect(server.seat.hasPressedPointerButtons());
+    try std.testing.expect(server.seat.authority.acceptsPointerGrab(
+        clients.id(client).?,
+        .{ .domain = .wayring_server, .value = disable_move_serial },
+        surface_id,
+    ));
+    server.commitHeadlessSurface(surface_id, .{ .width = 20, .height = 20 }, false);
+    try std.testing.expect(server.seat.hasPressedPointerButtons());
+    try std.testing.expect(server.seat.authority.acceptsPointerGrab(
+        clients.id(client).?,
+        .{ .domain = .wayring_server, .value = disable_move_serial },
+        surface_id,
+    ));
+    const disabled_move_position = server.scene.windowPosition(info.scene_id).?;
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 15, moved_x + 20, moved_y + 20);
+    try std.testing.expectEqual(disabled_move_position, server.scene.windowPosition(info.scene_id).?);
+    server.pointerButtonForSeat(&server.seat, 16, linux_button_left, .released);
+    try std.testing.expect(!server.seat.hasPressedPointerButtons());
+    server.xdg_shell_core.setWindowInteractionEnabled(window_id, true);
+
     server.pointerMotionGlobalForSeat(
         server.primaryRenderOutput(),
         &server.seat,
-        14,
-        @as(f64, @floatFromInt(moved_window.position.x - moved_offset.x)) + 10,
-        @as(f64, @floatFromInt(moved_window.position.y - moved_offset.y)) + 10,
+        17,
+        moved_x,
+        moved_y,
     );
     const resize_enter = try T.drain(client);
     defer std.testing.allocator.free(resize_enter);
-    server.pointerButtonForSeat(&server.seat, 14, linux_button_left, .pressed);
+    server.pointerButtonForSeat(&server.seat, 18, linux_button_left, .pressed);
     const resize_press = try T.drain(client);
     defer std.testing.allocator.free(resize_press);
     const resize_serial = T.eventWord(resize_press, 12, 3, 0) orelse return error.Unexpected;
@@ -14534,13 +14608,51 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
         .{ .object = 11 }, .{ .uint = resize_serial }, .{ .uint = 10 },
     });
     try std.testing.expect(server.window_manager.clientXdgPointerGrabActive());
-    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 15, pointer_x + 20, pointer_y + 20);
-    server.pointerButtonForSeat(&server.seat, 16, linux_button_left, .released);
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 19, moved_x + 20, moved_y + 20);
+    server.pointerButtonForSeat(&server.seat, 20, linux_button_left, .released);
     try std.testing.expect(!server.window_manager.directManipulationActive());
     try std.testing.expect(!server.xdg_shell_core.windowInfo(window_id).?.configuration.resizing);
     const resize_configures = try T.drain(client);
     defer std.testing.allocator.free(resize_configures);
     try std.testing.expect(resize_configures.len != 0);
+
+    var presentation_windows = server.scene.iterator();
+    const presentation_window = presentation_windows.next().?.window;
+    const presentation_offset = presentation_window.content_geometry.?.offset;
+    const presentation_x: f64 = @as(f64, @floatFromInt(presentation_window.position.x - presentation_offset.x)) + 10;
+    const presentation_y: f64 = @as(f64, @floatFromInt(presentation_window.position.y - presentation_offset.y)) + 10;
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 21, presentation_x, presentation_y);
+    const disable_resize_enter = try T.drain(client);
+    defer std.testing.allocator.free(disable_resize_enter);
+    server.pointerButtonForSeat(&server.seat, 22, linux_button_left, .pressed);
+    const disable_resize_press = try T.drain(client);
+    defer std.testing.allocator.free(disable_resize_press);
+    const disable_resize_serial = T.eventWord(disable_resize_press, 12, 3, 0) orelse return error.Unexpected;
+    try T.send(client, 7, 6, &core.xdg_toplevel.request_messages[6], &.{
+        .{ .object = 11 }, .{ .uint = disable_resize_serial }, .{ .uint = 10 },
+    });
+    try std.testing.expect(server.window_manager.clientXdgPointerGrabActive());
+    try server.xdg_shell_core.setWindowScenePresentationEnabled(window_id, false);
+    try std.testing.expect(!server.window_manager.directManipulationActive());
+    try std.testing.expect(server.seat.hasPressedPointerButtons());
+    try std.testing.expect(server.seat.authority.acceptsPointerGrab(
+        clients.id(client).?,
+        .{ .domain = .wayring_server, .value = disable_resize_serial },
+        surface_id,
+    ));
+    server.commitHeadlessSurface(surface_id, .{ .width = 20, .height = 20 }, false);
+    try std.testing.expect(server.seat.hasPressedPointerButtons());
+    try std.testing.expect(server.seat.authority.acceptsPointerGrab(
+        clients.id(client).?,
+        .{ .domain = .wayring_server, .value = disable_resize_serial },
+        surface_id,
+    ));
+    const disabled_resize_position = server.scene.windowPosition(info.scene_id).?;
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 23, presentation_x + 20, presentation_y + 20);
+    try std.testing.expectEqual(disabled_resize_position, server.scene.windowPosition(info.scene_id).?);
+    server.pointerButtonForSeat(&server.seat, 24, linux_button_left, .released);
+    try std.testing.expect(!server.seat.hasPressedPointerButtons());
+    try server.xdg_shell_core.setWindowScenePresentationEnabled(window_id, true);
 
     var resized_windows = server.scene.iterator();
     const resized_window = resized_windows.next().?.window;
@@ -14657,6 +14769,20 @@ test "unpublished Wayring XDG lifecycle uses the real headless window manager" {
     // of Scene policy and every presentation path until Wave 6.
     try T.send(client, 3, 0, &core.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 13 } }});
     const popup_surface_id = compositor.surfaceId(client, 13).?;
+    try std.testing.expectEqual(
+        HeadlessSurfaceForest.PresentationClass.background,
+        server.headless_surface_forest.presentationClass(popup_surface_id).?,
+    );
+    try T.send(client, 13, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = 10 }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(client, 13, 6, &core.wl_surface.request_messages[6], &.{});
+    server.pointerMotionGlobalForSeat(server.primaryRenderOutput(), &server.seat, 28, capability_x, capability_y);
+    const background_focus_enter = try T.drain(client);
+    defer std.testing.allocator.free(background_focus_enter);
+    try std.testing.expectEqual(surface_id, server.seat.pointerFocus().?.generated.?.root);
+    try std.testing.expect(server.focusGeneratedSurface(popup_surface_id));
+    try std.testing.expectEqual(popup_surface_id, server.seat.generatedKeyboardFocus().?.surface);
+    try T.send(client, 13, 1, &core.wl_surface.request_messages[1], &.{ .{ .object = null }, .{ .int = 0 }, .{ .int = 0 } });
+    try T.send(client, 13, 6, &core.wl_surface.request_messages[6], &.{});
     try T.send(client, 5, 2, &core.xdg_wm_base.request_messages[2], &.{ .{ .new_id = .{ .typed = 14 } }, .{ .object = 13 } });
     try T.send(client, 5, 1, &core.xdg_wm_base.request_messages[1], &.{.{ .new_id = .{ .typed = 15 } }});
     try T.send(client, 15, 1, &core.xdg_positioner.request_messages[1], &.{ .{ .int = 1 }, .{ .int = 1 } });

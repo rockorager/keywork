@@ -1088,6 +1088,9 @@ fn configureToplevel(
         .{ .array = std.mem.sliceAsBytes(states) },
     };
     const surface_values = [_]wire.Value{.{ .uint = serial }};
+    // This generated-adapter filter is intentionally narrower than the
+    // mature compatibility surface. Keep mature behavior unchanged until
+    // capabilities have one parity-safe neutral policy source.
     const capability_values = [_]u32{ 2, 3, 4 };
     const capabilities = [_]wire.Value{.{
         .array = std.mem.sliceAsBytes(&capability_values),

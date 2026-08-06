@@ -730,10 +730,19 @@ fn removeWindowPointerInteractions(self: *Self, id: WindowId) void {
 
 fn clearGeneratedEndpointsForWindow(self: *Self, id: WindowId) void {
     const window = self.windows.get(id) orelse return;
-    if (self.seat.pointerFocus()) |focus| if (focus.generated) |generated| {
-        if (std.meta.eql(generated.root, window.surface_id))
+    if (self.seat.generatedPointerState()) |state| {
+        if (std.meta.eql(state.target.root, window.surface_id))
             self.seat.reconcileGeneratedPointerFocus(null);
-    };
+    }
+    if (self.seat.generatedKeyboardFocus()) |focus| {
+        if (std.meta.eql(focus.surface, window.surface_id))
+            _ = self.seat.clearGeneratedKeyboardFocus();
+    }
+}
+
+fn suppressGeneratedEndpointsForWindow(self: *Self, id: WindowId) void {
+    const window = self.windows.get(id) orelse return;
+    self.seat.suppressGeneratedPointerFocus(window.surface_id);
     if (self.seat.generatedKeyboardFocus()) |focus| {
         if (std.meta.eql(focus.surface, window.surface_id))
             _ = self.seat.clearGeneratedKeyboardFocus();
@@ -1155,6 +1164,28 @@ test "workspace selection owns keyboard focus only without lock or layer focus" 
     try std.testing.expect(!manager.selectionOwnsKeyboardFocus());
 }
 
+test "session lock rejects client XDG manipulation before consulting live authority" {
+    var manager: Self = undefined;
+    manager.session_locked = true;
+    manager.tiling_drag = null;
+    manager.toplevel_drag = null;
+    manager.interactive_resize = null;
+
+    try std.testing.expect(!manager.beginClientPointerMove(undefined));
+    try std.testing.expect(!manager.beginClientPointerResize(undefined, .{ .right = true }));
+    try std.testing.expect(!manager.beginWindowMove(
+        undefined,
+        0,
+        0,
+        0,
+        0,
+        false,
+        .client_xdg_pointer,
+        true,
+    ));
+    try std.testing.expect(!manager.updateCompositorPointerGrab(1, 1));
+}
+
 fn clearFocusedUrgency(self: *Self) void {
     if (!self.selectionOwnsKeyboardFocus()) return;
     const workspace_index = self.workspaceFor(self.default_output) orelse return;
@@ -1385,6 +1416,7 @@ pub fn beginModifierMove(
     pointer_x: f64,
     pointer_y: f64,
 ) bool {
+    if (self.session_locked) return false;
     if (self.beginTilingDrag(root, pointer_x, pointer_y)) return true;
     const id = self.windowForSurface(root orelse return false) orelse return false;
     const window = self.windows.get(id) orelse return false;
@@ -1407,7 +1439,7 @@ pub fn beginInteractiveResize(
     pointer_x: f64,
     pointer_y: f64,
 ) bool {
-    if (self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
+    if (self.session_locked or self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
     if (root) |surface_id| {
         const id = self.windowForSurface(surface_id) orelse return false;
         return self.beginInteractiveResizeWindow(id, pointer_x, pointer_y);
@@ -1553,6 +1585,10 @@ fn cursorShapeForInteractiveResize(resize: InteractiveResize) PointerShape {
 }
 
 pub fn updateCompositorPointerGrab(self: *Self, pointer_x: f64, pointer_y: f64) bool {
+    if (self.session_locked) {
+        _ = self.endCompositorPointerGrab(false);
+        return false;
+    }
     if (self.tiling_drag != null) return self.updateTilingDrag(pointer_x, pointer_y);
     if (self.toplevel_drag) |drag| {
         if (drag.origin != .toplevel_drag) {
@@ -1668,6 +1704,7 @@ pub fn beginToplevelDrag(
 }
 
 fn beginClientPointerMove(self: *Self, xdg_id: XdgShell.WindowId) bool {
+    if (self.session_locked) return false;
     const point = self.seat.pointerPosition() orelse return false;
     const id = self.findXdg(xdg_id) orelse return false;
     return self.beginWindowMove(
@@ -1687,11 +1724,17 @@ fn beginClientPointerResize(
     xdg_id: XdgShell.WindowId,
     requested: XdgShell.ResizeEdges,
 ) bool {
-    if (self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
+    if (self.session_locked or self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
     const point = self.seat.pointerPosition() orelse return false;
     const id = self.findXdg(xdg_id) orelse return false;
     const candidate = self.windows.get(id) orelse return false;
-    var resize: InteractiveResize = if (self.isFloating(candidate)) floating: {
+    if (!self.isFloating(candidate)) {
+        // Tiled layout resize selection is proximity-based and does not yet
+        // prove the requested protocol edge. Keep client-XDG tiled resize
+        // inert until policy exposes an exact edge-aware split query.
+        return false;
+    }
+    const resize: InteractiveResize = floating: {
         if (!candidate.presentation_enabled or !candidate.interaction_enabled or
             !candidate.mapped or candidate.minimized or candidate.fullscreen_output != null or
             !self.workspaces.items[candidate.workspace].active) return false;
@@ -1709,20 +1752,7 @@ fn beginClientPointerResize(
             .constraints = self.windowSizeConstraints(candidate),
             .origin = .client_xdg_pointer,
         } };
-    } else self.interactiveResizeForWindow(id, point.x, point.y) orelse return false;
-    switch (resize) {
-        .floating => {},
-        .tiled => |*value| {
-            const compatible = switch (value.resize) {
-                .tiled => |tiled| switch (tiled.axis) {
-                    .horizontal => requested.left or requested.right,
-                    .vertical => requested.top or requested.bottom,
-                },
-            };
-            if (!compatible) return false;
-            value.origin = .client_xdg_pointer;
-        },
-    }
+    };
     self.interactive_resize = resize;
     const window = self.windows.get(id).?;
     const workspace = &self.workspaces.items[window.workspace];
@@ -1750,7 +1780,7 @@ fn beginWindowMove(
     origin: DirectManipulationOrigin,
     allow_tiled: bool,
 ) bool {
-    if (self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
+    if (self.session_locked or self.pointerInteractionActive() or self.layer_focus == .exclusive) return false;
     const window = self.windows.get(id) orelse return false;
     if (!window.presentation_enabled or !window.interaction_enabled or
         !window.mapped or window.minimized or
@@ -1804,7 +1834,7 @@ pub fn updateToplevelDrag(self: *Self, pointer_x: f64, pointer_y: f64) void {
         self.toplevel_drag = null;
         return;
     };
-    if (!window.presentation_enabled or !window.interaction_enabled or !window.mapped or
+    if (self.session_locked or !window.presentation_enabled or !window.interaction_enabled or !window.mapped or
         window.minimized or window.fullscreen_output != null or self.layer_focus == .exclusive or
         !self.workspaces.items[window.workspace].active)
     {
@@ -1853,7 +1883,7 @@ fn updateFloatingResize(
         self.interactive_resize = null;
         return false;
     };
-    if (!window.presentation_enabled or !window.interaction_enabled or !window.mapped or window.minimized or
+    if (self.session_locked or !window.presentation_enabled or !window.interaction_enabled or !window.mapped or window.minimized or
         window.fullscreen_output != null or !self.workspaces.items[window.workspace].active or
         !self.isFloating(window))
     {
@@ -2981,7 +3011,7 @@ fn windowPresentationChanged(
     if (enabled == window.presentation_enabled) return;
     if (!enabled) {
         self.removeWindowPointerInteractions(managed_id);
-        self.clearGeneratedEndpointsForWindow(managed_id);
+        self.suppressGeneratedEndpointsForWindow(managed_id);
     }
     if (enabled) {
         const inserted = try self.workspaces.items[window.workspace].workspace.insert(
@@ -3011,7 +3041,7 @@ fn windowInteractionChanged(context: *anyopaque, id: XdgShell.WindowId, enabled:
     if (window.interaction_enabled == enabled) return;
     if (!enabled) {
         self.removeWindowPointerInteractions(managed_id);
-        self.clearGeneratedEndpointsForWindow(managed_id);
+        self.suppressGeneratedEndpointsForWindow(managed_id);
     }
     window.interaction_enabled = enabled;
     self.relayout();
