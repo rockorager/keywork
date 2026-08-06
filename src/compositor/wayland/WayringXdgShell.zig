@@ -815,9 +815,39 @@ fn handlePopup(
     popup: *Popup,
 ) !void {
     switch (request) {
-        .destroy => popup.adapter.destroyPopup(popup, false),
-        .grab => {},
+        .destroy => {
+            if (!popup.adapter.core_shell.popupIsTopmost(popup.core_id)) {
+                popup.adapter.postManagerError(
+                    popup.surface.manager,
+                    .not_the_topmost_popup,
+                    "destroy the topmost xdg_popup first",
+                );
+                return;
+            }
+            popup.adapter.destroyPopup(popup, false);
+        },
+        .grab => |set| {
+            const surface = popup.adapter.core_shell.popupPresentationInfo(popup.core_id) orelse return;
+            const client = (popup.adapter.seat orelse return).acceptsXdgUserAction(
+                popup.surface.client,
+                set.seat,
+                set.serial,
+            );
+            const action: XdgShell.UserAction = .{
+                .client = client orelse surface.client,
+                .serial = .{ .domain = .wayring_server, .value = set.serial },
+                .granted = client != null,
+            };
+            _ = popup.adapter.core_shell.grabPopup(popup.core_id, action) catch {
+                popup.surface.client.postProtocolError(
+                    &popup.resource.runtime,
+                    @intCast(core.xdg_popup.@"error".invalid_grab),
+                    "invalid xdg_popup grab",
+                );
+            };
+        },
         .reposition => |set| {
+            if (popup.adapter.core_shell.popupDismissed(popup.core_id)) return;
             const positioner = popup.adapter.findPositioner(
                 popup.surface.client,
                 set.positioner,
@@ -839,9 +869,33 @@ fn handlePopup(
                 );
                 return;
             }
-            // Wave 6 owns popup placement/reposition policy. Retain only the
-            // copied wire intent and opaque client token here.
+            const previous_reposition = popup.reposition;
             popup.reposition = .{ .positioner = snapshot, .token = set.token };
+            _ = popup.adapter.core_shell.sendPopupConfigure(popup.core_id, snapshot.rules) catch |err| {
+                popup.reposition = previous_reposition;
+                switch (err) {
+                    error.OutOfMemory => popup.surface.client.postOutOfMemory(
+                        &popup.resource.runtime,
+                        "configuring repositioned popup",
+                    ),
+                    error.InvalidParent => popup.adapter.postManagerError(
+                        popup.surface.manager,
+                        .invalid_popup_parent,
+                        "invalid popup parent",
+                    ),
+                    error.InvalidPositioner => popup.adapter.postManagerError(
+                        popup.surface.manager,
+                        .invalid_positioner,
+                        "invalid popup reposition",
+                    ),
+                    error.ConfigureSequenceExhausted => popup.surface.client.postImplementationError(
+                        &popup.surface.manager.resource.runtime,
+                        "popup configure sequence exhausted",
+                    ),
+                }
+                return;
+            };
+            popup.positioner = snapshot;
         },
     }
 }
@@ -962,6 +1016,11 @@ fn validateCommit(
 fn preUnmap(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
     const surface: *Surface = @ptrCast(@alignCast(context));
     const commit = surface.prepared_commit orelse unreachable;
+    if (commit.current_size != null and commit.next_size == null) if (surface.active_role) |role|
+        switch (role) {
+            .popup => |popup| surface.adapter.core_shell.setPopupScenePresentationEnabled(popup.core_id, false),
+            .toplevel => {},
+        };
     surface.adapter.core_shell.beforeAppliedCommit(
         surface.core_id,
         commit.current_size != null,
@@ -979,11 +1038,6 @@ fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
         );
         surface.pending_geometry_changed = false;
     }
-    const applies_buffer = commit.attachment_changed and commit.next_size != null;
-    const accepted: ?XdgShell.AcceptedConfigure = if (applies_buffer)
-        if (surface.accepted_configure) |configure| configure.accepted else null
-    else
-        null;
     const dismissed_popup = switch (surface.active_role orelse {
         finishPreparedCommit(surface);
         return;
@@ -991,6 +1045,15 @@ fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
         .toplevel => false,
         .popup => |popup| surface.adapter.core_shell.popupDismissed(popup.core_id),
     };
+    const applies_buffer = commit.attachment_changed and commit.next_size != null;
+    const applies_configure = switch (surface.active_role.?) {
+        .toplevel => applies_buffer,
+        .popup => commit.next_size != null and !dismissed_popup,
+    };
+    const accepted: ?XdgShell.AcceptedConfigure = if (applies_configure)
+        if (surface.accepted_configure) |configure| configure.accepted else null
+    else
+        null;
     if (commit.next_size != null) switch (surface.active_role.?) {
         .toplevel => |toplevel| {
             const info = surface.adapter.core_shell.windowInfo(toplevel.core_id) orelse {
@@ -1042,9 +1105,13 @@ fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
                 surface.adapter.core_shell.setWindowInteractionEnabled(toplevel.core_id, true);
             }
         },
-        .popup => {},
+        .popup => |popup| {
+            if (surface.adapter.core_shell.popupMapped(popup.core_id) and
+                surface.adapter.core_shell.popupParentChainInteractive(popup.core_id))
+                surface.adapter.core_shell.setPopupScenePresentationEnabled(popup.core_id, true);
+        },
     };
-    if (applies_buffer and !dismissed_popup) surface.accepted_configure = null;
+    if (applies_configure) surface.accepted_configure = null;
     if (commit.current_size != null and commit.next_size == null and !dismissed_popup) {
         resetWireState(surface);
     }
@@ -1289,6 +1356,7 @@ fn destroyPopup(self: *WayringXdgShell, popup: *Popup, surface_gone: bool) void 
     const surface = popup.surface;
     std.debug.assert(surface.active_role != null and surface.active_role.? == .popup and
         surface.active_role.?.popup == popup);
+    self.core_shell.setPopupScenePresentationEnabled(popup.core_id, false);
     surface.active_role = null;
     self.core_shell.destroyPopup(popup.core_id);
     if (!surface_gone) self.compositor.detachXdgRole(surface.reservation, .popup) catch unreachable;
@@ -1416,7 +1484,11 @@ fn resolveConfigureToken(
     return null;
 }
 
-const ManagerError = enum { invalid_popup_parent, invalid_positioner };
+const ManagerError = enum {
+    invalid_popup_parent,
+    invalid_positioner,
+    not_the_topmost_popup,
+};
 
 fn postManagerError(
     self: *WayringXdgShell,
@@ -1427,6 +1499,7 @@ fn postManagerError(
     manager.client.postProtocolError(&manager.resource.runtime, switch (code) {
         .invalid_popup_parent => @intCast(core.xdg_wm_base.@"error".invalid_popup_parent),
         .invalid_positioner => @intCast(core.xdg_wm_base.@"error".invalid_positioner),
+        .not_the_topmost_popup => @intCast(core.xdg_wm_base.@"error".not_the_topmost_popup),
     }, detail);
     _ = self;
 }

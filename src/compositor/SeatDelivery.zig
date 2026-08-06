@@ -61,6 +61,11 @@ pub const RequestSink = struct {
         ClientRegistry.Serial,
         SurfaceRegistry.Id,
     ) bool = rejectsPointerGrab,
+    accepts_action: *const fn (
+        *anyopaque,
+        ClientRegistry.Id,
+        ClientRegistry.Serial,
+    ) bool = rejectsAction,
     set_cursor: *const fn (*anyopaque, CursorRequest) CursorRequestResult,
     cursor_committed: *const fn (*anyopaque, SurfaceRegistry.Id, i32, i32) void,
     cursor_removed: *const fn (*anyopaque, SurfaceRegistry.Id) void,
@@ -73,6 +78,10 @@ fn rejectsPointerGrab(
     _: ClientRegistry.Serial,
     _: SurfaceRegistry.Id,
 ) bool {
+    return false;
+}
+
+fn rejectsAction(_: *anyopaque, _: ClientRegistry.Id, _: ClientRegistry.Serial) bool {
     return false;
 }
 

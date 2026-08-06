@@ -1711,6 +1711,55 @@ pub fn popupMapped(self: *XdgShell, id: PopupId) bool {
     return popup.mapped;
 }
 
+pub const PopupPresentationInfo = struct {
+    surface: SurfaceRegistry.Id,
+    scene_id: Scene.PopupId,
+    client: ClientRegistry.Id,
+    mapped: bool,
+    scene_presentation_enabled: bool,
+};
+
+/// Returns the exact neutral/Scene ownership tuple for a popup. Callers must
+/// still verify frontend ownership; this deliberately performs no ancestry
+/// inference from the popup's root toplevel.
+pub fn popupPresentationInfo(self: *XdgShell, id: PopupId) ?PopupPresentationInfo {
+    const popup = self.popups.get(id) orelse return null;
+    const state = self.xdg_surfaces.get(popup.xdg_surface_id) orelse return null;
+    return .{
+        .surface = state.surface_id,
+        .scene_id = popup.scene_id orelse return null,
+        .client = popup.client,
+        .mapped = popup.mapped,
+        .scene_presentation_enabled = popup.scene_presentation_enabled,
+    };
+}
+
+/// True only while every neutral parent is presented and interactive.
+pub fn popupParentChainInteractive(self: *XdgShell, id: PopupId) bool {
+    var popup = self.popups.get(id) orelse return false;
+    var remaining = self.popups.len() + 1;
+    while (remaining > 0) : (remaining -= 1) switch (popup.parent) {
+        .unattached => return false,
+        .layer_surface => |layer_id| return (self.scene.layerSurface(layer_id) orelse return false).mapped,
+        .xdg_surface => |parent_id| {
+            const parent = self.xdg_surfaces.get(parent_id) orelse return false;
+            if (!parent.mapped) return false;
+            switch (parent.role orelse return false) {
+                .toplevel => |window_id| {
+                    const window = self.windows.get(window_id) orelse return false;
+                    return window.scene_presentation_enabled and window.interaction_enabled and
+                        self.scene.surfaceMapped(parent.surface_id);
+                },
+                .popup => |popup_id| {
+                    popup = self.popups.get(popup_id) orelse return false;
+                    if (!popup.mapped or !popup.scene_presentation_enabled) return false;
+                },
+            }
+        },
+    };
+    return false;
+}
+
 pub fn popupScenePresentationEnabled(self: *XdgShell, id: PopupId) bool {
     const popup = self.popups.get(id) orelse return false;
     return popup.scene_presentation_enabled;
