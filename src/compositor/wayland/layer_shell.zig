@@ -16,6 +16,8 @@ const MatureXdgShell = @import("xdg_shell.zig");
 const MatureSerials = @import("mature_serials.zig");
 const MatureClients = @import("MatureClients.zig");
 const Core = @import("../LayerShell.zig");
+const ClientRegistry = @import("../ClientRegistry.zig");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 
 const wl = wayland.server.wl;
 const zwlr = wayland.server.zwlr;
@@ -39,7 +41,7 @@ policy_listener: ?PolicyListener = null,
 repaint_listener: ?RepaintListener = null,
 
 const Store = slot_map.SlotMap(State, enum { layer_surface });
-const Id = Store.Id;
+pub const Id = Store.Id;
 
 pub const Rect = struct { x: i32, y: i32, width: i32, height: i32 };
 pub const FocusClass = enum { exclusive, non_exclusive, none };
@@ -53,16 +55,107 @@ pub const RepaintListener = struct {
     request: *const fn (*anyopaque) void,
 };
 const State = struct {
-    adapter: *Adapter,
+    frontend: Frontend,
     core_id: Core.LayerSurfaceId,
-    surface_id: Surface.Id,
     scene_id: Scene.LayerSurfaceId,
-    serials: std.ArrayList(SerialMapping) = .empty,
     last_size: ?[2]u32 = null,
+    prepared_layer: ?Scene.PreparedLayerSurfaceLayer = null,
+    prepared_commit: ?Core.PreparedCommit = null,
 };
 const SerialMapping = struct { wire: u32, token: Core.ConfigureToken };
 const StateValue = Core.State;
-const Adapter = struct { shell: *Self, id: Id, resource: ?*zwlr.LayerSurfaceV1, surface: ?*Surface };
+const Adapter = struct {
+    shell: *Self,
+    id: Id,
+    resource: ?*zwlr.LayerSurfaceV1,
+    surface: ?*Surface,
+    serials: std.ArrayList(SerialMapping) = .empty,
+};
+
+/// Resource-free borrowed bridge implemented by either protocol frontend.
+pub const Frontend = struct {
+    context: *anyopaque,
+    surface: SurfaceRegistry.Id,
+    has_committed: *const fn (*anyopaque) bool,
+    out_of_memory: *const fn (*anyopaque) void,
+    release_role: *const fn (*anyopaque) void,
+};
+
+pub const Registration = struct {
+    policy_id: Id,
+    core_id: Core.LayerSurfaceId,
+    scene_id: Scene.LayerSurfaceId,
+};
+
+pub fn resolveDefaultOutput(self: *Self) OutputLayout.Id {
+    return self.outputForUnspecifiedSurface();
+}
+
+/// Atomically publishes canonical policy and Scene ownership for a frontend
+/// that has already reserved its permanent surface role.
+pub fn registerPreparedSurface(self: *Self, client: ClientRegistry.Id, output: OutputLayout.Id, namespace: []const u8, layer: Core.Layer, endpoint: Core.Endpoint, frontend: Frontend) Core.CreateError!Registration {
+    const scene_id = self.scene.addLayerSurface(frontend.surface, sceneCoreLayer(layer)) catch return error.OutOfMemory;
+    errdefer self.scene.removeLayerSurface(scene_id);
+    const core_id = try self.core.createSurface(client, frontend.surface, output, namespace, layer, endpoint);
+    errdefer self.core.destroySurface(core_id);
+    const policy_id = self.states.insert(self.allocator, .{
+        .frontend = frontend,
+        .core_id = core_id,
+        .scene_id = scene_id,
+    }) catch return error.OutOfMemory;
+    return .{ .policy_id = policy_id, .core_id = core_id, .scene_id = scene_id };
+}
+
+pub fn destroyPreparedSurface(self: *Self, id: Id) void {
+    self.remove(id);
+}
+
+pub fn attachPopup(self: *Self, id: Id, popup: XdgShell.PopupId) !void {
+    const state = self.states.get(id) orelse return error.InvalidLayerSurface;
+    try self.xdg_core.attachPopup(popup, state.scene_id);
+}
+
+pub fn validateDirectCommit(self: *Self, id: Id, has_buffer: bool) Core.CommitValidationError!void {
+    const state = self.states.get(id) orelse return error.InvalidLayerSurface;
+    try self.core.validateCommit(state.core_id, has_buffer);
+}
+
+/// Reserves all policy storage required by an atomic generated commit.
+pub fn prepareDirectCommit(self: *Self, id: Id, has_buffer: bool) bool {
+    const state = self.states.get(id) orelse return false;
+    std.debug.assert(state.prepared_commit == null);
+    state.prepared_commit = self.core.prepareCommit(state.core_id, has_buffer) catch {
+        state.prepared_layer = null;
+        state.frontend.out_of_memory(state.frontend.context);
+        return false;
+    };
+    return true;
+}
+
+pub fn abortDirectCommit(self: *Self, id: Id) void {
+    const state = self.states.get(id) orelse return;
+    state.prepared_commit = null;
+    state.prepared_layer = null;
+}
+
+/// Runs after content publication and is allocation-free.
+pub fn finishDirectCommit(self: *Self, id: Id) void {
+    const state = self.states.get(id) orelse return;
+    const prepared = state.prepared_commit orelse return;
+    const was_mapped = self.core.snapshot(state.core_id).?.mapped;
+    state.prepared_commit = null;
+    self.core.finalizeCommit(prepared);
+    if (!prepared.has_buffer and was_mapped) {
+        self.xdg_core.dismissLayerSurfacePopups(state.scene_id);
+        state.last_size = null;
+        self.scene.setLayerSurfaceMapped(state.scene_id, false);
+        self.invalidateFocus(state.frontend.surface);
+    } else if (prepared.has_buffer) {
+        self.scene.setLayerSurfaceMapped(state.scene_id, true);
+        self.scene.layerSurfaceCommitted(state.scene_id);
+    }
+    self.arrange();
+}
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server, outputs: *OutputLayout, output_id: OutputLayout.Id, scene: *Scene, seat: *Seat, xdg_shell: *MatureXdgShell, xdg_core: *XdgShell, surfaces: *Surface.Store, core: *Core, mature_clients: *MatureClients) !void {
     const output = outputs.get(output_id) orelse unreachable;
@@ -106,7 +199,7 @@ pub fn usableAreaFor(self: *Self, output_id: OutputLayout.Id) ?Rect {
         const snapshot = self.core.snapshot(state.core_id) orelse continue;
         if (!std.meta.eql(snapshot.output, output_id)) continue;
         if (snapshot.awaiting_initial_commit) continue;
-        if (!snapshot.configured and state.adapter.surface.?.state().has_committed == false) continue;
+        if (!snapshot.configured and !state.frontend.has_committed(state.frontend.context)) continue;
         if (snapshot.current.exclusive_zone <= 0) continue;
         const edge = exclusiveEdge(snapshot.current) orelse continue;
         subtract(
@@ -129,7 +222,7 @@ pub fn outputRemoved(self: *Self, output_id: OutputLayout.Id) void {
     var iterator = self.states.iterator();
     while (iterator.next()) |entry| {
         if (!std.meta.eql(self.core.snapshot(entry.value.core_id).?.output, output_id)) continue;
-        if (entry.value.adapter.resource) |resource| resource.sendClosed();
+        self.core.close(entry.value.core_id);
         std.debug.assert(self.removeState(entry.id));
         removed = true;
     }
@@ -191,7 +284,7 @@ fn exclusiveKeyboardFocus(self: *Self) ?Surface.Id {
         while (it.next()) |entry| {
             if (!entry.layer_surface.mapped) continue;
             const state = self.findScene(entry.id) orelse continue;
-            if (self.core.snapshot(state.core_id).?.current.keyboard_interactivity == .exclusive) return state.surface_id;
+            if (self.core.snapshot(state.core_id).?.current.keyboard_interactivity == .exclusive) return state.frontend.surface;
         }
     }
     return null;
@@ -211,7 +304,7 @@ pub fn keyboardFocus(self: *Self, popup_focus: ?Surface.Id) ?Surface.Id {
         if (popup_focus) |popup| {
             const root = self.xdg_core.popupRootLayerSurface(popup);
             const state = if (root) |id| self.findScene(id) else null;
-            if (state != null and std.meta.eql(state.?.surface_id, exclusive)) return popup;
+            if (state != null and std.meta.eql(state.?.frontend.surface, exclusive)) return popup;
         }
         return exclusive;
     }
@@ -234,7 +327,7 @@ pub fn pointerPressed(self: *Self, id: ?Surface.Id) void {
     const snapshot = self.core.snapshot(state.core_id) orelse return;
     const current = snapshot.current;
     if (snapshot.mapped and (current.keyboard_interactivity == .on_demand or
-        ((current.layer == .background or current.layer == .bottom) and current.keyboard_interactivity == .exclusive))) self.regular_focus = state.surface_id;
+        ((current.layer == .background or current.layer == .bottom) and current.keyboard_interactivity == .exclusive))) self.regular_focus = state.frontend.surface;
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -297,21 +390,24 @@ fn createSurface(self: *Self, manager: *zwlr.LayerShellV1, r: anytype) CreateErr
         .preferred_scale = surfacePreferredScale,
     }) catch return error.Role;
     errdefer surface.releaseRole(adapter);
-    const scene_id = self.scene.addLayerSurface(surface.handle(), sceneLayer(r.layer)) catch return error.OutOfMemory;
-    errdefer self.scene.removeLayerSurface(scene_id);
-    const core_id = self.core.createSurface(client_id, surface.handle(), output_id, std.mem.span(r.namespace), @enumFromInt(@intFromEnum(r.layer)), .{ .context = adapter, .configure = configureEndpoint, .close = closeEndpoint }) catch |err| return switch (err) {
+    adapter.* = .{ .shell = self, .id = undefined, .resource = null, .surface = surface };
+    const registration = self.registerPreparedSurface(client_id, output_id, std.mem.span(r.namespace), @enumFromInt(@intFromEnum(r.layer)), .{ .context = adapter, .configure = configureEndpoint, .close = closeEndpoint }, .{
+        .context = adapter,
+        .surface = surface.handle(),
+        .has_committed = matureHasCommitted,
+        .out_of_memory = matureOutOfMemory,
+        .release_role = matureReleaseRole,
+    }) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.InvalidNamespace => error.InvalidNamespace,
         error.InvalidLayer => error.InvalidLayer,
         error.InvalidOutput => error.InvalidOutput,
         error.InvalidClient, error.InvalidSurface => error.InvalidOutput,
     };
-    errdefer self.core.destroySurface(core_id);
-    const id = self.states.insert(self.allocator, .{ .adapter = adapter, .core_id = core_id, .surface_id = surface.handle(), .scene_id = scene_id }) catch return error.OutOfMemory;
-    adapter.* = .{ .shell = self, .id = id, .resource = null, .surface = surface };
+    const id = registration.policy_id;
+    adapter.id = id;
     const protocol = zwlr.LayerSurfaceV1.create(manager.getClient(), manager.getVersion(), r.id) catch {
-        var unpublished = self.states.remove(id).?;
-        unpublished.serials.deinit(self.allocator);
+        _ = self.removeState(id);
         return error.OutOfMemory;
     };
     adapter.resource = protocol;
@@ -365,11 +461,12 @@ fn surfaceRequest(resource: *zwlr.LayerSurfaceV1, request: zwlr.LayerSurfaceV1.R
 }
 
 fn ackConfigure(resource: *zwlr.LayerSurfaceV1, state: *State, serial: u32) void {
-    for (state.serials.items, 0..) |candidate, i| {
+    const adapter: *Adapter = @ptrCast(@alignCast(state.frontend.context));
+    for (adapter.serials.items, 0..) |candidate, i| {
         if (candidate.wire != serial) continue;
-        state.adapter.shell.core.ackConfigure(state.core_id, candidate.token) catch break;
+        adapter.shell.core.ackConfigure(state.core_id, candidate.token) catch break;
         var count = i + 1;
-        while (count > 0) : (count -= 1) _ = state.serials.orderedRemove(0);
+        while (count > 0) : (count -= 1) _ = adapter.serials.orderedRemove(0);
         return;
     }
     resource.postError(.invalid_surface_state, "configure serial was not issued by this layer surface");
@@ -393,7 +490,7 @@ fn afterCommit(context: *anyopaque, info: Surface.CommitInfo) void {
     self.core.applyCommit(state.core_id, info.has_buffer) catch {
         adapter.resource.?.postNoMemory();
         if (was_mapped and !info.has_buffer) {
-            self.invalidateFocus(state.surface_id);
+            self.invalidateFocus(state.frontend.surface);
             self.arrange();
         }
         return;
@@ -401,9 +498,9 @@ fn afterCommit(context: *anyopaque, info: Surface.CommitInfo) void {
     if (!info.has_buffer and was_mapped) {
         self.xdg_core.dismissLayerSurfacePopups(state.scene_id);
         state.last_size = null;
-        state.serials.clearRetainingCapacity();
+        adapter.serials.clearRetainingCapacity();
         self.scene.setLayerSurfaceMapped(state.scene_id, false);
-        self.invalidateFocus(state.surface_id);
+        self.invalidateFocus(state.frontend.surface);
         self.arrange();
         return;
     }
@@ -434,14 +531,14 @@ fn arrangeOutput(self: *Self, output_id: OutputLayout.Id, output: *Output) Rect 
             const snapshot = self.core.snapshot(state.core_id) orelse continue;
             if (!std.meta.eql(snapshot.output, output_id)) continue;
             if (snapshot.awaiting_initial_commit) continue;
-            if (!snapshot.configured and state.adapter.surface.?.state().has_committed == false) continue;
+            if (!snapshot.configured and !state.frontend.has_committed(state.frontend.context)) continue;
             const current = snapshot.current;
             const edge = exclusiveEdge(current);
             if ((pass == 0) != (current.exclusive_zone > 0 and edge != null)) continue;
             const bounds = if (current.exclusive_zone == -1) output_bounds else usable;
             const hint = place(bounds, current, null);
-            const actual: ?[2]i32 = if (snapshot.mapped) if (Surface.currentLogicalSize(self.surfaces, state.surface_id)) |logical|
-                .{ @intCast(logical.width), @intCast(logical.height) }
+            const actual: ?[2]i32 = if (snapshot.mapped) if (self.core.logicalSize(state.core_id)) |render_state|
+                .{ @intCast(render_state.logical_size.width), @intCast(render_state.logical_size.height) }
             else
                 null else null;
             const geometry = place(bounds, current, actual);
@@ -454,7 +551,7 @@ fn arrangeOutput(self: *Self, output_id: OutputLayout.Id, output: *Output) Rect 
             );
             if (!snapshot.configured or !std.meta.eql(state.last_size, desired)) {
                 _ = self.core.sendConfigure(state.core_id, desired[0], desired[1]) catch {
-                    state.adapter.resource.?.postNoMemory();
+                    state.frontend.out_of_memory(state.frontend.context);
                     continue;
                 };
                 state.last_size = desired;
@@ -476,11 +573,8 @@ fn outputBounds(output: *const Output) Rect {
 
 fn resourceDestroyed(_: *zwlr.LayerSurfaceV1, adapter: *Adapter) void {
     adapter.resource = null;
-    if (adapter.shell.states.get(adapter.id) != null) {
-        adapter.shell.remove(adapter.id);
-    } else {
-        adapter.shell.allocator.destroy(adapter);
-    }
+    if (adapter.shell.states.get(adapter.id) != null) adapter.shell.remove(adapter.id);
+    adapter.shell.allocator.destroy(adapter);
 }
 fn surfaceDestroyed(context: *anyopaque) void {
     const adapter: *Adapter = @ptrCast(@alignCast(context));
@@ -496,10 +590,8 @@ fn removeState(self: *Self, id: Id) bool {
     self.core.destroySurface(state.core_id);
     self.xdg_core.dismissLayerSurfacePopups(state.scene_id);
     self.scene.removeLayerSurface(state.scene_id);
-    self.invalidateFocus(state.surface_id);
-    if (state.adapter.surface) |surface| surface.releaseRole(state.adapter);
-    state.serials.deinit(self.allocator);
-    if (state.adapter.resource == null) self.allocator.destroy(state.adapter);
+    self.invalidateFocus(state.frontend.surface);
+    state.frontend.release_role(state.frontend.context);
     return true;
 }
 
@@ -510,7 +602,7 @@ fn invalidateFocus(self: *Self, id: Surface.Id) void {
 }
 fn findSurface(self: *Self, id: Surface.Id) ?*State {
     var it = self.states.iterator();
-    while (it.next()) |e| if (std.meta.eql(e.value.surface_id, id)) return e.value;
+    while (it.next()) |e| if (std.meta.eql(e.value.frontend.surface, id)) return e.value;
     return null;
 }
 fn findScene(self: *Self, id: Scene.LayerSurfaceId) ?*State {
@@ -524,15 +616,6 @@ fn validLayer(layer: zwlr.LayerShellV1.Layer) bool {
         _ => false,
     };
 }
-fn sceneLayer(layer: zwlr.LayerShellV1.Layer) Scene.Layer {
-    return switch (layer) {
-        .background => .background,
-        .bottom => .bottom,
-        .top => .top,
-        .overlay => .overlay,
-        _ => unreachable,
-    };
-}
 fn sceneCoreLayer(layer: Core.Layer) Scene.Layer {
     return switch (layer) {
         .background => .background,
@@ -542,26 +625,47 @@ fn sceneCoreLayer(layer: Core.Layer) Scene.Layer {
         _ => unreachable,
     };
 }
-fn configureEndpoint(context: *anyopaque, width: u32, height: u32, token: Core.ConfigureToken) error{OutOfMemory}!void {
+fn configureEndpoint(context: *anyopaque, width: u32, height: u32, token: Core.ConfigureToken) error{ OutOfMemory, ConfigureSerialExhausted }!void {
     const adapter: *Adapter = @ptrCast(@alignCast(context));
-    const state = adapter.shell.states.get(adapter.id) orelse return;
+    if (adapter.shell.states.get(adapter.id) == null) return;
     const serial = MatureSerials.issueWire(adapter.shell.display);
-    try state.serials.append(adapter.shell.allocator, .{ .wire = serial, .token = token });
+    try adapter.serials.append(adapter.shell.allocator, .{ .wire = serial, .token = token });
     adapter.resource.?.sendConfigure(serial, width, height);
 }
 fn closeEndpoint(context: *anyopaque) void {
     const adapter: *Adapter = @ptrCast(@alignCast(context));
     if (adapter.resource) |resource| resource.sendClosed();
 }
+fn matureHasCommitted(context: *anyopaque) bool {
+    const adapter: *Adapter = @ptrCast(@alignCast(context));
+    return if (adapter.surface) |surface| surface.state().has_committed else false;
+}
+fn matureOutOfMemory(context: *anyopaque) void {
+    const adapter: *Adapter = @ptrCast(@alignCast(context));
+    if (adapter.resource) |resource| resource.postNoMemory();
+}
+fn matureReleaseRole(context: *anyopaque) void {
+    const adapter: *Adapter = @ptrCast(@alignCast(context));
+    if (adapter.surface) |surface| surface.releaseRole(adapter);
+    adapter.serials.deinit(adapter.shell.allocator);
+}
 fn coreApplying(context: *anyopaque, id: Core.LayerSurfaceId, pending: Core.State) error{OutOfMemory}!void {
     const self: *Self = @ptrCast(@alignCast(context));
     var it = self.states.iterator();
     while (it.next()) |entry| if (std.meta.eql(entry.value.core_id, id)) {
-        try self.scene.setLayerSurfaceLayer(entry.value.scene_id, sceneCoreLayer(pending.layer));
+        entry.value.prepared_layer = try self.scene.prepareLayerSurfaceLayer(entry.value.scene_id, sceneCoreLayer(pending.layer));
         return;
     };
 }
-fn coreCommitted(_: *anyopaque, _: Core.LayerSurfaceId, _: Core.Snapshot) void {}
+fn coreCommitted(context: *anyopaque, id: Core.LayerSurfaceId, _: Core.Snapshot) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    var it = self.states.iterator();
+    while (it.next()) |entry| if (std.meta.eql(entry.value.core_id, id)) {
+        if (entry.value.prepared_layer) |prepared| self.scene.commitPreparedLayerSurfaceLayer(prepared);
+        entry.value.prepared_layer = null;
+        return;
+    };
+}
 fn coreUnmapped(_: *anyopaque, _: Core.LayerSurfaceId) void {}
 fn coreDestroyed(_: *anyopaque, _: Core.LayerSurfaceId) void {}
 fn postCoreError(resource: *zwlr.LayerSurfaceV1, err: Core.CommitValidationError) void {

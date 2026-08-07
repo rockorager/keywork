@@ -48,7 +48,7 @@ pub const Snapshot = struct {
 };
 pub const Endpoint = struct {
     context: *anyopaque,
-    configure: *const fn (*anyopaque, u32, u32, ConfigureToken) error{OutOfMemory}!void,
+    configure: *const fn (*anyopaque, u32, u32, ConfigureToken) error{ OutOfMemory, ConfigureSerialExhausted }!void,
     close: *const fn (*anyopaque) void,
 };
 pub const Observer = struct {
@@ -71,6 +71,11 @@ pub const AccessError = error{InvalidLayerSurface};
 pub const AckError = error{ InvalidLayerSurface, ForeignConfigure, StaleConfigure };
 pub const CommitValidationError = ValidationError || error{ InvalidLayerSurface, UnconfiguredBuffer };
 pub const CommitError = error{ InvalidLayerSurface, OutOfMemory };
+pub const PreparedCommit = struct {
+    surface: LayerSurfaceId,
+    has_buffer: bool,
+    pending: State,
+};
 
 const Surface = struct {
     client: ClientRegistry.Id,
@@ -152,6 +157,11 @@ pub fn surfaceFor(self: *LayerShell, surface: SurfaceRegistry.Id) ?LayerSurfaceI
     return null;
 }
 
+pub fn logicalSize(self: *const LayerShell, id: LayerSurfaceId) ?SurfaceRegistry.RenderState {
+    const state = self.surfaces.getConst(id) orelse return null;
+    return self.surface_registry.renderState(state.surface);
+}
+
 fn snapshotOf(state: *const Surface) Snapshot {
     return .{ .client = state.client, .surface = state.surface, .output = state.output, .namespace = state.namespace, .pending = state.pending, .current = state.current, .awaiting_initial_commit = state.awaiting_initial_commit, .configured = state.configured, .mapped = state.mapped };
 }
@@ -215,7 +225,7 @@ fn validExclusiveEdge(state: State) bool {
     return edge == 0 or (@popCount(edge) == 1 and (edge & anchor) != 0);
 }
 
-pub fn sendConfigure(self: *LayerShell, id: LayerSurfaceId, width: u32, height: u32) (AccessError || error{ OutOfMemory, ConfigureSequenceExhausted })!ConfigureToken {
+pub fn sendConfigure(self: *LayerShell, id: LayerSurfaceId, width: u32, height: u32) (AccessError || error{ OutOfMemory, ConfigureSequenceExhausted, ConfigureSerialExhausted })!ConfigureToken {
     const state = self.surfaces.get(id) orelse return error.InvalidLayerSurface;
     if (state.next_sequence == 0) return error.ConfigureSequenceExhausted;
     const token: ConfigureToken = .{ .surface = id, .sequence = state.next_sequence };
@@ -251,8 +261,24 @@ pub fn validateCommit(self: *const LayerShell, id: LayerSurfaceId, has_buffer: b
 /// advances current state, so an allocation failure leaves the transaction
 /// retryable.
 pub fn applyCommit(self: *LayerShell, id: LayerSurfaceId, has_buffer: bool) CommitError!void {
+    const prepared = try self.prepareCommit(id, has_buffer);
+    self.finalizeCommit(prepared);
+}
+
+/// Performs all fallible policy preparation without advancing canonical state.
+pub fn prepareCommit(self: *LayerShell, id: LayerSurfaceId, has_buffer: bool) CommitError!PreparedCommit {
     const state = self.surfaces.get(id) orelse return error.InvalidLayerSurface;
-    if (!has_buffer and state.mapped) {
+    if ((has_buffer or !state.mapped) and self.observer != null)
+        try self.observer.?.applying(self.observer.?.context, id, state.pending);
+    return .{ .surface = id, .has_buffer = has_buffer, .pending = state.pending };
+}
+
+/// Publishes a prepared commit. The frontend must ensure the surface still
+/// exists and did not receive another pending-state mutation in between.
+pub fn finalizeCommit(self: *LayerShell, prepared: PreparedCommit) void {
+    const state = self.surfaces.get(prepared.surface) orelse return;
+    std.debug.assert(std.meta.eql(state.pending, prepared.pending));
+    if (!prepared.has_buffer and state.mapped) {
         const reset: State = .{ .layer = state.initial_layer };
         state.mapped = false;
         state.configured = false;
@@ -261,14 +287,13 @@ pub fn applyCommit(self: *LayerShell, id: LayerSurfaceId, has_buffer: bool) Comm
         state.configure_tokens.clearRetainingCapacity();
         state.pending = reset;
         state.current = reset;
-        if (self.observer) |observer| observer.unmapped(observer.context, id);
+        if (self.observer) |observer| observer.unmapped(observer.context, prepared.surface);
     } else {
-        if (self.observer) |observer| try observer.applying(observer.context, id, state.pending);
         state.current = state.pending;
         state.awaiting_initial_commit = false;
-        if (has_buffer) state.mapped = true;
+        if (prepared.has_buffer) state.mapped = true;
     }
-    if (self.observer) |observer| observer.committed(observer.context, id, snapshotOf(state));
+    if (self.observer) |observer| observer.committed(observer.context, prepared.surface, snapshotOf(state));
 }
 
 pub fn close(self: *LayerShell, id: LayerSurfaceId) void {

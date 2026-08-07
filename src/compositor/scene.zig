@@ -32,6 +32,10 @@ pub const ShellSurfaceStore = slot_map.SlotMap(ShellSurface, enum { scene_shell_
 pub const ShellSurfaceId = ShellSurfaceStore.Id;
 pub const LayerSurfaceStore = slot_map.SlotMap(LayerSurface, enum { scene_layer_surface });
 pub const LayerSurfaceId = LayerSurfaceStore.Id;
+pub const PreparedLayerSurfaceLayer = struct {
+    id: LayerSurfaceId,
+    layer: Layer,
+};
 pub const PopupStore = slot_map.SlotMap(Popup, enum { scene_popup });
 pub const PopupId = PopupStore.Id;
 
@@ -613,6 +617,33 @@ pub fn setLayerSurfaceLayer(
     removeLayerSurfaceFromStack(self, id, layer_surface.layer);
     layer_surface.layer = layer;
     self.requestNodeDamage(.{ .layer_surface = id });
+}
+
+/// Reserves the only allocation needed to move a layer surface between stacks.
+/// The returned value carries no semantic mutation and may simply be discarded.
+pub fn prepareLayerSurfaceLayer(
+    self: *Self,
+    id: LayerSurfaceId,
+    layer: Layer,
+) error{OutOfMemory}!?PreparedLayerSurfaceLayer {
+    const layer_surface = self.layer_surfaces.get(id) orelse return null;
+    if (layer_surface.layer == layer) return .{ .id = id, .layer = layer };
+    try self.layer_stacks[layerIndex(layer)].ensureUnusedCapacity(self.allocator, 1);
+    return .{ .id = id, .layer = layer };
+}
+
+/// Commits a previously prepared layer move without allocating.
+pub fn commitPreparedLayerSurfaceLayer(
+    self: *Self,
+    prepared: PreparedLayerSurfaceLayer,
+) void {
+    const layer_surface = self.layer_surfaces.get(prepared.id) orelse return;
+    if (layer_surface.layer == prepared.layer) return;
+    self.layer_stacks[layerIndex(prepared.layer)].appendAssumeCapacity(prepared.id);
+    self.requestNodeDamage(.{ .layer_surface = prepared.id });
+    removeLayerSurfaceFromStack(self, prepared.id, layer_surface.layer);
+    layer_surface.layer = prepared.layer;
+    self.requestNodeDamage(.{ .layer_surface = prepared.id });
 }
 
 pub fn layerSurfaceCommitted(self: *Self, id: LayerSurfaceId) void {

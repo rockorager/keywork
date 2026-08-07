@@ -188,6 +188,13 @@ pub fn surfaceIdentity(self: *WayringXdgShell, client: *server.Client, surface_o
     return self.compositor.surfaceId(client, surface_object_id);
 }
 
+/// Resolves only an exact live same-client generated xdg_popup. The returned
+/// value is the neutral identity; no generated resource escapes this adapter.
+pub fn popupIdForResource(self: *WayringXdgShell, client: *server.Client, object_id: u32) ?XdgShell.PopupId {
+    const popup = self.findPopup(client, object_id) orelse return null;
+    return popup.core_id;
+}
+
 pub fn toplevelContentState(
     self: *WayringXdgShell,
     identity: ToplevelIdentity,
@@ -1590,6 +1597,13 @@ fn findToplevel(self: *WayringXdgShell, client: *server.Client, object_id: u32) 
     const resource = client.lookup(object_id) orelse return null;
     for (self.toplevels.items) |toplevel| if (toplevel.surface.client == client and
         &toplevel.resource.runtime == resource and toplevel.resource.state() == .live) return toplevel;
+    return null;
+}
+
+fn findPopup(self: *WayringXdgShell, client: *server.Client, object_id: u32) ?*Popup {
+    const resource = client.lookup(object_id) orelse return null;
+    for (self.popups.items) |popup| if (popup.surface.client == client and
+        &popup.resource.runtime == resource and popup.resource.state() == .live) return popup;
     return null;
 }
 
