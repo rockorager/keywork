@@ -15,6 +15,7 @@ const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCursorShape = @import("wayland/WayringCursorShape.zig");
 const WayringDataDevice = @import("wayland/WayringDataDevice.zig");
+const WayringPrimarySelection = @import("wayland/WayringPrimarySelection.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
@@ -217,6 +218,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_data_device: WayringDataDevice = undefined;
     var wayring_data_device_initialized = false;
     var wayring_data_device_published = false;
+    var wayring_primary_selection: WayringPrimarySelection = undefined;
+    var wayring_primary_selection_initialized = false;
+    var wayring_primary_selection_published = false;
     const WayringLifecycle = struct {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
@@ -229,6 +233,7 @@ pub fn main(init: std.process.Init) !void {
         compositor: *WayringCompositor,
         seat: *WayringSeatAdapter,
         data_device: ?*WayringDataDevice,
+        primary_selection: ?*WayringPrimarySelection,
 
         fn accepted(erased: *anyopaque, client: *wayring.server.Client) !void {
             const self: *@This() = @ptrCast(@alignCast(erased));
@@ -239,6 +244,7 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            if (self.primary_selection) |primary| primary.destroyClientResources(client);
             if (self.data_device) |data_device| data_device.destroyClientResources(client);
             if (self.xdg_activation) |activation| activation.destroyClientResources(client);
             if (self.xdg_decoration) |decoration| decoration.destroyClientResources(client);
@@ -259,6 +265,11 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_primary_selection_initialized) {
+            server.setPrimarySelectionObserver(null);
+            if (wayring_primary_selection_published) wayring_primary_selection.unpublish();
+            wayring_primary_selection.deinit();
+        }
         if (wayring_data_device_initialized) {
             server.setDataDeviceObserver(null);
             if (wayring_data_device_published) wayring_data_device.unpublish();
@@ -326,6 +337,8 @@ pub fn main(init: std.process.Init) !void {
         wayring_seat_adapter_initialized = true;
         wayring_data_device.init(init.gpa, &wayring_protocol_server.?, &wayring_clients, &wayring_seat_adapter, server.neutralDataDevice(), &wayring_compositor);
         wayring_data_device_initialized = true;
+        wayring_primary_selection.init(init.gpa, &wayring_protocol_server.?, &wayring_clients, &wayring_seat_adapter, server.neutralDataDevice());
+        wayring_primary_selection_initialized = true;
         server.setDataDeviceObserver(.{
             .context = &wayring_data_device,
             .transaction_finalize = WayringDataDevice.transactionFinalize,
@@ -337,6 +350,16 @@ pub fn main(init: std.process.Init) !void {
             .offer_source_actions_changed = WayringDataDevice.offerSourceActionsChanged,
             .offer_action_preflight = WayringDataDevice.offerActionPreflight,
             .offer_action_changed = WayringDataDevice.offerActionChanged,
+        });
+        server.setPrimarySelectionObserver(.{
+            .context = &wayring_primary_selection,
+            .transaction_finalize = WayringPrimarySelection.transactionFinalize,
+            .transaction_commit = WayringPrimarySelection.transactionCommit,
+            .transaction_abort = WayringPrimarySelection.transactionAbort,
+            .selection_changed = WayringPrimarySelection.selectionChanged,
+            .mime_offered = WayringPrimarySelection.mimeOffered,
+            .offer_rolled_back = WayringPrimarySelection.offerRolledBack,
+            .offer_mime_offered = WayringPrimarySelection.offerMimeOffered,
         });
         wayring_cursor_shape.init(
             init.gpa,
@@ -406,10 +429,12 @@ pub fn main(init: std.process.Init) !void {
             wayring_xdg_decoration_published = true;
             try wayring_xdg_activation.publish();
             wayring_xdg_activation_published = true;
-            // Keep the stateful DnD global production-last: clients can only
-            // observe it after the headless shell and activation are ready.
+            // Publish stateful transfer globals only after the headless shell
+            // and activation are ready, with primary selection after DnD v4.
             try wayring_data_device.publish();
             wayring_data_device_published = true;
+            try wayring_primary_selection.publish();
+            wayring_primary_selection_published = true;
         }
         wayring_lifecycle = .{
             .clients = &wayring_clients,
@@ -423,6 +448,7 @@ pub fn main(init: std.process.Init) !void {
             .compositor = &wayring_compositor,
             .seat = &wayring_seat_adapter,
             .data_device = if (wayring_data_device_initialized) &wayring_data_device else null,
+            .primary_selection = if (wayring_primary_selection_initialized) &wayring_primary_selection else null,
         };
         wayring_host = try WayringHost.create(
             init.gpa,
@@ -816,6 +842,7 @@ test {
     _ = @import("wayland/WayringOutput.zig");
     _ = @import("wayland/WayringSeatAdapter.zig");
     _ = @import("wayland/WayringDataDevice.zig");
+    _ = @import("wayland/WayringPrimarySelection.zig");
     _ = @import("wayland/surface.zig");
     _ = @import("wayland/surface_geometry.zig");
     _ = @import("wayland/region.zig");
