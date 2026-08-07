@@ -89,7 +89,9 @@ pub fn deinit(self: *WayringInputMethod) void {
 }
 
 pub fn publish(self: *WayringInputMethod) !void {
-    self.global = try self.protocol_server.addGlobal(protocol.zwp_input_method_manager_v2, 1, WayringInputMethod, self, bind);
+    self.global = try self.protocol_server.addGlobalWithOptions(protocol.zwp_input_method_manager_v2, 1, WayringInputMethod, self, bind, .{
+        .visibility = .restricted,
+    });
 }
 
 pub fn unpublish(self: *WayringInputMethod) void {
