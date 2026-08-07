@@ -160,6 +160,26 @@ pub const LayerError = error{
 pub const LayerDirectCommit = XdgDirectCommit;
 pub const LayerCommitHandler = XdgCommitHandler;
 
+pub const SessionLockReservation = struct {
+    surface: SurfaceId,
+    generation: u64,
+};
+
+pub const SessionLockError = error{
+    NotLive,
+    WrongClient,
+    NotRoot,
+    RoleConflict,
+    AlreadyConstructed,
+    GenerationExhausted,
+    StaleReservation,
+    HandlerAlreadyAttached,
+    HandlerMismatch,
+};
+
+pub const SessionLockDirectCommit = XdgDirectCommit;
+pub const SessionLockCommitHandler = XdgCommitHandler;
+
 pub const XdgContentState = struct {
     has_pending_attachment: bool,
     has_committed_buffer: bool,
@@ -227,7 +247,7 @@ const FrameCallback = struct {
 };
 
 const Surface = struct {
-    const Role = enum { none, subsurface, cursor, drag_icon, input_popup, xdg_toplevel, xdg_popup, layer_surface };
+    const Role = enum { none, subsurface, cursor, drag_icon, input_popup, xdg_toplevel, xdg_popup, layer_surface, session_lock };
     resource: core.wl_surface.Resource,
     id: SurfaceId,
     destroying: bool = false,
@@ -268,6 +288,7 @@ const Surface = struct {
     active_subsurface: ?*Subsurface = null,
     xdg_association: ?XdgAssociation = null,
     layer_association: ?LayerAssociation = null,
+    session_lock_association: ?SessionLockAssociation = null,
     input_popup: ?InputPopupReservation = null,
     children: std.ArrayList(ChildPlacement) = .empty,
     parent_sentinel_index: usize = 0,
@@ -283,6 +304,12 @@ const XdgAssociation = struct {
 const LayerAssociation = struct {
     reservation: LayerReservation,
     handler: ?LayerCommitHandler = null,
+};
+
+const SessionLockAssociation = struct {
+    reservation: SessionLockReservation,
+    handler: ?SessionLockCommitHandler = null,
+    published: bool = false,
 };
 
 const AssociationIdentity = struct {
@@ -513,6 +540,7 @@ owned_provider_count: usize = 0,
 next_relationship_generation: ?u64 = 1,
 next_xdg_generation: ?u64 = 1,
 next_layer_generation: ?u64 = 1,
+next_session_lock_generation: ?u64 = 1,
 next_input_popup_generation: ?u64 = 1,
 completing_frame_callbacks: bool = false,
 commit_fault: if (builtin.is_test) ?CommitFault else void,
@@ -632,6 +660,13 @@ pub fn xdgContentState(self: *const WayringCompositor, id: SurfaceId) ?XdgConten
         .has_committed_buffer = surface.current_logical_size != null,
         .has_committed = surface.next_content_sequence != 1,
     };
+}
+
+/// Returns the applied generated logical size, including viewport and scale.
+pub fn currentLogicalSize(self: *const WayringCompositor, id: SurfaceId) ?render.Size {
+    const surface = self.surfaceForId(id) orelse return null;
+    if (surface.destroying or surface.resource.runtime.state() != .live) return null;
+    return surface.current_logical_size;
 }
 
 /// Resolves a live canonical surface to a current neutral client identity.
@@ -764,7 +799,7 @@ pub fn assignCursorRole(self: *WayringCompositor, client: *const server.Client, 
     if (surface.destroying or surface.resource.runtime.state() != .live) return .not_live;
     const owner = self.clientForResource(&surface.resource.runtime) orelse return .not_live;
     if (owner != client) return .wrong_client;
-    if (surface.xdg_association != null or surface.layer_association != null) return .role_conflict;
+    if (surface.xdg_association != null or surface.layer_association != null or surface.session_lock_association != null) return .role_conflict;
     return switch (surface.role) {
         .none => blk: {
             surface.role = .cursor;
@@ -772,7 +807,7 @@ pub fn assignCursorRole(self: *WayringCompositor, client: *const server.Client, 
             break :blk .assigned;
         },
         .cursor => .already_cursor,
-        .subsurface, .drag_icon, .input_popup, .xdg_toplevel, .xdg_popup, .layer_surface => .role_conflict,
+        .subsurface, .drag_icon, .input_popup, .xdg_toplevel, .xdg_popup, .layer_surface, .session_lock => .role_conflict,
     };
 }
 
@@ -780,7 +815,7 @@ pub fn assignDragIconRole(self: *WayringCompositor, client: *const server.Client
     const surface = self.surfaceForId(id) orelse return .not_live;
     if (surface.destroying or surface.resource.runtime.state() != .live) return .not_live;
     if ((self.clientForResource(&surface.resource.runtime) orelse return .not_live) != client) return .wrong_client;
-    if (surface.xdg_association != null or surface.layer_association != null) return .role_conflict;
+    if (surface.xdg_association != null or surface.layer_association != null or surface.session_lock_association != null) return .role_conflict;
     return switch (surface.role) {
         .none => blk: {
             surface.role = .drag_icon;
@@ -788,7 +823,7 @@ pub fn assignDragIconRole(self: *WayringCompositor, client: *const server.Client
             break :blk .assigned;
         },
         .drag_icon => .already_drag_icon,
-        .subsurface, .cursor, .input_popup, .xdg_toplevel, .xdg_popup, .layer_surface => .role_conflict,
+        .subsurface, .cursor, .input_popup, .xdg_toplevel, .xdg_popup, .layer_surface, .session_lock => .role_conflict,
     };
 }
 
@@ -804,7 +839,7 @@ pub fn reserveInputPopup(self: *WayringCompositor, client: *const server.Client,
     const surface = self.surfaceForId(id) orelse return error.NotLive;
     if (surface.destroying or surface.resource.runtime.state() != .live) return error.NotLive;
     if ((self.clientForResource(&surface.resource.runtime) orelse return error.NotLive) != client) return error.WrongClient;
-    if (surface.relationship != null or surface.active_subsurface != null or surface.xdg_association != null or surface.layer_association != null or
+    if (surface.relationship != null or surface.active_subsurface != null or surface.xdg_association != null or surface.layer_association != null or surface.session_lock_association != null or
         surface.input_popup != null or surface.role != .none) return error.RoleConflict;
     const generation = self.next_input_popup_generation orelse return error.GenerationExhausted;
     self.next_input_popup_generation = if (generation == std.math.maxInt(u64)) null else generation + 1;
@@ -857,9 +892,9 @@ pub fn reserveXdgRoot(
     if (surface.relationship != null or surface.active_subsurface != null) return error.NotRoot;
     switch (surface.role) {
         .none, .xdg_toplevel, .xdg_popup => {},
-        .subsurface, .cursor, .drag_icon, .input_popup, .layer_surface => return error.RoleConflict,
+        .subsurface, .cursor, .drag_icon, .input_popup, .layer_surface, .session_lock => return error.RoleConflict,
     }
-    if (surface.xdg_association != null or surface.layer_association != null) return error.AlreadyReserved;
+    if (surface.xdg_association != null or surface.layer_association != null or surface.session_lock_association != null) return error.AlreadyReserved;
     const generation = self.next_xdg_generation orelse return error.GenerationExhausted;
     const reservation: XdgReservation = .{ .surface = id, .generation = generation };
     self.next_xdg_generation = if (generation == std.math.maxInt(u64)) null else generation + 1;
@@ -948,7 +983,7 @@ pub fn permanentXdgRole(self: *const WayringCompositor, id: SurfaceId) ?XdgRole 
     return switch (surface.role) {
         .xdg_toplevel => .toplevel,
         .xdg_popup => .popup,
-        .none, .subsurface, .cursor, .drag_icon, .input_popup, .layer_surface => null,
+        .none, .subsurface, .cursor, .drag_icon, .input_popup, .layer_surface, .session_lock => null,
     };
 }
 
@@ -959,7 +994,7 @@ pub fn reserveLayerRoot(self: *WayringCompositor, client: *const server.Client, 
     if ((self.clientForResource(&surface.resource.runtime) orelse return error.NotLive) != client)
         return error.WrongClient;
     if (surface.relationship != null or surface.active_subsurface != null) return error.NotRoot;
-    if ((surface.role != .none and surface.role != .layer_surface) or surface.xdg_association != null)
+    if ((surface.role != .none and surface.role != .layer_surface) or surface.xdg_association != null or surface.session_lock_association != null)
         return error.RoleConflict;
     // Mature layer-shell permits the permanent layer role through its initial
     // role check, then gives existing content precedence over the live role
@@ -1022,6 +1057,77 @@ pub fn hasLayerReservation(self: *const WayringCompositor, reservation: LayerRes
         std.meta.eql(association.reservation, reservation);
 }
 
+pub fn reserveSessionLockRoot(self: *WayringCompositor, client: *const server.Client, id: SurfaceId) SessionLockError!SessionLockReservation {
+    const surface = self.surfaceForId(id) orelse return error.NotLive;
+    if (!self.surface_registry.contains(id) or surface.destroying or surface.resource.runtime.state() != .live)
+        return error.NotLive;
+    if ((self.clientForResource(&surface.resource.runtime) orelse return error.NotLive) != client)
+        return error.WrongClient;
+    if (surface.relationship != null or surface.active_subsurface != null) return error.NotRoot;
+    // ext-session-lock checks role ownership before content so a permanently
+    // assigned lock role never degrades into AlreadyConstructed.
+    if (surface.role != .none or surface.xdg_association != null or surface.layer_association != null or
+        surface.session_lock_association != null or surface.input_popup != null) return error.RoleConflict;
+    if (surface.pending_attachment != null or surface.has_committed_buffer) return error.AlreadyConstructed;
+    const generation = self.next_session_lock_generation orelse return error.GenerationExhausted;
+    self.next_session_lock_generation = if (generation == std.math.maxInt(u64)) null else generation + 1;
+    const reservation: SessionLockReservation = .{ .surface = id, .generation = generation };
+    surface.role = .session_lock;
+    surface.session_lock_association = .{ .reservation = reservation };
+    self.notifyPresentationClass(id, .xdg_reserved);
+    return reservation;
+}
+
+pub fn attachSessionLockCommitHandler(self: *WayringCompositor, reservation: SessionLockReservation, handler: SessionLockCommitHandler) SessionLockError!void {
+    const association = self.exactLiveSessionLockAssociation(reservation) orelse return error.StaleReservation;
+    if (association.handler != null) return error.HandlerAlreadyAttached;
+    association.handler = handler;
+}
+
+pub fn detachSessionLockCommitHandler(self: *WayringCompositor, reservation: SessionLockReservation, context: *anyopaque) SessionLockError!void {
+    const association = self.exactLiveSessionLockAssociation(reservation) orelse return error.StaleReservation;
+    const handler = association.handler orelse return error.HandlerMismatch;
+    if (handler.context != context) return error.HandlerMismatch;
+    association.handler = null;
+}
+
+pub fn publishSessionLockRoot(self: *WayringCompositor, reservation: SessionLockReservation) SessionLockError!void {
+    const association = self.exactLiveSessionLockAssociation(reservation) orelse return error.StaleReservation;
+    association.published = true;
+    self.notifyPresentationClass(reservation.surface, .session_lock);
+}
+
+pub fn releaseSessionLockRoot(self: *WayringCompositor, reservation: SessionLockReservation) SessionLockError!void {
+    const surface = self.surfaceForId(reservation.surface) orelse return error.StaleReservation;
+    _ = self.exactLiveSessionLockAssociation(reservation) orelse return error.StaleReservation;
+    surface.session_lock_association = null;
+}
+
+pub fn abortSessionLockRoot(self: *WayringCompositor, reservation: SessionLockReservation) SessionLockError!void {
+    const surface = self.surfaceForId(reservation.surface) orelse return error.StaleReservation;
+    const association = self.exactLiveSessionLockAssociation(reservation) orelse return error.StaleReservation;
+    const published = association.published;
+    surface.session_lock_association = null;
+    if (!published) {
+        surface.role = .none;
+        self.notifyPresentationClass(surface.id, .background);
+    }
+}
+
+pub fn hasSessionLockReservation(self: *const WayringCompositor, reservation: SessionLockReservation) bool {
+    const surface = self.surfaceForId(reservation.surface) orelse return false;
+    const association = surface.session_lock_association orelse return false;
+    return !surface.destroying and surface.resource.runtime.state() == .live and
+        std.meta.eql(association.reservation, reservation);
+}
+
+fn exactLiveSessionLockAssociation(self: *WayringCompositor, reservation: SessionLockReservation) ?*SessionLockAssociation {
+    const surface = self.surfaceForId(reservation.surface) orelse return null;
+    if (surface.destroying or surface.resource.runtime.state() != .live) return null;
+    const association = if (surface.session_lock_association) |*value| value else return null;
+    return if (std.meta.eql(association.reservation, reservation)) association else null;
+}
+
 fn exactLiveLayerAssociation(self: *WayringCompositor, reservation: LayerReservation) ?*LayerAssociation {
     const surface = self.surfaceForId(reservation.surface) orelse return null;
     if (surface.destroying or surface.resource.runtime.state() != .live) return null;
@@ -1071,7 +1177,7 @@ fn testAssociate(self: *WayringCompositor, child_id: SurfaceId, parent_id: Surfa
     const child = self.surfaceForId(child_id) orelse return error.UnknownSurface;
     const parent = self.surfaceForId(parent_id) orelse return error.UnknownSurface;
     if ((child.role != .none and child.role != .subsurface) or child.relationship != null or
-        child.xdg_association != null or child.layer_association != null or std.meta.eql(child_id, parent_id)) return error.BadRelationship;
+        child.xdg_association != null or child.layer_association != null or child.session_lock_association != null or std.meta.eql(child_id, parent_id)) return error.BadRelationship;
     var cursor = parent;
     var depth: usize = 0;
     while (true) {
@@ -1356,7 +1462,7 @@ fn createSubsurface(self: *WayringCompositor, manager: *core.wl_subcompositor.Re
         return;
     };
     if ((child.role != .none and child.role != .subsurface) or child.active_subsurface != null or
-        child.relationship != null or child.xdg_association != null or child.layer_association != null)
+        child.relationship != null or child.xdg_association != null or child.layer_association != null or child.session_lock_association != null)
     {
         client.postProtocolError(&manager.runtime, @intCast(core.wl_subcompositor.@"error".bad_surface), "surface already has a role");
         return;
@@ -1663,7 +1769,7 @@ fn handleSurface(
                 association.live_role != null
             else
                 false;
-            if (surface.active_subsurface != null or live_xdg_role or surface.layer_association != null or surface.input_popup != null) {
+            if (surface.active_subsurface != null or live_xdg_role or surface.layer_association != null or surface.session_lock_association != null or surface.input_popup != null) {
                 const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
                 client.postProtocolError(&resource.runtime, @intCast(core.wl_surface.@"error".defunct_role_object), "surface has a live role object");
                 return;
@@ -1988,6 +2094,8 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     const direct_handler = if (surface.xdg_association) |association|
         association.handler
     else if (surface.layer_association) |association|
+        association.handler
+    else if (surface.session_lock_association) |association|
         association.handler
     else
         null;
@@ -2626,6 +2734,11 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     if (surface.layer_association) |association| {
         const handler = association.handler;
         surface.layer_association = null;
+        if (handler) |live| live.surface_destroyed(live.context, surface.id);
+    }
+    if (surface.session_lock_association) |association| {
+        const handler = association.handler;
+        surface.session_lock_association = null;
         if (handler) |live| live.surface_destroyed(live.context, surface.id);
     }
     if (surface.input_popup != null) {

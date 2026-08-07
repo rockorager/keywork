@@ -141,6 +141,52 @@ pub fn outputIdForResource(
     return null;
 }
 
+/// Exact generated wl_output resource resolution for protocols which retain
+/// a role after output removal. A retired result is still an authentic,
+/// same-client resource, but must not be used to create canonical output
+/// state. `invalid` also covers stale ids and resources owned by another
+/// client.
+pub const StableIdentity = *const anyopaque;
+
+pub const ResourceIdentity = union(enum) {
+    live: struct {
+        output: OutputLayout.Id,
+        identity: StableIdentity,
+    },
+    retired: StableIdentity,
+    invalid,
+};
+
+pub const LogicalSize = struct {
+    width: u32,
+    height: u32,
+};
+
+pub fn identifyResource(
+    self: *WayringOutput,
+    client: *server.Client,
+    object_id: u32,
+) ResourceIdentity {
+    for (self.adapters.items) |adapter| {
+        for (adapter.bindings.items) |binding| {
+            if (binding.client != client or binding.resource.state() != .live or
+                client.lookup(object_id) != &binding.resource.runtime) continue;
+            const identity: StableIdentity = adapter;
+            return if (adapter.retired)
+                .{ .retired = identity }
+            else
+                .{ .live = .{ .output = adapter.id, .identity = identity } };
+        }
+    }
+    return .invalid;
+}
+
+pub fn logicalSize(self: *const WayringOutput, id: OutputLayout.Id) ?LogicalSize {
+    const output = self.layout.get(id) orelse return null;
+    const size = output.logicalSize();
+    return .{ .width = size.width, .height = size.height };
+}
+
 fn publish(self: *WayringOutput, id: OutputLayout.Id, output: *Output) !void {
     // Nothing may fail after addGlobal publishes to existing registries.
     try self.adapters.ensureUnusedCapacity(self.allocator, 1);
