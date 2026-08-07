@@ -251,6 +251,7 @@ const Surface = struct {
     current_transform: render.BufferTransform = .normal,
     current: ?CopiedBufferSnapshot = null,
     current_logical_size: ?render.Size = null,
+    has_committed_buffer: bool = false,
     pending_viewport: ViewportState = .{},
     current_viewport: ViewportState = .{},
     viewport_handler: ?ViewportHandler = null,
@@ -963,7 +964,7 @@ pub fn reserveLayerRoot(self: *WayringCompositor, client: *const server.Client, 
     // Mature layer-shell permits the permanent layer role through its initial
     // role check, then gives existing content precedence over the live role
     // handler conflict. Keep that ordering before mutating the association.
-    if (surface.has_pending_attachment or surface.current_logical_size != null)
+    if (surface.pending_attachment != null or surface.has_committed_buffer)
         return error.AlreadyConstructed;
     if (surface.layer_association != null) return error.RoleConflict;
     const generation = self.next_layer_generation orelse return error.GenerationExhausted;
@@ -2031,8 +2032,10 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     };
     std.debug.assert(callbacks_to_queue == 0);
     const publishes_snapshot = candidate.prepared.publishes_snapshot;
+    const commits_buffer = candidate.prepared.attachment_changed and candidate.prepared.logical_size != null;
     surface.content_updates.appendAssumeCapacity(candidate);
     candidate_owned = false;
+    if (commits_buffer) surface.has_committed_buffer = true;
     const stored = &surface.content_updates.items[surface.content_updates.items.len - 1];
     for (stored.claims.items) |claim| {
         const claimed = self.updateForToken(claim.token) orelse unreachable;
@@ -7402,6 +7405,9 @@ test "queued CU projection and callbacks follow exact update application" {
     try requestFrame(client, 6, 9);
     try attachBuffer(client, 6, 8);
     try commitSurfaceResource(client, 6);
+    // Mature records successful non-null synchronized commits when cached,
+    // before the parent publishes them.
+    try std.testing.expect(child.has_committed_buffer);
     try requestFrame(client, 6, 10);
     try setBufferScale(client, 6, 2);
     try commitSurfaceResource(client, 6);
@@ -7451,6 +7457,7 @@ test "queued CU projection and callbacks follow exact update application" {
     try commitSurfaceResource(client, 6);
     try setBufferScale(client, 6, 1);
     try commitSurfaceResource(client, 6);
+    try std.testing.expect(child.has_committed_buffer);
     try std.testing.expectEqual(@as(usize, 2), child.content_updates.items.len);
     try std.testing.expect(child.content_updates.items[0].prepared.physical_size == null);
     try std.testing.expect(child.content_updates.items[0].prepared.logical_size == null);
@@ -8122,12 +8129,25 @@ test "layer root reservation is permanent after release and abort is reversible"
     defer compositor.deinit();
     const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     const client = managed.client();
-    defer managed.destroy();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
     const other_managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
     defer other_managed.destroy();
 
     try bindCompositor(client, 3);
-    try createSurfaceResource(client, 3, 4);
+    for (4..10) |object_id| {
+        try createSurfaceResource(client, 3, @intCast(object_id));
+        try std.testing.expect(client.fatal() == null);
+    }
+    try bindShm(&compositor, client, 10);
+    const pixels = [_]u32{0xff12_3456};
+    const fd = try memfdWithPixels(&pixels);
+    defer _ = std.c.close(fd);
+    try createShmPool(client, 10, 11, fd, @sizeOf(@TypeOf(pixels)));
+    try createShmBuffer(client, 11, 12, 0, .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+
     const id = compositor.surfaceId(client, 4).?;
     try std.testing.expectError(error.WrongClient, compositor.reserveLayerRoot(other_managed.client(), id));
     const first = try compositor.reserveLayerRoot(client, id);
@@ -8140,44 +8160,79 @@ test "layer root reservation is permanent after release and abort is reversible"
     var probe: TestXdgCommitHandler = .{};
     try compositor.attachLayerCommitHandler(second, probe.handler());
 
-    // A content-free duplicate reaches the live association conflict. Pending
-    // or committed content instead wins exactly as in the mature frontend,
-    // without replacing the existing reservation or commit handler.
+    // A pending null attachment is an operation but not buffer content. It
+    // therefore leaves the content-free live association conflict in force.
     try std.testing.expectError(error.RoleConflict, compositor.reserveLayerRoot(client, id));
-    const surface = compositor.surfaceForId(id).?;
-    surface.has_pending_attachment = true;
+    try attachBuffer(client, 4, null);
+    try std.testing.expect(compositor.surfaceForId(id).?.has_pending_attachment);
+    try std.testing.expect(compositor.surfaceForId(id).?.pending_attachment == null);
+    try std.testing.expectError(error.RoleConflict, compositor.reserveLayerRoot(client, id));
+    try commitSurfaceResource(client, 4);
+    try std.testing.expect(!compositor.surfaceForId(id).?.has_committed_buffer);
+
+    // A real pending buffer and every later state after its successful commit
+    // take already-constructed precedence without replacing the live handler.
+    try attachBuffer(client, 4, 12);
     try std.testing.expectError(error.AlreadyConstructed, compositor.reserveLayerRoot(client, id));
     try std.testing.expect(compositor.hasLayerReservation(second));
-    surface.has_pending_attachment = false;
-    surface.current_logical_size = .{ .width = 1, .height = 1 };
+    try commitSurfaceResource(client, 4);
+    try std.testing.expect(compositor.surfaceForId(id).?.has_committed_buffer);
     try std.testing.expectError(error.AlreadyConstructed, compositor.reserveLayerRoot(client, id));
     try std.testing.expect(compositor.hasLayerReservation(second));
-    surface.current_logical_size = null;
+
+    try attachBuffer(client, 4, null);
+    try std.testing.expectError(error.AlreadyConstructed, compositor.reserveLayerRoot(client, id));
+    try commitSurfaceResource(client, 4);
+    try std.testing.expect(compositor.currentBuffer(id) == null);
+    try std.testing.expect(compositor.surfaceForId(id).?.has_committed_buffer);
+    try std.testing.expectError(error.AlreadyConstructed, compositor.reserveLayerRoot(client, id));
 
     // A different permanent role retains role precedence even when content is
     // pending, matching mature assigned-role validation.
-    try createSurfaceResource(client, 3, 5);
     const cursor = compositor.surfaceId(client, 5).?;
     try std.testing.expectEqual(CursorRoleResult.assigned, compositor.assignCursorRole(client, cursor));
-    compositor.surfaceForId(cursor).?.has_pending_attachment = true;
+    try attachBuffer(client, 5, 12);
     try std.testing.expectError(error.RoleConflict, compositor.reserveLayerRoot(client, cursor));
-    compositor.surfaceForId(cursor).?.has_pending_attachment = false;
 
-    try commitSurfaceResource(client, 4);
-    try std.testing.expectEqual(@as(usize, 1), probe.preparations);
-    try std.testing.expectEqual(@as(usize, 1), probe.validations);
-    try std.testing.expectEqual(@as(usize, 1), probe.post_applies);
+    // Without a live association, pending null permits a fresh reservation,
+    // while a real pending buffer is already constructed.
+    const pending_null = compositor.surfaceId(client, 6).?;
+    try attachBuffer(client, 6, null);
+    const pending_null_reservation = try compositor.reserveLayerRoot(client, pending_null);
+    try compositor.abortLayerRoot(pending_null_reservation);
+    try std.testing.expectEqual(Surface.Role.none, compositor.surfaceForId(pending_null).?.role);
+    const pending_buffer = compositor.surfaceId(client, 7).?;
+    try attachBuffer(client, 7, 12);
+    try std.testing.expectError(error.AlreadyConstructed, compositor.reserveLayerRoot(client, pending_buffer));
+
+    // A rejected direct commit consumes its pending attachment but does not
+    // acquire the sticky successful-commit fact.
+    const rejected_id = compositor.surfaceId(client, 8).?;
+    const rejected = try compositor.reserveLayerRoot(client, rejected_id);
+    var rejected_probe: TestXdgCommitHandler = .{ .prepare_decision = .reject };
+    try compositor.attachLayerCommitHandler(rejected, rejected_probe.handler());
+    try attachBuffer(client, 8, 12);
+    try commitSurfaceResource(client, 8);
+    try std.testing.expect(!compositor.surfaceForId(rejected_id).?.has_committed_buffer);
+    try std.testing.expectError(error.RoleConflict, compositor.reserveLayerRoot(client, rejected_id));
+    try std.testing.expectEqual(@as(usize, 1), rejected_probe.preparations);
+    try std.testing.expectEqual(@as(usize, 1), rejected_probe.preparation_aborts);
+    try std.testing.expectEqual(@as(usize, 0), rejected_probe.post_applies);
+    try compositor.detachLayerCommitHandler(rejected, &rejected_probe);
+    try compositor.releaseLayerRoot(rejected);
+
+    try std.testing.expectEqual(@as(usize, 3), probe.preparations);
+    try std.testing.expectEqual(@as(usize, 3), probe.validations);
+    try std.testing.expectEqual(@as(usize, 3), probe.post_applies);
+    try std.testing.expectEqual(@as(usize, 1), probe.pre_unmaps);
     try compositor.detachLayerCommitHandler(second, &probe);
     try compositor.releaseLayerRoot(second);
     try std.testing.expectEqual(Surface.Role.layer_surface, compositor.surfaceForId(id).?.role);
     try std.testing.expectError(error.RoleConflict, compositor.reserveXdgRoot(client, id));
-    const replacement = try compositor.reserveLayerRoot(client, id);
-    try std.testing.expect(!replacement.role_was_unassigned);
-    try compositor.abortLayerRoot(replacement);
+    try std.testing.expectError(error.AlreadyConstructed, compositor.reserveLayerRoot(client, id));
     try std.testing.expectEqual(Surface.Role.layer_surface, compositor.surfaceForId(id).?.role);
 
-    try createSurfaceResource(client, 3, 6);
-    const destroyed = try compositor.reserveLayerRoot(client, compositor.surfaceId(client, 6).?);
+    const destroyed = try compositor.reserveLayerRoot(client, compositor.surfaceId(client, 9).?);
     try compositor.attachLayerCommitHandler(destroyed, probe.handler());
     compositor.destroyClientResources(client);
     try std.testing.expectEqual(@as(usize, 1), probe.surface_destroys);
