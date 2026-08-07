@@ -110,6 +110,7 @@ const Offer = struct {
     drag_generation: u64 = 0,
     active: bool = false,
     accepted: bool = false,
+    implicit_copy: bool = false,
     destination_actions: Actions = .{},
     preferred_action: Actions = .{},
     selected_action: Actions = .{},
@@ -818,6 +819,10 @@ fn commitLegacyOffer(self: *DataDevice, id: OfferId) void {
     const source = self.sources.get(offer.source orelse unreachable) orelse unreachable;
     offer.destination_actions = .{ .copy = true };
     offer.preferred_action = .{ .copy = true };
+    // Before wl_data_offer v3, accept is source feedback rather than drop
+    // eligibility. The protocol's implicit copy action is sufficient.
+    offer.implicit_copy = true;
+    offer.accepted = true;
     offer.selected_action = selectAction(source.actions, offer.destination_actions, offer.preferred_action);
     self.notifyOfferAction(id, offer.selected_action);
     source.endpoint.action(source.endpoint.context, offer.selected_action);
@@ -863,8 +868,9 @@ pub fn accept(self: *DataDevice, offer_id: OfferId, mime: ?[]const u8) Error!voi
     const offer = self.offers.get(offer_id) orelse return error.InvalidOffer;
     if (offer.kind != .drag or (!offer.active and !offer.dropped)) return error.InvalidOffer;
     const source = self.sources.get(offer.source orelse return error.InvalidSource) orelse return error.InvalidSource;
-    offer.accepted = if (mime) |value| hasMime(source, value) else false;
-    source.endpoint.target(source.endpoint.context, if (offer.accepted) mime else null);
+    const accepted_mime = if (mime) |value| hasMime(source, value) else false;
+    if (!offer.implicit_copy) offer.accepted = accepted_mime;
+    source.endpoint.target(source.endpoint.context, if (accepted_mime) mime else null);
 }
 
 pub fn setOfferActions(self: *DataDevice, offer_id: OfferId, actions: Actions, preferred: Actions) Error!void {
@@ -884,7 +890,9 @@ pub fn setOfferActions(self: *DataDevice, offer_id: OfferId, actions: Actions, p
     const selected = selectAction(source.actions, actions, preferred);
     if (@as(u32, @bitCast(selected)) != @as(u32, @bitCast(offer.selected_action))) {
         offer.selected_action = selected;
-        self.notifyOfferAction(offer_id, selected);
+        // Ask may be resolved after drop. At that point only the source gets
+        // the final action; the destination must not receive another action.
+        if (!offer.dropped) self.notifyOfferAction(offer_id, selected);
         source.endpoint.action(source.endpoint.context, selected);
     }
 }

@@ -1,11 +1,10 @@
-//! Unpublished generated wl_data_device selection adapter.
+//! Generated wl_data_device clipboard and drag-and-drop adapter.
 //!
 //! This owns wire resources only. DataDevice remains the sole clipboard and
-//! drag semantic owner; drag-only requests are rejected until the DnD wave.
+//! drag semantic owner.
 
 const WayringDataDevice = @This();
 
-const builtin = @import("builtin");
 const std = @import("std");
 const protocol = @import("wayring-protocol");
 const wayring = @import("wayring");
@@ -19,18 +18,19 @@ const WayringCompositor = @import("WayringCompositor.zig");
 const WayringSeatAdapter = @import("WayringSeatAdapter.zig");
 const wire = wayring.wire;
 
-const test_manager_version = 3;
+const manager_version = 4;
 
 const Manager = struct { owner: *WayringDataDevice, client: *wayring.server.Client, resource: protocol.wl_data_device_manager.Resource };
 const Source = struct { owner: *WayringDataDevice, client: *wayring.server.Client, resource: protocol.wl_data_source.Resource, id: DataDevice.SourceId };
-const Device = struct { owner: *WayringDataDevice, client: *wayring.server.Client, resource: protocol.wl_data_device.Resource, id: DataDevice.DeviceId };
-const Offer = struct { owner: *WayringDataDevice, client: *wayring.server.Client, resource: protocol.wl_data_offer.Resource, id: DataDevice.OfferId, device: ?*Device };
+const Device = struct { owner: *WayringDataDevice, client: *wayring.server.Client, resource: protocol.wl_data_device.Resource, id: DataDevice.DeviceId, enter_serial: u32 = 0 };
+const Offer = struct { owner: *WayringDataDevice, client: *wayring.server.Client, resource: protocol.wl_data_offer.Resource, id: DataDevice.OfferId, device: ?*Device, enter_serial: u32 = 0, published: bool = false };
 
 allocator: std.mem.Allocator,
 protocol_server: *wayring.server.Server,
 clients: *WayringClients,
 seat: *WayringSeatAdapter,
 canonical: *DataDevice,
+compositor: ?*WayringCompositor,
 global: ?*const wayring.server.Server.Global = null,
 managers: std.ArrayList(*Manager) = .empty,
 sources: std.ArrayList(*Source) = .empty,
@@ -44,6 +44,7 @@ pub fn init(
     clients: *WayringClients,
     seat: *WayringSeatAdapter,
     canonical: *DataDevice,
+    compositor: ?*WayringCompositor,
 ) void {
     self.* = .{
         .allocator = allocator,
@@ -51,7 +52,13 @@ pub fn init(
         .clients = clients,
         .seat = seat,
         .canonical = canonical,
+        .compositor = compositor,
     };
+    if (compositor) |value| value.setDragIconListener(.{
+        .context = self,
+        .committed = dragIconCommitted,
+        .removed = dragIconRemoved,
+    });
 }
 
 pub fn deinit(self: *WayringDataDevice) void {
@@ -60,26 +67,33 @@ pub fn deinit(self: *WayringDataDevice) void {
     self.sources.deinit(self.allocator);
     self.devices.deinit(self.allocator);
     self.offers.deinit(self.allocator);
+    if (self.compositor) |compositor| compositor.setDragIconListener(null);
     self.* = undefined;
 }
 
-/// Adds the generated manager only to a test server's registry. Production
-/// assembly neither constructs this adapter nor has a callable publication
-/// path, so the incomplete v3 DnD surface cannot be advertised accidentally.
-pub fn installUnpublishedForTest(self: *WayringDataDevice) !void {
-    if (comptime !builtin.is_test) @compileError("generated data-device installation is test-only");
+fn dragIconCommitted(context: *anyopaque, id: SurfaceRegistry.Id, x: i32, y: i32) void {
+    const self: *WayringDataDevice = @ptrCast(@alignCast(context));
+    const icon = self.canonical.dragIcon() orelse return;
+    if (std.meta.eql(icon.surface, id)) self.canonical.offsetDragIcon(x, y);
+}
+
+fn dragIconRemoved(context: *anyopaque, id: SurfaceRegistry.Id) void {
+    const self: *WayringDataDevice = @ptrCast(@alignCast(context));
+    self.canonical.surfaceDestroyed(id);
+}
+
+pub fn publish(self: *WayringDataDevice) !void {
     std.debug.assert(self.global == null);
     self.global = try self.protocol_server.addGlobal(
         protocol.wl_data_device_manager,
-        test_manager_version,
+        manager_version,
         WayringDataDevice,
         self,
         bindManager,
     );
 }
 
-pub fn uninstallUnpublishedForTest(self: *WayringDataDevice) void {
-    if (comptime !builtin.is_test) @compileError("generated data-device installation is test-only");
+pub fn unpublish(self: *WayringDataDevice) void {
     const global = self.global orelse unreachable;
     self.protocol_server.removeGlobal(global) catch |err| switch (err) {
         error.AlreadyRemoved => {},
@@ -159,7 +173,7 @@ fn createSource(self: *WayringDataDevice, manager: *Manager, id: u32) !void {
         .selection_cancelled = sourceCancelled,
         .drop_performed = sourceDrop,
         .finished = sourceFinished,
-    }, .{});
+    }, .{ .actions = if (manager.resource.version() < 3) .{ .copy = true } else .{} });
     errdefer self.canonical.destroySource(canonical_id);
     value.* = .{ .owner = self, .client = manager.client, .resource = .init(self.allocator, id, manager.resource.version(), .client, manager.client.ownerHooks()), .id = canonical_id };
     errdefer {
@@ -175,7 +189,11 @@ fn sourceRequest(_: *protocol.wl_data_source.Resource, request: protocol.wl_data
     switch (request) {
         .offer => |args| value.owner.canonical.offerMime(value.id, args.mime_type) catch |err| if (err == error.OutOfMemory) return error.OutOfMemory,
         .destroy => value.owner.destroySource(value),
-        .set_actions => value.client.postImplementationError(&value.resource.runtime, "drag-and-drop source actions are not implemented"),
+        .set_actions => |args| value.owner.canonical.setSourceActions(value.id, fromWireActions(args.dnd_actions)) catch |err| switch (err) {
+            error.InvalidActionMask => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_source.@"error".invalid_action_mask), "invalid drag-and-drop action mask"),
+            error.ActionsAlreadySet, error.SourceAlreadyUsed => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_source.@"error".invalid_source), "data source is already in use or actions were already set"),
+            else => {},
+        },
     }
 }
 
@@ -236,7 +254,32 @@ fn deviceRequest(_: *protocol.wl_data_device.Resource, request: protocol.wl_data
             };
         },
         .release => value.owner.destroyDevice(value),
-        .start_drag => value.client.postImplementationError(&value.resource.runtime, "drag-and-drop is not implemented"),
+        .start_drag => |args| try value.owner.startDrag(value, args.source, args.origin, args.icon, args.serial),
+    }
+}
+
+fn startDrag(self: *WayringDataDevice, device: *Device, source_object: ?u32, origin_object: u32, icon_object: ?u32, serial: u32) !void {
+    const source_resource = if (source_object) |id| (self.sourceForObject(device.client, id) orelse return) else null;
+    const source_id = if (source_resource) |source| source.id else null;
+    const compositor = self.compositor orelse return;
+    const origin = compositor.surfaceId(device.client, origin_object) orelse return;
+    const icon_surface = if (icon_object) |id| (compositor.surfaceId(device.client, id) orelse return) else null;
+    const icon: ?DataDevice.DragIcon = if (icon_surface) |surface| .{ .surface = surface } else null;
+    const require_actions = if (source_resource) |source| source.resource.version() >= 3 else false;
+    self.canonical.validateDragStart(device.id, source_id, origin, icon, .{ .domain = .wayring_server, .value = serial }, require_actions) catch |err| return handleStartError(device, source_object, err);
+    if (icon_surface) |surface| switch (compositor.assignDragIconRole(device.client, surface)) {
+        .assigned, .already_drag_icon => {},
+        .role_conflict => return device.client.postProtocolError(&device.resource.runtime, @intCast(protocol.wl_data_device.@"error".role), "drag icon surface already has another role"),
+        .not_live, .wrong_client => return,
+    };
+    _ = self.canonical.startDrag(device.id, source_id, origin, icon, .{ .domain = .wayring_server, .value = serial }, require_actions) catch |err| handleStartError(device, source_object, err);
+}
+
+fn handleStartError(device: *Device, source_object: ?u32, err: DataDevice.Error) void {
+    switch (err) {
+        error.MissingActions, error.InvalidSource => if (source_object) |id| if (device.client.lookup(id)) |source| device.client.postProtocolError(source, @intCast(protocol.wl_data_source.@"error".invalid_source), "drag-and-drop actions were not set"),
+        error.SourceAlreadyUsed => device.client.postProtocolError(&device.resource.runtime, @intCast(protocol.wl_data_device.@"error".used_source), "data source was already used"),
+        else => {},
     }
 }
 
@@ -260,20 +303,39 @@ fn createOffer(self: *WayringDataDevice, device: *Device, canonical_id: DataDevi
 }
 
 fn offerRequest(_: *protocol.wl_data_offer.Resource, request: protocol.wl_data_offer.Request, value: *Offer) !void {
+    const info = value.owner.canonical.offerInfo(value.id);
+    if (info != null and info.?.finished) switch (request) {
+        .destroy => {},
+        .finish => return value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_finish), "drag-and-drop offer was already finished"),
+        else => return value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_offer), "finished drag-and-drop offer accepts only destroy"),
+    };
     switch (request) {
-        .accept => |args| value.owner.canonical.accept(value.id, args.mime_type) catch {},
+        .accept => |args| {
+            if (info) |offer| if (offer.active and args.serial != value.enter_serial) return;
+            value.owner.canonical.accept(value.id, args.mime_type) catch {};
+        },
         .receive => |args| {
             defer _ = std.c.close(args.fd);
             value.owner.canonical.receive(value.id, args.mime_type, args.fd) catch {};
         },
         .destroy => value.owner.destroyOffer(value),
-        .finish, .set_actions => value.client.postImplementationError(&value.resource.runtime, "drag-and-drop offer requests are not implemented"),
+        .finish => value.owner.canonical.finish(value.id) catch value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_finish), "drag-and-drop offer cannot be finished"),
+        .set_actions => |args| value.owner.canonical.setOfferActions(value.id, fromWireActions(args.dnd_actions), fromWireActions(args.preferred_action)) catch |err| switch (err) {
+            error.InvalidActionMask => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_action_mask), "invalid drag-and-drop action mask"),
+            error.InvalidPreferredAction => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_action), "invalid preferred drag-and-drop action"),
+            error.InvalidOffer => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_offer), "actions are invalid for this offer"),
+            else => {},
+        },
     }
 }
 
 fn sourceIdentity(self: *WayringDataDevice, client: *wayring.server.Client, object_id: u32) ?DataDevice.SourceId {
+    return if (self.sourceForObject(client, object_id)) |source| source.id else null;
+}
+
+fn sourceForObject(self: *WayringDataDevice, client: *wayring.server.Client, object_id: u32) ?*Source {
     const installed = client.lookup(object_id) orelse return null;
-    for (self.sources.items) |value| if (value.client == client and value.resource.id() == object_id and installed == &value.resource.runtime and value.resource.runtime.state() == .live) return value.id;
+    for (self.sources.items) |value| if (value.client == client and value.resource.id() == object_id and installed == &value.resource.runtime and value.resource.runtime.state() == .live) return value;
     return null;
 }
 
@@ -349,6 +411,18 @@ pub fn offerMimeOffered(context: *anyopaque, id: DataDevice.OfferId, mime: []con
         return;
     };
 }
+pub fn offerSourceActionsChanged(context: *anyopaque, id: DataDevice.OfferId, actions: DataDevice.Actions) void {
+    const self: *WayringDataDevice = @ptrCast(@alignCast(context));
+    const value = findOffer(self, id) orelse return;
+    if (value.published and value.resource.version() >= 3)
+        protocol.wl_data_offer.@"send:source_actions"(&value.resource, toWireActions(actions)) catch {};
+}
+pub fn offerActionChanged(context: *anyopaque, id: DataDevice.OfferId, actions: DataDevice.Actions) void {
+    const self: *WayringDataDevice = @ptrCast(@alignCast(context));
+    const value = findOffer(self, id) orelse return;
+    if (value.published and value.resource.version() >= 3)
+        protocol.wl_data_offer.@"send:action"(&value.resource, toWireActions(actions)) catch {};
+}
 
 fn sourceSend(context: *anyopaque, mime: []const u8, fd: std.posix.fd_t) void {
     const value: *Source = @ptrCast(@alignCast(context));
@@ -365,23 +439,96 @@ fn sourceCancelled(context: *anyopaque) void {
     protocol.wl_data_source.@"send:cancelled"(&value.resource) catch
         value.client.postOutOfMemory(&value.resource.runtime, "queueing generated source cancellation");
 }
-fn sourceAction(_: *anyopaque, _: DataDevice.Actions) void {}
-fn sourceDrop(_: *anyopaque) void {}
-fn sourceFinished(_: *anyopaque) void {}
-fn deviceDragPrepare(_: *anyopaque, _: ?DataDevice.OfferId) error{OutOfMemory}!DataDevice.DragPreparation {
-    return .{};
+fn sourceAction(context: *anyopaque, actions: DataDevice.Actions) void {
+    const value: *Source = @ptrCast(@alignCast(context));
+    if (value.resource.version() >= 3) protocol.wl_data_source.@"send:action"(&value.resource, toWireActions(actions)) catch value.client.postOutOfMemory(&value.resource.runtime, "queueing generated source action");
 }
-fn deviceDragEnter(_: *anyopaque, _: @import("../SurfaceRegistry.zig").Id, _: f64, _: f64, _: ?DataDevice.OfferId) void {}
-fn deviceDragMotion(_: *anyopaque, _: u32, _: f64, _: f64) void {}
-fn deviceDragLeave(_: *anyopaque) void {}
-fn deviceDragDrop(_: *anyopaque) void {}
+fn sourceDrop(context: *anyopaque) void {
+    const value: *Source = @ptrCast(@alignCast(context));
+    if (value.resource.version() >= 3) protocol.wl_data_source.@"send:dnd_drop_performed"(&value.resource) catch
+        value.client.postOutOfMemory(&value.resource.runtime, "queueing generated source drop");
+}
+fn sourceFinished(context: *anyopaque) void {
+    const value: *Source = @ptrCast(@alignCast(context));
+    if (value.resource.version() >= 3) protocol.wl_data_source.@"send:dnd_finished"(&value.resource) catch
+        value.client.postOutOfMemory(&value.resource.runtime, "queueing generated source finish");
+}
+fn deviceDragPrepare(context: *anyopaque, id: ?DataDevice.OfferId) error{OutOfMemory}!DataDevice.DragPreparation {
+    const device: *Device = @ptrCast(@alignCast(context));
+    const serial = device.owner.protocol_server.nextSerial() catch {
+        device.client.postImplementationError(&device.resource.runtime, "generated data-device serial exhausted");
+        return error.OutOfMemory;
+    };
+    device.enter_serial = serial;
+    if (id) |offer_id| {
+        const offer = device.owner.createOffer(device, offer_id) catch return error.OutOfMemory;
+        offer.enter_serial = serial;
+    }
+    return .{ .legacy_copy = id != null and device.resource.version() < 3 };
+}
+fn deviceDragEnter(context: *anyopaque, surface_id: SurfaceRegistry.Id, x: f64, y: f64, id: ?DataDevice.OfferId) void {
+    const device: *Device = @ptrCast(@alignCast(context));
+    const endpoint = (device.owner.compositor orelse return).surfaceEndpoint(surface_id) orelse return;
+    const offer = if (id) |offer_id| findOffer(device.owner, offer_id) else null;
+    if (offer) |value| publishOffer(value, device) catch {
+        device.client.postOutOfMemory(&device.resource.runtime, "publishing generated drag offer");
+        return;
+    };
+    const serial = if (offer) |value| value.enter_serial else device.enter_serial;
+    protocol.wl_data_device.@"send:enter"(&device.resource, serial, endpoint.resource.id(), fixed(x), fixed(y), if (offer) |value| value.resource.id() else null) catch
+        device.client.postOutOfMemory(&device.resource.runtime, "queueing generated drag enter");
+}
+fn deviceDragMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
+    const device: *Device = @ptrCast(@alignCast(context));
+    protocol.wl_data_device.@"send:motion"(&device.resource, time, fixed(x), fixed(y)) catch
+        device.client.postOutOfMemory(&device.resource.runtime, "queueing generated drag motion");
+}
+fn deviceDragLeave(context: *anyopaque) void {
+    const device: *Device = @ptrCast(@alignCast(context));
+    protocol.wl_data_device.@"send:leave"(&device.resource) catch
+        device.client.postOutOfMemory(&device.resource.runtime, "queueing generated drag leave");
+}
+fn deviceDragDrop(context: *anyopaque) void {
+    const device: *Device = @ptrCast(@alignCast(context));
+    protocol.wl_data_device.@"send:drop"(&device.resource) catch
+        device.client.postOutOfMemory(&device.resource.runtime, "queueing generated drag drop");
+}
+
+fn findOffer(self: *WayringDataDevice, id: DataDevice.OfferId) ?*Offer {
+    for (self.offers.items) |offer| if (std.meta.eql(offer.id, id)) return offer;
+    return null;
+}
+fn publishOffer(offer: *Offer, device: *Device) !void {
+    if (offer.published) return;
+    const info = offer.owner.canonical.offerInfo(offer.id) orelse return;
+    try protocol.wl_data_device.@"send:data_offer"(&device.resource, offer.resource.id());
+    if (info.source) |source| {
+        for (try offer.owner.canonical.sourceMimeTypes(source)) |mime| try protocol.wl_data_offer.@"send:offer"(&offer.resource, mime);
+        if (offer.resource.version() >= 3 and info.kind == .drag) {
+            try protocol.wl_data_offer.@"send:source_actions"(&offer.resource, toWireActions(try offer.owner.canonical.sourceActions(source)));
+            try protocol.wl_data_offer.@"send:action"(&offer.resource, toWireActions(info.selected_action));
+        }
+    }
+    offer.published = true;
+}
+fn fromWireActions(value: anytype) DataDevice.Actions {
+    return @bitCast(@as(u32, @intCast(value)));
+}
+fn toWireActions(value: DataDevice.Actions) u32 {
+    return @bitCast(value);
+}
+fn fixed(value: f64) i32 {
+    const minimum = @as(f64, @floatFromInt(std.math.minInt(i32))) / 256.0;
+    const maximum = @as(f64, @floatFromInt(std.math.maxInt(i32))) / 256.0;
+    return @intFromFloat(std.math.clamp(value, minimum, maximum) * 256.0);
+}
 
 fn destroyOffer(self: *WayringDataDevice, value: *Offer) void {
     for (self.offers.items, 0..) |item, i| if (item == value) {
         _ = self.offers.swapRemove(i);
         break;
     };
-    self.canonical.destroyOffer(value.id);
+    self.canonical.retireOffer(value.id, value.resource.version() < 3);
     value.resource.destroy();
     value.resource.deinit();
     self.allocator.destroy(value);
@@ -419,31 +566,93 @@ fn destroyManager(self: *WayringDataDevice, value: *Manager) void {
     self.allocator.destroy(value);
 }
 
-test "generated descriptor covers v4 while unpublished selection hook is capped at v3" {
+test "generated descriptor and publication cover v4" {
+    const ExpectedMessage = struct { name: []const u8, since: u32, destructor: bool = false };
+    const manager_requests = [_]ExpectedMessage{
+        .{ .name = "create_data_source", .since = 1 },
+        .{ .name = "get_data_device", .since = 1 },
+        .{ .name = "release", .since = 4, .destructor = true },
+    };
+    const source_requests = [_]ExpectedMessage{
+        .{ .name = "offer", .since = 1 },
+        .{ .name = "destroy", .since = 1, .destructor = true },
+        .{ .name = "set_actions", .since = 3 },
+    };
+    const source_events = [_]ExpectedMessage{
+        .{ .name = "target", .since = 1 },
+        .{ .name = "send", .since = 1 },
+        .{ .name = "cancelled", .since = 1 },
+        .{ .name = "dnd_drop_performed", .since = 3 },
+        .{ .name = "dnd_finished", .since = 3 },
+        .{ .name = "action", .since = 3 },
+    };
+    const device_requests = [_]ExpectedMessage{
+        .{ .name = "start_drag", .since = 1 },
+        .{ .name = "set_selection", .since = 1 },
+        .{ .name = "release", .since = 2, .destructor = true },
+    };
+    const device_events = [_]ExpectedMessage{
+        .{ .name = "data_offer", .since = 1 },
+        .{ .name = "enter", .since = 1 },
+        .{ .name = "leave", .since = 1 },
+        .{ .name = "motion", .since = 1 },
+        .{ .name = "drop", .since = 1 },
+        .{ .name = "selection", .since = 1 },
+    };
+    const offer_requests = [_]ExpectedMessage{
+        .{ .name = "accept", .since = 1 },
+        .{ .name = "receive", .since = 1 },
+        .{ .name = "destroy", .since = 1, .destructor = true },
+        .{ .name = "finish", .since = 3 },
+        .{ .name = "set_actions", .since = 3 },
+    };
+    const offer_events = [_]ExpectedMessage{
+        .{ .name = "offer", .since = 1 },
+        .{ .name = "source_actions", .since = 3 },
+        .{ .name = "action", .since = 3 },
+    };
+    inline for (.{
+        .{ protocol.wl_data_device_manager.request_messages, &manager_requests },
+        .{ protocol.wl_data_source.request_messages, &source_requests },
+        .{ protocol.wl_data_source.event_messages, &source_events },
+        .{ protocol.wl_data_device.request_messages, &device_requests },
+        .{ protocol.wl_data_device.event_messages, &device_events },
+        .{ protocol.wl_data_offer.request_messages, &offer_requests },
+        .{ protocol.wl_data_offer.event_messages, &offer_events },
+    }) |pair| {
+        try std.testing.expectEqual(pair[1].len, pair[0].len);
+        for (pair[0], pair[1]) |actual, expected| {
+            try std.testing.expectEqualStrings(expected.name, actual.name);
+            try std.testing.expectEqual(expected.since, actual.since);
+            try std.testing.expectEqual(expected.destructor, actual.destructor);
+        }
+    }
     try std.testing.expectEqual(@as(u32, 4), protocol.wl_data_device_manager.interface.version);
-    try std.testing.expectEqual(@as(u32, 3), test_manager_version);
-    try std.testing.expect(!@hasDecl(WayringDataDevice, "publish"));
-    try std.testing.expectEqualStrings("create_data_source", protocol.wl_data_device_manager.request_messages[0].name);
-    try std.testing.expectEqualStrings("get_data_device", protocol.wl_data_device_manager.request_messages[1].name);
-    try std.testing.expectEqualStrings("start_drag", protocol.wl_data_device.request_messages[0].name);
-    try std.testing.expectEqualStrings("set_selection", protocol.wl_data_device.request_messages[1].name);
-    try std.testing.expectEqualStrings("receive", protocol.wl_data_offer.request_messages[1].name);
+    try std.testing.expectEqual(@as(u32, 4), manager_version);
+    try std.testing.expectEqual(@as(i64, 0), protocol.wl_data_source.@"error".invalid_action_mask);
+    try std.testing.expectEqual(@as(i64, 1), protocol.wl_data_source.@"error".invalid_source);
+    try std.testing.expectEqual(@as(i64, 0), protocol.wl_data_device.@"error".role);
+    try std.testing.expectEqual(@as(i64, 1), protocol.wl_data_device.@"error".used_source);
+    try std.testing.expectEqual(@as(i64, 0), protocol.wl_data_offer.@"error".invalid_finish);
+    try std.testing.expectEqual(@as(i64, 1), protocol.wl_data_offer.@"error".invalid_action_mask);
+    try std.testing.expectEqual(@as(i64, 2), protocol.wl_data_offer.@"error".invalid_action);
+    try std.testing.expectEqual(@as(i64, 3), protocol.wl_data_offer.@"error".invalid_offer);
 }
 
-test "test-only manager install is singular v3 and rolls back allocation failure" {
+test "manager publication is singular v4 and rolls back allocation failure" {
     var host: wayring.server.Server = .init(std.testing.allocator);
     defer host.deinit();
     var adapter: WayringDataDevice = undefined;
-    adapter.init(std.testing.allocator, &host, undefined, undefined, undefined);
+    adapter.init(std.testing.allocator, &host, undefined, undefined, undefined, null);
     defer {
-        if (adapter.global != null) adapter.uninstallUnpublishedForTest();
+        if (adapter.global != null) adapter.unpublish();
         adapter.deinit();
     }
 
     var before: usize = 0;
     var globals = host.iterator();
     while (globals.next()) |_| before += 1;
-    try adapter.installUnpublishedForTest();
+    try adapter.publish();
     var managers: usize = 0;
     var total: usize = 0;
     globals = host.iterator();
@@ -451,12 +660,12 @@ test "test-only manager install is singular v3 and rolls back allocation failure
         total += 1;
         if (std.mem.eql(u8, global.interface().name, "wl_data_device_manager")) {
             managers += 1;
-            try std.testing.expectEqual(@as(u32, 3), global.version());
+            try std.testing.expectEqual(@as(u32, 4), global.version());
         }
     }
     try std.testing.expectEqual(before + 1, total);
     try std.testing.expectEqual(@as(usize, 1), managers);
-    adapter.uninstallUnpublishedForTest();
+    adapter.unpublish();
 
     globals = host.iterator();
     total = 0;
@@ -473,9 +682,9 @@ test "test-only manager install is singular v3 and rolls back allocation failure
     var failing_host: wayring.server.Server = .init(failing.allocator());
     defer failing_host.deinit();
     var failing_adapter: WayringDataDevice = undefined;
-    failing_adapter.init(std.testing.allocator, &failing_host, undefined, undefined, undefined);
+    failing_adapter.init(std.testing.allocator, &failing_host, undefined, undefined, undefined, null);
     defer failing_adapter.deinit();
-    try std.testing.expectError(error.OutOfMemory, failing_adapter.installUnpublishedForTest());
+    try std.testing.expectError(error.OutOfMemory, failing_adapter.publish());
     try std.testing.expect(failing_adapter.global == null);
     try std.testing.expect(failing.has_induced_failure);
 }
@@ -541,8 +750,8 @@ const DataDeviceFixture = struct {
             .offer_rolled_back = offerRolledBack,
             .offer_mime_offered = offerMimeOffered,
         });
-        self.adapter.init(std.testing.allocator, &self.host, &self.mapped, &self.seat, &self.canonical);
-        try self.adapter.installUnpublishedForTest();
+        self.adapter.init(std.testing.allocator, &self.host, &self.mapped, &self.seat, &self.canonical, &self.compositor);
+        try self.adapter.publish();
         self.managed = try wayring.server.CoreClient.create(std.testing.allocator, &self.host, .{});
         self.client_id = try self.mapped.register(self.client());
         try testSend(self.client(), 1, 1, &protocol.wl_display.request_messages[1], &.{.{ .new_id = .{ .typed = 2 } }});
@@ -559,7 +768,7 @@ const DataDeviceFixture = struct {
         _ = self.authority.clientDisconnected(self.client_id);
         self.mapped.unregister(self.client());
         self.managed.destroy();
-        self.adapter.uninstallUnpublishedForTest();
+        self.adapter.unpublish();
         self.seat.unpublish();
         self.adapter.deinit();
         self.canonical.deinit();
@@ -669,7 +878,7 @@ test "focused late device materializes before synchronous selection publication"
     try std.testing.expectEqual(@as(usize, 1), counts.offers);
 }
 
-test "deferred generated start_drag terminalizes offender without canonical drag mutation" {
+test "generated start_drag assigns a permanent icon role and follows surface lifecycle" {
     var fixture: DataDeviceFixture = undefined;
     try fixture.init();
     defer fixture.deinit();
@@ -678,25 +887,29 @@ test "deferred generated start_drag terminalizes offender without canonical drag
     try fixture.bind("wl_compositor", 5, 6);
     try testSend(client, 5, 0, &protocol.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 6 } }});
     try testSend(client, 4, 1, &protocol.wl_data_device_manager.request_messages[1], &.{ .{ .new_id = .{ .typed = 7 } }, .{ .object = 3 } });
+    try testSend(client, 5, 0, &protocol.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 8 } }});
+    const origin = fixture.compositor.surfaceId(client, 6).?;
+    const icon = fixture.compositor.surfaceId(client, 8).?;
+    const serial: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 1 };
+    try std.testing.expect(try fixture.authority.addPointerPress(fixture.client_id, serial, 0x110, origin));
     const selection_generation = fixture.canonical.selectionGeneration();
     try std.testing.expect(!fixture.canonical.isDragging());
     try std.testing.expect(fixture.canonical.dragIcon() == null);
     try testSend(client, 7, 0, &protocol.wl_data_device.request_messages[0], &.{
         .{ .object = null },
         .{ .object = 6 },
-        .{ .object = null },
+        .{ .object = 8 },
         .{ .uint = 1 },
     });
-    const fatal = client.fatal().?;
-    try std.testing.expectEqual(wayring.server.Fatal.Kind.implementation, fatal.kind);
-    try std.testing.expectEqual(@as(u32, 7), fatal.object_id);
-    try std.testing.expect(fatal.opcode == null);
-    try std.testing.expect(fatal.protocol_code == null);
-    try std.testing.expect(fatal.interface == &protocol.wl_data_device.interface);
-    try std.testing.expect(fatal.message == null);
-    try std.testing.expectEqualStrings("wl_data_device", fatal.interface.?.name);
-    try std.testing.expectEqualStrings("drag-and-drop is not implemented", fatal.detail());
-    try std.testing.expect(!fixture.canonical.isDragging());
-    try std.testing.expect(fixture.canonical.dragIcon() == null);
+    try std.testing.expect(client.fatal() == null);
+    try std.testing.expect(fixture.canonical.isDragging());
+    try std.testing.expectEqual(icon, fixture.canonical.dragIcon().?.surface);
+    try std.testing.expect(fixture.compositor.isDragIconRole(icon));
     try std.testing.expectEqual(selection_generation, fixture.canonical.selectionGeneration());
+    try testSend(client, 8, 0, &protocol.wl_surface.request_messages[0], &.{});
+    try std.testing.expect(fixture.canonical.isDragging());
+    try std.testing.expect(fixture.canonical.dragIcon() == null);
+    try testSend(client, 6, 0, &protocol.wl_surface.request_messages[0], &.{});
+    fixture.canonical.surfaceDestroyed(origin);
+    try std.testing.expect(!fixture.canonical.isDragging());
 }

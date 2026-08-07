@@ -57,7 +57,7 @@ pub const Placement = union(enum) {
 };
 
 /// Presentation ownership for an attached compound root. This is independent
-/// from wl_surface role and child topology. Managed and cursor are permanent;
+/// from wl_surface role and child topology. Managed, cursor, and drag icon are permanent;
 /// an unpublished XDG reservation may return to background until a concrete
 /// role is assigned.
 pub const PresentationClass = enum {
@@ -65,6 +65,7 @@ pub const PresentationClass = enum {
     xdg_reserved,
     managed,
     cursor,
+    drag_icon,
 };
 
 pub const NodeState = struct {
@@ -327,6 +328,7 @@ pub fn setRootPresentationClass(
         .xdg_reserved => class == .background or class == .xdg_reserved or class == .managed,
         .managed => class == .managed,
         .cursor => class == .cursor,
+        .drag_icon => class == .drag_icon,
     };
     if (!allowed) return false;
     target.presentation_class = class;
@@ -345,6 +347,10 @@ pub fn presentationClass(
 
 pub fn isCursorRole(self: *const HeadlessSurfaceForest, id: SurfaceRegistry.Id) bool {
     return self.presentationClass(id) == .cursor;
+}
+
+pub fn isDragIconRole(self: *const HeadlessSurfaceForest, id: SurfaceRegistry.Id) bool {
+    return self.presentationClass(id) == .drag_icon;
 }
 
 pub fn state(self: *const HeadlessSurfaceForest, id: SurfaceRegistry.Id) ?NodeState {
@@ -583,7 +589,12 @@ pub fn inputHit(
         .steps_remaining = self.node_count *| 2 +| self.root_count,
     };
     while (iterator.next()) |entry| {
-        if (self.isCursorRole(entry.id)) continue;
+        // Cursor and drag-icon compounds are compositor-owned pointer
+        // adornments. Skipping every node in either compound here, rather
+        // than rejecting only the eventual root in the caller, preserves the
+        // hit below an overlapping adornment.
+        const class = self.presentationClass(entry.id) orelse continue;
+        if (class == .cursor or class == .drag_icon) continue;
         const surface_x = x - @as(f64, @floatFromInt(entry.position.x));
         const surface_y = y - @as(f64, @floatFromInt(entry.position.y));
         if (surface_x < 0 or surface_y < 0 or
@@ -1215,6 +1226,42 @@ test "input hit follows topmost compound paint order without allocation" {
     try std.testing.expect(!failing.has_induced_failure);
     forest.remove(root);
     forest.remove(child);
+}
+
+test "drag icon compound is click-through including subsurfaces" {
+    const Filter = struct {
+        fn accepts(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64) bool {
+            return true;
+        }
+    };
+    var forest = HeadlessSurfaceForest.init(std.testing.allocator);
+    defer forest.deinit();
+    const target: SurfaceRegistry.Id = .{ .index = 0, .generation = 1 };
+    const icon: SurfaceRegistry.Id = .{ .index = 1, .generation = 1 };
+    const child: SurfaceRegistry.Id = .{ .index = 2, .generation = 1 };
+    try forest.addRoot(target, null);
+    try forest.addRoot(icon, null);
+    try forest.addRoot(child, null);
+    inline for (.{ target, icon, child }) |id|
+        applyOne(&forest, id, .{ .width = 4, .height = 4 }, false);
+    try std.testing.expect(forest.setRootPresentationClass(icon, .drag_icon));
+    const stack = [_]AppliedStackEntry{
+        .parent,
+        .{ .child = .{ .id = child, .position = .{} } },
+    };
+    forest.apply(.{
+        .surfaces = &.{},
+        .parents = &.{.{ .id = icon, .stack = &stack }},
+    });
+    var context: u8 = 0;
+    const hit = forest.inputHit(1, 1, .{
+        .context = &context,
+        .accepts = Filter.accepts,
+    }).?;
+    try std.testing.expectEqual(target, hit.id);
+    forest.remove(icon);
+    forest.remove(child);
+    forest.remove(target);
 }
 
 test "nested stack paints below parent above with grandchildren and negative positions" {

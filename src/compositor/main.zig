@@ -14,6 +14,7 @@ const Systemd = @import("systemd.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCursorShape = @import("wayland/WayringCursorShape.zig");
+const WayringDataDevice = @import("wayland/WayringDataDevice.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
@@ -212,6 +213,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_seat_adapter: WayringSeatAdapter = undefined;
     var wayring_seat_adapter_initialized = false;
     var wayring_seat_published = false;
+    var wayring_data_device: WayringDataDevice = undefined;
+    var wayring_data_device_initialized = false;
+    var wayring_data_device_published = false;
     const WayringLifecycle = struct {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
@@ -223,6 +227,7 @@ pub fn main(init: std.process.Init) !void {
         xdg_activation: ?*WayringXdgActivation,
         compositor: *WayringCompositor,
         seat: *WayringSeatAdapter,
+        data_device: ?*WayringDataDevice,
 
         fn accepted(erased: *anyopaque, client: *wayring.server.Client) !void {
             const self: *@This() = @ptrCast(@alignCast(erased));
@@ -233,6 +238,7 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            if (self.data_device) |data_device| data_device.destroyClientResources(client);
             if (self.xdg_activation) |activation| activation.destroyClientResources(client);
             if (self.xdg_decoration) |decoration| decoration.destroyClientResources(client);
             if (self.cursor_shape) |cursor_shape| cursor_shape.destroyClientResources(client);
@@ -252,6 +258,11 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_data_device_initialized) {
+            server.setDataDeviceObserver(null);
+            if (wayring_data_device_published) wayring_data_device.unpublish();
+            wayring_data_device.deinit();
+        }
         if (wayring_xdg_activation_initialized) {
             if (wayring_xdg_activation_published) wayring_xdg_activation.unpublish();
             wayring_xdg_activation.deinit();
@@ -312,6 +323,15 @@ pub fn main(init: std.process.Init) !void {
             server.generatedSeatName(),
         );
         wayring_seat_adapter_initialized = true;
+        wayring_data_device.init(init.gpa, &wayring_protocol_server.?, &wayring_clients, &wayring_seat_adapter, server.neutralDataDevice(), &wayring_compositor);
+        wayring_data_device_initialized = true;
+        server.setDataDeviceObserver(.{
+            .context = &wayring_data_device,
+            .offer_rolled_back = WayringDataDevice.offerRolledBack,
+            .offer_mime_offered = WayringDataDevice.offerMimeOffered,
+            .offer_source_actions_changed = WayringDataDevice.offerSourceActionsChanged,
+            .offer_action_changed = WayringDataDevice.offerActionChanged,
+        });
         wayring_cursor_shape.init(
             init.gpa,
             &wayring_protocol_server.?,
@@ -380,6 +400,10 @@ pub fn main(init: std.process.Init) !void {
             wayring_xdg_decoration_published = true;
             try wayring_xdg_activation.publish();
             wayring_xdg_activation_published = true;
+            // Keep the stateful DnD global production-last: clients can only
+            // observe it after the headless shell and activation are ready.
+            try wayring_data_device.publish();
+            wayring_data_device_published = true;
         }
         wayring_lifecycle = .{
             .clients = &wayring_clients,
@@ -392,6 +416,7 @@ pub fn main(init: std.process.Init) !void {
             .xdg_activation = if (wayring_xdg_activation_initialized) &wayring_xdg_activation else null,
             .compositor = &wayring_compositor,
             .seat = &wayring_seat_adapter,
+            .data_device = if (wayring_data_device_initialized) &wayring_data_device else null,
         };
         wayring_host = try WayringHost.create(
             init.gpa,
