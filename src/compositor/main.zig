@@ -407,7 +407,7 @@ pub fn main(init: std.process.Init) !void {
         server.setGeneratedInputMethodObserver(.{
             .context = &wayring_input_method,
             .set_inhibited = WayringInputMethod.observerSetInhibited,
-            .popup_iterator = WayringInputMethod.observerPopupIterator,
+            .send_popup_rectangle = WayringInputMethod.observerSendPopupRectangle,
             .refresh_popups = WayringInputMethod.observerRefreshPopups,
         });
         server.setDataDeviceObserver(.{

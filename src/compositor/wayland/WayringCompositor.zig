@@ -790,6 +790,15 @@ pub fn releaseInputPopup(self: *WayringCompositor, reservation: InputPopupReserv
     surface.input_popup = null;
 }
 
+pub fn abortInputPopup(self: *WayringCompositor, reservation: InputPopupReservation) InputPopupError!void {
+    const surface = self.surfaceForId(reservation.surface) orelse return error.StaleReservation;
+    if (surface.destroying or surface.resource.runtime.state() != .live or surface.input_popup == null or
+        !std.meta.eql(surface.input_popup.?, reservation) or surface.role != .input_popup) return error.StaleReservation;
+    surface.input_popup = null;
+    surface.role = .none;
+    self.notifyPresentationClass(surface.id, .background);
+}
+
 pub fn isDragIconRole(self: *const WayringCompositor, id: SurfaceId) bool {
     const surface = self.surfaceForId(id) orelse return false;
     return surface.role == .drag_icon;

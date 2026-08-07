@@ -179,8 +179,15 @@ pub const DataControlObserver = struct {
 pub const GeneratedInputMethodObserver = struct {
     context: *anyopaque,
     set_inhibited: *const fn (*anyopaque, bool) void,
-    popup_iterator: *const fn (*anyopaque) WayringInputMethod.PopupIterator,
+    send_popup_rectangle: *const fn (*anyopaque, NeutralTextInput.PopupId, NeutralTextInput.Rectangle) void,
     refresh_popups: *const fn (*anyopaque) void,
+};
+const GeneratedInputPopup = struct {
+    id: NeutralTextInput.PopupId,
+    method: NeutralTextInput.MethodId,
+    surface_id: SurfaceRegistry.Id,
+    mapped: bool = false,
+    position: WayringInputMethod.Position = .{},
 };
 var expected_protocol_error: if (builtin.is_test) ?ExpectedProtocolError else void =
     if (builtin.is_test) null else {};
@@ -362,6 +369,7 @@ data_device_observer: ?DataDeviceObserver = null,
 primary_selection_observer: ?PrimarySelectionObserver = null,
 data_control_observer: ?DataControlObserver = null,
 generated_input_method_observer: ?GeneratedInputMethodObserver = null,
+generated_input_popups: std.ArrayList(GeneratedInputPopup) = .empty,
 xdg_toplevel_drag: XdgToplevelDrag,
 xdg_toplevel_icon: XdgToplevelIcon,
 xdg_dialog: XdgDialog,
@@ -2183,6 +2191,8 @@ pub fn destroy(self: *Self) void {
     self.routed_gestures.deinit(allocator);
     self.routed_buttons.deinit(allocator);
     self.routed_keys.deinit(allocator);
+    std.debug.assert(self.generated_input_popups.items.len == 0);
+    self.generated_input_popups.deinit(allocator);
     self.seat.deinit();
     self.compositor.deinit();
     std.debug.assert(self.headless_surface_forest.len() == 0);
@@ -3970,11 +3980,87 @@ pub fn setGeneratedInputMethodObserver(self: *Self, observer: ?GeneratedInputMet
 pub fn generatedInputMethodLayout(self: *Self) WayringInputMethod.Layout {
     return .{
         .context = self,
-        .surface_position = generatedInputMethodSurfacePosition,
-        .output_size = generatedInputMethodOutputSize,
-        .popup_size = generatedInputMethodPopupSize,
-        .repaint = requestRepaint,
+        .popup_created = generatedInputPopupCreated,
+        .popup_changed = generatedInputPopupChanged,
+        .popup_destroyed = generatedInputPopupDestroyed,
     };
+}
+
+fn generatedInputPopupCreated(context: *anyopaque, id: NeutralTextInput.PopupId, method: NeutralTextInput.MethodId, surface_id: SurfaceRegistry.Id) error{OutOfMemory}!void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    try self.generated_input_popups.append(self.allocator, .{ .id = id, .method = method, .surface_id = surface_id });
+}
+
+fn generatedInputPopupChanged(context: *anyopaque, id: NeutralTextInput.PopupId) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    for (self.generated_input_popups.items) |*popup| if (std.meta.eql(popup.id, id)) {
+        const old_mapped = popup.mapped;
+        const old_position = popup.position;
+        const active = self.neutral_text_input.activeMethodSnapshot(popup.method);
+        const popup_size = generatedInputMethodPopupSize(self, popup.surface_id);
+        popup.mapped = active != null and popup_size != null;
+        if (active) |snapshot| {
+            const focus = generatedInputMethodSurfacePosition(self, snapshot.surface) orelse WayringInputMethod.Position{};
+            const placement = placeGeneratedInputPopup(
+                generatedInputMethodOutputSize(self),
+                focus,
+                snapshot.cursor_rectangle,
+                popup_size orelse .{ .width = 0, .height = 0 },
+            );
+            popup.position = placement.position;
+            if (self.generated_input_method_observer) |observer|
+                observer.send_popup_rectangle(observer.context, id, placement.rectangle);
+        }
+        if (old_mapped != popup.mapped or (popup.mapped and !std.meta.eql(old_position, popup.position)))
+            requestRepaint(self);
+        return;
+    };
+}
+
+fn generatedInputPopupDestroyed(context: *anyopaque, id: NeutralTextInput.PopupId) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    for (self.generated_input_popups.items, 0..) |popup, index| if (std.meta.eql(popup.id, id)) {
+        const mapped = popup.mapped;
+        _ = self.generated_input_popups.orderedRemove(index);
+        if (mapped) requestRepaint(self);
+        return;
+    };
+}
+
+const GeneratedInputPopupPlacement = struct {
+    position: WayringInputMethod.Position,
+    rectangle: NeutralTextInput.Rectangle,
+};
+
+fn placeGeneratedInputPopup(output: render.Size, focus: WayringInputMethod.Position, maybe_rectangle: ?NeutralTextInput.Rectangle, popup: render.Size) GeneratedInputPopupPlacement {
+    const rectangle = maybe_rectangle orelse NeutralTextInput.Rectangle{ .x = 0, .y = 0, .width = 0, .height = 0 };
+    const left = @as(i64, focus.x) + rectangle.x;
+    const top = @as(i64, focus.y) + rectangle.y;
+    const right = left + rectangle.width;
+    const bottom = top + rectangle.height;
+    const max_x = @max(@as(i64, output.width) - popup.width, 0);
+    const max_y = @max(@as(i64, output.height) - popup.height, 0);
+    const desired_x = if (left + popup.width <= output.width) left else right - popup.width;
+    const desired_y = if (bottom + popup.height <= output.height) bottom else top - popup.height;
+    const x: i32 = @intCast(std.math.clamp(desired_x, 0, max_x));
+    const y: i32 = @intCast(std.math.clamp(desired_y, 0, max_y));
+    return .{ .position = .{ .x = x, .y = y }, .rectangle = .{
+        .x = @intCast(std.math.clamp(left - x, std.math.minInt(i32), std.math.maxInt(i32))),
+        .y = @intCast(std.math.clamp(top - y, std.math.minInt(i32), std.math.maxInt(i32))),
+        .width = rectangle.width,
+        .height = rectangle.height,
+    } };
+}
+
+test "generated input popup placement flips at output edges" {
+    const placement = placeGeneratedInputPopup(
+        .{ .width = 800, .height = 600 },
+        .{ .x = 700, .y = 500 },
+        .{ .x = 10, .y = 10, .width = 20, .height = 20 },
+        .{ .width = 200, .height = 100 },
+    );
+    try std.testing.expectEqual(WayringInputMethod.Position{ .x = 530, .y = 410 }, placement.position);
+    try std.testing.expectEqual(NeutralTextInput.Rectangle{ .x = 180, .y = 100, .width = 20, .height = 20 }, placement.rectangle);
 }
 
 fn generatedInputMethodSurfacePosition(context: *anyopaque, surface_id: SurfaceRegistry.Id) ?WayringInputMethod.Position {
@@ -4376,7 +4462,9 @@ fn reconcileGeneratedPointerTopology(self: *Self) void {
                     self.generatedManagedRootStructurallyLive(generated.root, generated.client)
                 else
                     self.generatedManagedRootEligible(generated.root, generated.client)),
-            .xdg_reserved, .cursor, .drag_icon, .input_popup => false,
+            .input_popup => self.isGeneratedInputPopup(generated.root) and
+                self.headless_surface_forest.mappedInCompound(state.surface_id, generated.root),
+            .xdg_reserved, .cursor, .drag_icon => false,
         }
     else
         false;
@@ -8430,10 +8518,9 @@ fn generatedPointerRoute(focus: GeneratedPointerFocus) PointerRoute {
 }
 
 fn generatedInputPopupFocus(self: *Self, x: f64, y: f64) ?GeneratedPointerFocus {
-    const observer = self.generated_input_method_observer orelse return null;
-    var popups = observer.popup_iterator(observer.context);
     var result: ?GeneratedPointerFocus = null;
-    while (popups.next()) |popup| {
+    for (self.generated_input_popups.items) |popup| {
+        if (!popup.mapped) continue;
         const root = self.headless_surface_forest.compoundRoot(popup.surface_id) orelse continue;
         const client = self.seat.generatedSurfaceOwner(root) orelse continue;
         var filter: GeneratedInputFilter = .{ .server = self, .root = root };
@@ -8449,10 +8536,8 @@ fn generatedInputPopupFocus(self: *Self, x: f64, y: f64) ?GeneratedPointerFocus 
 }
 
 fn isGeneratedInputPopup(self: *Self, root: SurfaceRegistry.Id) bool {
-    const observer = self.generated_input_method_observer orelse return false;
-    var popups = observer.popup_iterator(observer.context);
-    while (popups.next()) |popup|
-        if (std.meta.eql(self.headless_surface_forest.compoundRoot(popup.surface_id) orelse continue, root))
+    for (self.generated_input_popups.items) |popup|
+        if (popup.mapped and std.meta.eql(self.headless_surface_forest.compoundRoot(popup.surface_id) orelse continue, root))
             return true;
     return false;
 }
@@ -10734,9 +10819,10 @@ fn renderDesktopContents(
     }
     if (self.generated_input_method_observer) |observer| {
         observer.refresh_popups(observer.context);
-        var generated_popups = observer.popup_iterator(observer.context);
-        while (generated_popups.next()) |popup|
+        for (self.generated_input_popups.items) |popup| {
+            if (!popup.mapped) continue;
             try self.renderGeneratedCompound(frame, popup.surface_id, popup.position.x, popup.position.y);
+        }
     }
 
     const drag_icon = self.mature_data_device.iconInfo();
@@ -20720,7 +20806,7 @@ const MatureTextClient = struct {
     const client_wl = wayland.client.wl;
     const client_zwp = wayland.client.zwp;
     const Role = enum { application, input_method };
-    const Stage = enum(u8) { starting, ready, state_received, edit_received, popup_clicked, popup_unmapped, disconnected, failed };
+    const Stage = enum(u8) { starting, ready, state_received, edit_received, popup_clicked, popup_recommitted, popup_unmapped, disconnected, failed };
     const EditTag = enum { preedit, delete, commit, done };
     fd: std.posix.fd_t,
     role: Role,
@@ -20867,6 +20953,10 @@ const MatureTextClient = struct {
                         if (self.shutdown_requested.load(.acquire)) return;
                         try expectClientRoundtrip(display);
                     }
+                    popup_surface.damageBuffer(0, 0, 1, 1);
+                    popup_surface.commit();
+                    try expectClientRoundtrip(display);
+                    self.stage.store(@intFromEnum(Stage.popup_recommitted), .release);
                 }
                 while (!self.proceed.load(.acquire)) {
                     if (self.shutdown_requested.load(.acquire)) return;
@@ -23516,7 +23606,7 @@ test "production generated data device completes the exact profile and supports 
     server.setGeneratedInputMethodObserver(.{
         .context = &input_method,
         .set_inhibited = WayringInputMethod.observerSetInhibited,
-        .popup_iterator = WayringInputMethod.observerPopupIterator,
+        .send_popup_rectangle = WayringInputMethod.observerSendPopupRectangle,
         .refresh_popups = WayringInputMethod.observerRefreshPopups,
     });
     try input_method.publish();
@@ -24198,11 +24288,11 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(usize, 1), server.neutralTextInput().resourceSnapshot().popups);
     try std.testing.expectEqual(HeadlessSurfaceForest.PresentationClass.input_popup, server.headless_surface_forest.presentationClass(popup_surface).?);
     try std.testing.expect(generatedInputMethodPopupSize(server, popup_surface) != null);
-    var popup_iterator = input_method.popupIterator();
-    const popup_info = popup_iterator.next() orelse return error.GeneratedInputPopupNotMapped;
+    try std.testing.expectEqual(@as(usize, 1), server.generated_input_popups.items.len);
+    const popup_info = server.generated_input_popups.items[0];
+    try std.testing.expect(popup_info.mapped);
     try std.testing.expectEqual(popup_surface, popup_info.surface_id);
     try std.testing.expectEqual(WayringInputMethod.Position{ .x = 2, .y = 8 }, popup_info.position);
-    try std.testing.expect(popup_iterator.next() == null);
     // Initial text state, settled surface state, and popup materialization each
     // publish the current rectangle; the final event carries settled geometry.
     try std.testing.expectEqual(@as(usize, 3), method.popup_rectangle_count);
@@ -24218,8 +24308,10 @@ test "production generated data device completes the exact profile and supports 
     pointerMotion(output, 78, 2.5, 8.5);
     pointerButton(output, 79, linux_button_left, .pressed);
     pointerFrame(output);
-    try waitForMatureTextStage(server, &method, .popup_clicked);
+    try waitForMatureTextStage(server, &method, .popup_recommitted);
     try std.testing.expectEqual(method.popup_surface_object_id, method.popup_pointer_surface);
+    try std.testing.expect(server.seat.implicitPointerGrabActive());
+    try std.testing.expectEqual(popup_surface, server.seat.pointerFocus().?.surface_id);
     pointerButton(output, 80, linux_button_left, .released);
     pointerFrame(output);
     method.proceed.store(true, .release);
@@ -24227,8 +24319,8 @@ test "production generated data device completes the exact profile and supports 
     try waitForGeneratedTextInputStage(server, host, &generated_text, .edit_received);
     try waitForMatureTextStage(server, &method, .popup_unmapped);
     input_method.refreshPopups();
-    var empty_popup_iterator = input_method.popupIterator();
-    try std.testing.expect(empty_popup_iterator.next() == null);
+    try std.testing.expectEqual(@as(usize, 1), server.generated_input_popups.items.len);
+    try std.testing.expect(!server.generated_input_popups.items[0].mapped);
     try std.testing.expect(output.repaint_needed);
     try std.testing.expectEqualSlices(
         GeneratedTextInputClient.EditTag,

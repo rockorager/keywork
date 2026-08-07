@@ -11,7 +11,6 @@ const Seat = @import("seat.zig");
 const WayringClients = @import("WayringClients.zig");
 const WayringSeatAdapter = @import("WayringSeatAdapter.zig");
 const WayringCompositor = @import("WayringCompositor.zig");
-const render = @import("../render/types.zig");
 
 const wl = wayland.server.wl;
 
@@ -27,10 +26,9 @@ pub const Authorization = union(enum) {
 
 pub const Layout = struct {
     context: *anyopaque,
-    surface_position: *const fn (*anyopaque, WayringCompositor.SurfaceId) ?Position,
-    output_size: *const fn (*anyopaque) render.Size,
-    popup_size: *const fn (*anyopaque, WayringCompositor.SurfaceId) ?render.Size,
-    repaint: *const fn (*anyopaque) void,
+    popup_created: *const fn (*anyopaque, TextInput.PopupId, TextInput.MethodId, WayringCompositor.SurfaceId) error{OutOfMemory}!void,
+    popup_changed: *const fn (*anyopaque, TextInput.PopupId) void,
+    popup_destroyed: *const fn (*anyopaque, TextInput.PopupId) void,
 };
 
 pub const Position = struct { x: i32 = 0, y: i32 = 0 };
@@ -59,8 +57,6 @@ const Popup = struct {
     neutral_id: ?TextInput.PopupId,
     reservation: ?WayringCompositor.InputPopupReservation,
     surface_id: ?WayringCompositor.SurfaceId,
-    mapped: bool = false,
-    position: Position = .{},
 };
 
 allocator: std.mem.Allocator,
@@ -249,12 +245,18 @@ fn clientFailure(grab: *Grab, message: []const u8) void {
 fn createPopup(self: *WayringInputMethod, method: *Method, id: u32, surface: u32, usable: bool) !void {
     try method.popups.ensureUnusedCapacity(self.allocator, 1);
     const popup = try self.allocator.create(Popup);
-    errdefer self.allocator.destroy(popup);
     popup.* = .{ .method = method, .resource = .init(self.allocator, id, 1, .client, method.client.ownerHooks()), .neutral_id = null, .reservation = null, .surface_id = null };
-    errdefer {
+    var published = false;
+    defer if (!published) {
+        if (popup.neutral_id) |neutral_id| {
+            self.layout.popup_destroyed(self.layout.context, neutral_id);
+            self.owner.destroyPopup(neutral_id);
+        }
+        if (popup.reservation) |reservation| self.compositor.abortInputPopup(reservation) catch {};
         popup.resource.destroy();
         popup.resource.deinit();
-    }
+        self.allocator.destroy(popup);
+    };
     if (usable) {
         const surface_id = self.compositor.surfaceId(method.client, surface) orelse {
             method.client.postProtocolError(&method.resource.runtime, @intCast(protocol.zwp_input_method_v2.@"error".role), "wl_surface is not a live same-client generated surface");
@@ -271,15 +273,15 @@ fn createPopup(self: *WayringInputMethod, method: *Method, id: u32, surface: u32
             },
             error.StaleReservation => unreachable,
         };
-        errdefer self.compositor.releaseInputPopup(popup.reservation.?) catch {};
         popup.surface_id = surface_id;
         popup.neutral_id = try self.owner.createPopup(method.neutral_id, surface_id);
-        errdefer self.owner.destroyPopup(popup.neutral_id.?);
+        try self.layout.popup_created(self.layout.context, popup.neutral_id.?, method.neutral_id, surface_id);
     }
     try popup.resource.setHandler(Popup, popup, popupRequest, null);
     try method.client.materialize(&popup.resource.runtime);
     method.popups.appendAssumeCapacity(popup);
-    updatePopup(popup, false);
+    published = true;
+    if (popup.neutral_id) |neutral_id| self.layout.popup_changed(self.layout.context, neutral_id);
 }
 fn popupRequest(_: *protocol.zwp_input_popup_surface_v2.Resource, request: protocol.zwp_input_popup_surface_v2.Request, popup: *Popup) !void {
     switch (request) {
@@ -291,36 +293,22 @@ pub fn sendPopupRectangle(_: *WayringInputMethod, popup: *Popup, rectangle: Text
     protocol.zwp_input_popup_surface_v2.@"send:text_input_rectangle"(&popup.resource, rectangle.x, rectangle.y, rectangle.width, rectangle.height) catch popup.method.client.postOutOfMemory(&popup.resource.runtime, "sending input popup rectangle");
 }
 
-pub const PopupInfo = struct { surface_id: WayringCompositor.SurfaceId, position: Position };
-pub const PopupIterator = struct {
-    owner: *WayringInputMethod,
-    method_index: usize = 0,
-    popup_index: usize = 0,
-    pub fn next(self: *PopupIterator) ?PopupInfo {
-        while (self.method_index < self.owner.methods.items.len) {
-            const method = self.owner.methods.items[self.method_index];
-            while (self.popup_index < method.popups.items.len) {
-                const popup = method.popups.items[self.popup_index];
-                self.popup_index += 1;
-                if (popup.mapped) return .{ .surface_id = popup.surface_id.?, .position = popup.position };
-            }
-            self.method_index += 1;
-            self.popup_index = 0;
-        }
-        return null;
-    }
-};
-pub fn popupIterator(self: *WayringInputMethod) PopupIterator {
-    return .{ .owner = self };
+pub fn observerSendPopupRectangle(context: *anyopaque, id: TextInput.PopupId, rectangle: TextInput.Rectangle) void {
+    const self: *WayringInputMethod = @ptrCast(@alignCast(context));
+    for (self.methods.items) |method| for (method.popups.items) |popup|
+        if (popup.neutral_id != null and std.meta.eql(popup.neutral_id.?, id)) return self.sendPopupRectangle(popup, rectangle);
 }
+
 pub fn refreshPopups(self: *WayringInputMethod) void {
-    for (self.methods.items) |method| for (method.popups.items) |popup| updatePopup(popup, false);
+    for (self.methods.items) |method| for (method.popups.items) |popup|
+        if (popup.neutral_id) |neutral_id| self.layout.popup_changed(self.layout.context, neutral_id);
 }
 
 fn popupCommitted(context: *anyopaque, surface: WayringCompositor.SurfaceId) void {
     const self: *WayringInputMethod = @ptrCast(@alignCast(context));
     for (self.methods.items) |method| for (method.popups.items) |popup|
-        if (popup.surface_id != null and std.meta.eql(popup.surface_id.?, surface)) updatePopup(popup, true);
+        if (popup.surface_id != null and std.meta.eql(popup.surface_id.?, surface))
+            if (popup.neutral_id) |neutral_id| self.layout.popup_changed(self.layout.context, neutral_id);
 }
 
 fn popupRemoved(context: *anyopaque, surface: WayringCompositor.SurfaceId) void {
@@ -335,45 +323,6 @@ fn popupRemoved(context: *anyopaque, surface: WayringCompositor.SurfaceId) void 
             }
         }
     }
-}
-
-fn updatePopup(popup: *Popup, content_changed: bool) void {
-    const self = popup.method.owner;
-    const surface = popup.surface_id orelse return;
-    const old_mapped = popup.mapped;
-    const old_position = popup.position;
-    const active = self.owner.activeMethodSnapshot(popup.method.neutral_id);
-    const popup_size = self.layout.popup_size(self.layout.context, surface);
-    popup.mapped = active != null and popup_size != null;
-    if (active) |snapshot| {
-        const focus: Position = self.layout.surface_position(self.layout.context, snapshot.surface) orelse .{};
-        const placement = placePopup(self.layout.output_size(self.layout.context), focus, snapshot.cursor_rectangle, popup_size orelse .{ .width = 0, .height = 0 });
-        popup.position = placement.position;
-        self.sendPopupRectangle(popup, placement.rectangle);
-    }
-    if (old_mapped != popup.mapped or (popup.mapped and (content_changed or !std.meta.eql(old_position, popup.position))))
-        self.layout.repaint(self.layout.context);
-}
-
-const Placement = struct { position: Position, rectangle: TextInput.Rectangle };
-fn placePopup(output: render.Size, focus: Position, maybe_rectangle: ?TextInput.Rectangle, popup: render.Size) Placement {
-    const rectangle = maybe_rectangle orelse TextInput.Rectangle{ .x = 0, .y = 0, .width = 0, .height = 0 };
-    const left = @as(i64, focus.x) + rectangle.x;
-    const top = @as(i64, focus.y) + rectangle.y;
-    const right = left + rectangle.width;
-    const bottom = top + rectangle.height;
-    const max_x = @max(@as(i64, output.width) - popup.width, 0);
-    const max_y = @max(@as(i64, output.height) - popup.height, 0);
-    const desired_x = if (left + popup.width <= output.width) left else right - popup.width;
-    const desired_y = if (bottom + popup.height <= output.height) bottom else top - popup.height;
-    const x: i32 = @intCast(std.math.clamp(desired_x, 0, max_x));
-    const y: i32 = @intCast(std.math.clamp(desired_y, 0, max_y));
-    return .{ .position = .{ .x = x, .y = y }, .rectangle = .{
-        .x = @intCast(std.math.clamp(left - x, std.math.minInt(i32), std.math.maxInt(i32))),
-        .y = @intCast(std.math.clamp(top - y, std.math.minInt(i32), std.math.maxInt(i32))),
-        .width = rectangle.width,
-        .height = rectangle.height,
-    } };
 }
 
 pub fn setInhibited(self: *WayringInputMethod, inhibited: bool) void {
@@ -436,14 +385,15 @@ fn destroyGrab(self: *WayringInputMethod, grab: *Grab) void {
     }
 }
 fn destroyPopup(self: *WayringInputMethod, popup: *Popup) void {
-    const was_mapped = popup.mapped;
     remove(Popup, &popup.method.popups, popup);
     if (popup.reservation) |reservation| self.compositor.releaseInputPopup(reservation) catch {};
-    if (popup.neutral_id) |neutral_id| self.owner.destroyPopup(neutral_id);
+    if (popup.neutral_id) |neutral_id| {
+        self.layout.popup_destroyed(self.layout.context, neutral_id);
+        self.owner.destroyPopup(neutral_id);
+    }
     popup.resource.destroy();
     popup.resource.deinit();
     self.allocator.destroy(popup);
-    if (was_mapped) self.layout.repaint(self.layout.context);
 }
 fn remove(comptime T: type, list: *std.ArrayList(*T), value: *T) void {
     for (list.items, 0..) |item, index| if (item == value) {
@@ -488,11 +438,6 @@ fn validPreeditCursor(text: []const u8, begin: i32, end: i32) bool {
 pub fn observerSetInhibited(context: *anyopaque, inhibited: bool) void {
     const self: *WayringInputMethod = @ptrCast(@alignCast(context));
     self.setInhibited(inhibited);
-}
-
-pub fn observerPopupIterator(context: *anyopaque) PopupIterator {
-    const self: *WayringInputMethod = @ptrCast(@alignCast(context));
-    return self.popupIterator();
 }
 
 pub fn observerRefreshPopups(context: *anyopaque) void {
@@ -630,15 +575,4 @@ test "preedit validation uses UTF-8 byte boundaries" {
     try std.testing.expect(!validPreeditCursor("hé", -1, 3));
     try std.testing.expect(!validPreeditCursor("hé", 2, 3));
     try std.testing.expect(!validText("\xff"));
-}
-
-test "popup placement flips at output edges" {
-    const placement = placePopup(
-        .{ .width = 800, .height = 600 },
-        .{ .x = 700, .y = 500 },
-        .{ .x = 10, .y = 10, .width = 20, .height = 20 },
-        .{ .width = 200, .height = 100 },
-    );
-    try std.testing.expectEqual(Position{ .x = 530, .y = 410 }, placement.position);
-    try std.testing.expectEqual(TextInput.Rectangle{ .x = 180, .y = 100, .width = 20, .height = 20 }, placement.rectangle);
 }
