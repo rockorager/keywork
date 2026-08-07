@@ -27,6 +27,16 @@ pub const Global = opaque {
     pub fn published(self: *const Global) bool {
         return globalRecord(self).is_published;
     }
+
+    pub fn visibility(self: *const Global) GlobalVisibility {
+        return globalRecord(self).visibility_value;
+    }
+};
+
+pub const GlobalVisibility = enum { public, restricted };
+
+pub const GlobalOptions = struct {
+    visibility: GlobalVisibility = .public,
 };
 
 pub const Publication = enum { added, removed };
@@ -63,6 +73,7 @@ const GlobalRecord = struct {
     global_name: u32,
     interface_descriptor: *const wire.Interface,
     advertised_version: u32,
+    visibility_value: GlobalVisibility,
     is_published: bool = true,
     context: *anyopaque,
     bind_erased: *const fn (*Client, u32, u32, *anyopaque) anyerror!void,
@@ -135,6 +146,19 @@ pub fn addGlobal(
     context_value: *Context,
     comptime bind_value: *const fn (client: *Client, id: u32, version: u32, context: *Context) anyerror!void,
 ) !*const Global {
+    return self.addGlobalWithOptions(ProtocolInterface, version_value, Context, context_value, bind_value, .{});
+}
+
+/// Publishes a global whose immutable visibility is set before observers run.
+pub fn addGlobalWithOptions(
+    self: *Server,
+    comptime ProtocolInterface: type,
+    version_value: u32,
+    comptime Context: type,
+    context_value: *Context,
+    comptime bind_value: *const fn (client: *Client, id: u32, version: u32, context: *Context) anyerror!void,
+    options: GlobalOptions,
+) !*const Global {
     if (version_value == 0 or version_value > ProtocolInterface.interface.version) return error.InvalidGlobalVersion;
     if (self.names_exhausted) return error.GlobalNameExhausted;
     const global = try self.allocator.create(GlobalRecord);
@@ -143,6 +167,7 @@ pub fn addGlobal(
         .global_name = self.next_name,
         .interface_descriptor = &ProtocolInterface.interface,
         .advertised_version = version_value,
+        .visibility_value = options.visibility,
         .context = context_value,
         .bind_erased = struct {
             fn call(client: *Client, id: u32, version: u32, erased: *anyopaque) anyerror!void {

@@ -165,6 +165,16 @@ pub const PrimarySelectionObserver = struct {
     offer_rolled_back: *const fn (*anyopaque, NeutralDataDevice.PrimaryOfferId) void,
     offer_mime_offered: *const fn (*anyopaque, NeutralDataDevice.PrimaryOfferId, []const u8) void,
 };
+/// Canonical privileged data-control notifications consumed by the generated
+/// resource adapter. Authorization remains a frontend publication concern.
+pub const DataControlObserver = struct {
+    context: *anyopaque,
+    transaction_finalize: *const fn (*anyopaque) error{OutOfMemory}!void,
+    transaction_commit: *const fn (*anyopaque) void,
+    transaction_abort: *const fn (*anyopaque) void,
+    offer_rolled_back: *const fn (*anyopaque, NeutralDataDevice.ControlOfferId) void,
+    offer_mime_offered: *const fn (*anyopaque, NeutralDataDevice.ControlOfferId, []const u8) void,
+};
 var expected_protocol_error: if (builtin.is_test) ?ExpectedProtocolError else void =
     if (builtin.is_test) null else {};
 
@@ -343,6 +353,7 @@ data_device: NeutralDataDevice,
 mature_data_device: WaylandDataDevice,
 data_device_observer: ?DataDeviceObserver = null,
 primary_selection_observer: ?PrimarySelectionObserver = null,
+data_control_observer: ?DataControlObserver = null,
 xdg_toplevel_drag: XdgToplevelDrag,
 xdg_toplevel_icon: XdgToplevelIcon,
 xdg_dialog: XdgDialog,
@@ -1634,6 +1645,8 @@ pub fn createWithVirtualOutput(
             .primary_mime_offered = primaryMimeOffered,
             .primary_offer_rolled_back = primaryOfferRolledBack,
             .primary_offer_mime_offered = primaryOfferMimeOffered,
+            .control_offer_rolled_back = dataControlOfferRolledBack,
+            .control_offer_mime_offered = dataControlOfferMimeOffered,
         },
     );
     errdefer self.data_device.deinit();
@@ -3967,6 +3980,10 @@ pub fn setDataDeviceObserver(self: *Self, observer: ?DataDeviceObserver) void {
 
 pub fn setPrimarySelectionObserver(self: *Self, observer: ?PrimarySelectionObserver) void {
     self.primary_selection_observer = observer;
+}
+
+pub fn setDataControlObserver(self: *Self, observer: ?DataControlObserver) void {
+    self.data_control_observer = observer;
 }
 
 /// Neutral XDG semantic owner used by unpublished generated adapters.
@@ -7751,11 +7768,26 @@ fn dataDeviceOfferRolledBack(context: *anyopaque, offer: NeutralDataDevice.Offer
         observer.offer_rolled_back(observer.context, offer);
 }
 
+fn dataControlOfferRolledBack(context: *anyopaque, offer: NeutralDataDevice.ControlOfferId) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.data_control_observer) |observer| observer.offer_rolled_back(observer.context, offer);
+}
+
+fn dataControlOfferMimeOffered(context: *anyopaque, offer: NeutralDataDevice.ControlOfferId, mime: []const u8) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.data_control_observer) |observer| observer.offer_mime_offered(observer.context, offer, mime);
+}
+
 fn dataDeviceTransactionFinalize(context: *anyopaque) error{OutOfMemory}!void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.data_device_observer) |observer| try observer.transaction_finalize(observer.context);
     if (self.primary_selection_observer) |observer| observer.transaction_finalize(observer.context) catch {
         if (self.data_device_observer) |data_observer| data_observer.transaction_abort(data_observer.context);
+        return error.OutOfMemory;
+    };
+    if (self.data_control_observer) |observer| observer.transaction_finalize(observer.context) catch {
+        if (self.data_device_observer) |data_observer| data_observer.transaction_abort(data_observer.context);
+        if (self.primary_selection_observer) |primary_observer| primary_observer.transaction_abort(primary_observer.context);
         return error.OutOfMemory;
     };
 }
@@ -7764,6 +7796,7 @@ fn dataDeviceTransactionCommit(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.data_device_observer) |observer| observer.transaction_commit(observer.context);
     if (self.primary_selection_observer) |observer| observer.transaction_commit(observer.context);
+    if (self.data_control_observer) |observer| observer.transaction_commit(observer.context);
 }
 
 fn dataDeviceTransactionAbort(context: *anyopaque) void {
@@ -7771,6 +7804,7 @@ fn dataDeviceTransactionAbort(context: *anyopaque) void {
     self.primary_selection.transactionAbort();
     if (self.data_device_observer) |observer| observer.transaction_abort(observer.context);
     if (self.primary_selection_observer) |observer| observer.transaction_abort(observer.context);
+    if (self.data_control_observer) |observer| observer.transaction_abort(observer.context);
 }
 
 fn dataDeviceOfferSourceActionsPreflight(context: *anyopaque, offer: NeutralDataDevice.OfferId, actions: NeutralDataDevice.Actions) error{OutOfMemory}!void {
@@ -17057,6 +17091,7 @@ const WayringSubsurfaceClient = struct {
 // registry and all configure state is delivered by libwayland-client.
 const WayringXdgClient = struct {
     const client_wl = wayland.client.wl;
+    const client_ext = wayland.client.ext;
     const client_xdg = wayland.client.xdg;
     const client_zxdg = wayland.client.zxdg;
     const Stage = enum(u8) {
@@ -17091,6 +17126,9 @@ const WayringXdgClient = struct {
     registry_watch_data_device: bool = false,
     registry_watch_primary_selection: bool = false,
     expect_text_input: bool = false,
+    expect_data_control: bool = false,
+    guessed_data_control_name: ?u32 = null,
+    guessed_data_control_bind_issued: bool = false,
     offense: ?Offense = null,
     activation_role: ?ActivationRole = null,
     activation_exchange: ?*ActivationExchange = null,
@@ -17104,6 +17142,7 @@ const WayringXdgClient = struct {
     wm_base: ?*client_xdg.WmBase = null,
     decoration_manager: ?*client_zxdg.DecorationManagerV1 = null,
     activation: ?*client_xdg.ActivationV1 = null,
+    data_control_manager: ?*client_ext.DataControlManagerV1 = null,
     global_count: usize = 0,
     globals_exact: bool = true,
     data_device_manager_count: usize = 0,
@@ -17116,6 +17155,10 @@ const WayringXdgClient = struct {
     primary_selection_manager_removed: bool = false,
     text_input_manager_count: usize = 0,
     text_input_manager_version: u32 = 0,
+    data_control_manager_count: usize = 0,
+    data_control_manager_version: u32 = 0,
+    data_control_manager_name: u32 = 0,
+    data_control_manager_removed: bool = false,
     generated_input_method_seen: bool = false,
     generated_virtual_keyboard_seen: bool = false,
     configure_serial: u32 = 0,
@@ -17161,10 +17204,12 @@ const WayringXdgClient = struct {
         .{ .name = "wl_data_device_manager", .version = 4 },
         .{ .name = "zwp_primary_selection_device_manager_v1", .version = 1 },
         .{ .name = "zwp_text_input_manager_v3", .version = 2 },
+        .{ .name = "ext_data_control_manager_v1", .version = 1 },
     };
 
     fn expectedGlobalCount(self: *const @This()) usize {
-        return expected_globals.len - @intFromBool(!self.expect_text_input);
+        return expected_globals.len - @intFromBool(!self.expect_text_input) -
+            @intFromBool(!self.expect_data_control);
     }
 
     fn run(self: *@This()) void {
@@ -17202,6 +17247,9 @@ const WayringXdgClient = struct {
         registry.setListener(*@This(), registryEvent, self);
         try expectClientRoundtrip(display);
         if (!self.globals_exact or self.global_count != self.expectedGlobalCount()) return error.UnexpectedRegistrySnapshot;
+        // A bind emitted from the registry callback follows the first sync.
+        // Materialize it before a test is allowed to unpublish the global.
+        if (self.data_control_manager != null) try expectClientRoundtrip(display);
         const compositor = self.compositor orelse return error.CompositorMissing;
         const shm = self.shm orelse return error.ShmMissing;
         const output = self.output orelse return error.OutputMissing;
@@ -17220,11 +17268,33 @@ const WayringXdgClient = struct {
         const activation = self.activation orelse return error.ActivationMissing;
         var activation_live = true;
         defer if (activation_live) activation.destroy();
+        defer if (self.data_control_manager) |manager| manager.destroy();
         if (self.registry_only) {
             try self.pause(.registry_ready);
+            if (self.guessed_data_control_name) |name| {
+                // Materialize any publication that occurred while paused and
+                // prove the restricted global remained absent before trying
+                // to bypass registry visibility with its guessed name.
+                try expectClientRoundtrip(display);
+                if (!self.globals_exact or self.global_count != self.expectedGlobalCount() or
+                    self.data_control_manager_count != 0 or self.data_control_manager != null)
+                    return error.RestrictedGlobalAdvertised;
+                try self.pause(.manager_added);
+                // Deliberately bypass registry visibility. The server must
+                // terminalize this connection rather than materialize a
+                // restricted manager for a derived transport.
+                self.data_control_manager = try registry.bind(name, client_ext.DataControlManagerV1, 1);
+                self.guessed_data_control_bind_issued = true;
+                expectClientRoundtrip(display) catch return;
+                return error.RestrictedGlobalBindAccepted;
+            }
             if (self.registry_watch_data_device) {
                 try expectClientRoundtrip(display);
                 if (!self.data_device_manager_removed) return error.DataDeviceManagerRemovalMissing;
+                if (self.data_control_manager) |manager| {
+                    manager.destroy();
+                    self.data_control_manager = null;
+                }
                 try self.pause(.manager_removed);
             } else if (self.registry_watch_primary_selection) {
                 try expectClientRoundtrip(display);
@@ -17243,7 +17313,9 @@ const WayringXdgClient = struct {
             output_live = false;
             registry.destroy();
             registry_live = false;
-            try expectClientRoundtrip(display);
+            // Do not require a final sync after globals have been withdrawn:
+            // disconnect is the authoritative cleanup path, and a concurrent
+            // denied peer may already have terminalized its own transport.
             return;
         }
 
@@ -17458,6 +17530,11 @@ const WayringXdgClient = struct {
                 if (std.mem.eql(u8, interface, "zwp_text_input_manager_v3")) {
                     self.text_input_manager_count += 1;
                     self.text_input_manager_version = global.version;
+                } else if (std.mem.eql(u8, interface, "ext_data_control_manager_v1")) {
+                    self.data_control_manager_count += 1;
+                    self.data_control_manager_version = global.version;
+                    self.data_control_manager_name = global.name;
+                    self.data_control_manager = registry.bind(global.name, client_ext.DataControlManagerV1, 1) catch null;
                 } else if (std.mem.eql(u8, interface, "zwp_input_method_manager_v2")) {
                     self.generated_input_method_seen = true;
                 } else if (std.mem.eql(u8, interface, "zwp_virtual_keyboard_manager_v1")) {
@@ -17474,6 +17551,8 @@ const WayringXdgClient = struct {
                     self.data_device_manager_removed = true;
                 if (removed.name == self.primary_selection_manager_name)
                     self.primary_selection_manager_removed = true;
+                if (removed.name == self.data_control_manager_name)
+                    self.data_control_manager_removed = true;
             },
         }
     }
@@ -19610,6 +19689,272 @@ const GeneratedClipboardClient = struct {
     }
 };
 
+/// Direct libwayland-client coverage for the privileged EXT data-control
+/// bridge. This client deliberately owns both sides of each transfer so the
+/// test can verify descriptor ownership and per-device offer fanout without
+/// involving focus, surfaces, or serials.
+const GeneratedDataControlClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_ext = wayland.client.ext;
+    const Stage = enum(u8) { starting, ready, selected, transferred, replaced, cleared, released, disconnected, failed };
+    const Channel = enum { regular, primary };
+    const regular_mime: [:0]const u8 = "text/plain";
+    const primary_mime: [:0]const u8 = "text/x-keywork-primary";
+    const regular_bytes = "generated data-control regular\n";
+    const primary_bytes = "generated data-control primary\n";
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    seat: ?*client_wl.Seat = null,
+    manager: ?*client_ext.DataControlManagerV1 = null,
+    manager_count: usize = 0,
+    manager_version: u32 = 0,
+    devices: [2]?*client_ext.DataControlDeviceV1 = .{ null, null },
+    pending: [2]?*client_ext.DataControlOfferV1 = .{ null, null },
+    offers: [2][2]?*client_ext.DataControlOfferV1 = @splat(@splat(null)),
+    data_offer_count: usize = 0,
+    mime_count: usize = 0,
+    selection_count: usize = 0,
+    primary_selection_count: usize = 0,
+    null_selection_count: usize = 0,
+    null_primary_count: usize = 0,
+    regular_send_count: usize = 0,
+    primary_send_count: usize = 0,
+    regular_cancelled_count: usize = 0,
+    primary_cancelled_count: usize = 0,
+    initial_offer_count: usize = 0,
+    received_regular: [64]u8 = undefined,
+    received_regular_len: usize = 0,
+    received_primary: [64]u8 = undefined,
+    received_primary_len: usize = 0,
+    regular_source: ?*client_ext.DataControlSourceV1 = null,
+    primary_source: ?*client_ext.DataControlSourceV1 = null,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}/{s}", .{ self.runtime_directory, self.display_name }, 0);
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        if (self.manager_count != 1 or self.manager_version != 1) return error.DataControlGlobalMismatch;
+        const seat = self.seat orelse return error.SeatMissing;
+        defer seat.release();
+        const manager = self.manager orelse return error.DataControlManagerMissing;
+        defer manager.destroy();
+        for (0..2) |index| {
+            const device = try manager.getDataDevice(seat);
+            self.devices[index] = device;
+            device.setListener(*@This(), deviceEvent, self);
+        }
+        try expectClientRoundtrip(display);
+        if (self.null_selection_count != 2 or self.null_primary_count != 2) return error.InitialDataControlStateMissing;
+        self.null_selection_count = 0;
+        self.null_primary_count = 0;
+        try self.pause(.ready);
+
+        const regular = try manager.createDataSource();
+        self.regular_source = regular;
+        regular.setListener(*@This(), sourceEvent, self);
+        regular.offer(regular_mime);
+        const primary = try manager.createDataSource();
+        self.primary_source = primary;
+        primary.setListener(*@This(), sourceEvent, self);
+        primary.offer(primary_mime);
+        self.devices[0].?.setSelection(regular);
+        self.devices[0].?.setPrimarySelection(primary);
+        try expectClientRoundtrip(display);
+        if (self.data_offer_count != 4 or self.mime_count != 4 or self.selection_count != 2 or self.primary_selection_count != 2)
+            return error.DataControlFanoutMissing;
+        for (self.offers) |pair| if (pair[0] == null or pair[1] == null or pair[0] == pair[1])
+            return error.DataControlOfferIdentityMissing;
+        self.initial_offer_count = self.data_offer_count;
+        try self.pause(.selected);
+
+        // EXT explicitly keeps offers alive independently of their device.
+        self.devices[0].?.destroy();
+        self.devices[0] = null;
+        var regular_pipe: [2]std.posix.fd_t = undefined;
+        var primary_pipe: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&regular_pipe) != 0 or std.c.pipe(&primary_pipe) != 0) return error.PipeFailed;
+        var regular_read_open = true;
+        var primary_read_open = true;
+        defer if (regular_read_open) {
+            _ = std.os.linux.close(regular_pipe[0]);
+        };
+        defer if (primary_read_open) {
+            _ = std.os.linux.close(primary_pipe[0]);
+        };
+        self.offers[0][0].?.receive(regular_mime, regular_pipe[1]);
+        try closeMatureTransferFd(regular_pipe[1]);
+        self.offers[1][1].?.receive(primary_mime, primary_pipe[1]);
+        try closeMatureTransferFd(primary_pipe[1]);
+        try expectClientRoundtrip(display);
+        if (self.failure) |err| return err;
+        self.received_regular_len = try readMatureTransfer(regular_pipe[0], &self.received_regular);
+        try closeMatureTransferFd(regular_pipe[0]);
+        regular_read_open = false;
+        self.received_primary_len = try readMatureTransfer(primary_pipe[0], &self.received_primary);
+        try closeMatureTransferFd(primary_pipe[0]);
+        primary_read_open = false;
+        if (!std.mem.eql(u8, self.received_regular[0..self.received_regular_len], regular_bytes) or
+            !std.mem.eql(u8, self.received_primary[0..self.received_primary_len], primary_bytes))
+            return error.DataControlPayloadMismatch;
+        try self.pause(.transferred);
+
+        const replacement_regular = try manager.createDataSource();
+        replacement_regular.setListener(*@This(), sourceEvent, self);
+        replacement_regular.offer(regular_mime);
+        const replacement_primary = try manager.createDataSource();
+        replacement_primary.setListener(*@This(), sourceEvent, self);
+        replacement_primary.offer(primary_mime);
+        self.devices[1].?.setSelection(replacement_regular);
+        self.devices[1].?.setPrimarySelection(replacement_primary);
+        try expectClientRoundtrip(display);
+        if (self.regular_cancelled_count != 1 or self.primary_cancelled_count != 1) return error.DataControlCancellationMissing;
+        try self.pause(.replaced);
+        self.devices[1].?.setSelection(null);
+        self.devices[1].?.setPrimarySelection(null);
+        try expectClientRoundtrip(display);
+        if (self.null_selection_count != 1 or self.null_primary_count != 1) return error.DataControlClearMissing;
+        try self.pause(.cleared);
+
+        for (&self.offers) |*pair| for (pair) |*offer| if (offer.*) |value| {
+            value.destroy();
+            offer.* = null;
+        };
+        self.devices[1].?.destroy();
+        self.devices[1] = null;
+        regular.destroy();
+        primary.destroy();
+        replacement_regular.destroy();
+        replacement_primary.destroy();
+        self.regular_source = null;
+        self.primary_source = null;
+        try expectClientRoundtrip(display);
+        try self.pause(.released);
+    }
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null else if (std.mem.eql(u8, interface, "ext_data_control_manager_v1")) {
+                    self.manager_count += 1;
+                    self.manager_version = global.version;
+                    self.manager = registry.bind(global.name, client_ext.DataControlManagerV1, 1) catch null;
+                }
+            },
+            .global_remove => {},
+        }
+    }
+    fn deviceIndex(self: *@This(), device: *client_ext.DataControlDeviceV1) ?usize {
+        for (self.devices, 0..) |candidate, index| if (candidate == device) return index;
+        return null;
+    }
+    fn deviceEvent(device: *client_ext.DataControlDeviceV1, event: client_ext.DataControlDeviceV1.Event, self: *@This()) void {
+        const index = self.deviceIndex(device) orelse return;
+        switch (event) {
+            .data_offer => |data| {
+                self.pending[index] = data.id;
+                data.id.setListener(*@This(), offerEvent, self);
+                self.data_offer_count += 1;
+            },
+            .selection => |selection| {
+                if (selection.id) |offer| {
+                    if (self.offers[index][0]) |old| if (old != offer) old.destroy();
+                    self.offers[index][0] = offer;
+                    self.selection_count += 1;
+                } else self.null_selection_count += 1;
+                self.pending[index] = null;
+            },
+            .primary_selection => |selection| {
+                if (selection.id) |offer| {
+                    if (self.offers[index][1]) |old| if (old != offer) old.destroy();
+                    self.offers[index][1] = offer;
+                    self.primary_selection_count += 1;
+                } else self.null_primary_count += 1;
+                self.pending[index] = null;
+            },
+            .finished => {},
+        }
+    }
+    fn offerEvent(_: *client_ext.DataControlOfferV1, event: client_ext.DataControlOfferV1.Event, self: *@This()) void {
+        switch (event) {
+            .offer => self.mime_count += 1,
+        }
+    }
+    fn sourceEvent(source: *client_ext.DataControlSourceV1, event: client_ext.DataControlSourceV1.Event, self: *@This()) void {
+        const channel: Channel = if (source == self.regular_source) .regular else .primary;
+        switch (event) {
+            .send => |send| {
+                if (std.c.fcntl(send.fd, std.posix.F.GETFD) < 0) {
+                    self.failure = error.DataControlSendFdClosed;
+                    return;
+                }
+                const bytes = if (channel == .regular) regular_bytes else primary_bytes;
+                if (std.c.write(send.fd, bytes.ptr, bytes.len) != bytes.len) {
+                    self.failure = error.DataControlSendFailed;
+                }
+                closeMatureTransferFd(send.fd) catch |err| {
+                    if (self.failure == null) self.failure = err;
+                    return;
+                };
+                if (self.failure != null) return;
+                if (channel == .regular) self.regular_send_count += 1 else self.primary_send_count += 1;
+            },
+            .cancelled => {
+                if (channel == .regular) {
+                    self.regular_cancelled_count += 1;
+                } else self.primary_cancelled_count += 1;
+            },
+        }
+    }
+    fn pause(self: *@This(), value: Stage) !void {
+        self.stage.store(@intFromEnum(value), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+    fn closeWake(self: *@This(), shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(-2, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+    fn shutdown(self: *@This()) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
 /// Independent generated client that proves a terminal data-device fault is
 /// isolated by the production host from valid clipboard peers.
 const GeneratedDragOffender = struct {
@@ -20952,6 +21297,23 @@ fn waitForClipboardStage(server: *Self, host: anytype, client: anytype, expected
     });
     std.debug.print("clipboard events: {d}, serial: {d}\n", .{ client.event_count, client.keyboard_serial });
     return error.ClipboardClientTimedOut;
+}
+
+fn waitForDataControlStage(
+    server: *Self,
+    host: anytype,
+    client: *GeneratedDataControlClient,
+    expected: GeneratedDataControlClient.Stage,
+) !void {
+    for (0..2_000) |_| {
+        const stage: GeneratedDataControlClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure orelse error.GeneratedDataControlClientFailed;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    }
+    return error.GeneratedDataControlClientTimedOut;
 }
 
 fn waitForPrimaryStage(server: *Self, host: anytype, client: anytype, expected: GeneratedPrimaryClient.Stage) !void {
@@ -22694,6 +23056,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
 
 test "production generated data device completes the exact profile and supports unpublish" {
     const WayringHost = @import("wayland/WayringHost.zig");
+    const WayringDataControl = @import("wayland/WayringDataControl.zig");
     const WayringTextInput = @import("wayland/WayringTextInput.zig");
     const wayring = @import("wayring");
     const linux = std.os.linux;
@@ -22903,10 +23266,37 @@ test "production generated data device completes the exact profile and supports 
         text_input.deinit();
     }
     try text_input.publish();
+    var data_control: WayringDataControl = undefined;
+    data_control.init(
+        std.testing.allocator,
+        &protocol_server,
+        &clients,
+        &seat,
+        server.neutralDataDevice(),
+        linux.getuid(),
+    );
+    defer {
+        if (data_control.global != null) data_control.unpublish();
+        data_control.deinit();
+    }
+    protocol_server.setGlobalFilter(WayringDataControl, &data_control, WayringDataControl.globalFilter);
+    defer protocol_server.clearGlobalFilter();
+    server.setDataControlObserver(.{
+        .context = &data_control,
+        .transaction_finalize = WayringDataControl.transactionFinalize,
+        .transaction_commit = WayringDataControl.transactionCommit,
+        .transaction_abort = WayringDataControl.transactionAbort,
+        .offer_rolled_back = WayringDataControl.offerRolledBack,
+        .offer_mime_offered = WayringDataControl.offerMimeOffered,
+    });
+    defer server.setDataControlObserver(null);
+    // Privileged data-control is the final production global.
+    try data_control.publish();
 
     const Lifecycle = struct {
         const FatalEvidence = struct {
             kind: wayring.server.Fatal.Kind,
+            transport_provenance: wayring.server.Client.TransportProvenance,
             object_id: u32,
             opcode: ?u16,
             protocol_code: ?u32,
@@ -22933,25 +23323,40 @@ test "production generated data device completes the exact profile and supports 
         data_device: *WayringDataDevice,
         primary_selection: *WayringPrimarySelection,
         text_input: *WayringTextInput,
+        data_control: *WayringDataControl,
         generated_client: ?ClientRegistry.Id = null,
         generated_raw: ?*wayring.server.Client = null,
         offender_fatal: ?FatalEvidence = null,
+        denied_fatal: ?FatalEvidence = null,
         fatal_count: usize = 0,
 
         fn accepted(context: *anyopaque, client: *wayring.server.Client) !void {
             const self: *@This() = @ptrCast(@alignCast(context));
-            self.generated_raw = client;
-            self.generated_client = try self.clients.register(client);
+            const id = try self.clients.register(client);
             errdefer self.clients.unregister(client);
+            // Derived transports participate in shared protocol cleanup but
+            // must not replace the direct-client handle used by later phases.
+            if (client.transportProvenance() == .direct) {
+                self.generated_raw = client;
+                self.generated_client = id;
+            }
             try self.seat.trackClient(client);
         }
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
-            if (client.fatal()) |fatal| if (fatal.kind == .implementation) {
-                self.fatal_count += 1;
-                if (self.offender_fatal == null) {
+            if (client.fatal()) |fatal| {
+                const provenance = client.transportProvenance();
+                const destination: ?*?FatalEvidence = if (provenance == .security_context)
+                    &self.denied_fatal
+                else if (fatal.kind == .implementation)
+                    &self.offender_fatal
+                else
+                    null;
+                if (fatal.kind == .implementation) self.fatal_count += 1;
+                if (destination) |evidence_slot| if (evidence_slot.* == null) {
                     var evidence: FatalEvidence = .{
                         .kind = fatal.kind,
+                        .transport_provenance = provenance,
                         .object_id = fatal.object_id,
                         .opcode = fatal.opcode,
                         .protocol_code = fatal.protocol_code,
@@ -22961,9 +23366,10 @@ test "production generated data device completes the exact profile and supports 
                     const detail = fatal.detail();
                     @memcpy(evidence.detail_buffer[0..detail.len], detail);
                     evidence.detail_len = detail.len;
-                    self.offender_fatal = evidence;
-                }
-            };
+                    evidence_slot.* = evidence;
+                };
+            }
+            self.data_control.destroyClientResources(client);
             self.text_input.destroyClientResources(client);
             self.data_device.destroyClientResources(client);
             self.primary_selection.destroyClientResources(client);
@@ -22994,6 +23400,7 @@ test "production generated data device completes the exact profile and supports 
         .data_device = &data_device,
         .primary_selection = &primary_selection,
         .text_input = &text_input,
+        .data_control = &data_control,
     };
     const host = try WayringHost.create(
         std.testing.allocator,
@@ -23020,6 +23427,7 @@ test "production generated data device completes the exact profile and supports 
         .registry_only = true,
         .registry_watch_data_device = true,
         .expect_text_input = true,
+        .expect_data_control = true,
     };
     const thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&peer});
     var joined = false;
@@ -23036,16 +23444,93 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(u32, 1), peer.primary_selection_manager_version);
     try std.testing.expectEqual(@as(usize, 1), peer.text_input_manager_count);
     try std.testing.expectEqual(@as(u32, 2), peer.text_input_manager_version);
+    try std.testing.expectEqual(@as(usize, 1), peer.data_control_manager_count);
+    try std.testing.expectEqual(@as(u32, 1), peer.data_control_manager_version);
     try std.testing.expect(!peer.generated_input_method_seen);
     try std.testing.expect(!peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
 
+    // A same-UID security-context transport gets the public registry but not
+    // the privileged data-control global. Keep the direct peer connected so a
+    // guessed bind also proves that protocol terminalization is isolated.
+    const denied_host = try WayringHost.createWithOptions(
+        std.testing.allocator,
+        server.eventLoop(),
+        &protocol_server,
+        runtime_directory,
+        .{
+            .context = &lifecycle,
+            .accepted = Lifecycle.accepted,
+            .destroy_resources = Lifecycle.destroy,
+        },
+        .{ .transport_provenance = .security_context },
+    );
+    var denied_host_live = true;
+    defer if (denied_host_live) denied_host.destroy() catch {};
+    const raw_denied_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_denied_command) != .SUCCESS) return error.EventFdFailed;
+    const denied_command: std.posix.fd_t = @intCast(raw_denied_command);
+    defer _ = linux.close(denied_command);
+    var denied: WayringXdgClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = denied_host.displayName(),
+        .command_fd = denied_command,
+        .registry_only = true,
+        .expect_text_input = true,
+    };
+    const denied_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied});
+    var denied_joined = false;
+    defer if (!denied_joined) {
+        denied.shutdown();
+        denied_thread.join();
+    };
+    try waitForWayringXdgStage(server, denied_host, &denied, .registry_ready);
+    try std.testing.expect(denied.globals_exact);
+    try std.testing.expectEqual(@as(usize, 14), denied.global_count);
+    try std.testing.expectEqual(@as(usize, 0), denied.data_control_manager_count);
+    const before_denied_bind = server.dataDeviceResourceSnapshot();
+    const restricted_name = peer.data_control_manager_name;
+    data_control.unpublish();
+    try data_control.publish();
+    // Global names are allocated monotonically by the protocol server. No
+    // other publication occurs between these two operations.
+    denied.guessed_data_control_name = restricted_name + 1;
+    try signalWayringCommand(denied_command);
+    try waitForWayringXdgStage(server, denied_host, &denied, .manager_added);
+    try std.testing.expect(denied.globals_exact);
+    try std.testing.expectEqual(@as(usize, 14), denied.global_count);
+    try std.testing.expectEqual(@as(usize, 0), denied.data_control_manager_count);
+    try std.testing.expect(denied.data_control_manager == null);
+    const managers_before_denied_bind = data_control.managers.items.len;
+    try signalWayringCommand(denied_command);
+    try waitForWayringXdgStage(server, denied_host, &denied, .disconnected);
+    denied_thread.join();
+    denied_joined = true;
+    try std.testing.expect(denied.guessed_data_control_bind_issued);
+    try std.testing.expectEqual(managers_before_denied_bind, data_control.managers.items.len);
+    const denied_fatal = lifecycle.denied_fatal orelse return error.RestrictedBindFatalMissing;
+    try std.testing.expectEqual(wayring.server.Client.TransportProvenance.security_context, denied_fatal.transport_provenance);
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.protocol, denied_fatal.kind);
+    try std.testing.expectEqual(@as(?u32, 0), denied_fatal.protocol_code);
+    try std.testing.expect(denied_fatal.interface != null);
+    try std.testing.expectEqualStrings("wl_registry", denied_fatal.interface.?.name);
+    try std.testing.expectEqualStrings("invalid wl_registry.bind", denied_fatal.detail());
+    try std.testing.expectEqual(before_denied_bind, server.dataDeviceResourceSnapshot());
+    try std.testing.expectEqual(
+        WayringXdgClient.Stage.registry_ready,
+        @as(WayringXdgClient.Stage, @enumFromInt(peer.stage.load(.acquire))),
+    );
+    try denied_host.destroy();
+    denied_host_live = false;
+
+    data_control.unpublish();
     text_input.unpublish();
     primary_selection.unpublish();
     data_device.unpublish();
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .manager_removed);
     try std.testing.expect(peer.data_device_manager_removed);
+    try std.testing.expect(peer.data_control_manager_removed);
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .disconnected);
     thread.join();
@@ -23058,6 +23543,66 @@ test "production generated data device completes the exact profile and supports 
     try data_device.publish();
     try primary_selection.publish();
     try text_input.publish();
+    try data_control.publish();
+
+    const control_regular_resource_baseline = server.neutralDataDevice().resourceCounts();
+    const control_primary_resource_baseline = server.neutralDataDevice().primaryResourceCounts();
+    const control_resource_baseline = server.neutralDataDevice().controlResourceCounts();
+    const raw_control_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_control_command) != .SUCCESS) return error.EventFdFailed;
+    const control_command: std.posix.fd_t = @intCast(raw_control_command);
+    defer _ = linux.close(control_command);
+    const control_fd_baseline = try countMatureDataDeviceFds();
+    var control_client: GeneratedDataControlClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = control_command,
+    };
+    const control_thread = try std.Thread.spawn(.{}, GeneratedDataControlClient.run, .{&control_client});
+    var control_joined = false;
+    defer if (!control_joined) {
+        control_client.shutdown();
+        control_thread.join();
+    };
+    try waitForDataControlStage(server, host, &control_client, .ready);
+    try std.testing.expectEqual(@as(usize, 1), host.connectionCount());
+    try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
+    try signalWayringCommand(control_command);
+    try waitForDataControlStage(server, host, &control_client, .selected);
+    try std.testing.expectEqual(@as(usize, 4), control_client.initial_offer_count);
+    try std.testing.expectEqual(@as(usize, 4), control_client.mime_count);
+    try signalWayringCommand(control_command);
+    try waitForDataControlStage(server, host, &control_client, .transferred);
+    try std.testing.expectEqual(@as(usize, 1), control_client.regular_send_count);
+    try std.testing.expectEqual(@as(usize, 1), control_client.primary_send_count);
+    try std.testing.expectEqualStrings(GeneratedDataControlClient.regular_bytes, control_client.received_regular[0..control_client.received_regular_len]);
+    try std.testing.expectEqualStrings(GeneratedDataControlClient.primary_bytes, control_client.received_primary[0..control_client.received_primary_len]);
+    try signalWayringCommand(control_command);
+    try waitForDataControlStage(server, host, &control_client, .replaced);
+    try std.testing.expectEqual(@as(usize, 1), control_client.regular_cancelled_count);
+    try std.testing.expectEqual(@as(usize, 1), control_client.primary_cancelled_count);
+    try signalWayringCommand(control_command);
+    try waitForDataControlStage(server, host, &control_client, .cleared);
+    try std.testing.expectEqual(@as(usize, 1), control_client.null_selection_count);
+    try std.testing.expectEqual(@as(usize, 1), control_client.null_primary_count);
+    try signalWayringCommand(control_command);
+    try waitForDataControlStage(server, host, &control_client, .released);
+    try signalWayringCommand(control_command);
+    try waitForDataControlStage(server, host, &control_client, .disconnected);
+    control_thread.join();
+    control_joined = true;
+    for (0..2_000) |_| {
+        if (host.connectionCount() == 0 and server.client_registry.len() == client_baseline and
+            std.meta.eql(server.neutralDataDevice().resourceCounts(), control_regular_resource_baseline) and
+            std.meta.eql(server.neutralDataDevice().primaryResourceCounts(), control_primary_resource_baseline) and
+            std.meta.eql(server.neutralDataDevice().controlResourceCounts(), control_resource_baseline) and
+            !server.neutralDataDevice().hasSelection() and !server.neutralDataDevice().hasPrimarySelection()) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedDataControlCleanupTimedOut;
+    try std.testing.expectEqual(control_fd_baseline, try countMatureDataDeviceFds());
+
     const primary_resource_baseline = server.neutralDataDevice().primaryResourceCounts();
     const raw_generated_primary_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     const raw_mature_primary_command = linux.eventfd(0, linux.EFD.CLOEXEC);
@@ -23251,6 +23796,7 @@ test "production generated data device completes the exact profile and supports 
         .registry_only = true,
         .registry_watch_primary_selection = true,
         .expect_text_input = true,
+        .expect_data_control = true,
     };
     const primary_watch_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_watch});
     var primary_watch_joined = false;
@@ -23261,6 +23807,7 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringXdgStage(server, host, &primary_watch, .registry_ready);
     try std.testing.expect(primary_watch.globals_exact);
     try std.testing.expectEqual(@as(usize, 1), primary_watch.primary_selection_manager_count);
+    data_control.unpublish();
     text_input.unpublish();
     primary_selection.unpublish();
     try signalWayringCommand(primary_watch_command);
@@ -23274,6 +23821,7 @@ test "production generated data device completes the exact profile and supports 
 
     try primary_selection.publish();
     try text_input.publish();
+    try data_control.publish();
     const raw_primary_rebind_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_primary_rebind_command) != .SUCCESS) return error.EventFdFailed;
     const primary_rebind_command: std.posix.fd_t = @intCast(raw_primary_rebind_command);
@@ -23284,6 +23832,7 @@ test "production generated data device completes the exact profile and supports 
         .command_fd = primary_rebind_command,
         .registry_only = true,
         .expect_text_input = true,
+        .expect_data_control = true,
     };
     const primary_rebind_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_rebind});
     var primary_rebind_joined = false;

@@ -336,21 +336,35 @@ pub const Server = struct {
     prefer_send: bool = true,
     connection_cursor: usize = 0,
     shutting_down: bool = false,
+    transport_provenance: server.Client.TransportProvenance = .unknown,
+
+    pub const Options = struct {
+        transport_provenance: server.Client.TransportProvenance = .unknown,
+    };
 
     /// Takes ownership of an already-bound, listening Unix socket descriptor.
     pub fn init(allocator: std.mem.Allocator, sans_io: *server.Server, listener_fd: linux.fd_t) !Server {
+        return initWithOptions(allocator, sans_io, listener_fd, .{});
+    }
+
+    pub fn initWithOptions(allocator: std.mem.Allocator, sans_io: *server.Server, listener_fd: linux.fd_t, options: Options) !Server {
         if (listener_fd < 0) return error.InvalidListener;
         return .{
             .allocator = allocator,
             .sans_io = sans_io,
             .listener_fd = listener_fd,
             .operations = .init(allocator),
+            .transport_provenance = options.transport_provenance,
         };
     }
 
     /// Creates and owns the first available `wayland-N` listener in an
     /// explicit runtime directory. Existing paths are never removed.
     pub fn listenAuto(allocator: std.mem.Allocator, sans_io: *server.Server, runtime_directory: []const u8) !Server {
+        return listenAutoWithOptions(allocator, sans_io, runtime_directory, .{});
+    }
+
+    pub fn listenAutoWithOptions(allocator: std.mem.Allocator, sans_io: *server.Server, runtime_directory: []const u8, options: Options) !Server {
         if (!std.fs.path.isAbsolute(runtime_directory)) return error.InvalidRuntimeDirectory;
         var name_buffer: ["wayland-".len + 10]u8 = undefined;
         for (0..max_auto_socket_number + 1) |number| {
@@ -368,6 +382,7 @@ pub const Server = struct {
                 .owned_socket_path = path,
                 .owned_socket_name = path[path.len - name.len ..],
                 .operations = .init(allocator),
+                .transport_provenance = options.transport_provenance,
             };
         }
         return error.NoAvailableSocketName;
@@ -603,7 +618,10 @@ pub const Server = struct {
         const credentials = try peerCredentials(fd);
         const connection = try self.allocator.create(Connection);
         errdefer self.allocator.destroy(connection);
-        const core = try server.CoreClient.create(self.allocator, self.sans_io, .{ .credentials = credentials });
+        const core = try server.CoreClient.create(self.allocator, self.sans_io, .{
+            .credentials = credentials,
+            .transport_provenance = self.transport_provenance,
+        });
         errdefer core.destroy();
         connection.* = .{ .fd = fd, .core = core };
         try self.connections.append(self.allocator, connection);
@@ -964,6 +982,7 @@ test "accepted connection is stable and requires explicit release" {
     try std.testing.expectEqual(linux.getpid(), credentials.pid);
     try std.testing.expectEqual(linux.getuid(), credentials.uid);
     try std.testing.expectEqual(linux.getgid(), credentials.gid);
+    try std.testing.expectEqual(server.Client.TransportProvenance.unknown, connection.client().transportProvenance());
     try std.testing.expectError(error.ConnectionsLive, transport.deinit());
     const interface: wire.Interface = .{ .name = "test_application", .version = 1 };
     var resource: server.Resource = .init(std.testing.allocator, 2, 1, &interface, &.{}, .client, connection.client().ownerHooks());
@@ -972,6 +991,23 @@ test "accepted connection is stable and requires explicit release" {
     try std.testing.expect(linux.fcntl(accepted, linux.F.GETFD, 0) <= std.math.maxInt(isize));
     resource.destroy();
     resource.deinit();
+    try transport.release(connection);
+    try transport.deinit();
+}
+
+test "accepted connections snapshot server-assigned security provenance" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const listener: linux.fd_t = @intCast(linux.dup(0));
+    var transport = try Server.initWithOptions(std.testing.allocator, &host, listener, .{
+        .transport_provenance = .security_context,
+    });
+    const connection = (try transport.completeAccept(try testPeerSocket())).accepted;
+    try std.testing.expectEqual(
+        server.Client.TransportProvenance.security_context,
+        connection.client().transportProvenance(),
+    );
+    try std.testing.expectEqual(linux.getuid(), connection.client().credentials().?.uid);
     try transport.release(connection);
     try transport.deinit();
 }
