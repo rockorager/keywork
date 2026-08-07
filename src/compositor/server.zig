@@ -888,6 +888,8 @@ const WindowTransition = struct {
     target: ?WindowAnimation.Snapshot = null,
     target_dirty: bool = false,
     coordinated: bool = false,
+    // Split-coordinated transitions slide at full opacity; centered 0 <-> 1 transitions fade.
+    opacity_transition: bool = true,
     detached: bool = false,
     effects: ?Scene.Effects = null,
     borders: ?Scene.Borders = null,
@@ -4557,6 +4559,7 @@ const WindowMotion = struct {
     rect: WindowAnimation.Rect,
     duration: u64,
     easing: WindowAnimation.Easing,
+    opacity_transition: bool,
 };
 
 fn windowReflowIndex(
@@ -4594,12 +4597,14 @@ fn windowAppearanceMotion(
             .rect = WindowAnimation.splitCollapsedRect(reflow.target_rect, target_rect),
             .duration = reflow.duration,
             .easing = reflow.easing,
+            .opacity_transition = false,
         };
     };
     return .{
         .rect = WindowAnimation.appearanceStart(target_rect),
         .duration = WindowAnimation.fast_duration_nanoseconds,
         .easing = .entrance,
+        .opacity_transition = true,
     };
 }
 
@@ -4615,12 +4620,14 @@ fn windowDisappearanceMotion(
             .rect = WindowAnimation.splitCollapsedRect(reflow.old_rect, closing_rect),
             .duration = reflow.duration,
             .easing = reflow.easing,
+            .opacity_transition = false,
         };
     };
     return .{
         .rect = WindowAnimation.appearanceStart(closing_rect),
         .duration = WindowAnimation.fast_duration_nanoseconds,
         .easing = .exit,
+        .opacity_transition = true,
     };
 }
 
@@ -4638,6 +4645,7 @@ fn refreshWindowDisappearanceTargets(self: *Self, output_id: OutputLayout.Id) vo
         self.window_transitions.items[index].target_rect = motion.rect;
         self.window_transitions.items[index].duration = motion.duration;
         self.window_transitions.items[index].easing = motion.easing;
+        self.window_transitions.items[index].opacity_transition = motion.opacity_transition;
     }
 }
 
@@ -4677,6 +4685,7 @@ fn geometryTransitionAppeared(
         .buffer_update_required = false,
         .old = old,
         .coordinated = appearance.coordinated,
+        .opacity_transition = motion.opacity_transition,
         .phase = .target_pending,
         .start = nowNanoseconds(self.io),
         .duration = motion.duration,
@@ -4732,6 +4741,7 @@ fn geometryTransitionClosing(
         .old = old,
         .target = transparent,
         .coordinated = closure.coordinated,
+        .opacity_transition = motion.opacity_transition,
         .detached = true,
         .effects = window.effects,
         .borders = window.borders,
@@ -9514,7 +9524,9 @@ fn renderWindowTransition(
         )
     else
         0;
-    const opacity = switch (transition.kind) {
+    const opacity = if (!transition.opacity_transition)
+        std.math.maxInt(u32)
+    else switch (transition.kind) {
         .reflow => std.math.maxInt(u32),
         .appearance => WindowAnimation.appearanceProgress(
             transition.start,
