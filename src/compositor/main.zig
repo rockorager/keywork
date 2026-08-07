@@ -27,6 +27,7 @@ const wayring = @import("wayring");
 
 comptime {
     _ = @import("DataDevice.zig");
+    _ = @import("TextInput.zig");
 }
 
 pub const std_options: std.Options = .{
