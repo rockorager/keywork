@@ -310,7 +310,8 @@ fn createSurface(self: *Self, manager: *zwlr.LayerShellV1, r: anytype) CreateErr
     const id = self.states.insert(self.allocator, .{ .adapter = adapter, .core_id = core_id, .surface_id = surface.handle(), .scene_id = scene_id }) catch return error.OutOfMemory;
     adapter.* = .{ .shell = self, .id = id, .resource = null, .surface = surface };
     const protocol = zwlr.LayerSurfaceV1.create(manager.getClient(), manager.getVersion(), r.id) catch {
-        self.remove(id);
+        var unpublished = self.states.remove(id).?;
+        unpublished.serials.deinit(self.allocator);
         return error.OutOfMemory;
     };
     adapter.resource = protocol;

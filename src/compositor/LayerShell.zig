@@ -254,7 +254,6 @@ pub fn applyCommit(self: *LayerShell, id: LayerSurfaceId, has_buffer: bool) Comm
     const state = self.surfaces.get(id) orelse return error.InvalidLayerSurface;
     if (!has_buffer and state.mapped) {
         const reset: State = .{ .layer = state.initial_layer };
-        if (self.observer) |observer| try observer.applying(observer.context, id, reset);
         state.mapped = false;
         state.configured = false;
         state.acked = false;
@@ -462,16 +461,15 @@ test "transactions own namespace configure acknowledgements and remap state" {
     try shell.applyCommit(id, true);
     try std.testing.expectEqual(Layer.overlay, shell.snapshot(id).?.current.layer);
     observer.fail_apply = true;
-    try std.testing.expectError(error.OutOfMemory, shell.applyCommit(id, false));
-    try std.testing.expect(shell.snapshot(id).?.mapped);
+    try std.testing.expectError(error.OutOfMemory, shell.applyCommit(id, true));
     try std.testing.expectEqual(Layer.overlay, shell.snapshot(id).?.current.layer);
-    observer.fail_apply = false;
     try shell.applyCommit(id, false);
     const reset = shell.snapshot(id).?;
     try std.testing.expect(!reset.mapped);
     try std.testing.expect(reset.awaiting_initial_commit);
     try std.testing.expectEqual(Layer.top, reset.current.layer);
     try std.testing.expectEqual(@as(usize, 1), observer.unmap_count);
+    observer.fail_apply = false;
     try shell.setSize(id, 40, 20);
     try std.testing.expectError(error.UnconfiguredBuffer, shell.validateCommit(id, true));
 
