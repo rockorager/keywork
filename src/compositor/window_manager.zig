@@ -15,6 +15,7 @@ const Seat = @import("wayland/seat.zig");
 const XdgShell = @import("XdgShell.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
 const WorkspaceProtocol = @import("wayland/workspace.zig");
+const NeutralWorkspace = @import("Workspace.zig");
 const Xwm = @import("xwayland/xwm.zig");
 const ConfigureTransaction = @import("window_manager/ConfigureTransaction.zig");
 const XwaylandController = @import("window_manager/XwaylandController.zig");
@@ -291,19 +292,19 @@ pub fn init(
         .workspace_protocol = workspace_protocol,
         .configure_timer = undefined,
     };
-    var output_iterator = outputs.iterator();
-    while (output_iterator.next()) |entry| {
-        self.appendOutputWorkspaces(entry.id) catch |err| {
-            for (self.workspaces.items) |*workspace| workspace.workspace.deinit(allocator);
-            self.workspaces.deinit(allocator);
-            return err;
-        };
-    }
-    std.debug.assert(self.workspaceFor(default_output) != null);
     errdefer {
-        for (self.workspaces.items) |*entry| entry.workspace.deinit(allocator);
+        for (self.workspaces.items) |*entry| {
+            workspace_protocol.rollbackOutputSnapshot(entry.output);
+            entry.workspace.deinit(allocator);
+        }
         self.workspaces.deinit(allocator);
     }
+    var output_iterator = outputs.iterator();
+    while (output_iterator.next()) |entry| {
+        try self.appendOutputWorkspaces(entry.id);
+        try self.publishWorkspaceSnapshot(entry.id);
+    }
+    std.debug.assert(self.workspaceFor(default_output) != null);
     self.configure_timer = try display.getEventLoop().addTimer(*Self, configureTimeout, self);
     errdefer self.configure_timer.remove();
     xdg_shell.setWindowListener(.{
@@ -778,20 +779,28 @@ fn addXwayland(self: *Self, xwayland_id: Xwm.WindowId) !?WindowId {
 }
 
 fn reportWorkspaceOccupancy(self: *Self, index: usize) void {
-    const entry = &self.workspaces.items[index];
-    self.workspace_protocol.setOccupied(entry.output, entry.number, entry.workspace.members.items.len != 0);
+    self.publishWorkspaceSnapshot(self.workspaces.items[index].output) catch unreachable;
 }
 
 fn reportWorkspaceUrgency(self: *Self, index: usize) void {
-    const entry = &self.workspaces.items[index];
-    for (entry.workspace.members.items) |member| {
-        const window = self.windows.get(internal(member)) orelse continue;
-        if (window.urgent) {
-            self.workspace_protocol.setUrgent(entry.output, entry.number, true);
-            return;
+    self.publishWorkspaceSnapshot(self.workspaces.items[index].output) catch unreachable;
+}
+
+/// Derives the protocol projection only from canonical workspaces and windows.
+fn publishWorkspaceSnapshot(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!void {
+    var snapshot: NeutralWorkspace.Snapshot = .{ .output = output };
+    var found = false;
+    for (self.workspaces.items) |entry| {
+        if (!std.meta.eql(entry.output, output)) continue;
+        found = true;
+        if (entry.active) snapshot.active = entry.number;
+        snapshot.occupied[entry.number - 1] = entry.workspace.members.items.len != 0;
+        for (entry.workspace.members.items) |member| {
+            const window = self.windows.get(internal(member)) orelse continue;
+            if (window.urgent) snapshot.urgent[entry.number - 1] = true;
         }
     }
-    self.workspace_protocol.setUrgent(entry.output, entry.number, false);
+    if (found) try self.workspace_protocol.publishSnapshot(snapshot);
 }
 
 fn moveWindowToWorkspace(
@@ -870,7 +879,13 @@ fn appendOutputWorkspaces(self: *Self, output: OutputLayout.Id) !void {
 }
 
 pub fn outputAdded(self: *Self, output: OutputLayout.Id) !void {
+    const previous_len = self.workspaces.items.len;
     if (self.workspaceFor(output) == null) try self.appendOutputWorkspaces(output);
+    errdefer {
+        for (self.workspaces.items[previous_len..]) |*entry| entry.workspace.deinit(self.allocator);
+        self.workspaces.shrinkRetainingCapacity(previous_len);
+    }
+    try self.publishWorkspaceSnapshot(output);
     self.relayout();
 }
 
@@ -2131,8 +2146,39 @@ pub fn switchWorkspace(self: *Self, number: u8) void {
     _ = self.activateWorkspace(self.pointerOutput(), number, true, .preserve);
 }
 
-pub fn activateWorkspaceFromProtocol(self: *Self, output: OutputLayout.Id, number: u8) bool {
-    return self.activateWorkspace(output, number, false, .output);
+/// Validates and applies protocol activation intents without entering layout or
+/// publishing observers. The adapter can therefore commit its prepared wire
+/// transaction before finishWorkspaceActivationFromProtocol re-enters them.
+pub fn prepareWorkspacesActivationFromProtocol(self: *Self, intents: []const NeutralWorkspace.Intent) ?bool {
+    for (intents) |intent| {
+        if (self.workspaceFor(intent.output) == null or self.workspaceNumber(intent.output, intent.number) == null) return null;
+    }
+    var needs_finish = false;
+    for (intents) |intent| {
+        const current = self.workspaceFor(intent.output).?;
+        const target = self.workspaceNumber(intent.output, intent.number).?;
+        const output_changed = !std.meta.eql(self.default_output, intent.output);
+        self.default_output = intent.output;
+        if (current == target) {
+            needs_finish = needs_finish or output_changed;
+            continue;
+        }
+        if (self.pointerInteractionWindow()) |id| if (self.windows.get(id)) |window| {
+            if (window.workspace == current) self.removeWindowPointerInteractions(id);
+        };
+        if (self.geometry_listener) |listener| {
+            listener.workspace_switching(listener.context, intent.output);
+            queueWorkspaceTransition(self.workspaces.items, intent.output, target);
+        }
+        self.workspaces.items[current].active = false;
+        self.workspaces.items[target].active = true;
+        needs_finish = true;
+    }
+    return needs_finish;
+}
+
+pub fn finishWorkspaceActivationFromProtocol(self: *Self) void {
+    self.relayout();
 }
 
 fn activateWorkspace(
@@ -2159,7 +2205,7 @@ fn activateWorkspace(
     }
     self.workspaces.items[current].active = false;
     self.workspaces.items[target].active = true;
-    if (notify_protocol) self.workspace_protocol.setActive(output, number);
+    if (notify_protocol) self.publishWorkspaceSnapshot(output) catch unreachable;
     self.relayout();
     return true;
 }

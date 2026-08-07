@@ -1,244 +1,245 @@
-//! Privileged discovery and activation of compositor-owned workspaces.
+//! Mature libwayland adapter for the neutral workspace projection.
 
 const Self = @This();
-
 const std = @import("std");
 const wayland = @import("wayland");
+const Neutral = @import("../Workspace.zig");
+const MatureClients = @import("MatureClients.zig");
 const Output = @import("output.zig");
 const OutputLayout = @import("output_layout.zig");
 const SecurityContext = @import("security_context.zig");
-
 const wl = wayland.server.wl;
 const ext = wayland.server.ext;
-const workspace_count: u8 = 10;
-const workspace_names = [_][*:0]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "10" };
 
 allocator: std.mem.Allocator,
 global: *wl.Global,
 security_context: *SecurityContext,
 outputs: *OutputLayout,
-output_states: std.ArrayList(OutputState),
+clients: *MatureClients,
+model: *Neutral,
 bindings: std.ArrayList(*Binding),
 activation_listener: ?ActivationListener,
 
 pub const ActivationListener = struct {
     context: *anyopaque,
-    activate: *const fn (*anyopaque, OutputLayout.Id, u8) bool,
-};
-
-const OutputState = struct {
-    output: OutputLayout.Id,
-    active: u8 = 1,
-    occupied: [workspace_count]bool = @splat(false),
-    urgent: [workspace_count]bool = @splat(false),
-
-    fn isAdvertised(self: OutputState, number: u8) bool {
-        std.debug.assert(number >= 1 and number <= workspace_count);
-        return self.active == number or self.occupied[number - 1] or self.urgent[number - 1];
-    }
-};
-
-const PendingActivation = struct {
-    output: OutputLayout.Id,
-    number: u8,
+    prepare: *const fn (*anyopaque, []const Neutral.Intent) ?bool,
+    finish: *const fn (*anyopaque) void,
 };
 
 const Binding = struct {
     owner: *Self,
     manager: ?*ext.WorkspaceManagerV1,
+    client: Neutral.ClientId,
     groups: std.ArrayList(*GroupResource) = .empty,
     workspaces: std.ArrayList(*WorkspaceResource) = .empty,
-    pending_activations: std.ArrayList(PendingActivation) = .empty,
 
-    fn create(owner: *Self, client: *wl.Client, version: u32, id: u32) !void {
-        const manager = try ext.WorkspaceManagerV1.create(client, version, id);
+    const Prepared = struct {
+        binding: *Binding,
+        neutral: Neutral.Prepared,
+
+        fn abort(self: *Prepared) void {
+            if (!self.neutral.isPending()) return;
+            self.binding.discardPreparedResources(&self.neutral);
+            self.binding.owner.model.rollbackPrepared(&self.neutral);
+        }
+
+        fn deinit(self: *Prepared) void {
+            self.neutral.deinit();
+        }
+    };
+
+    fn create(owner: *Self, raw_client: *wl.Client, version: u32, id: u32) !void {
+        const manager = try ext.WorkspaceManagerV1.create(raw_client, version, id);
         errdefer manager.destroy();
+        const identity = owner.clients.id(raw_client) orelse return error.InvalidClient;
+        const neutral_client = try owner.model.attachClient(identity);
+        errdefer owner.model.detachClient(neutral_client);
         const self = try owner.allocator.create(Binding);
         errdefer owner.allocator.destroy(self);
-        self.* = .{ .owner = owner, .manager = manager };
-        errdefer {
-            self.groups.deinit(owner.allocator);
-            self.workspaces.deinit(owner.allocator);
-            self.pending_activations.deinit(owner.allocator);
-        }
+        self.* = .{ .owner = owner, .manager = manager, .client = neutral_client };
+        errdefer self.deinitLists();
         try owner.bindings.append(owner.allocator, self);
+        errdefer _ = owner.bindings.pop();
+        var prepared = try self.prepareInitial();
+        defer prepared.deinit();
+        defer prepared.abort();
+        self.finalize(&prepared);
+        // Install the manager callback only after initial publication succeeds.
+        // Before this point the errdefers may reclaim `self` before destroying
+        // the manager resource, so a callback would retain a dead context.
         manager.setHandler(*Binding, handleManagerRequest, handleManagerDestroy, self);
-        for (owner.output_states.items) |state| {
-            self.addOutput(state) catch {
-                manager.postNoMemory();
-                return;
-            };
-        }
-        manager.sendDone();
     }
 
-    fn addOutput(self: *Binding, state: OutputState) !void {
-        const manager = self.manager orelse return;
-        _ = try GroupResource.create(self, manager, state.output);
-        for (1..workspace_count + 1) |number| {
-            const workspace_number: u8 = @intCast(number);
-            if (!state.isAdvertised(workspace_number)) continue;
-            try WorkspaceResource.create(
-                self,
-                manager,
-                state.output,
-                workspace_number,
-                state.active == number,
-                state.urgent[number - 1],
-            );
-        }
+    fn reconcile(self: *Binding) !void {
+        var prepared = try self.prepare(self.owner.model.snapshotSlice());
+        defer prepared.deinit();
+        defer prepared.abort();
+        self.finalize(&prepared);
     }
 
-    fn workspaceFor(self: *Binding, output: OutputLayout.Id, number: u8) ?*WorkspaceResource {
-        for (self.workspaces.items) |workspace| {
-            if (!workspace.removed and workspace.number == number and std.meta.eql(workspace.output, output)) {
-                return workspace;
-            }
-        }
-        return null;
+    fn prepare(self: *Binding, snapshots: []const Neutral.Snapshot) !Prepared {
+        const manager = self.manager orelse return error.InvalidClient;
+        var neutral = try self.owner.model.prepareUpdateAgainst(self.client, snapshots);
+        errdefer neutral.deinit();
+        errdefer self.owner.model.rollbackPrepared(&neutral);
+        errdefer self.discardPreparedResources(&neutral);
+
+        // Allocate every wl_resource and adapter node before emitting any event.
+        for (neutral.groups.items) |id| try self.allocateGroup(manager, id);
+        for (neutral.handles.items) |id| try self.allocateWorkspace(manager, id);
+        return .{ .binding = self, .neutral = neutral };
     }
 
-    fn removeWorkspace(self: *Binding, output: OutputLayout.Id, number: u8) void {
-        const workspace = self.workspaceFor(output, number) orelse return;
-        if (self.groupFor(output)) |group| {
-            if (group.resource) |group_resource| group_resource.sendWorkspaceLeave(workspace.resource);
-        }
-        workspace.resource.sendRemoved();
-        workspace.removed = true;
+    fn prepareInitial(self: *Binding) !Prepared {
+        const manager = self.manager orelse return error.InvalidClient;
+        var neutral = try self.owner.model.prepareInitial(self.client);
+        errdefer neutral.deinit();
+        errdefer self.owner.model.rollbackPrepared(&neutral);
+        errdefer self.discardPreparedResources(&neutral);
+        for (neutral.groups.items) |id| try self.allocateGroup(manager, id);
+        for (neutral.handles.items) |id| try self.allocateWorkspace(manager, id);
+        return .{ .binding = self, .neutral = neutral };
     }
 
-    fn removeOutput(self: *Binding, output_id: OutputLayout.Id, output: *Output) void {
-        const manager = self.manager orelse return;
-        const group = self.groupFor(output_id);
-        for (self.workspaces.items) |workspace| {
-            if (workspace.removed or !std.meta.eql(workspace.output, output_id)) continue;
-            if (group) |group_resource| {
-                if (group_resource.resource) |group_handle| {
-                    group_handle.sendWorkspaceLeave(workspace.resource);
-                }
-            }
-            workspace.resource.sendRemoved();
-            workspace.removed = true;
-        }
-        if (group) |group_resource| {
-            if (group_resource.resource) |group_handle| {
-                for (output.boundResources()) |output_resource| {
-                    if (output_resource.getClient() == manager.getClient()) {
-                        group_handle.sendOutputLeave(output_resource);
-                    }
-                }
-                group_handle.sendRemoved();
-            }
-            group_resource.removed = true;
-        }
-        manager.sendDone();
-    }
-
-    fn groupFor(self: *Binding, output_id: OutputLayout.Id) ?*GroupResource {
-        for (self.groups.items) |group| {
-            if (!group.removed and std.meta.eql(group.output, output_id)) return group;
-        }
-        return null;
-    }
-
-    fn queueActivation(self: *Binding, output: OutputLayout.Id, number: u8) !void {
-        for (self.pending_activations.items) |*pending| {
-            if (!std.meta.eql(pending.output, output)) continue;
-            pending.number = number;
+    /// Emits and commits a fully prepared transaction without allocating.
+    fn finalize(self: *Binding, prepared: *Prepared) void {
+        const manager = self.manager orelse {
+            prepared.abort();
             return;
-        }
-        try self.pending_activations.append(self.owner.allocator, .{
-            .output = output,
-            .number = number,
-        });
+        };
+        for (prepared.neutral.events.items) |event| switch (event) {
+            .group => |id| {
+                const node = self.group(id) orelse continue;
+                const resource = node.resource orelse continue;
+                manager.sendWorkspaceGroup(resource);
+                resource.sendCapabilities(.{});
+            },
+            .output_enter => |value| if (self.group(value.group)) |group_node| {
+                const group_resource = group_node.resource orelse continue;
+                if (self.owner.outputs.get(value.output)) |output| for (output.boundResources()) |resource| {
+                    if (resource.getClient() == manager.getClient()) group_resource.sendOutputEnter(resource);
+                };
+            },
+            .workspace => |id| if (self.workspace(id)) |node| manager.sendWorkspace(node.resource),
+            .name => |id| {
+                const metadata = self.owner.model.metadata(self.client, id) orelse continue;
+                const node = self.workspace(id) orelse continue;
+                node.resource.sendName(@ptrCast(&metadata.name));
+            },
+            .coordinates => |id| {
+                var coordinate = (self.owner.model.metadata(self.client, id) orelse continue).coordinate;
+                var array: wl.Array = .{ .size = @sizeOf(u32), .alloc = @sizeOf(u32), .data = @ptrCast(&coordinate) };
+                const node = self.workspace(id) orelse continue;
+                node.resource.sendCoordinates(&array);
+            },
+            .state => |value| if (self.workspace(value.workspace)) |node| node.resource.sendState(.{ .active = value.value.active, .urgent = value.value.urgent }),
+            .capabilities => |id| if (self.workspace(id)) |node| node.resource.sendCapabilities(.{ .activate = true }),
+            .workspace_enter => |value| if (self.group(value.group)) |group_node| if (group_node.resource) |group_resource| if (self.workspace(value.workspace)) |workspace_node| group_resource.sendWorkspaceEnter(workspace_node.resource),
+            .workspace_leave => |value| if (self.group(value.group)) |group_node| if (group_node.resource) |resource| if (self.workspace(value.workspace)) |workspace_node| resource.sendWorkspaceLeave(workspace_node.resource),
+            .workspace_removed => |id| if (self.workspace(id)) |workspace_node| {
+                workspace_node.resource.sendRemoved();
+                workspace_node.removed = true;
+            },
+            .output_leave => |value| if (self.group(value.group)) |group_node| if (group_node.resource) |resource| {
+                if (self.owner.outputs.get(value.output)) |output| for (output.boundResources()) |output_resource| {
+                    if (output_resource.getClient() == manager.getClient()) resource.sendOutputLeave(output_resource);
+                };
+            },
+            .group_removed => |id| if (self.group(id)) |group_node| {
+                if (group_node.resource) |resource| resource.sendRemoved();
+                group_node.removed = true;
+            },
+            .done => manager.sendDone(),
+        };
+        self.owner.model.commitPrepared(&prepared.neutral) catch unreachable;
+    }
+
+    fn allocateGroup(self: *Binding, manager: *ext.WorkspaceManagerV1, id: Neutral.GroupId) !void {
+        const node = try self.owner.allocator.create(GroupResource);
+        errdefer self.owner.allocator.destroy(node);
+        const resource = try ext.WorkspaceGroupHandleV1.create(manager.getClient(), manager.getVersion(), 0);
+        errdefer resource.destroy();
+        node.* = .{ .binding = self, .id = id, .resource = resource };
+        try self.groups.append(self.owner.allocator, node);
+        resource.setHandler(*GroupResource, GroupResource.handleRequest, GroupResource.handleDestroy, node);
+    }
+
+    fn allocateWorkspace(self: *Binding, manager: *ext.WorkspaceManagerV1, id: Neutral.HandleId) !void {
+        const node = try self.owner.allocator.create(WorkspaceResource);
+        errdefer self.owner.allocator.destroy(node);
+        const resource = try ext.WorkspaceHandleV1.create(manager.getClient(), manager.getVersion(), 0);
+        errdefer resource.destroy();
+        node.* = .{ .binding = self, .id = id, .resource = resource };
+        try self.workspaces.append(self.owner.allocator, node);
+        resource.setHandler(*WorkspaceResource, WorkspaceResource.handleRequest, WorkspaceResource.handleDestroy, node);
+    }
+
+    fn discardPreparedResources(self: *Binding, prepared: *const Neutral.Prepared) void {
+        for (prepared.handles.items) |id| if (self.workspace(id)) |node| node.resource.destroy();
+        for (prepared.groups.items) |id| if (self.group(id)) |node| node.resource.?.destroy();
+    }
+
+    fn group(self: *Binding, id: Neutral.GroupId) ?*GroupResource {
+        for (self.groups.items) |node| if (std.meta.eql(node.id, id)) return node;
+        return null;
+    }
+    fn workspace(self: *Binding, id: Neutral.HandleId) ?*WorkspaceResource {
+        for (self.workspaces.items) |node| if (std.meta.eql(node.id, id)) return node;
+        return null;
     }
 
     fn commit(self: *Binding) void {
-        var changed = false;
-        for (self.pending_activations.items) |pending| {
-            const listener = self.owner.activation_listener orelse continue;
-            if (!listener.activate(listener.context, pending.output, pending.number)) continue;
-            changed = self.owner.updateActive(pending.output, pending.number) or changed;
-        }
-        self.pending_activations.clearRetainingCapacity();
-        if (changed) self.owner.sendDone();
+        const intents = self.owner.model.takeIntents(self.client) catch return;
+        defer self.owner.model.clearIntents(self.client);
+        if (intents.len == 0) return;
+        const listener = self.owner.activation_listener orelse return;
+        self.owner.activatePrepared(self, intents, listener);
     }
 
-    fn handleManagerRequest(
-        resource: *ext.WorkspaceManagerV1,
-        request: ext.WorkspaceManagerV1.Request,
-        self: *Binding,
-    ) void {
+    fn handleManagerRequest(resource: *ext.WorkspaceManagerV1, request: ext.WorkspaceManagerV1.Request, self: *Binding) void {
         switch (request) {
             .commit => self.commit(),
             .stop => resource.destroySendFinished(),
         }
     }
-
     fn handleManagerDestroy(_: *ext.WorkspaceManagerV1, self: *Binding) void {
         self.manager = null;
-        self.pending_activations.clearRetainingCapacity();
+        self.owner.model.clearIntents(self.client);
         self.maybeDestroy();
     }
-
     fn maybeDestroy(self: *Binding) void {
         if (self.manager != null or self.groups.items.len != 0 or self.workspaces.items.len != 0) return;
-        for (self.owner.bindings.items, 0..) |binding, index| {
-            if (binding != self) continue;
+        for (self.owner.bindings.items, 0..) |binding, index| if (binding == self) {
             _ = self.owner.bindings.swapRemove(index);
             break;
-        }
+        };
+        self.owner.model.detachClient(self.client);
+        self.deinitLists();
+        self.owner.allocator.destroy(self);
+    }
+    fn deinitLists(self: *Binding) void {
         self.groups.deinit(self.owner.allocator);
         self.workspaces.deinit(self.owner.allocator);
-        self.pending_activations.deinit(self.owner.allocator);
-        self.owner.allocator.destroy(self);
     }
 };
 
 const GroupResource = struct {
     binding: *Binding,
-    output: OutputLayout.Id,
+    id: Neutral.GroupId,
     resource: ?*ext.WorkspaceGroupHandleV1,
     removed: bool = false,
-
-    fn create(binding: *Binding, manager: *ext.WorkspaceManagerV1, output_id: OutputLayout.Id) !*GroupResource {
-        const self = try binding.owner.allocator.create(GroupResource);
-        errdefer binding.owner.allocator.destroy(self);
-        const resource = try ext.WorkspaceGroupHandleV1.create(manager.getClient(), manager.getVersion(), 0);
-        errdefer resource.destroy();
-        self.* = .{ .binding = binding, .output = output_id, .resource = resource };
-        try binding.groups.append(binding.owner.allocator, self);
-        resource.setHandler(*GroupResource, handleRequest, handleDestroy, self);
-        manager.sendWorkspaceGroup(resource);
-        resource.sendCapabilities(.{});
-        if (binding.owner.outputs.get(output_id)) |output| {
-            for (output.boundResources()) |output_resource| {
-                if (output_resource.getClient() == manager.getClient()) {
-                    resource.sendOutputEnter(output_resource);
-                }
-            }
-        }
-        return self;
-    }
-
-    fn handleRequest(
-        resource: *ext.WorkspaceGroupHandleV1,
-        request: ext.WorkspaceGroupHandleV1.Request,
-        _: *GroupResource,
-    ) void {
+    fn handleRequest(resource: *ext.WorkspaceGroupHandleV1, request: ext.WorkspaceGroupHandleV1.Request, _: *GroupResource) void {
         switch (request) {
             .destroy => resource.destroy(),
             .create_workspace => {},
         }
     }
-
     fn handleDestroy(_: *ext.WorkspaceGroupHandleV1, self: *GroupResource) void {
         const binding = self.binding;
-        for (binding.groups.items, 0..) |group, index| {
-            if (group != self) continue;
+        for (binding.groups.items, 0..) |node, index| if (node == self) {
             _ = binding.groups.swapRemove(index);
             break;
-        }
+        };
         binding.owner.allocator.destroy(self);
         binding.maybeDestroy();
     }
@@ -246,106 +247,37 @@ const GroupResource = struct {
 
 const WorkspaceResource = struct {
     binding: *Binding,
-    output: OutputLayout.Id,
-    number: u8,
+    id: Neutral.HandleId,
     resource: *ext.WorkspaceHandleV1,
     removed: bool = false,
-
-    fn create(
-        binding: *Binding,
-        manager: *ext.WorkspaceManagerV1,
-        output_id: OutputLayout.Id,
-        number: u8,
-        active: bool,
-        urgent: bool,
-    ) !void {
-        std.debug.assert(number >= 1 and number <= workspace_count);
-        const self = try binding.owner.allocator.create(WorkspaceResource);
-        errdefer binding.owner.allocator.destroy(self);
-        const resource = try ext.WorkspaceHandleV1.create(manager.getClient(), manager.getVersion(), 0);
-        errdefer resource.destroy();
-        self.* = .{
-            .binding = binding,
-            .output = output_id,
-            .number = number,
-            .resource = resource,
-        };
-        try binding.workspaces.append(binding.owner.allocator, self);
-        resource.setHandler(*WorkspaceResource, handleRequest, handleDestroy, self);
-        manager.sendWorkspace(resource);
-        resource.sendName(workspace_names[number - 1]);
-        var coordinate: u32 = number - 1;
-        var coordinates: wl.Array = .{
-            .size = @sizeOf(u32),
-            .alloc = @sizeOf(u32),
-            .data = @ptrCast(&coordinate),
-        };
-        resource.sendCoordinates(&coordinates);
-        resource.sendState(.{ .active = active, .urgent = urgent });
-        resource.sendCapabilities(.{ .activate = true });
-        if (binding.groupFor(output_id)) |group| {
-            if (group.resource) |group_resource| group_resource.sendWorkspaceEnter(resource);
-        }
-    }
-
-    fn handleRequest(
-        resource: *ext.WorkspaceHandleV1,
-        request: ext.WorkspaceHandleV1.Request,
-        self: *WorkspaceResource,
-    ) void {
+    fn handleRequest(resource: *ext.WorkspaceHandleV1, request: ext.WorkspaceHandleV1.Request, self: *WorkspaceResource) void {
         switch (request) {
             .destroy => resource.destroy(),
-            .activate => {
-                if (self.removed or self.binding.manager == null) return;
-                self.binding.queueActivation(self.output, self.number) catch resource.postNoMemory();
-            },
+            .activate => if (!self.removed and self.binding.manager != null) self.binding.owner.model.queueActivate(self.binding.client, self.id) catch resource.postNoMemory(),
             .deactivate, .assign, .remove => {},
         }
     }
-
     fn handleDestroy(_: *ext.WorkspaceHandleV1, self: *WorkspaceResource) void {
         const binding = self.binding;
-        for (binding.workspaces.items, 0..) |workspace, index| {
-            if (workspace != self) continue;
+        binding.owner.model.releaseHandle(binding.client, self.id);
+        for (binding.workspaces.items, 0..) |node, index| if (node == self) {
             _ = binding.workspaces.swapRemove(index);
             break;
-        }
+        };
         binding.owner.allocator.destroy(self);
         binding.maybeDestroy();
     }
 };
 
-pub fn init(
-    self: *Self,
-    allocator: std.mem.Allocator,
-    display: *wl.Server,
-    security_context: *SecurityContext,
-    outputs: *OutputLayout,
-) !void {
-    self.* = .{
-        .allocator = allocator,
-        .global = undefined,
-        .security_context = security_context,
-        .outputs = outputs,
-        .output_states = .empty,
-        .bindings = .empty,
-        .activation_listener = null,
-    };
-    errdefer self.output_states.deinit(allocator);
+pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server, security_context: *SecurityContext, outputs: *OutputLayout, clients: *MatureClients, model: *Neutral) !void {
+    self.* = .{ .allocator = allocator, .global = undefined, .security_context = security_context, .outputs = outputs, .clients = clients, .model = model, .bindings = .empty, .activation_listener = null };
     errdefer self.bindings.deinit(allocator);
-    var iterator = outputs.iterator();
-    while (iterator.next()) |entry| {
-        try self.output_states.append(allocator, .{ .output = entry.id });
-    }
     self.global = try wl.Global.create(display, ext.WorkspaceManagerV1, 1, *Self, self, bind);
     errdefer self.global.destroy();
     try security_context.restrictGlobal(self.global);
     errdefer security_context.unrestrictGlobal(self.global);
-    iterator = outputs.iterator();
-    while (iterator.next()) |entry| entry.output.setBindListener(.{
-        .context = self,
-        .bound = outputBound,
-    });
+    var iterator = outputs.iterator();
+    while (iterator.next()) |entry| entry.output.setBindListener(.{ .context = self, .bound = outputBound });
 }
 
 pub fn deinit(self: *Self) void {
@@ -355,252 +287,111 @@ pub fn deinit(self: *Self) void {
     self.security_context.unrestrictGlobal(self.global);
     self.global.destroy();
     std.debug.assert(self.bindings.items.len == 0);
-    self.output_states.deinit(self.allocator);
     self.bindings.deinit(self.allocator);
     self.* = undefined;
 }
-
-/// Copies the listener and retains its context until clearActivationListener.
 pub fn setActivationListener(self: *Self, listener: ActivationListener) void {
     std.debug.assert(self.activation_listener == null);
     self.activation_listener = listener;
 }
-
 pub fn clearActivationListener(self: *Self) void {
     std.debug.assert(self.activation_listener != null);
     self.activation_listener = null;
 }
 
-pub fn addOutput(self: *Self, output_id: OutputLayout.Id) error{OutOfMemory}!void {
-    std.debug.assert(self.outputState(output_id) == null);
-    const output = self.outputs.get(output_id) orelse return;
-    try self.output_states.append(self.allocator, .{ .output = output_id });
-    output.setBindListener(.{ .context = self, .bound = outputBound });
+fn activatePrepared(self: *Self, requester: *Binding, intents: []const Neutral.Intent, listener: ActivationListener) void {
+    var proposed: std.ArrayList(Neutral.Snapshot) = .empty;
+    defer proposed.deinit(self.allocator);
+    proposed.appendSlice(self.allocator, self.model.snapshotSlice()) catch {
+        if (requester.manager) |manager| manager.postNoMemory();
+        return;
+    };
+    for (intents) |intent| {
+        var found = false;
+        for (proposed.items) |*snapshot| {
+            if (!std.meta.eql(snapshot.output, intent.output)) continue;
+            if (intent.number == 0 or intent.number > Neutral.workspace_count) return;
+            snapshot.active = intent.number;
+            found = true;
+            break;
+        }
+        if (!found) return;
+    }
+
+    var prepared: std.ArrayList(Binding.Prepared) = .empty;
+    defer {
+        for (prepared.items) |*transaction| {
+            transaction.abort();
+            transaction.deinit();
+        }
+        prepared.deinit(self.allocator);
+    }
+    prepared.ensureTotalCapacity(self.allocator, self.bindings.items.len) catch {
+        if (requester.manager) |manager| manager.postNoMemory();
+        return;
+    };
     for (self.bindings.items) |binding| {
-        const manager = binding.manager orelse continue;
-        binding.addOutput(.{ .output = output_id }) catch {
-            manager.postNoMemory();
+        if (binding.manager == null) continue;
+        const transaction = binding.prepare(proposed.items) catch |err| {
+            if (err == error.OutOfMemory) if (binding.manager) |manager| manager.postNoMemory();
+            // The requester must observe preparation success before its intent
+            // can mutate canonical policy. Unrelated failed clients are isolated.
+            if (binding == requester) return;
             continue;
         };
-        manager.sendDone();
+        prepared.appendAssumeCapacity(transaction);
     }
+    const needs_finish = listener.prepare(listener.context, intents) orelse return;
+    for (proposed.items) |snapshot| self.model.setSnapshot(snapshot) catch unreachable;
+    for (prepared.items) |*transaction| transaction.binding.finalize(transaction);
+    if (needs_finish) listener.finish(listener.context);
 }
 
-pub fn removeOutput(self: *Self, output_id: OutputLayout.Id) void {
-    const output = self.outputs.get(output_id) orelse return;
-    for (self.bindings.items) |binding| binding.removeOutput(output_id, output);
-    output.clearBindListener();
-    for (self.output_states.items, 0..) |state, index| {
-        if (!std.meta.eql(state.output, output_id)) continue;
-        _ = self.output_states.orderedRemove(index);
-        return;
-    }
-}
-
-pub fn setActive(self: *Self, output: OutputLayout.Id, number: u8) void {
-    if (self.updateActive(output, number)) self.sendDone();
-}
-
-pub fn setOccupied(self: *Self, output: OutputLayout.Id, number: u8, occupied: bool) void {
-    if (number == 0 or number > workspace_count) return;
-    const state = self.outputState(output) orelse return;
-    const was_advertised = state.isAdvertised(number);
-    if (!self.updateOccupied(output, number, occupied)) return;
-    const is_advertised = state.isAdvertised(number);
-    if (was_advertised == is_advertised) return;
-    for (self.bindings.items) |binding| {
-        const manager = binding.manager orelse continue;
-        if (is_advertised) {
-            WorkspaceResource.create(
-                binding,
-                manager,
-                output,
-                number,
-                state.active == number,
-                state.urgent[number - 1],
-            ) catch {
-                manager.postNoMemory();
-                continue;
-            };
-        } else {
-            binding.removeWorkspace(output, number);
+/// Publishes a canonical WM snapshot. A failing binding is isolated; other
+/// clients still receive their complete atomic reconciliation.
+pub fn publishSnapshot(self: *Self, snapshot: Neutral.Snapshot) error{OutOfMemory}!void {
+    try self.model.setSnapshot(snapshot);
+    for (self.bindings.items) |binding| binding.reconcile() catch |err| {
+        switch (err) {
+            error.OutOfMemory => if (binding.manager) |manager| manager.postNoMemory(),
+            error.InvalidClient => {}, // The raw client is already retiring.
+            else => unreachable,
         }
-        manager.sendDone();
-    }
+    };
+}
+pub fn addOutput(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!void {
+    const value = self.outputs.get(output) orelse return;
+    value.setBindListener(.{ .context = self, .bound = outputBound });
+}
+pub fn removeOutput(self: *Self, output: OutputLayout.Id) void {
+    if (self.outputs.get(output)) |value| value.clearBindListener();
+    self.model.removeOutput(output);
+    for (self.bindings.items) |binding| binding.reconcile() catch {
+        if (binding.manager) |manager| manager.postNoMemory();
+    };
 }
 
-pub fn setUrgent(self: *Self, output: OutputLayout.Id, number: u8, urgent: bool) void {
-    if (number == 0 or number > workspace_count) return;
-    const state = self.outputState(output) orelse return;
-    const was_advertised = state.isAdvertised(number);
-    if (!self.updateUrgent(output, number, urgent)) return;
-    const is_advertised = state.isAdvertised(number);
-    for (self.bindings.items) |binding| {
-        const manager = binding.manager orelse continue;
-        if (binding.workspaceFor(output, number)) |workspace| {
-            workspace.resource.sendState(.{
-                .active = state.active == number,
-                .urgent = urgent,
-            });
-            if (!is_advertised) binding.removeWorkspace(output, number);
-        } else if (is_advertised) {
-            WorkspaceResource.create(
-                binding,
-                manager,
-                output,
-                number,
-                state.active == number,
-                urgent,
-            ) catch manager.postNoMemory();
-        }
-        if (was_advertised != is_advertised or binding.workspaceFor(output, number) != null) {
-            manager.sendDone();
-        }
-    }
-}
-
-fn updateActive(self: *Self, output: OutputLayout.Id, number: u8) bool {
-    if (number == 0 or number > workspace_count) return false;
-    const state = self.outputState(output) orelse return false;
-    if (state.active == number) return false;
-    const previous = state.active;
-    state.active = number;
-    for (self.bindings.items) |binding| {
-        const manager = binding.manager orelse continue;
-        if (binding.workspaceFor(output, number)) |workspace| {
-            workspace.resource.sendState(.{
-                .active = true,
-                .urgent = state.urgent[number - 1],
-            });
-        } else {
-            WorkspaceResource.create(
-                binding,
-                manager,
-                output,
-                number,
-                true,
-                state.urgent[number - 1],
-            ) catch manager.postNoMemory();
-        }
-        if (binding.workspaceFor(output, previous)) |workspace| {
-            workspace.resource.sendState(.{
-                .active = false,
-                .urgent = state.urgent[previous - 1],
-            });
-            if (!state.isAdvertised(previous)) binding.removeWorkspace(output, previous);
-        }
-    }
-    return true;
-}
-
-fn updateOccupied(self: *Self, output: OutputLayout.Id, number: u8, occupied: bool) bool {
-    if (number == 0 or number > workspace_count) return false;
-    const state = self.outputState(output) orelse return false;
-    if (state.occupied[number - 1] == occupied) return false;
-    state.occupied[number - 1] = occupied;
-    return true;
-}
-
-fn updateUrgent(self: *Self, output: OutputLayout.Id, number: u8, urgent: bool) bool {
-    if (number == 0 or number > workspace_count) return false;
-    const state = self.outputState(output) orelse return false;
-    if (state.urgent[number - 1] == urgent) return false;
-    state.urgent[number - 1] = urgent;
-    return true;
-}
-
-fn sendDone(self: *Self) void {
-    for (self.bindings.items) |binding| {
-        if (binding.manager) |manager| manager.sendDone();
-    }
-}
-
-fn outputState(self: *Self, output: OutputLayout.Id) ?*OutputState {
-    for (self.output_states.items) |*state| {
-        if (std.meta.eql(state.output, output)) return state;
-    }
-    return null;
+/// Rolls back canonical initialization before any output state was published.
+pub fn rollbackOutputSnapshot(self: *Self, output: OutputLayout.Id) void {
+    self.model.removeOutput(output);
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     Binding.create(self, client, version, id) catch client.postNoMemory();
 }
-
 fn outputBound(context: *anyopaque, _: *Output, output_resource: *wl.Output) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    const output = self.outputs.findResource(output_resource) orelse return;
     for (self.bindings.items) |binding| {
         const manager = binding.manager orelse continue;
-        if (output_resource.getClient() != manager.getClient()) continue;
-        const group = binding.groupFor(self.outputs.findResource(output_resource).?.id) orelse continue;
-        const resource = group.resource orelse continue;
-        resource.sendOutputEnter(output_resource);
-        manager.sendDone();
+        if (manager.getClient() != output_resource.getClient()) continue;
+        for (binding.groups.items) |group_node| if (!group_node.removed) {
+            // A group receives this wl_output only when its canonical output matches.
+            // Resolve that relation through the pending/committed workspace snapshot.
+            const group_output = self.model.groupOutput(binding.client, group_node.id) orelse continue;
+            if (!std.meta.eql(group_output, output.id)) continue;
+            group_node.resource.?.sendOutputEnter(output_resource);
+            manager.sendDone();
+        };
     }
-}
-
-test "workspace model tracks one active numbered workspace per output" {
-    var workspace: Self = undefined;
-    workspace.output_states = .empty;
-    workspace.bindings = .empty;
-    defer workspace.output_states.deinit(std.testing.allocator);
-    defer workspace.bindings.deinit(std.testing.allocator);
-
-    const first: OutputLayout.Id = .{ .index = 1, .generation = 1 };
-    const second: OutputLayout.Id = .{ .index = 2, .generation = 1 };
-    try workspace.output_states.append(std.testing.allocator, .{ .output = first });
-    try workspace.output_states.append(std.testing.allocator, .{ .output = second });
-
-    try std.testing.expect(workspace.updateActive(first, 10));
-    try std.testing.expectEqual(@as(u8, 10), workspace.outputState(first).?.active);
-    try std.testing.expectEqual(@as(u8, 1), workspace.outputState(second).?.active);
-    try std.testing.expect(!workspace.updateActive(first, 10));
-    try std.testing.expect(!workspace.updateActive(first, 0));
-    try std.testing.expect(workspace.outputState(first).?.isAdvertised(10));
-    try std.testing.expect(!workspace.outputState(first).?.isAdvertised(1));
-}
-
-test "workspace model tracks occupied workspaces per output" {
-    var workspace: Self = undefined;
-    workspace.output_states = .empty;
-    defer workspace.output_states.deinit(std.testing.allocator);
-
-    const first: OutputLayout.Id = .{ .index = 1, .generation = 1 };
-    const second: OutputLayout.Id = .{ .index = 2, .generation = 1 };
-    try workspace.output_states.append(std.testing.allocator, .{ .output = first });
-    try workspace.output_states.append(std.testing.allocator, .{ .output = second });
-
-    try std.testing.expect(workspace.updateOccupied(first, 10, true));
-    try std.testing.expect(workspace.outputState(first).?.occupied[9]);
-    try std.testing.expect(workspace.outputState(first).?.isAdvertised(10));
-    try std.testing.expect(!workspace.outputState(second).?.occupied[9]);
-    try std.testing.expect(!workspace.updateOccupied(first, 10, true));
-    try std.testing.expect(workspace.updateOccupied(first, 10, false));
-    try std.testing.expect(!workspace.updateOccupied(first, 0, true));
-}
-
-test "workspace urgency is independent per output and keeps a workspace advertised" {
-    var workspace: Self = undefined;
-    workspace.output_states = .empty;
-    workspace.bindings = .empty;
-    defer workspace.output_states.deinit(std.testing.allocator);
-    defer workspace.bindings.deinit(std.testing.allocator);
-
-    const first: OutputLayout.Id = .{ .index = 1, .generation = 1 };
-    const second: OutputLayout.Id = .{ .index = 2, .generation = 1 };
-    try workspace.output_states.append(std.testing.allocator, .{ .output = first });
-    try workspace.output_states.append(std.testing.allocator, .{ .output = second });
-
-    try std.testing.expect(workspace.updateUrgent(first, 10, true));
-    try std.testing.expect(workspace.outputState(first).?.urgent[9]);
-    try std.testing.expect(workspace.outputState(first).?.isAdvertised(10));
-    try std.testing.expect(!workspace.outputState(second).?.urgent[9]);
-    try std.testing.expect(!workspace.updateUrgent(first, 10, true));
-    try std.testing.expect(workspace.updateUrgent(first, 10, false));
-    try std.testing.expect(!workspace.outputState(first).?.isAdvertised(10));
-    try std.testing.expect(!workspace.updateUrgent(first, 0, true));
-}
-
-test "workspace names match their numbers" {
-    try std.testing.expectEqualStrings("1", std.mem.span(workspace_names[0]));
-    try std.testing.expectEqualStrings("10", std.mem.span(workspace_names[9]));
 }
