@@ -18,6 +18,7 @@ const WayringDataControl = @import("wayland/WayringDataControl.zig");
 const WayringDataDevice = @import("wayland/WayringDataDevice.zig");
 const WayringPrimarySelection = @import("wayland/WayringPrimarySelection.zig");
 const WayringTextInput = @import("wayland/WayringTextInput.zig");
+const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
@@ -229,6 +230,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_data_control: WayringDataControl = undefined;
     var wayring_data_control_initialized = false;
     var wayring_data_control_published = false;
+    var wayring_input_method: WayringInputMethod = undefined;
+    var wayring_input_method_initialized = false;
+    var wayring_input_method_published = false;
     const WayringLifecycle = struct {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
@@ -244,6 +248,16 @@ pub fn main(init: std.process.Init) !void {
         primary_selection: ?*WayringPrimarySelection,
         text_input: ?*WayringTextInput,
         data_control: ?*WayringDataControl,
+        input_method: ?*WayringInputMethod,
+        expected_uid: std.os.linux.uid_t,
+
+        fn globalVisible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
+            if (self.data_control) |data_control|
+                if (!data_control.globalFilter(client, global)) return false;
+            if (!std.mem.eql(u8, global.interface().name, "zwp_input_method_manager_v2")) return true;
+            const credentials = client.credentials() orelse return false;
+            return credentials.uid == self.expected_uid;
+        }
 
         fn accepted(erased: *anyopaque, client: *wayring.server.Client) !void {
             const self: *@This() = @ptrCast(@alignCast(erased));
@@ -254,6 +268,7 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            if (self.input_method) |input_method| input_method.destroyClientResources(client);
             if (self.data_control) |data_control| data_control.destroyClientResources(client);
             if (self.text_input) |text_input| text_input.destroyClientResources(client);
             if (self.primary_selection) |primary| primary.destroyClientResources(client);
@@ -277,10 +292,15 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_protocol_server) |*protocol_server| protocol_server.clearGlobalFilter();
+        if (wayring_input_method_initialized) {
+            server.setGeneratedInputMethodObserver(null);
+            if (wayring_input_method_published) wayring_input_method.unpublish();
+            wayring_input_method.deinit();
+        }
         if (wayring_data_control_initialized) {
             server.setDataControlObserver(null);
             if (wayring_data_control_published) wayring_data_control.unpublish();
-            if (wayring_protocol_server) |*protocol_server| protocol_server.clearGlobalFilter();
             wayring_data_control.deinit();
         }
         if (wayring_text_input_initialized) {
@@ -372,11 +392,24 @@ pub fn main(init: std.process.Init) !void {
             std.os.linux.getuid(),
         );
         wayring_data_control_initialized = true;
-        wayring_protocol_server.?.setGlobalFilter(
-            WayringDataControl,
-            &wayring_data_control,
-            WayringDataControl.globalFilter,
+        wayring_input_method.init(
+            init.gpa,
+            &wayring_protocol_server.?,
+            &wayring_clients,
+            &wayring_seat_adapter,
+            server.canonicalSeat(),
+            server.neutralTextInput(),
+            &wayring_compositor,
+            .{ .expected_uid = std.c.geteuid() },
+            server.generatedInputMethodLayout(),
         );
+        wayring_input_method_initialized = true;
+        server.setGeneratedInputMethodObserver(.{
+            .context = &wayring_input_method,
+            .set_inhibited = WayringInputMethod.observerSetInhibited,
+            .popup_iterator = WayringInputMethod.observerPopupIterator,
+            .refresh_popups = WayringInputMethod.observerRefreshPopups,
+        });
         server.setDataDeviceObserver(.{
             .context = &wayring_data_device,
             .transaction_finalize = WayringDataDevice.transactionFinalize,
@@ -490,6 +523,8 @@ pub fn main(init: std.process.Init) !void {
             // registry-filtered by immutable peer credentials.
             try wayring_data_control.publish();
             wayring_data_control_published = true;
+            try wayring_input_method.publish();
+            wayring_input_method_published = true;
         }
         wayring_lifecycle = .{
             .clients = &wayring_clients,
@@ -506,7 +541,14 @@ pub fn main(init: std.process.Init) !void {
             .primary_selection = if (wayring_primary_selection_initialized) &wayring_primary_selection else null,
             .text_input = if (wayring_text_input_initialized) &wayring_text_input else null,
             .data_control = if (wayring_data_control_initialized) &wayring_data_control else null,
+            .input_method = if (wayring_input_method_initialized) &wayring_input_method else null,
+            .expected_uid = std.c.geteuid(),
         };
+        wayring_protocol_server.?.setGlobalFilter(
+            WayringLifecycle,
+            &wayring_lifecycle,
+            WayringLifecycle.globalVisible,
+        );
         wayring_host = try WayringHost.create(
             init.gpa,
             server.eventLoop(),
@@ -963,6 +1005,7 @@ test {
     _ = @import("wayland/session_lock.zig");
     _ = @import("wayland/cursor_shape.zig");
     _ = @import("wayland/WayringCursorShape.zig");
+    _ = @import("wayland/WayringInputMethod.zig");
     _ = @import("wayland/WayringXdgDecoration.zig");
     _ = @import("wayland/WayringXdgActivation.zig");
     _ = @import("wayland/tablet.zig");

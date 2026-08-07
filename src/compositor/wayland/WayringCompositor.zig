@@ -170,6 +170,19 @@ pub const DragIconListener = struct {
     removed: *const fn (*anyopaque, SurfaceId) void,
 };
 
+pub const InputPopupListener = struct {
+    context: *anyopaque,
+    committed: *const fn (*anyopaque, SurfaceId) void,
+    removed: *const fn (*anyopaque, SurfaceId) void,
+};
+
+pub const InputPopupReservation = struct {
+    surface: SurfaceId,
+    generation: u64,
+};
+
+pub const InputPopupError = error{ NotLive, WrongClient, RoleConflict, GenerationExhausted, StaleReservation };
+
 pub const CursorRoleResult = enum { assigned, already_cursor, role_conflict, not_live, wrong_client };
 pub const DragIconRoleResult = enum { assigned, already_drag_icon, role_conflict, not_live, wrong_client };
 
@@ -191,7 +204,7 @@ const FrameCallback = struct {
 };
 
 const Surface = struct {
-    const Role = enum { none, subsurface, cursor, drag_icon, xdg_toplevel, xdg_popup };
+    const Role = enum { none, subsurface, cursor, drag_icon, input_popup, xdg_toplevel, xdg_popup };
     resource: core.wl_surface.Resource,
     id: SurfaceId,
     destroying: bool = false,
@@ -230,6 +243,7 @@ const Surface = struct {
     role: Role = .none,
     active_subsurface: ?*Subsurface = null,
     xdg_association: ?XdgAssociation = null,
+    input_popup: ?InputPopupReservation = null,
     children: std.ArrayList(ChildPlacement) = .empty,
     parent_sentinel_index: usize = 0,
     topology_dirty: bool = false,
@@ -460,6 +474,7 @@ surface_registry: *SurfaceRegistry,
 presentation_listener: ?PresentationListener,
 cursor_listener: ?CursorListener = null,
 drag_icon_listener: ?DragIconListener = null,
+input_popup_listener: ?InputPopupListener = null,
 global: *const server.Server.Global,
 subcompositor_global: *const server.Server.Global,
 shm: Shm,
@@ -467,6 +482,7 @@ clients: std.ArrayList(*ClientObjects) = .empty,
 owned_provider_count: usize = 0,
 next_relationship_generation: ?u64 = 1,
 next_xdg_generation: ?u64 = 1,
+next_input_popup_generation: ?u64 = 1,
 completing_frame_callbacks: bool = false,
 commit_fault: if (builtin.is_test) ?CommitFault else void,
 
@@ -724,7 +740,7 @@ pub fn assignCursorRole(self: *WayringCompositor, client: *const server.Client, 
             break :blk .assigned;
         },
         .cursor => .already_cursor,
-        .subsurface, .drag_icon, .xdg_toplevel, .xdg_popup => .role_conflict,
+        .subsurface, .drag_icon, .input_popup, .xdg_toplevel, .xdg_popup => .role_conflict,
     };
 }
 
@@ -740,12 +756,38 @@ pub fn assignDragIconRole(self: *WayringCompositor, client: *const server.Client
             break :blk .assigned;
         },
         .drag_icon => .already_drag_icon,
-        .subsurface, .cursor, .xdg_toplevel, .xdg_popup => .role_conflict,
+        .subsurface, .cursor, .input_popup, .xdg_toplevel, .xdg_popup => .role_conflict,
     };
 }
 
 pub fn setDragIconListener(self: *WayringCompositor, listener: ?DragIconListener) void {
     self.drag_icon_listener = listener;
+}
+
+pub fn setInputPopupListener(self: *WayringCompositor, listener: ?InputPopupListener) void {
+    self.input_popup_listener = listener;
+}
+
+pub fn reserveInputPopup(self: *WayringCompositor, client: *const server.Client, id: SurfaceId) InputPopupError!InputPopupReservation {
+    const surface = self.surfaceForId(id) orelse return error.NotLive;
+    if (surface.destroying or surface.resource.runtime.state() != .live) return error.NotLive;
+    if ((self.clientForResource(&surface.resource.runtime) orelse return error.NotLive) != client) return error.WrongClient;
+    if (surface.relationship != null or surface.active_subsurface != null or surface.xdg_association != null or
+        surface.input_popup != null or surface.role != .none) return error.RoleConflict;
+    const generation = self.next_input_popup_generation orelse return error.GenerationExhausted;
+    self.next_input_popup_generation = if (generation == std.math.maxInt(u64)) null else generation + 1;
+    const reservation: InputPopupReservation = .{ .surface = id, .generation = generation };
+    surface.role = .input_popup;
+    surface.input_popup = reservation;
+    self.notifyPresentationClass(id, .input_popup);
+    return reservation;
+}
+
+pub fn releaseInputPopup(self: *WayringCompositor, reservation: InputPopupReservation) InputPopupError!void {
+    const surface = self.surfaceForId(reservation.surface) orelse return error.StaleReservation;
+    if (surface.destroying or surface.resource.runtime.state() != .live or surface.input_popup == null or
+        !std.meta.eql(surface.input_popup.?, reservation)) return error.StaleReservation;
+    surface.input_popup = null;
 }
 
 pub fn isDragIconRole(self: *const WayringCompositor, id: SurfaceId) bool {
@@ -774,7 +816,7 @@ pub fn reserveXdgRoot(
     if (surface.relationship != null or surface.active_subsurface != null) return error.NotRoot;
     switch (surface.role) {
         .none, .xdg_toplevel, .xdg_popup => {},
-        .subsurface, .cursor, .drag_icon => return error.RoleConflict,
+        .subsurface, .cursor, .drag_icon, .input_popup => return error.RoleConflict,
     }
     if (surface.xdg_association != null) return error.AlreadyReserved;
     const generation = self.next_xdg_generation orelse return error.GenerationExhausted;
@@ -865,7 +907,7 @@ pub fn permanentXdgRole(self: *const WayringCompositor, id: SurfaceId) ?XdgRole 
     return switch (surface.role) {
         .xdg_toplevel => .toplevel,
         .xdg_popup => .popup,
-        .none, .subsurface, .cursor, .drag_icon => null,
+        .none, .subsurface, .cursor, .drag_icon, .input_popup => null,
     };
 }
 
@@ -1503,7 +1545,7 @@ fn handleSurface(
                 association.live_role != null
             else
                 false;
-            if (surface.active_subsurface != null or live_xdg_role) {
+            if (surface.active_subsurface != null or live_xdg_role or surface.input_popup != null) {
                 const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
                 client.postProtocolError(&resource.runtime, @intCast(core.wl_surface.@"error".defunct_role_object), "surface has a live role object");
                 return;
@@ -2292,6 +2334,8 @@ fn publishPreparedCommit(
             listener.committed(listener.context, surface.id, prepared.offset_x, prepared.offset_y),
         .drag_icon => if (self.drag_icon_listener) |listener|
             listener.committed(listener.context, surface.id, prepared.offset_x, prepared.offset_y),
+        .input_popup => if (self.input_popup_listener) |listener|
+            listener.committed(listener.context, surface.id),
         else => {},
     }
 
@@ -2440,6 +2484,7 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     const objects = self.findClient(client) orelse unreachable;
     std.debug.assert(!surface.destroying);
     surface.destroying = true;
+    const removed_input_popup = surface.input_popup != null;
     if (surface.viewport_handler) |handler| {
         surface.viewport_handler = null;
         handler.surface_destroyed(handler.context);
@@ -2452,6 +2497,11 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
         const handler = association.handler;
         surface.xdg_association = null;
         if (handler) |live| live.surface_destroyed(live.context, surface.id);
+    }
+    if (surface.input_popup != null) {
+        surface.input_popup = null;
+        // The listener may destroy the popup protocol resource. Notify only
+        // after this surface has finished its own resource destruction path.
     }
     switch (surface.role) {
         .cursor => if (self.cursor_listener) |listener| listener.removed(listener.context, surface.id),
@@ -2494,6 +2544,8 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     surface.pending_damage.deinit();
     surface.resource.destroy();
     surface.resource.deinit();
+    if (removed_input_popup) if (self.input_popup_listener) |listener|
+        listener.removed(listener.context, surface.id);
     self.allocator.destroy(surface);
 }
 
