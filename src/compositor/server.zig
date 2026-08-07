@@ -30,6 +30,7 @@ const AlphaModifier = @import("wayland/alpha_modifier.zig");
 const BackgroundEffect = @import("wayland/background_effect.zig");
 const SecurityContext = @import("wayland/security_context.zig");
 const SessionLock = @import("wayland/session_lock.zig");
+const NeutralSessionLock = @import("SessionLock.zig");
 const CursorShape = @import("wayland/cursor_shape.zig");
 const Tablet = @import("wayland/tablet.zig");
 const RelativePointer = @import("wayland/relative_pointer.zig");
@@ -341,8 +342,10 @@ color_representation: ColorRepresentation,
 alpha_modifier: AlphaModifier,
 background_effect: BackgroundEffect,
 security_context: SecurityContext,
+session_lock_core: NeutralSessionLock,
 session_lock: SessionLock,
 session_lock_initialized: bool,
+session_lock_keyboard_focus: ?Surface.Id,
 cursor_shape: CursorShape,
 tablet: Tablet,
 relative_pointer: RelativePointer,
@@ -1174,8 +1177,10 @@ pub fn createWithVirtualOutput(
         .alpha_modifier = undefined,
         .background_effect = undefined,
         .security_context = undefined,
+        .session_lock_core = undefined,
         .session_lock = undefined,
         .session_lock_initialized = false,
+        .session_lock_keyboard_focus = null,
         .cursor_shape = undefined,
         .tablet = undefined,
         .relative_pointer = undefined,
@@ -1480,18 +1485,33 @@ pub fn createWithVirtualOutput(
     errdefer self.content_type.deinit();
     try self.background_effect.init(allocator, display);
     errdefer self.background_effect.deinit();
-    try self.session_lock.init(
+    self.session_lock_core = NeutralSessionLock.init(
         allocator,
-        display,
-        &self.outputs,
-        self.compositor.surfaceStore(),
-        &self.security_context,
+        &self.client_registry,
+        &self.surface_registry,
         .{
             .context = self,
             .state_changed = sessionLockStateChanged,
             .output_secure_without_frame = outputSecureWithoutFrame,
             .repaint = requestRepaint,
         },
+    );
+    try self.client_registry.addDisconnectListener(.{
+        .context = &self.session_lock_core,
+        .notify = sessionLockClientDisconnected,
+    });
+    errdefer self.client_registry.removeDisconnectListener(&self.session_lock_core);
+    errdefer self.session_lock_core.deinit();
+    var session_lock_outputs = self.outputs.iterator();
+    while (session_lock_outputs.next()) |entry| try self.session_lock_core.outputAdded(entry.id);
+    try self.session_lock.init(
+        allocator,
+        display,
+        &self.outputs,
+        self.compositor.surfaceStore(),
+        &self.security_context,
+        &self.session_lock_core,
+        &self.mature_clients,
     );
     self.session_lock_initialized = true;
     errdefer {
@@ -2184,6 +2204,8 @@ pub fn destroy(self: *Self) void {
     self.tablet.deinit();
     self.session_lock.deinit();
     self.session_lock_initialized = false;
+    self.client_registry.removeDisconnectListener(&self.session_lock_core);
+    self.session_lock_core.deinit();
     self.security_context.deinit();
     self.background_effect.deinit();
     self.content_type.deinit();
@@ -2320,7 +2342,13 @@ fn addRenderOutput(
     if (self.window_manager_initialized) {
         try self.window_manager.outputAdded(render_output.protocol_id);
     }
-    if (self.session_lock_initialized) self.session_lock.refreshOutputs();
+    errdefer if (self.window_manager_initialized) {
+        self.window_manager.outputRemoved(render_output.protocol_id) catch self.terminate();
+    };
+    if (self.session_lock_initialized) {
+        try self.session_lock_core.outputAdded(render_output.protocol_id);
+        self.session_lock.refreshOutputs();
+    }
     self.damageFullOutput(render_output);
     return id;
 }
@@ -2542,6 +2570,9 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     self.color_management.refreshPreferred();
     if (self.session_lock_initialized) {
         self.session_lock.outputRemoved(render_output.protocol_id);
+        if (self.session_lock_keyboard_focus != null and
+            !self.session_lock_core.ownsMappedSurface(self.session_lock_keyboard_focus.?))
+            self.session_lock_keyboard_focus = null;
         self.session_lock.refreshOutputs();
     }
     render_output.clearPendingFrame();
@@ -6438,6 +6469,7 @@ fn xdgActivationRequested(
 
 fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (!locked) self.session_lock_keyboard_focus = null;
     if (self.window_manager_initialized) self.window_manager.setSessionLocked(locked);
     if (locked) {
         finishAllWindowTransitions(self);
@@ -6473,6 +6505,27 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
             self.pointer_constraints.syncFocus();
         }
     }
+}
+
+fn sessionLockKeyboardFocus(self: *Self) ?Surface.Id {
+    if (self.session_lock_keyboard_focus) |focus| {
+        if (self.session_lock_core.ownsMappedSurface(focus)) return focus;
+    }
+    const focus = self.session_lock_core.firstMappedSurface();
+    self.session_lock_keyboard_focus = focus;
+    return focus;
+}
+
+fn sessionLockPointerPressed(self: *Self, surface: ?Surface.Id) void {
+    const focus = surface orelse return;
+    if (!self.session_lock_core.ownsMappedSurface(focus)) return;
+    self.session_lock_keyboard_focus = focus;
+    requestRepaint(self);
+}
+
+fn sessionLockClientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
+    const core: *NeutralSessionLock = @ptrCast(@alignCast(context));
+    core.clientDisconnected(client);
 }
 
 fn inputMethodSurfacePosition(context: *anyopaque, surface_id: Surface.Id) ?InputMethod.Position {
@@ -7233,7 +7286,7 @@ fn routeTouchDown(
     const first_touch = !seat.touchSequenceActive();
     if (self.session_lock.isLocked()) {
         if (focus) |target| {
-            self.session_lock.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
+            self.sessionLockPointerPressed(self.subcompositor.rootSurface(target.surface_id));
         }
     } else if (seat == &self.seat) {
         if (focus != null and focus.?.generated == null) {
@@ -7787,7 +7840,7 @@ fn pointerButtonForSeat(
                 self.subcompositor.rootSurface(surface_id)
             else
                 null;
-            self.session_lock.pointerPressed(focused);
+            self.sessionLockPointerPressed(focused);
         }
         const grab_ended = seat.pointerButton(time, button, state) catch {
             log.err("failed to store pointer button state", .{});
@@ -8291,7 +8344,7 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     const first_touch = !self.seat.touchSequenceActive();
     if (self.session_lock.isLocked()) {
         if (focus) |target| {
-            self.session_lock.pointerPressed(self.subcompositor.rootSurface(target.surface_id));
+            self.sessionLockPointerPressed(self.subcompositor.rootSurface(target.surface_id));
         }
         self.seat.touchDown(time, id, point.x, point.y, focus) catch {
             log.err("failed to store touch point", .{});
@@ -11080,7 +11133,7 @@ fn refreshKeyboardFocusReplacingGenerated(self: *Self) void {
 
 fn refreshKeyboardFocusWithGeneratedRetention(self: *Self, retain_generated: bool) void {
     if (self.session_lock.isLocked()) {
-        const focus = self.session_lock.keyboardFocus();
+        const focus = self.sessionLockKeyboardFocus();
         self.applyMatureKeyboardFocus(focus);
         self.syncXwaylandFocus(null);
         return;
@@ -13989,6 +14042,88 @@ test "production mature layer shell v5 maps, reserves, unmaps, and remaps" {
         if (server.client_registry.len() == 0 and server.compositor.surfaceStore().len() == surface_baseline) break;
         try server.eventLoop().dispatch(1);
     } else return error.MatureLayerCleanupTimedOut;
+    try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
+    try std.testing.expectEqual(fd_baseline, try countMatureDataDeviceFds());
+}
+
+test "production mature session lock v1 covers output, acquires, renders, and unlocks" {
+    const linux = std.os.linux;
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(std.testing.allocator, "/tmp/keywork-mature-session-lock-{d}-{x}", .{ linux.getpid(), @intFromPtr(&marker) }, 0);
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS) return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+    const previous_runtime = if (libc.getenv("XDG_RUNTIME_DIR")) |value| try std.testing.allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer {
+        if (previous_runtime) |value| {
+            _ = libc.setenv("XDG_RUNTIME_DIR", value, 1);
+            std.testing.allocator.free(value);
+        } else _ = libc.unsetenv("XDG_RUNTIME_DIR");
+    }
+    if (libc.setenv("XDG_RUNTIME_DIR", runtime_directory, 1) != 0) return error.RuntimeEnvironmentFailed;
+
+    const server = try Self.createWithVirtualOutput(std.testing.allocator, std.testing.io, .cpu, .headless, null, .{ .size = .{ .width = 64, .height = 48 }, .refresh_millihertz = 1 });
+    defer server.destroy();
+    const socket_name = try server.listen();
+    const surface_baseline = server.compositor.surfaceStore().len();
+    const registry_baseline = server.surface_registry.len();
+    const raw_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_command) != .SUCCESS) return error.EventFdFailed;
+    const command_fd: std.posix.fd_t = @intCast(raw_command);
+    defer _ = linux.close(command_fd);
+    const fd_baseline = try countMatureDataDeviceFds();
+    var client: MatureSessionLockClient = .{ .runtime_directory = runtime_directory, .display_name = socket_name, .command_fd = command_fd };
+    const thread = try std.Thread.spawn(.{}, MatureSessionLockClient.run, .{&client});
+    var joined = false;
+    defer if (!joined) {
+        client.shutdown();
+        thread.join();
+    };
+
+    try waitForMatureSessionLockStage(server, &client, .mapped);
+    try std.testing.expectEqual(@as(usize, 1), client.manager_global_count);
+    try std.testing.expectEqual(@as(u32, 1), client.manager_global_version);
+    try std.testing.expectEqual(@as(usize, 1), server.client_registry.len());
+    try std.testing.expectEqual(@as(u32, 64), client.configure_width);
+    try std.testing.expectEqual(@as(u32, 48), client.configure_height);
+    try std.testing.expect(client.configure_serial != 0);
+    try std.testing.expectEqual(client.configure_serial, client.acked_serial);
+    try std.testing.expectEqual(@as(usize, 0), client.locked_count.load(.acquire));
+    try std.testing.expect(server.session_lock_core.isLocked());
+    const output = server.primaryRenderOutput();
+    const snapshot = server.session_lock_core.surfaceForOutput(output.protocol_id) orelse return error.SessionLockSurfaceMissing;
+    try std.testing.expect(snapshot.mapped);
+    try std.testing.expectEqual(.{ @as(u32, 64), @as(u32, 48) }, snapshot.configured_size.?);
+    try std.testing.expectEqual(snapshot.surface, server.session_lock.surfaceForOutput(output.protocol_id).?.surface_id);
+    try std.testing.expect(server.session_lock.ownsSurface(snapshot.surface));
+    try std.testing.expectEqual(snapshot.surface, server.sessionLockKeyboardFocus().?);
+    try std.testing.expect(server.window_manager.focusedSurface() == null);
+    try std.testing.expect(server.scene.focusedSurface() == null);
+
+    try renderPendingTestOutput(server, output);
+    try std.testing.expect(output.sampled_surfaces_valid);
+    try std.testing.expect(surfaceWasSampled(output, snapshot.surface));
+    try std.testing.expectEqual(snapshot.surface, server.seat.matureKeyboardFocus().?);
+    try std.testing.expect(server.scene.topWindowSurface() == null);
+    try signalWayringCommand(command_fd);
+    try waitForMatureSessionLockStage(server, &client, .acquired);
+    try std.testing.expectEqual(@as(usize, 1), client.locked_count.load(.acquire));
+    try std.testing.expect(server.session_lock_core.isLocked());
+
+    try signalWayringCommand(command_fd);
+    try waitForMatureSessionLockStage(server, &client, .unlocked);
+    try std.testing.expect(!server.session_lock_core.isLocked());
+    try std.testing.expect(server.session_lock.surfaceForOutput(output.protocol_id) == null);
+    try std.testing.expect(server.seat.matureKeyboardFocus() == null);
+    try std.testing.expect(server.window_manager.focusedSurface() == null);
+    try signalWayringCommand(command_fd);
+    try waitForMatureSessionLockStage(server, &client, .disconnected);
+    thread.join();
+    joined = true;
+    for (0..2_000) |_| {
+        if (server.client_registry.len() == 0 and server.compositor.surfaceStore().len() == surface_baseline) break;
+        try server.eventLoop().dispatch(1);
+    } else return error.MatureSessionLockCleanupTimedOut;
     try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
     try std.testing.expectEqual(fd_baseline, try countMatureDataDeviceFds());
 }
@@ -19502,6 +19637,159 @@ const GeneratedLayerClient = struct {
     }
 };
 
+const MatureSessionLockClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_ext = wayland.client.ext;
+    const Stage = enum(u8) { starting, mapped, acquired, unlocked, disconnected, failed };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    locked_count: std.atomic.Value(usize) = .init(0),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    shm: ?*client_wl.Shm = null,
+    output: ?*client_wl.Output = null,
+    manager: ?*client_ext.SessionLockManagerV1 = null,
+    manager_global_count: usize = 0,
+    manager_global_version: u32 = 0,
+    configure_serial: u32 = 0,
+    acked_serial: u32 = 0,
+    configure_width: u32 = 0,
+    configure_height: u32 = 0,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}/{s}", .{ self.runtime_directory, self.display_name }, 0);
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake) != .SUCCESS) return error.WakeFdFailed;
+        const wake: i32 = @intCast(raw_wake);
+        if (self.wake_fd.cmpxchgStrong(-1, wake, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        if (self.manager_global_count != 1 or self.manager_global_version != 1) return error.SessionLockRegistryMismatch;
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        defer compositor.destroy();
+        const shm = self.shm orelse return error.ShmMissing;
+        defer shm.release();
+        const output = self.output orelse return error.OutputMissing;
+        defer output.release();
+        const manager = self.manager orelse return error.SessionLockManagerMissing;
+        defer manager.destroy();
+        if (manager.getVersion() != 1) return error.SessionLockVersionMismatch;
+        const lock = try manager.lock();
+        lock.setListener(*@This(), lockEvent, self);
+        const surface = try compositor.createSurface();
+        const lock_surface = try lock.getLockSurface(surface, output);
+        lock_surface.setListener(*@This(), lockSurfaceEvent, self);
+        try expectClientRoundtrip(display);
+        if (self.configure_serial == 0 or self.configure_width == 0 or self.configure_height == 0) return error.ConfigureMissing;
+        self.acked_serial = self.configure_serial;
+        lock_surface.ackConfigure(self.configure_serial);
+        const buffer = try createBuffer(shm, self.configure_width, self.configure_height);
+        defer buffer.buffer.destroy();
+        defer buffer.pool.destroy();
+        defer _ = std.os.linux.close(buffer.fd);
+        surface.attach(buffer.buffer, 0, 0);
+        surface.damageBuffer(0, 0, @intCast(self.configure_width), @intCast(self.configure_height));
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.locked_count.load(.acquire) != 0) return error.LockedBeforeCoverage;
+        try self.pause(.mapped);
+        try expectClientRoundtrip(display);
+        if (self.locked_count.load(.acquire) != 1) return error.LockedEventMismatch;
+        try self.pause(.acquired);
+        lock.unlockAndDestroy();
+        try expectClientRoundtrip(display);
+        try self.pause(.unlocked);
+        // The parent lock is already gone; its child remains independently destructible.
+        lock_surface.destroy();
+        surface.destroy();
+        try expectClientRoundtrip(display);
+    }
+
+    const TestBuffer = struct { fd: std.posix.fd_t, pool: *client_wl.ShmPool, buffer: *client_wl.Buffer };
+    fn createBuffer(shm: *client_wl.Shm, width: u32, height: u32) !TestBuffer {
+        const stride = std.math.mul(u32, width, @sizeOf(u32)) catch return error.ShmSizeOverflow;
+        const size = std.math.mul(u32, stride, height) catch return error.ShmSizeOverflow;
+        const fd = try std.posix.memfd_create("keywork-mature-session-lock", std.os.linux.MFD.CLOEXEC);
+        errdefer _ = std.os.linux.close(fd);
+        if (std.os.linux.errno(std.os.linux.ftruncate(fd, size)) != .SUCCESS) return error.ShmResizeFailed;
+        const pool = try shm.createPool(fd, @intCast(size));
+        errdefer pool.destroy();
+        return .{ .fd = fd, .pool = pool, .buffer = try pool.createBuffer(0, @intCast(width), @intCast(height), @intCast(stride), .argb8888) };
+    }
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, @min(global.version, 4)) catch null else if (std.mem.eql(u8, interface, "ext_session_lock_manager_v1")) {
+                    self.manager_global_count += 1;
+                    self.manager_global_version = global.version;
+                    self.manager = registry.bind(global.name, client_ext.SessionLockManagerV1, 1) catch null;
+                }
+            },
+            .global_remove => {},
+        }
+    }
+    fn lockEvent(_: *client_ext.SessionLockV1, event: client_ext.SessionLockV1.Event, self: *@This()) void {
+        switch (event) {
+            .locked => _ = self.locked_count.fetchAdd(1, .acq_rel),
+            .finished => {},
+        }
+    }
+    fn lockSurfaceEvent(_: *client_ext.SessionLockSurfaceV1, event: client_ext.SessionLockSurfaceV1.Event, self: *@This()) void {
+        switch (event) {
+            .configure => |configure| {
+                self.configure_serial = configure.serial;
+                self.configure_width = configure.width;
+                self.configure_height = configure.height;
+            },
+        }
+    }
+    fn pause(self: *@This(), value: Stage) !void {
+        self.stage.store(@intFromEnum(value), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+    fn closeWake(self: *@This(), replace: bool) void {
+        const value = self.wake_fd.swap(if (replace) -2 else -1, .acq_rel);
+        if (value >= 0) {
+            if (replace) _ = std.os.linux.shutdown(value, std.os.linux.SHUT.RDWR);
+            _ = std.os.linux.close(value);
+        }
+    }
+    fn shutdown(self: *@This()) void {
+        self.closeWake(true);
+        signalWayringCommand(self.command_fd) catch {};
+    }
+};
+
 const MatureDataDeviceClient = struct {
     const client_wl = wayland.client.wl;
     const client_ext = wayland.client.ext;
@@ -22519,6 +22807,17 @@ fn waitForGeneratedLayerStage(server: *Self, host: anytype, client: *GeneratedLa
         if (host.failure()) |err| return err;
     }
     return error.GeneratedLayerClientTimedOut;
+}
+
+fn waitForMatureSessionLockStage(server: *Self, client: *MatureSessionLockClient, expected: MatureSessionLockClient.Stage) !void {
+    for (0..2_000) |_| {
+        const stage: MatureSessionLockClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure.?;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+    }
+    return error.MatureSessionLockClientTimedOut;
 }
 
 fn waitForWayringDndStage(
