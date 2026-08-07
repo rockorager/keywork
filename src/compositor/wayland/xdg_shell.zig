@@ -1757,8 +1757,14 @@ const XdgSurfaceResource = struct {
         }
         if (info.had_buffer and !info.has_buffer) {
             switch (state.role.?) {
-                .toplevel => |window_id| if (self.shell.window_listener) |listener|
-                    listener.unmapping(listener.context, window_id),
+                .toplevel => |window_id| {
+                    // Closing snapshots are captured by the unmapping callback.
+                    // Dismiss descendants first so their stale mapped state does
+                    // not suppress the parent's disappearance transition.
+                    self.shell.dismissPopupsForParent(self.id);
+                    if (self.shell.window_listener) |listener|
+                        listener.unmapping(listener.context, window_id);
+                },
                 .popup => {},
             }
         }
@@ -1797,7 +1803,6 @@ const XdgSurfaceResource = struct {
         }
 
         if (info.had_buffer and !info.has_buffer) {
-            self.shell.dismissPopupsForParent(self.id);
             self.shell.reparentChildren(window_id, window.parent);
             self.shell.notifyWindowUnmapped(window_id);
             state.mapped = false;
