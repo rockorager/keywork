@@ -1656,8 +1656,6 @@ pub fn createWithVirtualOutput(
     errdefer self.mature_data_device.deinit();
     try self.primary_selection.init(allocator, display, &self.seat, &self.data_device);
     errdefer self.primary_selection.deinit();
-    try self.seat.addKeyboardFocusListener(.{ .context = self, .changed = primaryKeyboardFocusChanged });
-    errdefer self.seat.removeKeyboardFocusListener(self);
     try self.data_control.init(
         allocator,
         display,
@@ -1686,6 +1684,11 @@ pub fn createWithVirtualOutput(
         &self.neutral_text_input,
     );
     errdefer self.text_input.deinit();
+    try self.seat.addKeyboardFocusListener(.{
+        .context = self,
+        .changed = keyboardFocusChanged,
+    });
+    errdefer self.seat.removeKeyboardFocusListener(self);
     try self.input_method.init(
         allocator,
         display,
@@ -2099,11 +2102,11 @@ pub fn destroy(self: *Self) void {
     self.virtual_keyboard.deinit();
     self.transient_seat.deinit();
     self.input_method.deinit();
+    self.seat.removeKeyboardFocusListener(self);
     self.text_input.deinit();
     self.seat.mutableClientRegistry().removeDisconnectListener(&self.neutral_text_input);
     self.neutral_text_input.deinit();
     self.data_control.deinit();
-    self.seat.removeKeyboardFocusListener(self);
     self.primary_selection.deinit();
     self.mature_data_device.deinit();
     self.seat.mutableClientRegistry().removeDisconnectListener(&self.data_device);
@@ -3930,6 +3933,10 @@ pub fn surfaceRegistry(self: *Self) *SurfaceRegistry {
     return &self.surface_registry;
 }
 
+pub fn neutralTextInput(self: *Self) *NeutralTextInput {
+    return &self.neutral_text_input;
+}
+
 pub const DataDeviceResourceSnapshot = struct {
     neutral: NeutralDataDevice.ResourceCounts,
     mature: WaylandDataDevice.ResourceCounts,
@@ -4445,6 +4452,7 @@ fn wayringSurfaceApplied(context: *anyopaque, batch: WayringCompositor.AppliedBa
     const self: *Self = @ptrCast(@alignCast(context));
     self.damageActiveGeneratedCursor();
     for (batch.surfaces) |surface| {
+        self.neutral_text_input.surfaceCommitted(surface.id);
         const render_state = self.surface_registry.renderState(surface.id);
         if (surface.mapped_size) |mapped_size| {
             std.debug.assert(render_state != null);
@@ -4460,6 +4468,7 @@ fn wayringSurfaceApplied(context: *anyopaque, batch: WayringCompositor.AppliedBa
 fn wayringSurfaceRemoving(context: *anyopaque, id: SurfaceRegistry.Id) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.data_device.surfaceDestroyed(id);
+    self.neutral_text_input.surfaceDestroyed(id);
     self.damageActiveGeneratedCursor();
     if (self.headless_surface_forest.state(id).?.mapped_size) |mapped_size| {
         const render_state = self.surface_registry.renderState(id) orelse unreachable;
@@ -7706,6 +7715,11 @@ fn primaryKeyboardFocusChanged(context: *anyopaque, mature_client: ?*wl.Client) 
         null;
     self.data_device.setPrimaryFocus(focused_client) catch self.data_device.clearPrimaryFocusNoFail();
 }
+
+fn keyboardFocusChanged(context: *anyopaque, mature_client: ?*wl.Client) void {
+    primaryKeyboardFocusChanged(context, mature_client);
+    textInputKeyboardFocusChanged(context, mature_client);
+}
 fn primaryMimeOffered(context: *anyopaque, source: NeutralDataDevice.PrimarySourceId, mime: []const u8) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.primary_selection.neutralMimeOffered(source, mime);
@@ -7809,6 +7823,15 @@ fn dataDeviceClientDisconnected(context: *anyopaque, client: ClientRegistry.Id) 
 fn textInputClientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
     const text_input: *NeutralTextInput = @ptrCast(@alignCast(context));
     text_input.clientDisconnected(client);
+}
+
+fn textInputKeyboardFocusChanged(context: *anyopaque, _: ?*wl.Client) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.seat.textInputFocus()) |focus| {
+        self.neutral_text_input.setKeyboardFocus(focus.surface, focus.client) catch {
+            self.neutral_text_input.setKeyboardFocus(null, null) catch unreachable;
+        };
+    } else self.neutral_text_input.setKeyboardFocus(null, null) catch unreachable;
 }
 
 fn dataDeviceDragChanged(context: *anyopaque) void {
@@ -17067,6 +17090,7 @@ const WayringXdgClient = struct {
     registry_only: bool = false,
     registry_watch_data_device: bool = false,
     registry_watch_primary_selection: bool = false,
+    expect_text_input: bool = false,
     offense: ?Offense = null,
     activation_role: ?ActivationRole = null,
     activation_exchange: ?*ActivationExchange = null,
@@ -17090,6 +17114,10 @@ const WayringXdgClient = struct {
     primary_selection_manager_version: u32 = 0,
     primary_selection_manager_name: u32 = 0,
     primary_selection_manager_removed: bool = false,
+    text_input_manager_count: usize = 0,
+    text_input_manager_version: u32 = 0,
+    generated_input_method_seen: bool = false,
+    generated_virtual_keyboard_seen: bool = false,
     configure_serial: u32 = 0,
     configure_count: u8 = 0,
     toplevel_configure_count: u8 = 0,
@@ -17132,7 +17160,12 @@ const WayringXdgClient = struct {
         .{ .name = "xdg_activation_v1", .version = 1 },
         .{ .name = "wl_data_device_manager", .version = 4 },
         .{ .name = "zwp_primary_selection_device_manager_v1", .version = 1 },
+        .{ .name = "zwp_text_input_manager_v3", .version = 2 },
     };
+
+    fn expectedGlobalCount(self: *const @This()) usize {
+        return expected_globals.len - @intFromBool(!self.expect_text_input);
+    }
 
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
@@ -17168,7 +17201,7 @@ const WayringXdgClient = struct {
         defer if (registry_live) registry.destroy();
         registry.setListener(*@This(), registryEvent, self);
         try expectClientRoundtrip(display);
-        if (!self.globals_exact or self.global_count != expected_globals.len) return error.UnexpectedRegistrySnapshot;
+        if (!self.globals_exact or self.global_count != self.expectedGlobalCount()) return error.UnexpectedRegistrySnapshot;
         const compositor = self.compositor orelse return error.CompositorMissing;
         const shm = self.shm orelse return error.ShmMissing;
         const output = self.output orelse return error.OutputMissing;
@@ -17422,9 +17455,17 @@ const WayringXdgClient = struct {
                     self.primary_selection_manager_version = global.version;
                     self.primary_selection_manager_name = global.name;
                 }
+                if (std.mem.eql(u8, interface, "zwp_text_input_manager_v3")) {
+                    self.text_input_manager_count += 1;
+                    self.text_input_manager_version = global.version;
+                } else if (std.mem.eql(u8, interface, "zwp_input_method_manager_v2")) {
+                    self.generated_input_method_seen = true;
+                } else if (std.mem.eql(u8, interface, "zwp_virtual_keyboard_manager_v1")) {
+                    self.generated_virtual_keyboard_seen = true;
+                }
                 const index = self.global_count;
                 self.global_count += 1;
-                if (index >= expected_globals.len or !std.mem.eql(u8, interface, expected_globals[index].name) or
+                if (index >= self.expectedGlobalCount() or !std.mem.eql(u8, interface, expected_globals[index].name) or
                     global.version != expected_globals[index].version) self.globals_exact = false;
                 if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, 6) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, 4) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, 11) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, 7) catch null else if (std.mem.eql(u8, interface, "zxdg_decoration_manager_v1")) self.decoration_manager = registry.bind(global.name, client_zxdg.DecorationManagerV1, 2) catch null else if (std.mem.eql(u8, interface, "xdg_activation_v1")) self.activation = registry.bind(global.name, client_xdg.ActivationV1, 1) catch null;
             },
@@ -20253,7 +20294,13 @@ const MatureTextClient = struct {
     method_done_count: u32 = 0,
     method_events: [5]u8 = undefined,
     method_event_count: usize = 0,
+    method_surrounding: [16]u8 = undefined,
+    method_surrounding_len: usize = 0,
+    method_cursor: u32 = 0,
+    method_anchor: u32 = 0,
+    method_cause: i32 = 0,
     method_content_hint: u32 = 0,
+    method_content_purpose: i32 = 0,
     grab_delivery: bool = false,
 
     fn run(self: *@This()) void {
@@ -20368,10 +20415,21 @@ const MatureTextClient = struct {
     fn methodEvent(_: *client_zwp.InputMethodV2, event: client_zwp.InputMethodV2.Event, self: *@This()) void {
         const tag: u8 = switch (event) {
             .activate => 1,
-            .surrounding_text => 2,
-            .text_change_cause => 3,
+            .surrounding_text => |value| value: {
+                const text = std.mem.span(value.text);
+                self.method_surrounding_len = @min(text.len, self.method_surrounding.len);
+                @memcpy(self.method_surrounding[0..self.method_surrounding_len], text[0..self.method_surrounding_len]);
+                self.method_cursor = value.cursor;
+                self.method_anchor = value.anchor;
+                break :value 2;
+            },
+            .text_change_cause => |value| value: {
+                self.method_cause = @intFromEnum(value.cause);
+                break :value 3;
+            },
             .content_type => |value| value: {
                 self.method_content_hint = @bitCast(value.hint);
+                self.method_content_purpose = @intFromEnum(value.purpose);
                 break :value 4;
             },
             .done => value: {
@@ -20398,6 +20456,235 @@ const MatureTextClient = struct {
     fn shutdown(self: *@This()) void {
         self.shutdown_requested.store(true, .release);
         _ = std.os.linux.shutdown(self.fd, std.os.linux.SHUT.RDWR);
+    }
+};
+
+const GeneratedTextInputClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_xdg = wayland.client.xdg;
+    const client_zwp = wayland.client.zwp;
+    const Stage = enum(u8) { starting, mapped, state_sent, edit_received, left, disconnected, failed };
+    const EditTag = enum { preedit, delete, commit, done };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    shm: ?*client_wl.Shm = null,
+    seat: ?*client_wl.Seat = null,
+    wm_base: ?*client_xdg.WmBase = null,
+    text_manager: ?*client_zwp.TextInputManagerV3 = null,
+    surface_object_id: u32 = 0,
+    configure_serial: u32 = 0,
+    entered: bool = false,
+    left_value: bool = false,
+    edits: [4]EditTag = undefined,
+    edit_count: usize = 0,
+    preedit: [16]u8 = undefined,
+    preedit_len: usize = 0,
+    preedit_begin: i32 = 0,
+    preedit_end: i32 = 0,
+    delete_before: u32 = 0,
+    delete_after: u32 = 0,
+    committed: [16]u8 = undefined,
+    committed_len: usize = 0,
+    done_serial: u32 = 0,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(
+            std.heap.page_allocator,
+            "{s}/{s}",
+            .{ self.runtime_directory, self.display_name },
+            0,
+        );
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        defer compositor.destroy();
+        const shm = self.shm orelse return error.ShmMissing;
+        defer shm.release();
+        const seat = self.seat orelse return error.SeatMissing;
+        defer seat.release();
+        const wm_base = self.wm_base orelse return error.XdgWmBaseMissing;
+        defer wm_base.destroy();
+        wm_base.setListener(*@This(), wmBaseEvent, self);
+        const manager = self.text_manager orelse return error.TextInputManagerMissing;
+        defer manager.destroy();
+
+        const surface = try compositor.createSurface();
+        defer surface.destroy();
+        self.surface_object_id = surface.getId();
+        const xdg_surface = try wm_base.getXdgSurface(surface);
+        defer xdg_surface.destroy();
+        xdg_surface.setListener(*@This(), xdgSurfaceEvent, self);
+        const toplevel = try xdg_surface.getToplevel();
+        defer toplevel.destroy();
+        surface.commit();
+        while (self.configure_serial == 0) try expectClientRoundtrip(display);
+
+        const shm_fd = try std.posix.memfd_create("keywork-generated-text", std.os.linux.MFD.CLOEXEC);
+        defer _ = std.os.linux.close(shm_fd);
+        const pixel: u32 = 0xff33_6699;
+        if (std.os.linux.errno(std.os.linux.ftruncate(shm_fd, @sizeOf(u32))) != .SUCCESS)
+            return error.ShmResizeFailed;
+        if (std.c.pwrite(shm_fd, @ptrCast(&pixel), @sizeOf(u32), 0) != @sizeOf(u32))
+            return error.ShmWriteFailed;
+        const pool = try shm.createPool(shm_fd, @sizeOf(u32));
+        defer pool.destroy();
+        const buffer = try pool.createBuffer(0, 1, 1, @sizeOf(u32), .argb8888);
+        defer buffer.destroy();
+        surface.attach(buffer, 0, 0);
+        surface.damageBuffer(0, 0, 1, 1);
+        surface.commit();
+        try expectClientRoundtrip(display);
+
+        const input = try manager.getTextInput(seat);
+        defer input.destroy();
+        input.setListener(*@This(), textEvent, self);
+        try expectClientRoundtrip(display);
+        try self.pause(display, .mapped);
+        while (!self.entered) try expectClientRoundtrip(display);
+        input.enable();
+        input.setSurroundingText("héllo", 3, 1);
+        input.setTextChangeCause(.other);
+        input.setContentType(.{
+            .completion = true,
+            .on_screen_input_provided = true,
+            .no_emoji = true,
+            .preedit_shown = true,
+        }, .email);
+        input.setCursorRectangle(2, 3, 4, 5);
+        input.commit();
+        try expectClientRoundtrip(display);
+        try self.pause(display, .state_sent);
+        while (self.edit_count < self.edits.len) try expectClientRoundtrip(display);
+        try self.pause(display, .edit_received);
+        while (!self.left_value) try expectClientRoundtrip(display);
+        try self.pause(display, .left);
+    }
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor"))
+                    self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null
+                else if (std.mem.eql(u8, interface, "wl_shm"))
+                    self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null
+                else if (std.mem.eql(u8, interface, "wl_seat"))
+                    self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null
+                else if (std.mem.eql(u8, interface, "xdg_wm_base"))
+                    self.wm_base = registry.bind(global.name, client_xdg.WmBase, @min(global.version, 7)) catch null
+                else if (std.mem.eql(u8, interface, "zwp_text_input_manager_v3"))
+                    self.text_manager = registry.bind(global.name, client_zwp.TextInputManagerV3, @min(global.version, 2)) catch null;
+            },
+            .global_remove => {},
+        }
+    }
+
+    fn wmBaseEvent(wm_base: *client_xdg.WmBase, event: client_xdg.WmBase.Event, _: *@This()) void {
+        switch (event) {
+            .ping => |ping| wm_base.pong(ping.serial),
+        }
+    }
+
+    fn xdgSurfaceEvent(xdg_surface: *client_xdg.Surface, event: client_xdg.Surface.Event, self: *@This()) void {
+        switch (event) {
+            .configure => |configure| {
+                self.configure_serial = configure.serial;
+                xdg_surface.ackConfigure(configure.serial);
+            },
+        }
+    }
+
+    fn textEvent(_: *client_zwp.TextInputV3, event: client_zwp.TextInputV3.Event, self: *@This()) void {
+        const tag: ?EditTag = switch (event) {
+            .enter => value: {
+                self.entered = true;
+                break :value null;
+            },
+            .leave => value: {
+                self.left_value = true;
+                break :value null;
+            },
+            .preedit_string => |preedit| value: {
+                const text = if (preedit.text) |text| std.mem.span(text) else "";
+                self.preedit_len = @min(text.len, self.preedit.len);
+                @memcpy(self.preedit[0..self.preedit_len], text[0..self.preedit_len]);
+                self.preedit_begin = preedit.cursor_begin;
+                self.preedit_end = preedit.cursor_end;
+                break :value .preedit;
+            },
+            .delete_surrounding_text => |delete| value: {
+                self.delete_before = delete.before_length;
+                self.delete_after = delete.after_length;
+                break :value .delete;
+            },
+            .commit_string => |commit| value: {
+                const text = if (commit.text) |text| std.mem.span(text) else "";
+                self.committed_len = @min(text.len, self.committed.len);
+                @memcpy(self.committed[0..self.committed_len], text[0..self.committed_len]);
+                break :value .commit;
+            },
+            .done => |done| value: {
+                self.done_serial = done.serial;
+                break :value .done;
+            },
+            else => null,
+        };
+        if (tag) |value| if (self.edit_count < self.edits.len) {
+            self.edits[self.edit_count] = value;
+            self.edit_count += 1;
+        };
+    }
+
+    fn pause(self: *@This(), display: *client_wl.Display, stage_value: Stage) !void {
+        self.stage.store(@intFromEnum(stage_value), .release);
+        try waitForWayringCommandDraining(display, self.command_fd);
+    }
+
+    fn closeWake(self: *@This(), shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(-2, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+
+    fn shutdown(self: *@This()) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
     }
 };
 
@@ -20570,6 +20857,23 @@ fn waitForWayringXdgStage(server: *Self, host: anytype, client: *WayringXdgClien
         if (host.failure()) |err| return err;
     }
     return error.WayringXdgClientTimedOut;
+}
+
+fn waitForGeneratedTextInputStage(
+    server: *Self,
+    host: anytype,
+    client: *GeneratedTextInputClient,
+    expected: GeneratedTextInputClient.Stage,
+) !void {
+    for (0..4_000) |_| {
+        const stage: GeneratedTextInputClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure orelse error.GeneratedTextInputClientFailed;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    }
+    return error.GeneratedTextInputClientTimedOut;
 }
 
 fn waitForMatureKeyboardStage(
@@ -22390,6 +22694,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
 
 test "production generated data device completes the exact profile and supports unpublish" {
     const WayringHost = @import("wayland/WayringHost.zig");
+    const WayringTextInput = @import("wayland/WayringTextInput.zig");
     const wayring = @import("wayring");
     const linux = std.os.linux;
     var marker: u8 = 0;
@@ -22558,7 +22863,7 @@ test "production generated data device completes the exact profile and supports 
     });
     defer server.setDataDeviceObserver(null);
 
-    // Production publishes this global last, after every dependency is ready.
+    // Production publishes stateful data-device after its dependencies.
     try data_device.publish();
     var primary_selection: WayringPrimarySelection = undefined;
     primary_selection.init(
@@ -22584,6 +22889,20 @@ test "production generated data device completes the exact profile and supports 
     });
     defer server.setPrimarySelectionObserver(null);
     try primary_selection.publish();
+    var text_input: WayringTextInput = undefined;
+    text_input.init(
+        std.testing.allocator,
+        &protocol_server,
+        &clients,
+        &seat,
+        &compositor,
+        server.neutralTextInput(),
+    );
+    defer {
+        if (text_input.global != null) text_input.unpublish();
+        text_input.deinit();
+    }
+    try text_input.publish();
 
     const Lifecycle = struct {
         const FatalEvidence = struct {
@@ -22613,12 +22932,15 @@ test "production generated data device completes the exact profile and supports 
         activation: *WayringXdgActivation,
         data_device: *WayringDataDevice,
         primary_selection: *WayringPrimarySelection,
+        text_input: *WayringTextInput,
         generated_client: ?ClientRegistry.Id = null,
+        generated_raw: ?*wayring.server.Client = null,
         offender_fatal: ?FatalEvidence = null,
         fatal_count: usize = 0,
 
         fn accepted(context: *anyopaque, client: *wayring.server.Client) !void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            self.generated_raw = client;
             self.generated_client = try self.clients.register(client);
             errdefer self.clients.unregister(client);
             try self.seat.trackClient(client);
@@ -22642,6 +22964,7 @@ test "production generated data device completes the exact profile and supports 
                     self.offender_fatal = evidence;
                 }
             };
+            self.text_input.destroyClientResources(client);
             self.data_device.destroyClientResources(client);
             self.primary_selection.destroyClientResources(client);
             self.activation.destroyClientResources(client);
@@ -22653,6 +22976,7 @@ test "production generated data device completes the exact profile and supports 
             self.seat.destroyClientResources(client);
             self.outputs.destroyClientResources(client);
             self.compositor.destroyClientResources(client);
+            if (self.generated_raw == client) self.generated_raw = null;
             if (self.clients.id(client) != null) self.clients.unregister(client);
         }
     };
@@ -22669,6 +22993,7 @@ test "production generated data device completes the exact profile and supports 
         .activation = &activation,
         .data_device = &data_device,
         .primary_selection = &primary_selection,
+        .text_input = &text_input,
     };
     const host = try WayringHost.create(
         std.testing.allocator,
@@ -22694,6 +23019,7 @@ test "production generated data device completes the exact profile and supports 
         .command_fd = command_fd,
         .registry_only = true,
         .registry_watch_data_device = true,
+        .expect_text_input = true,
     };
     const thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&peer});
     var joined = false;
@@ -22708,8 +23034,13 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(u32, 4), peer.data_device_manager_version);
     try std.testing.expectEqual(@as(usize, 1), peer.primary_selection_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.primary_selection_manager_version);
+    try std.testing.expectEqual(@as(usize, 1), peer.text_input_manager_count);
+    try std.testing.expectEqual(@as(u32, 2), peer.text_input_manager_version);
+    try std.testing.expect(!peer.generated_input_method_seen);
+    try std.testing.expect(!peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
 
+    text_input.unpublish();
     primary_selection.unpublish();
     data_device.unpublish();
     try signalWayringCommand(command_fd);
@@ -22726,6 +23057,7 @@ test "production generated data device completes the exact profile and supports 
 
     try data_device.publish();
     try primary_selection.publish();
+    try text_input.publish();
     const primary_resource_baseline = server.neutralDataDevice().primaryResourceCounts();
     const raw_generated_primary_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     const raw_mature_primary_command = linux.eventfd(0, linux.EFD.CLOEXEC);
@@ -22918,6 +23250,7 @@ test "production generated data device completes the exact profile and supports 
         .command_fd = primary_watch_command,
         .registry_only = true,
         .registry_watch_primary_selection = true,
+        .expect_text_input = true,
     };
     const primary_watch_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_watch});
     var primary_watch_joined = false;
@@ -22928,6 +23261,7 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringXdgStage(server, host, &primary_watch, .registry_ready);
     try std.testing.expect(primary_watch.globals_exact);
     try std.testing.expectEqual(@as(usize, 1), primary_watch.primary_selection_manager_count);
+    text_input.unpublish();
     primary_selection.unpublish();
     try signalWayringCommand(primary_watch_command);
     try waitForWayringXdgStage(server, host, &primary_watch, .manager_removed);
@@ -22939,6 +23273,7 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringDisconnect(server, host, &compositor);
 
     try primary_selection.publish();
+    try text_input.publish();
     const raw_primary_rebind_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_primary_rebind_command) != .SUCCESS) return error.EventFdFailed;
     const primary_rebind_command: std.posix.fd_t = @intCast(raw_primary_rebind_command);
@@ -22948,6 +23283,7 @@ test "production generated data device completes the exact profile and supports 
         .display_name = host.displayName(),
         .command_fd = primary_rebind_command,
         .registry_only = true,
+        .expect_text_input = true,
     };
     const primary_rebind_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_rebind});
     var primary_rebind_joined = false;
@@ -22965,6 +23301,90 @@ test "production generated data device completes the exact profile and supports 
     primary_rebind_thread.join();
     primary_rebind_joined = true;
     try waitForWayringDisconnect(server, host, &compositor);
+    const text_resource_baseline = server.neutral_text_input.resourceSnapshot();
+    var method_sockets: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &method_sockets),
+    );
+    _ = wl.Client.create(server.display, method_sockets[0]) orelse return error.OutOfMemory;
+    var method: MatureTextClient = .{ .fd = method_sockets[1], .role = .input_method };
+    const method_thread = try std.Thread.spawn(.{}, MatureTextClient.run, .{&method});
+    var method_joined = false;
+    defer if (!method_joined) {
+        method.shutdown();
+        method_thread.join();
+    };
+    try waitForMatureTextStage(server, &method, .ready);
+
+    const raw_text_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_text_command) != .SUCCESS) return error.EventFdFailed;
+    const text_command: std.posix.fd_t = @intCast(raw_text_command);
+    defer _ = linux.close(text_command);
+    var generated_text: GeneratedTextInputClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = text_command,
+    };
+    const generated_text_thread = try std.Thread.spawn(.{}, GeneratedTextInputClient.run, .{&generated_text});
+    var generated_text_joined = false;
+    defer if (!generated_text_joined) {
+        generated_text.shutdown();
+        generated_text_thread.join();
+    };
+    try waitForGeneratedTextInputStage(server, host, &generated_text, .mapped);
+    const generated_text_surface = compositor.surfaceId(
+        lifecycle.generated_raw orelse return error.GeneratedTextClientMissing,
+        generated_text.surface_object_id,
+    ) orelse return error.GeneratedTextSurfaceMissing;
+    server.seat.ensureParentKeyboardEnter();
+    try std.testing.expect(server.seat.applyGeneratedKeyboardFocus(.{
+        .surface = generated_text_surface,
+        .client = server.seat.generatedSurfaceOwner(generated_text_surface) orelse
+            return error.GeneratedTextSurfaceOwnerMissing,
+    }, null));
+    try signalWayringCommand(text_command);
+    try waitForGeneratedTextInputStage(server, host, &generated_text, .state_sent);
+    try waitForMatureTextStage(server, &method, .state_received);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, method.method_events[0..method.method_event_count]);
+    try std.testing.expectEqualStrings("héllo", method.method_surrounding[0..method.method_surrounding_len]);
+    try std.testing.expectEqual(@as(u32, 3), method.method_cursor);
+    try std.testing.expectEqual(@as(u32, 1), method.method_anchor);
+    try std.testing.expectEqual(@as(i32, 1), method.method_cause);
+    try std.testing.expectEqual(@as(u32, (1 << 0) | (1 << 10) | (1 << 11) | (1 << 12)), method.method_content_hint);
+    try std.testing.expectEqual(@as(i32, 6), method.method_content_purpose);
+    method.proceed.store(true, .release);
+    try signalWayringCommand(text_command);
+    try waitForGeneratedTextInputStage(server, host, &generated_text, .edit_received);
+    try std.testing.expectEqualSlices(
+        GeneratedTextInputClient.EditTag,
+        &.{ .preedit, .delete, .commit, .done },
+        generated_text.edits[0..generated_text.edit_count],
+    );
+    try std.testing.expectEqualStrings("候補", generated_text.preedit[0..generated_text.preedit_len]);
+    try std.testing.expectEqual(@as(i32, 0), generated_text.preedit_begin);
+    try std.testing.expectEqual(@as(i32, 6), generated_text.preedit_end);
+    try std.testing.expectEqual(@as(u32, 2), generated_text.delete_before);
+    try std.testing.expectEqual(@as(u32, 1), generated_text.delete_after);
+    try std.testing.expectEqualStrings("確定", generated_text.committed[0..generated_text.committed_len]);
+    try std.testing.expectEqual(@as(u32, 1), generated_text.done_serial);
+    try std.testing.expect(server.seat.clearGeneratedKeyboardFocus());
+    try signalWayringCommand(text_command);
+    try waitForGeneratedTextInputStage(server, host, &generated_text, .left);
+    try signalWayringCommand(text_command);
+    try waitForGeneratedTextInputStage(server, host, &generated_text, .disconnected);
+    generated_text_thread.join();
+    generated_text_joined = true;
+    method.shutdown();
+    method_thread.join();
+    method_joined = true;
+    for (0..2_000) |_| {
+        if (host.connectionCount() == 0 and
+            std.meta.eql(server.neutral_text_input.resourceSnapshot(), text_resource_baseline)) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedTextCleanupTimedOut;
 
     const raw_generated_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     const raw_mature_command = linux.eventfd(0, linux.EFD.CLOEXEC);
