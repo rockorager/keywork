@@ -14415,6 +14415,29 @@ test "canonical generated keyboard delivery preserves focus aggregation authorit
     server.seat.setKeyboardAvailable(true);
     try server.seat.parentKeyboardEnter(&.{30});
     defer server.seat.setKeyboardAvailable(false);
+    var virtual_owner: u8 = 0;
+    try server.seat.createVirtualKeyboard(&virtual_owner);
+    defer server.seat.destroyVirtualKeyboard(&virtual_owner);
+    const virtual_keymap_fd = try std.posix.memfd_create("keywork-seat-virtual-test", std.os.linux.MFD.CLOEXEC);
+    const virtual_keymap = "keymap\x00";
+    if (std.os.linux.errno(std.os.linux.ftruncate(virtual_keymap_fd, virtual_keymap.len)) != .SUCCESS or
+        std.c.pwrite(virtual_keymap_fd, virtual_keymap.ptr, virtual_keymap.len, 0) != virtual_keymap.len)
+        return error.VirtualKeymapSetupFailed;
+    try server.seat.setVirtualKeyboardKeymap(&virtual_owner, virtual_keymap_fd, virtual_keymap.len);
+    var virtual_owner_b: u8 = 0;
+    try server.seat.createVirtualKeyboard(&virtual_owner_b);
+    defer server.seat.destroyVirtualKeyboard(&virtual_owner_b);
+    const virtual_keymap_b_fd = try std.posix.memfd_create("keywork-seat-virtual-test-b", std.os.linux.MFD.CLOEXEC);
+    if (std.os.linux.errno(std.os.linux.ftruncate(virtual_keymap_b_fd, virtual_keymap.len)) != .SUCCESS or
+        std.c.pwrite(virtual_keymap_b_fd, virtual_keymap.ptr, virtual_keymap.len, 0) != virtual_keymap.len)
+        return error.VirtualKeymapSetupFailed;
+    try server.seat.setVirtualKeyboardKeymap(&virtual_owner_b, virtual_keymap_b_fd, virtual_keymap.len);
+    const invalid_keymap_fd = try std.posix.memfd_create("keywork-seat-virtual-invalid", std.os.linux.MFD.CLOEXEC);
+    try std.testing.expectError(
+        error.InvalidKeymap,
+        server.seat.setVirtualKeyboardKeymap(&virtual_owner_b, invalid_keymap_fd, 0),
+    );
+    try std.testing.expect(std.c.fcntl(invalid_keymap_fd, std.posix.F.GETFD) < 0);
 
     try std.testing.expect(server.focusGeneratedSurface(root_a));
     try std.testing.expectEqualSlices(TestGeneratedSeatSink.KeyboardTag, &.{.enter}, sink.keyboard_events[0..sink.keyboard_event_count]);
@@ -14435,13 +14458,30 @@ test "canonical generated keyboard delivery preserves focus aggregation authorit
     const press_serial: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 3 };
     try std.testing.expect(server.seat.authority.acceptsAction(client_a, press_serial));
     try std.testing.expect(server.seat.authority.selectionOrder(client_a, press_serial) != null);
-    try server.seat.virtualKey(2, 31, .pressed);
+    try server.seat.virtualKey(&virtual_owner, 2, 31, .pressed);
     try server.seat.key(3, 31, .released);
     try std.testing.expectEqual(@as(usize, 3), sink.keyboard_event_count);
-    try server.seat.virtualKey(4, 31, .released);
+    try server.seat.virtualKey(&virtual_owner, 4, 31, .released);
     const release_serial: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 4 };
     try std.testing.expect(!server.seat.authority.acceptsAction(client_a, release_serial));
     try std.testing.expect(server.seat.authority.selectionOrder(client_a, release_serial) != null);
+
+    const events_before_overlap = sink.keyboard_event_count;
+    try server.seat.virtualKey(&virtual_owner, 9, 33, .pressed);
+    try server.seat.virtualKey(&virtual_owner_b, 10, 33, .pressed);
+    try std.testing.expectEqual(events_before_overlap + 1, sink.keyboard_event_count);
+    server.seat.releaseVirtualKeyboard(&virtual_owner_b);
+    try std.testing.expectEqual(events_before_overlap + 1, sink.keyboard_event_count);
+    try server.seat.virtualKey(&virtual_owner, 11, 33, .released);
+    try std.testing.expectEqual(events_before_overlap + 2, sink.keyboard_event_count);
+
+    try server.seat.virtualKey(&virtual_owner, 12, 34, .pressed);
+    const events_before_inhibition = sink.keyboard_event_count;
+    server.seat.setVirtualKeyboardsInhibited(true);
+    try std.testing.expectEqual(events_before_inhibition + 1, sink.keyboard_event_count);
+    try server.seat.virtualKey(&virtual_owner, 13, 35, .pressed);
+    try std.testing.expectEqual(events_before_inhibition + 1, sink.keyboard_event_count);
+    server.seat.setVirtualKeyboardsInhibited(false);
 
     try server.seat.key(5, 32, .pressed);
     try server.seat.key(6, 32, .repeated);
@@ -17379,11 +17419,14 @@ const WayringXdgClient = struct {
     registry_watch_input_method: bool = false,
     expect_text_input: bool = false,
     expect_data_control: bool = false,
+    expect_virtual_keyboard: bool = false,
     guessed_data_control_name: ?u32 = null,
+    guessed_virtual_keyboard_name: ?u32 = null,
     guessed_data_control_bind_issued: bool = false,
     guessed_input_method_name: ?u32 = null,
     guessed_input_method_bind_issued: bool = false,
     expect_input_method: bool = false,
+    guessed_virtual_keyboard_bind_issued: bool = false,
     offense: ?Offense = null,
     activation_role: ?ActivationRole = null,
     activation_exchange: ?*ActivationExchange = null,
@@ -17420,6 +17463,10 @@ const WayringXdgClient = struct {
     input_method_manager_name: u32 = 0,
     input_method_manager_removed: bool = false,
     generated_virtual_keyboard_seen: bool = false,
+    virtual_keyboard_manager_count: usize = 0,
+    virtual_keyboard_manager_version: u32 = 0,
+    virtual_keyboard_manager_name: u32 = 0,
+    virtual_keyboard_manager_removed: bool = false,
     configure_serial: u32 = 0,
     configure_count: u8 = 0,
     toplevel_configure_count: u8 = 0,
@@ -17465,11 +17512,14 @@ const WayringXdgClient = struct {
         .{ .name = "zwp_text_input_manager_v3", .version = 2 },
         .{ .name = "ext_data_control_manager_v1", .version = 1 },
         .{ .name = "zwp_input_method_manager_v2", .version = 1 },
+        .{ .name = "zwp_virtual_keyboard_manager_v1", .version = 1 },
     };
 
     fn expectedGlobalCount(self: *const @This()) usize {
         return expected_globals.len - @intFromBool(!self.expect_text_input) -
-            @intFromBool(!self.expect_data_control) - @intFromBool(!self.expect_input_method);
+            @intFromBool(!self.expect_data_control) -
+            @intFromBool(!self.expect_input_method) -
+            @intFromBool(!self.expect_virtual_keyboard);
     }
 
     fn run(self: *@This()) void {
@@ -17556,6 +17606,17 @@ const WayringXdgClient = struct {
                 try self.pause(.manager_added);
                 _ = try registry.bind(name, client_zwp.InputMethodManagerV2, 1);
                 self.guessed_input_method_bind_issued = true;
+                expectClientRoundtrip(display) catch return;
+                return error.RestrictedGlobalBindAccepted;
+            }
+            if (self.guessed_virtual_keyboard_name) |name| {
+                try expectClientRoundtrip(display);
+                if (!self.globals_exact or self.global_count != self.expectedGlobalCount() or
+                    self.virtual_keyboard_manager_count != 0)
+                    return error.RestrictedGlobalAdvertised;
+                try self.pause(.manager_added);
+                _ = try registry.bind(name, client_zwp.VirtualKeyboardManagerV1, 1);
+                self.guessed_virtual_keyboard_bind_issued = true;
                 expectClientRoundtrip(display) catch return;
                 return error.RestrictedGlobalBindAccepted;
             }
@@ -17815,6 +17876,9 @@ const WayringXdgClient = struct {
                     self.input_method_manager_name = global.name;
                 } else if (std.mem.eql(u8, interface, "zwp_virtual_keyboard_manager_v1")) {
                     self.generated_virtual_keyboard_seen = true;
+                    self.virtual_keyboard_manager_count += 1;
+                    self.virtual_keyboard_manager_version = global.version;
+                    self.virtual_keyboard_manager_name = global.name;
                 }
                 const index = self.global_count;
                 self.global_count += 1;
@@ -17831,6 +17895,8 @@ const WayringXdgClient = struct {
                     self.data_control_manager_removed = true;
                 if (removed.name == self.input_method_manager_name)
                     self.input_method_manager_removed = true;
+                if (removed.name == self.virtual_keyboard_manager_name)
+                    self.virtual_keyboard_manager_removed = true;
             },
         }
     }
@@ -21223,6 +21289,12 @@ const GeneratedTextInputClient = struct {
     committed: [16]u8 = undefined,
     committed_len: usize = 0,
     done_serial: u32 = 0,
+    keyboard_enter_serial: u32 = 0,
+    keyboard_serials: [2]u32 = @splat(0),
+    keyboard_times: [2]u32 = @splat(0),
+    keyboard_states: [2]client_wl.Keyboard.KeyState = undefined,
+    keyboard_event_count: usize = 0,
+    keyboard_modifiers_seen: bool = false,
 
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
@@ -21273,6 +21345,9 @@ const GeneratedTextInputClient = struct {
         wm_base.setListener(*@This(), wmBaseEvent, self);
         const manager = self.text_manager orelse return error.TextInputManagerMissing;
         defer manager.destroy();
+        const keyboard = try seat.getKeyboard();
+        defer keyboard.release();
+        keyboard.setListener(*@This(), keyboardEvent, self);
 
         const surface = try compositor.createSurface();
         defer surface.destroy();
@@ -21402,6 +21477,135 @@ const GeneratedTextInputClient = struct {
             self.edits[self.edit_count] = value;
             self.edit_count += 1;
         };
+    }
+
+    fn keyboardEvent(_: *client_wl.Keyboard, event: client_wl.Keyboard.Event, self: *@This()) void {
+        switch (event) {
+            .keymap => |keymap| _ = std.os.linux.close(keymap.fd),
+            .enter => |enter| self.keyboard_enter_serial = enter.serial,
+            .key => |key| if (self.keyboard_event_count < self.keyboard_serials.len) {
+                const index = self.keyboard_event_count;
+                self.keyboard_serials[index] = key.serial;
+                self.keyboard_times[index] = key.time;
+                self.keyboard_states[index] = key.state;
+                self.keyboard_event_count += 1;
+            },
+            .modifiers => |modifiers| {
+                if (modifiers.mods_depressed == 1 and modifiers.mods_latched == 2 and
+                    modifiers.mods_locked == 4 and modifiers.group == 3)
+                    self.keyboard_modifiers_seen = true;
+            },
+            else => {},
+        }
+    }
+
+    fn pause(self: *@This(), display: *client_wl.Display, stage_value: Stage) !void {
+        self.stage.store(@intFromEnum(stage_value), .release);
+        try waitForWayringCommandDraining(display, self.command_fd);
+    }
+
+    fn closeWake(self: *@This(), shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(-2, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+
+    fn shutdown(self: *@This()) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
+const GeneratedVirtualKeyboardClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_zwp = wayland.client.zwp;
+    const Stage = enum(u8) { starting, ready, sent, disconnected, failed };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    seat: ?*client_wl.Seat = null,
+    manager: ?*client_zwp.VirtualKeyboardManagerV1 = null,
+    keymap_fd_open_after_send: bool = false,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(
+            std.heap.page_allocator,
+            "{s}/{s}",
+            .{ self.runtime_directory, self.display_name },
+            0,
+        );
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        const seat = self.seat orelse return error.SeatMissing;
+        defer seat.release();
+        const manager = self.manager orelse return error.VirtualKeyboardManagerMissing;
+        defer manager.destroy();
+        const keyboard = try manager.createVirtualKeyboard(seat);
+        defer keyboard.destroy();
+        try expectClientRoundtrip(display);
+        try self.pause(display, .ready);
+
+        const keymap = "keymap\x00\x00";
+        const keymap_fd = try std.posix.memfd_create("keywork-generated-virtual-keyboard", std.os.linux.MFD.CLOEXEC);
+        defer _ = std.os.linux.close(keymap_fd);
+        if (std.os.linux.errno(std.os.linux.ftruncate(keymap_fd, keymap.len)) != .SUCCESS)
+            return error.KeymapResizeFailed;
+        if (std.c.pwrite(keymap_fd, keymap.ptr, keymap.len, 0) != keymap.len)
+            return error.KeymapWriteFailed;
+        keyboard.keymap(.xkb_v1, keymap_fd, keymap.len);
+        keyboard.key(41, 30, @intFromEnum(client_wl.Keyboard.KeyState.pressed));
+        keyboard.modifiers(1, 2, 4, 3);
+        keyboard.key(42, 30, @intFromEnum(client_wl.Keyboard.KeyState.released));
+        try expectClientRoundtrip(display);
+        self.keymap_fd_open_after_send = std.c.fcntl(keymap_fd, std.posix.F.GETFD) >= 0;
+        try self.pause(display, .sent);
+    }
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_seat"))
+                    self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null
+                else if (std.mem.eql(u8, interface, "zwp_virtual_keyboard_manager_v1"))
+                    self.manager = registry.bind(global.name, client_zwp.VirtualKeyboardManagerV1, 1) catch null;
+            },
+            .global_remove => {},
+        }
     }
 
     fn pause(self: *@This(), display: *client_wl.Display, stage_value: Stage) !void {
@@ -21608,6 +21812,23 @@ fn waitForGeneratedTextInputStage(
         if (host.failure()) |err| return err;
     }
     return error.GeneratedTextInputClientTimedOut;
+}
+
+fn waitForGeneratedVirtualKeyboardStage(
+    server: *Self,
+    host: anytype,
+    client: *GeneratedVirtualKeyboardClient,
+    expected: GeneratedVirtualKeyboardClient.Stage,
+) !void {
+    for (0..4_000) |_| {
+        const stage: GeneratedVirtualKeyboardClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure orelse error.GeneratedVirtualKeyboardClientFailed;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    }
+    return error.GeneratedVirtualKeyboardClientTimedOut;
 }
 
 fn waitForMatureKeyboardStage(
@@ -23447,6 +23668,7 @@ test "production generated data device completes the exact profile and supports 
     const WayringHost = @import("wayland/WayringHost.zig");
     const WayringDataControl = @import("wayland/WayringDataControl.zig");
     const WayringTextInput = @import("wayland/WayringTextInput.zig");
+    const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
     const wayring = @import("wayring");
     const linux = std.os.linux;
     var marker: u8 = 0;
@@ -23706,6 +23928,18 @@ test "production generated data device completes the exact profile and supports 
         .refresh_popups = WayringInputMethod.observerRefreshPopups,
     });
     try input_method.publish();
+    var virtual_keyboard: WayringVirtualKeyboard = undefined;
+    virtual_keyboard.init(
+        std.testing.allocator,
+        &protocol_server,
+        &seat,
+        server.canonicalSeat(),
+        linux.getuid(),
+    );
+    defer {
+        if (virtual_keyboard.global != null) virtual_keyboard.unpublish();
+        virtual_keyboard.deinit();
+    }
 
     const Lifecycle = struct {
         const FatalEvidence = struct {
@@ -23739,6 +23973,7 @@ test "production generated data device completes the exact profile and supports 
         text_input: *WayringTextInput,
         data_control: *WayringDataControl,
         input_method: *WayringInputMethod,
+        virtual_keyboard: *WayringVirtualKeyboard,
         generated_client: ?ClientRegistry.Id = null,
         generated_raw: ?*wayring.server.Client = null,
         offender_fatal: ?FatalEvidence = null,
@@ -23784,8 +24019,9 @@ test "production generated data device completes the exact profile and supports 
                     evidence_slot.* = evidence;
                 };
             }
-            self.data_control.destroyClientResources(client);
+            self.virtual_keyboard.destroyClientResources(client);
             self.input_method.destroyClientResources(client);
+            self.data_control.destroyClientResources(client);
             self.text_input.destroyClientResources(client);
             self.data_device.destroyClientResources(client);
             self.primary_selection.destroyClientResources(client);
@@ -23818,6 +24054,7 @@ test "production generated data device completes the exact profile and supports 
         .text_input = &text_input,
         .data_control = &data_control,
         .input_method = &input_method,
+        .virtual_keyboard = &virtual_keyboard,
     };
     const GlobalFilter = struct {
         data_control: *WayringDataControl,
@@ -23877,6 +24114,19 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(!peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
 
+    peer.expect_virtual_keyboard = true;
+    try virtual_keyboard.publish();
+    for (0..2_000) |_| {
+        if (peer.global_count == WayringXdgClient.expected_globals.len) break;
+        try server.eventLoop().dispatch(1);
+        if (host.failure()) |err| return err;
+    } else return error.VirtualKeyboardGlobalTimedOut;
+    try std.testing.expect(peer.globals_exact);
+    try std.testing.expect(peer.generated_virtual_keyboard_seen);
+    try std.testing.expectEqual(@as(usize, 1), peer.virtual_keyboard_manager_count);
+    try std.testing.expectEqual(@as(u32, 1), peer.virtual_keyboard_manager_version);
+    try std.testing.expectEqual(@as(usize, 17), peer.global_count);
+
     // A same-UID security-context transport gets the public registry but not
     // the privileged data-control global. Keep the direct peer connected so a
     // guessed bind also proves that protocol terminalization is isolated.
@@ -23916,12 +24166,11 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(usize, 14), denied.global_count);
     try std.testing.expectEqual(@as(usize, 0), denied.data_control_manager_count);
     const before_denied_bind = server.dataDeviceResourceSnapshot();
-    const restricted_name = peer.data_control_manager_name;
     data_control.unpublish();
     try data_control.publish();
     // Global names are allocated monotonically by the protocol server. No
     // other publication occurs between these two operations.
-    denied.guessed_data_control_name = restricted_name + 1;
+    denied.guessed_data_control_name = peer.virtual_keyboard_manager_name + 1;
     try signalWayringCommand(denied_command);
     try waitForWayringXdgStage(server, denied_host, &denied, .manager_added);
     try std.testing.expect(denied.globals_exact);
@@ -23990,6 +24239,46 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(?u32, 0), denied_method_fatal.protocol_code);
     try std.testing.expectEqualStrings("wl_registry", denied_method_fatal.interface.?.name);
     try std.testing.expectEqualStrings("invalid wl_registry.bind", denied_method_fatal.detail());
+
+    lifecycle.denied_fatal = null;
+    const raw_denied_virtual_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_denied_virtual_command) != .SUCCESS) return error.EventFdFailed;
+    const denied_virtual_command: std.posix.fd_t = @intCast(raw_denied_virtual_command);
+    defer _ = linux.close(denied_virtual_command);
+    var denied_virtual: WayringXdgClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = denied_host.displayName(),
+        .command_fd = denied_virtual_command,
+        .registry_only = true,
+        .expect_text_input = true,
+        .guessed_virtual_keyboard_name = peer.virtual_keyboard_manager_name,
+    };
+    const denied_virtual_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_virtual});
+    var denied_virtual_joined = false;
+    defer if (!denied_virtual_joined) {
+        denied_virtual.shutdown();
+        denied_virtual_thread.join();
+    };
+    try waitForWayringXdgStage(server, denied_host, &denied_virtual, .registry_ready);
+    try std.testing.expect(denied_virtual.globals_exact);
+    try std.testing.expectEqual(@as(usize, 14), denied_virtual.global_count);
+    try std.testing.expectEqual(@as(usize, 0), denied_virtual.virtual_keyboard_manager_count);
+    try signalWayringCommand(denied_virtual_command);
+    try waitForWayringXdgStage(server, denied_host, &denied_virtual, .manager_added);
+    const virtual_managers_before_denied_bind = virtual_keyboard.managers.items.len;
+    const virtual_devices_before_denied_bind = virtual_keyboard.devices.items.len;
+    try signalWayringCommand(denied_virtual_command);
+    try waitForWayringXdgStage(server, denied_host, &denied_virtual, .disconnected);
+    denied_virtual_thread.join();
+    denied_virtual_joined = true;
+    try std.testing.expect(denied_virtual.guessed_virtual_keyboard_bind_issued);
+    try std.testing.expectEqual(virtual_managers_before_denied_bind, virtual_keyboard.managers.items.len);
+    try std.testing.expectEqual(virtual_devices_before_denied_bind, virtual_keyboard.devices.items.len);
+    const denied_virtual_fatal = lifecycle.denied_fatal orelse return error.RestrictedVirtualBindFatalMissing;
+    try std.testing.expectEqual(wayring.server.Client.TransportProvenance.security_context, denied_virtual_fatal.transport_provenance);
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.protocol, denied_virtual_fatal.kind);
+    try std.testing.expectEqualStrings("wl_registry", denied_virtual_fatal.interface.?.name);
+    try std.testing.expectEqualStrings("invalid wl_registry.bind", denied_virtual_fatal.detail());
     try std.testing.expectEqual(
         WayringXdgClient.Stage.registry_ready,
         @as(WayringXdgClient.Stage, @enumFromInt(peer.stage.load(.acquire))),
@@ -23997,14 +24286,14 @@ test "production generated data device completes the exact profile and supports 
     try denied_host.destroy();
     denied_host_live = false;
 
-    data_control.unpublish();
+    virtual_keyboard.unpublish();
     try std.testing.expectEqual(@as(usize, 1), peer.input_method_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.input_method_manager_version);
     try std.testing.expect(peer.input_method_manager_name != 0);
-    try std.testing.expect(!peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
 
     input_method.unpublish();
+    data_control.unpublish();
     text_input.unpublish();
     primary_selection.unpublish();
     data_device.unpublish();
@@ -24013,6 +24302,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(peer.data_device_manager_removed);
     try std.testing.expect(peer.data_control_manager_removed);
     try std.testing.expect(peer.input_method_manager_removed);
+    try std.testing.expect(peer.virtual_keyboard_manager_removed);
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .disconnected);
     thread.join();
@@ -24026,6 +24316,7 @@ test "production generated data device completes the exact profile and supports 
     try primary_selection.publish();
     try text_input.publish();
     try data_control.publish();
+    try virtual_keyboard.publish();
 
     const control_regular_resource_baseline = server.neutralDataDevice().resourceCounts();
     const control_primary_resource_baseline = server.neutralDataDevice().primaryResourceCounts();
@@ -24282,6 +24573,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_text_input = true,
         .expect_data_control = true,
         .expect_input_method = true,
+        .expect_virtual_keyboard = true,
     };
     const primary_watch_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_watch});
     var primary_watch_joined = false;
@@ -24292,8 +24584,9 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringXdgStage(server, host, &primary_watch, .registry_ready);
     try std.testing.expect(primary_watch.globals_exact);
     try std.testing.expectEqual(@as(usize, 1), primary_watch.primary_selection_manager_count);
-    data_control.unpublish();
+    virtual_keyboard.unpublish();
     input_method.unpublish();
+    data_control.unpublish();
     text_input.unpublish();
     primary_selection.unpublish();
     try signalWayringCommand(primary_watch_command);
@@ -24310,6 +24603,7 @@ test "production generated data device completes the exact profile and supports 
     try text_input.publish();
     try data_control.publish();
     try input_method.publish();
+    try virtual_keyboard.publish();
     const raw_primary_rebind_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_primary_rebind_command) != .SUCCESS) return error.EventFdFailed;
     const primary_rebind_command: std.posix.fd_t = @intCast(raw_primary_rebind_command);
@@ -24322,6 +24616,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_text_input = true,
         .expect_data_control = true,
         .expect_input_method = true,
+        .expect_virtual_keyboard = true,
     };
     const primary_rebind_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_rebind});
     var primary_rebind_joined = false;
@@ -24331,7 +24626,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, host, &primary_rebind, .registry_ready);
     try std.testing.expect(primary_rebind.globals_exact);
-    try std.testing.expectEqual(@as(usize, 16), primary_rebind.global_count);
+    try std.testing.expectEqual(@as(usize, 17), primary_rebind.global_count);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.primary_selection_manager_count);
     try std.testing.expectEqual(@as(u32, 1), primary_rebind.primary_selection_manager_version);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.input_method_manager_count);
@@ -24412,6 +24707,67 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(generated_text_surface, server.window_manager.focusedSurface().?);
     try std.testing.expect(server.focusGeneratedSurface(generated_text_surface));
     try std.testing.expect(server.seat.generatedKeyboardFocus() != null);
+    try std.testing.expect(server.seat.applyGeneratedKeyboardFocus(.{
+        .surface = generated_text_surface,
+        .client = server.seat.generatedSurfaceOwner(generated_text_surface) orelse
+            return error.GeneratedTextSurfaceOwnerMissing,
+    }, null));
+
+    const raw_virtual_keyboard_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_virtual_keyboard_command) != .SUCCESS) return error.EventFdFailed;
+    const virtual_keyboard_command: std.posix.fd_t = @intCast(raw_virtual_keyboard_command);
+    defer _ = linux.close(virtual_keyboard_command);
+    const virtual_keyboard_fd_baseline = try countMatureDataDeviceFds();
+    var generated_virtual_keyboard: GeneratedVirtualKeyboardClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = virtual_keyboard_command,
+    };
+    const generated_virtual_keyboard_thread = try std.Thread.spawn(
+        .{},
+        GeneratedVirtualKeyboardClient.run,
+        .{&generated_virtual_keyboard},
+    );
+    var generated_virtual_keyboard_joined = false;
+    defer if (!generated_virtual_keyboard_joined) {
+        generated_virtual_keyboard.shutdown();
+        generated_virtual_keyboard_thread.join();
+    };
+    try waitForGeneratedVirtualKeyboardStage(server, host, &generated_virtual_keyboard, .ready);
+    try std.testing.expectEqual(@as(usize, 1), virtual_keyboard.managers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), virtual_keyboard.devices.items.len);
+    try signalWayringCommand(virtual_keyboard_command);
+    try waitForGeneratedVirtualKeyboardStage(server, host, &generated_virtual_keyboard, .sent);
+    for (0..2_000) |_| {
+        if (generated_text.keyboard_event_count == 2 and generated_text.keyboard_modifiers_seen) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedVirtualKeyboardDeliveryTimedOut;
+    try std.testing.expect(generated_virtual_keyboard.keymap_fd_open_after_send);
+    try std.testing.expect(generated_text.keyboard_enter_serial != 0);
+    try std.testing.expectEqualSlices(u32, &.{ 41, 42 }, &generated_text.keyboard_times);
+    try std.testing.expectEqualSlices(
+        wayland.client.wl.Keyboard.KeyState,
+        &.{ .pressed, .released },
+        &generated_text.keyboard_states,
+    );
+    try std.testing.expect(generated_text.keyboard_serials[0] != 0);
+    try std.testing.expect(generated_text.keyboard_serials[1] != 0);
+    try std.testing.expect(generated_text.keyboard_serials[0] != generated_text.keyboard_serials[1]);
+    try signalWayringCommand(virtual_keyboard_command);
+    try waitForGeneratedVirtualKeyboardStage(server, host, &generated_virtual_keyboard, .disconnected);
+    generated_virtual_keyboard_thread.join();
+    generated_virtual_keyboard_joined = true;
+    for (0..2_000) |_| {
+        if (virtual_keyboard.managers.items.len == 0 and virtual_keyboard.devices.items.len == 0 and
+            host.connectionCount() == 1) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedVirtualKeyboardCleanupTimedOut;
+    try std.testing.expectEqual(virtual_keyboard_fd_baseline, try countMatureDataDeviceFds());
+
     try signalWayringCommand(text_command);
     try waitForGeneratedTextInputStage(server, host, &generated_text, .state_sent);
     try waitForMatureTextStage(server, &method, .state_received);

@@ -19,6 +19,7 @@ const WayringDataDevice = @import("wayland/WayringDataDevice.zig");
 const WayringPrimarySelection = @import("wayland/WayringPrimarySelection.zig");
 const WayringTextInput = @import("wayland/WayringTextInput.zig");
 const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
+const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
@@ -233,6 +234,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_input_method: WayringInputMethod = undefined;
     var wayring_input_method_initialized = false;
     var wayring_input_method_published = false;
+    var wayring_virtual_keyboard: WayringVirtualKeyboard = undefined;
+    var wayring_virtual_keyboard_initialized = false;
+    var wayring_virtual_keyboard_published = false;
     const WayringLifecycle = struct {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
@@ -249,6 +253,8 @@ pub fn main(init: std.process.Init) !void {
         text_input: ?*WayringTextInput,
         data_control: ?*WayringDataControl,
         input_method: ?*WayringInputMethod,
+        virtual_keyboard: ?*WayringVirtualKeyboard,
+
         fn globalVisible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
             return if (self.data_control) |data_control| data_control.globalFilter(client, global) else global.visibility() != .restricted;
         }
@@ -262,6 +268,7 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            if (self.virtual_keyboard) |keyboard| keyboard.destroyClientResources(client);
             if (self.input_method) |input_method| input_method.destroyClientResources(client);
             if (self.data_control) |data_control| data_control.destroyClientResources(client);
             if (self.text_input) |text_input| text_input.destroyClientResources(client);
@@ -287,6 +294,10 @@ pub fn main(init: std.process.Init) !void {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
         if (wayring_protocol_server) |*protocol_server| protocol_server.clearGlobalFilter();
+        if (wayring_virtual_keyboard_initialized) {
+            if (wayring_virtual_keyboard_published) wayring_virtual_keyboard.unpublish();
+            wayring_virtual_keyboard.deinit();
+        }
         if (wayring_input_method_initialized) {
             server.setGeneratedInputMethodObserver(null);
             if (wayring_input_method_published) wayring_input_method.unpublish();
@@ -398,6 +409,14 @@ pub fn main(init: std.process.Init) !void {
             server.generatedInputMethodLayout(),
         );
         wayring_input_method_initialized = true;
+        wayring_virtual_keyboard.init(
+            init.gpa,
+            &wayring_protocol_server.?,
+            &wayring_seat_adapter,
+            server.canonicalSeat(),
+            std.os.linux.getuid(),
+        );
+        wayring_virtual_keyboard_initialized = true;
         server.setGeneratedInputMethodObserver(.{
             .context = &wayring_input_method,
             .set_inhibited = WayringInputMethod.observerSetInhibited,
@@ -519,6 +538,10 @@ pub fn main(init: std.process.Init) !void {
             wayring_data_control_published = true;
             try wayring_input_method.publish();
             wayring_input_method_published = true;
+            // Virtual keyboard is the most privileged generated input global
+            // and is published last under the same immutable restricted gate.
+            try wayring_virtual_keyboard.publish();
+            wayring_virtual_keyboard_published = true;
         }
         wayring_lifecycle = .{
             .clients = &wayring_clients,
@@ -536,6 +559,7 @@ pub fn main(init: std.process.Init) !void {
             .text_input = if (wayring_text_input_initialized) &wayring_text_input else null,
             .data_control = if (wayring_data_control_initialized) &wayring_data_control else null,
             .input_method = if (wayring_input_method_initialized) &wayring_input_method else null,
+            .virtual_keyboard = if (wayring_virtual_keyboard_initialized) &wayring_virtual_keyboard else null,
         };
         wayring_protocol_server.?.setGlobalFilter(
             WayringLifecycle,
@@ -937,6 +961,7 @@ test {
     _ = @import("wayland/WayringPrimarySelection.zig");
     _ = @import("wayland/WayringTextInput.zig");
     _ = @import("wayland/WayringDataControl.zig");
+    _ = @import("wayland/WayringVirtualKeyboard.zig");
     _ = @import("wayland/surface.zig");
     _ = @import("wayland/surface_geometry.zig");
     _ = @import("wayland/region.zig");

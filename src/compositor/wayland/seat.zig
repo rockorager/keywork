@@ -36,7 +36,8 @@ touch_resources: std.ArrayList(TouchResource),
 next_pointer_resource_generation: u64,
 next_touch_resource_generation: u64,
 keyboard_available: bool,
-virtual_keyboard_count: usize,
+virtual_keyboards: std.ArrayList(VirtualKeyboard),
+virtual_keyboards_inhibited: bool,
 pointer_available: bool,
 virtual_pointer_count: usize,
 keymap: ?Keymap,
@@ -68,6 +69,15 @@ const Keymap = struct {
     file: std.Io.File,
     size: u32,
 };
+
+const VirtualKeyboard = struct {
+    owner: *anyopaque,
+    pressed_keys: std.ArrayList(u32) = .empty,
+    has_keymap: bool = false,
+    deferred_keymap: ?Keymap = null,
+};
+
+const maximum_virtual_keymap_size = 16 * 1024 * 1024;
 
 const RepeatInfo = SeatDelivery.RepeatInfo;
 const Modifiers = SeatDelivery.Modifiers;
@@ -319,7 +329,8 @@ pub fn init(
         .next_pointer_resource_generation = 0,
         .next_touch_resource_generation = 0,
         .keyboard_available = false,
-        .virtual_keyboard_count = 0,
+        .virtual_keyboards = .empty,
+        .virtual_keyboards_inhibited = false,
         .pointer_available = false,
         .virtual_pointer_count = 0,
         .keymap = null,
@@ -351,6 +362,7 @@ pub fn init(
     errdefer self.pointer_resources.deinit(allocator);
     errdefer self.touch_resources.deinit(allocator);
     errdefer self.touch_points.deinit(allocator);
+    errdefer self.virtual_keyboards.deinit(allocator);
     errdefer self.pressed_keys.deinit();
     errdefer self.grabbed_keys.deinit(allocator);
     errdefer self.keyboard_focus_listeners.deinit(allocator);
@@ -366,7 +378,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.pointer_resources.items.len == 0);
     std.debug.assert(self.touch_resources.items.len == 0);
     std.debug.assert(self.cursor_surface_count == 0);
-    std.debug.assert(self.virtual_keyboard_count == 0);
+    std.debug.assert(self.virtual_keyboards.items.len == 0);
     std.debug.assert(self.virtual_pointer_count == 0);
     std.debug.assert(self.keyboard_grab == null);
     std.debug.assert(self.repaint_listener == null);
@@ -383,6 +395,7 @@ pub fn deinit(self: *Self) void {
     self.keyboard_focus_listeners.deinit(self.allocator);
     self.grabbed_keys.deinit(self.allocator);
     self.pressed_keys.deinit();
+    self.virtual_keyboards.deinit(self.allocator);
     self.touch_points.deinit(self.allocator);
     self.touch_resources.deinit(self.allocator);
     self.pointer_resources.deinit(self.allocator);
@@ -1168,17 +1181,63 @@ pub fn setDefaultCursor(self: *Self, cursor: ?CursorImage) void {
 pub fn setKeyboardAvailable(self: *Self, available: bool) void {
     if (self.keyboard_available == available) return;
     const old_capability = self.hasKeyboardCapability();
-    if (!available and self.virtual_keyboard_count == 0) self.parentKeyboardLeave();
+    if (!available and self.virtualKeyboardCount() == 0) self.parentKeyboardLeave();
     self.keyboard_available = available;
     const changed = self.delivery.setCapability(.keyboard, self.keyboardCapabilityAvailable());
     std.debug.assert(changed == (old_capability != self.hasKeyboardCapability()));
     if (changed) self.broadcastCapabilities();
 }
 
-pub fn addVirtualKeyboard(self: *Self) void {
+pub fn createVirtualKeyboard(self: *Self, owner: *anyopaque) error{OutOfMemory}!void {
+    std.debug.assert(self.virtualKeyboard(owner) == null);
+    try self.virtual_keyboards.append(self.allocator, .{ .owner = owner });
+}
+
+pub fn destroyVirtualKeyboard(self: *Self, owner: *anyopaque) void {
+    const index = self.virtualKeyboardIndex(owner) orelse unreachable;
     const old_capability = self.hasKeyboardCapability();
-    self.virtual_keyboard_count = std.math.add(usize, self.virtual_keyboard_count, 1) catch
-        unreachable;
+    self.releaseVirtualKeyboard(owner);
+    var removed = self.virtual_keyboards.orderedRemove(index);
+    if (removed.deferred_keymap) |keymap| keymap.file.close(self.io);
+    removed.pressed_keys.deinit(self.allocator);
+    const changed = self.delivery.setCapability(.keyboard, self.keyboardCapabilityAvailable());
+    std.debug.assert(changed == (old_capability != self.hasKeyboardCapability()));
+    if (!changed) return;
+    if (old_capability and !self.hasKeyboardCapability() and self.parent_focused) self.sendLeave();
+    self.broadcastCapabilities();
+    self.notifyKeyboardFocus();
+}
+
+pub fn virtualKeyboardHasKeymap(self: *const Self, owner: *anyopaque) bool {
+    const index = self.virtualKeyboardIndex(owner) orelse return false;
+    return self.virtual_keyboards.items[index].has_keymap;
+}
+
+/// Takes ownership of `fd` on every return path.
+pub fn setVirtualKeyboardKeymap(
+    self: *Self,
+    owner: *anyopaque,
+    fd: std.posix.fd_t,
+    size: u32,
+) error{InvalidKeymap}!void {
+    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+    const keyboard = self.virtualKeyboard(owner) orelse {
+        file.close(self.io);
+        return error.InvalidKeymap;
+    };
+    if (!validVirtualKeymap(self.io, file, size)) {
+        file.close(self.io);
+        return error.InvalidKeymap;
+    }
+    if (keyboard.deferred_keymap) |deferred| deferred.file.close(self.io);
+    keyboard.deferred_keymap = null;
+    const old_capability = self.hasKeyboardCapability();
+    if (self.virtual_keyboards_inhibited) {
+        keyboard.deferred_keymap = .{ .format = .xkb_v1, .file = file, .size = size };
+    } else {
+        self.setKeymap(.xkb_v1, fd, size);
+    }
+    keyboard.has_keymap = true;
     const changed = self.delivery.setCapability(.keyboard, self.keyboardCapabilityAvailable());
     std.debug.assert(changed == (old_capability != self.hasKeyboardCapability()));
     if (!changed) return;
@@ -1189,17 +1248,26 @@ pub fn addVirtualKeyboard(self: *Self) void {
     }
 }
 
-pub fn removeVirtualKeyboard(self: *Self) void {
-    std.debug.assert(self.virtual_keyboard_count > 0);
-    const old_capability = self.hasKeyboardCapability();
-    if (old_capability and !self.keyboard_available and
-        self.virtual_keyboard_count == 1 and self.parent_focused) self.sendLeave();
-    self.virtual_keyboard_count -= 1;
-    const changed = self.delivery.setCapability(.keyboard, self.keyboardCapabilityAvailable());
-    std.debug.assert(changed == (old_capability != self.hasKeyboardCapability()));
-    if (!changed) return;
-    self.broadcastCapabilities();
-    self.notifyKeyboardFocus();
+pub fn setVirtualKeyboardsInhibited(self: *Self, inhibited: bool) void {
+    if (self.virtual_keyboards_inhibited == inhibited) return;
+    self.virtual_keyboards_inhibited = inhibited;
+    if (inhibited) {
+        for (self.virtual_keyboards.items) |keyboard| self.releaseVirtualKeyboard(keyboard.owner);
+        return;
+    }
+    for (self.virtual_keyboards.items) |*keyboard| {
+        const deferred = keyboard.deferred_keymap orelse continue;
+        keyboard.deferred_keymap = null;
+        self.setKeymap(deferred.format, deferred.file.handle, deferred.size);
+    }
+}
+
+pub fn releaseVirtualKeyboard(self: *Self, owner: *anyopaque) void {
+    const keyboard = self.virtualKeyboard(owner) orelse return;
+    while (keyboard.pressed_keys.pop()) |key_code| {
+        self.keyWithGrab(0, key_code, .released, false) catch unreachable;
+    }
+    self.clearVirtualModifiers(owner);
 }
 
 pub fn setPointerAvailable(self: *Self, available: bool) void {
@@ -1473,11 +1541,32 @@ pub fn key(
 /// Releasing a key accepted from this stream does not allocate.
 pub fn virtualKey(
     self: *Self,
+    owner: *anyopaque,
     time: u32,
     key_code: u32,
     state: wl.Keyboard.KeyState,
 ) error{OutOfMemory}!void {
-    try self.keyWithGrab(time, key_code, state, false);
+    const keyboard = self.virtualKeyboard(owner) orelse return;
+    if (!keyboard.has_keymap or self.virtual_keyboards_inhibited) return;
+    switch (state) {
+        .pressed => {
+            for (keyboard.pressed_keys.items) |pressed| if (pressed == key_code) return;
+            try keyboard.pressed_keys.append(self.allocator, key_code);
+            self.keyWithGrab(time, key_code, state, false) catch |err| {
+                _ = keyboard.pressed_keys.pop();
+                return err;
+            };
+        },
+        .released => {
+            for (keyboard.pressed_keys.items, 0..) |pressed, index| {
+                if (pressed != key_code) continue;
+                _ = keyboard.pressed_keys.orderedRemove(index);
+                try self.keyWithGrab(time, key_code, state, false);
+                return;
+            }
+        },
+        else => {},
+    }
 }
 
 fn keyWithGrab(
@@ -1651,6 +1740,8 @@ pub fn setVirtualModifiers(
     locked: u32,
     group: u32,
 ) void {
+    const keyboard = self.virtualKeyboard(owner) orelse return;
+    if (!keyboard.has_keymap or self.virtual_keyboards_inhibited) return;
     self.modifier_state.setVirtual(owner, .{
         .depressed = depressed,
         .latched = latched,
@@ -2593,7 +2684,34 @@ fn keyboardDeliveryTarget(self: *Self) ?KeyboardDeliveryTarget {
 }
 
 fn keyboardCapabilityAvailable(self: *const Self) bool {
-    return (self.keyboard_available or self.virtual_keyboard_count > 0) and self.keymap != null;
+    return (self.keyboard_available or self.virtualKeyboardCount() > 0) and self.keymap != null;
+}
+
+fn virtualKeyboardCount(self: *const Self) usize {
+    var count: usize = 0;
+    for (self.virtual_keyboards.items) |keyboard| count += @intFromBool(keyboard.has_keymap);
+    return count;
+}
+
+fn virtualKeyboard(self: *Self, owner: *anyopaque) ?*VirtualKeyboard {
+    const index = self.virtualKeyboardIndex(owner) orelse return null;
+    return &self.virtual_keyboards.items[index];
+}
+
+fn virtualKeyboardIndex(self: *const Self, owner: *anyopaque) ?usize {
+    for (self.virtual_keyboards.items, 0..) |keyboard, index| {
+        if (keyboard.owner == owner) return index;
+    }
+    return null;
+}
+
+fn validVirtualKeymap(io: std.Io, file: std.Io.File, size: u32) bool {
+    if (size == 0 or size > maximum_virtual_keymap_size) return false;
+    const stat = file.stat(io) catch return false;
+    if (stat.size < size) return false;
+    var terminator: [1]u8 = undefined;
+    const read = file.readPositionalAll(io, &terminator, size - 1) catch return false;
+    return read == 1 and terminator[0] == 0;
 }
 
 fn pointerCapabilityAvailable(self: *const Self) bool {
