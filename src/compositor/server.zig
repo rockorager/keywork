@@ -4021,7 +4021,9 @@ fn generatedInputPopupDestroyed(context: *anyopaque, id: NeutralTextInput.PopupI
     const self: *Self = @ptrCast(@alignCast(context));
     for (self.generated_input_popups.items, 0..) |popup, index| if (std.meta.eql(popup.id, id)) {
         const mapped = popup.mapped;
+        self.cancelGeneratedTouchesInSubtree(popup.surface_id);
         _ = self.generated_input_popups.orderedRemove(index);
+        self.reconcileGeneratedPointerTopology();
         if (mapped) requestRepaint(self);
         return;
     };
@@ -6088,6 +6090,13 @@ fn damageHeadlessCompound(self: *Self, id: SurfaceRegistry.Id) void {
     // overflow, reattachment, and descendant-only commits.
     if (self.headless_surface_forest.isDragIconRole(root)) {
         if (self.generatedDragIconInfo() != null) requestRepaint(self);
+        return;
+    }
+    // Input popups render at server-owned translated positions rather than at
+    // their forest-local coordinates. Conservatively repaint their output so
+    // same-position content commits cannot leave stale pixels behind.
+    if (self.isGeneratedInputPopup(root)) {
+        requestRepaint(self);
         return;
     }
     if (self.managedGeneratedWindow(root)) |window| {
@@ -14715,6 +14724,75 @@ test "headless click and first touch focus compound root with synchronous repair
     child_live = false;
 }
 
+test "destroying a mapped generated input popup cancels pointer grab and touches" {
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 4, .height = 4 } },
+    );
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+
+    var provider: SyntheticSurfaceProvider = .{
+        .pixel = 0xff11_2233,
+        .logical_size = .{ .width = 2, .height = 2 },
+    };
+    const surface = try server.surface_registry.add(provider.provider());
+    try server.addHeadlessSurface(surface, null);
+    defer {
+        server.removeHeadlessSurface(surface);
+        server.surface_registry.remove(surface);
+    }
+    server.commitHeadlessSurface(surface, provider.logical_size, false);
+    try std.testing.expect(server.headless_surface_forest.setRootPresentationClass(surface, .input_popup));
+
+    const client = try server.client_registry.register(.wayring_server);
+    defer server.client_registry.unregister(client);
+    var sink: TestGeneratedSeatSink = .{
+        .clients = &server.client_registry,
+        .client = client,
+        .touch_max_resource_generation = 1,
+    };
+    server.setGeneratedSeatDeliverySink(sink.sink());
+    defer server.clearGeneratedSeatDeliverySink(&sink);
+    server.seat.setPointerAvailable(true);
+    server.seat.setTouchAvailable(true);
+    defer {
+        server.seat.setTouchAvailable(false);
+        server.seat.setPointerAvailable(false);
+    }
+
+    const popup_id: NeutralTextInput.PopupId = .{ .index = 1, .generation = 1 };
+    try server.generated_input_popups.append(std.testing.allocator, .{
+        .id = popup_id,
+        .method = .{ .index = 1, .generation = 1 },
+        .surface_id = surface,
+        .mapped = true,
+    });
+    pointerMotion(output, 1, 0.5, 0.5);
+    pointerButton(output, 2, linux_button_left, .pressed);
+    try std.testing.expect(server.seat.implicitPointerGrabActive());
+    try std.testing.expectEqual(surface, server.seat.pointerFocus().?.surface_id);
+    const touch_start = sink.touch_event_count;
+    touchDown(output, 3, 7, 0.5, 0.5);
+
+    generatedInputPopupDestroyed(server, popup_id);
+    try std.testing.expectEqual(@as(usize, 0), server.generated_input_popups.items.len);
+    try std.testing.expect(!server.seat.implicitPointerGrabActive());
+    try std.testing.expect(server.seat.pointerFocus() == null);
+    try std.testing.expectEqualSlices(
+        TestGeneratedSeatSink.TouchTag,
+        &.{ .down, .cancel },
+        sink.touch_events[touch_start..sink.touch_event_count],
+    );
+    touchMotion(output, 4, 7, 1, 1);
+    touchUp(output, 5, 7);
+    try std.testing.expectEqual(touch_start + 2, sink.touch_event_count);
+}
+
 test "generated topology mutation retargets hover and cancels invalid grabs" {
     const server = try Self.createWithVirtualOutput(
         std.testing.allocator,
@@ -20932,15 +21010,17 @@ const MatureTextClient = struct {
                 popup.setListener(*@This(), popupEvent, self);
                 const shm_fd = try std.posix.memfd_create("keywork-generated-input-popup", std.os.linux.MFD.CLOEXEC);
                 defer _ = std.os.linux.close(shm_fd);
-                const popup_pixel: u32 = 0xffe1_37a5;
-                if (std.os.linux.errno(std.os.linux.ftruncate(shm_fd, @sizeOf(u32))) != .SUCCESS)
+                const popup_pixels = [2]u32{ 0xffe1_37a5, 0xff46_c972 };
+                if (std.os.linux.errno(std.os.linux.ftruncate(shm_fd, @sizeOf(@TypeOf(popup_pixels)))) != .SUCCESS)
                     return error.ShmResizeFailed;
-                if (std.c.pwrite(shm_fd, @ptrCast(&popup_pixel), @sizeOf(u32), 0) != @sizeOf(u32))
+                if (std.c.pwrite(shm_fd, @ptrCast(&popup_pixels), @sizeOf(@TypeOf(popup_pixels)), 0) != @sizeOf(@TypeOf(popup_pixels)))
                     return error.ShmWriteFailed;
-                const pool = try shm.createPool(shm_fd, @sizeOf(u32));
+                const pool = try shm.createPool(shm_fd, @sizeOf(@TypeOf(popup_pixels)));
                 defer pool.destroy();
                 const buffer = try pool.createBuffer(0, 1, 1, @sizeOf(u32), .argb8888);
                 defer buffer.destroy();
+                const replacement_buffer = try pool.createBuffer(@sizeOf(u32), 1, 1, @sizeOf(u32), .argb8888);
+                defer replacement_buffer.destroy();
                 self.stage.store(@intFromEnum(Stage.ready), .release);
                 while (self.method_event_count < 5) try expectClientRoundtrip(display);
                 popup_surface.attach(buffer, 0, 0);
@@ -20953,6 +21033,7 @@ const MatureTextClient = struct {
                         if (self.shutdown_requested.load(.acquire)) return;
                         try expectClientRoundtrip(display);
                     }
+                    popup_surface.attach(replacement_buffer, 0, 0);
                     popup_surface.damageBuffer(0, 0, 1, 1);
                     popup_surface.commit();
                     try expectClientRoundtrip(display);
@@ -23724,14 +23805,16 @@ test "production generated data device completes the exact profile and supports 
         .input_method = &input_method,
     };
     const GlobalFilter = struct {
+        data_control: *WayringDataControl,
         expected_uid: std.os.linux.uid_t,
         fn visible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
+            if (!self.data_control.globalFilter(client, global)) return false;
             if (!std.mem.eql(u8, global.interface().name, "zwp_input_method_manager_v2")) return true;
             const credentials = client.credentials() orelse return false;
             return credentials.uid == self.expected_uid;
         }
     };
-    var global_filter: GlobalFilter = .{ .expected_uid = std.c.geteuid() };
+    var global_filter: GlobalFilter = .{ .data_control = &data_control, .expected_uid = std.c.geteuid() };
     protocol_server.setGlobalFilter(GlobalFilter, &global_filter, GlobalFilter.visible);
     defer protocol_server.clearGlobalFilter();
     const host = try WayringHost.create(
@@ -23770,7 +23853,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, host, &peer, .registry_ready);
     try std.testing.expect(peer.globals_exact);
-    try std.testing.expectEqual(@as(usize, 15), peer.global_count);
+    try std.testing.expectEqual(@as(usize, 16), peer.global_count);
     try std.testing.expectEqual(@as(usize, 1), peer.data_device_manager_count);
     try std.testing.expectEqual(@as(u32, 4), peer.data_device_manager_version);
     try std.testing.expectEqual(@as(usize, 1), peer.primary_selection_manager_count);
@@ -23779,7 +23862,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(u32, 2), peer.text_input_manager_version);
     try std.testing.expectEqual(@as(usize, 1), peer.data_control_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.data_control_manager_version);
-    try std.testing.expect(!peer.generated_input_method_seen);
+    try std.testing.expectEqual(@as(usize, 1), peer.input_method_manager_count);
     try std.testing.expect(!peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
 
@@ -24190,7 +24273,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, host, &primary_rebind, .registry_ready);
     try std.testing.expect(primary_rebind.globals_exact);
-    try std.testing.expectEqual(@as(usize, 15), primary_rebind.global_count);
+    try std.testing.expectEqual(@as(usize, 16), primary_rebind.global_count);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.primary_selection_manager_count);
     try std.testing.expectEqual(@as(u32, 1), primary_rebind.primary_selection_manager_version);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.input_method_manager_count);
@@ -24312,6 +24395,13 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(method.popup_surface_object_id, method.popup_pointer_surface);
     try std.testing.expect(server.seat.implicitPointerGrabActive());
     try std.testing.expectEqual(popup_surface, server.seat.pointerFocus().?.surface_id);
+    const recommitted_popup_frame = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, recommitted_popup_frame);
+    const recommitted_popup_target = switch (output.backend.acquire().?) {
+        .pixels => |pixels| pixels,
+        else => return error.ExpectedCpuHeadlessTarget,
+    };
+    try std.testing.expectEqual(@as(u32, 0xff46_c972), recommitted_popup_target.pixels[8 * 640 + 2]);
     pointerButton(output, 80, linux_button_left, .released);
     pointerFrame(output);
     method.proceed.store(true, .release);
