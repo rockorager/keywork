@@ -9498,6 +9498,44 @@ fn renderElasticGrowthSnapshot(
     }
 }
 
+fn windowTransitionOpacity(
+    kind: @FieldType(WindowTransition, "kind"),
+    phase: @FieldType(WindowTransition, "phase"),
+    start: i96,
+    now: i96,
+    duration: u64,
+) u32 {
+    return switch (kind) {
+        .reflow => std.math.maxInt(u32),
+        .appearance => WindowAnimation.appearanceProgress(start, now),
+        .disappearance => if (phase == .waiting)
+            std.math.maxInt(u32)
+        else
+            std.math.maxInt(u32) - WindowAnimation.disappearanceProgress(
+                start,
+                now,
+                duration,
+            ),
+    };
+}
+
+test "waiting disappearance retains full opacity" {
+    const far_future: i96 = 10 * std.time.ns_per_s;
+    const duration = WindowAnimation.normal_duration_nanoseconds;
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        windowTransitionOpacity(.disappearance, .waiting, 0, far_future, duration),
+    );
+    try std.testing.expectEqual(
+        std.math.maxInt(u32),
+        windowTransitionOpacity(.disappearance, .animating, far_future, far_future, duration),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        windowTransitionOpacity(.disappearance, .animating, 0, far_future, duration),
+    );
+}
+
 fn renderWindowTransition(
     self: *Self,
     frame: *const OutputFrame,
@@ -9526,18 +9564,14 @@ fn renderWindowTransition(
         0;
     const opacity = if (!transition.opacity_transition)
         std.math.maxInt(u32)
-    else switch (transition.kind) {
-        .reflow => std.math.maxInt(u32),
-        .appearance => WindowAnimation.appearanceProgress(
-            transition.start,
-            self.animation_now,
-        ),
-        .disappearance => std.math.maxInt(u32) - WindowAnimation.disappearanceProgress(
+    else
+        windowTransitionOpacity(
+            transition.kind,
+            transition.phase,
             transition.start,
             self.animation_now,
             transition.duration,
-        ),
-    };
+        );
     const effects = effectsWithOpacity(configured_effects, opacity);
     const borders = bordersWithOpacity(configured_borders, opacity);
     const animated_rect = WindowAnimation.constrainSplitOuterEdge(
