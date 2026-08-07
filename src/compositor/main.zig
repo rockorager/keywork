@@ -16,6 +16,7 @@ const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCursorShape = @import("wayland/WayringCursorShape.zig");
 const WayringDataDevice = @import("wayland/WayringDataDevice.zig");
 const WayringPrimarySelection = @import("wayland/WayringPrimarySelection.zig");
+const WayringTextInput = @import("wayland/WayringTextInput.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
@@ -221,6 +222,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_primary_selection: WayringPrimarySelection = undefined;
     var wayring_primary_selection_initialized = false;
     var wayring_primary_selection_published = false;
+    var wayring_text_input: WayringTextInput = undefined;
+    var wayring_text_input_initialized = false;
+    var wayring_text_input_published = false;
     const WayringLifecycle = struct {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
@@ -234,6 +238,7 @@ pub fn main(init: std.process.Init) !void {
         seat: *WayringSeatAdapter,
         data_device: ?*WayringDataDevice,
         primary_selection: ?*WayringPrimarySelection,
+        text_input: ?*WayringTextInput,
 
         fn accepted(erased: *anyopaque, client: *wayring.server.Client) !void {
             const self: *@This() = @ptrCast(@alignCast(erased));
@@ -244,6 +249,7 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            if (self.text_input) |text_input| text_input.destroyClientResources(client);
             if (self.primary_selection) |primary| primary.destroyClientResources(client);
             if (self.data_device) |data_device| data_device.destroyClientResources(client);
             if (self.xdg_activation) |activation| activation.destroyClientResources(client);
@@ -265,6 +271,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
+        if (wayring_text_input_initialized) {
+            if (wayring_text_input_published) wayring_text_input.unpublish();
+            wayring_text_input.deinit();
+        }
         if (wayring_primary_selection_initialized) {
             server.setPrimarySelectionObserver(null);
             if (wayring_primary_selection_published) wayring_primary_selection.unpublish();
@@ -339,6 +349,8 @@ pub fn main(init: std.process.Init) !void {
         wayring_data_device_initialized = true;
         wayring_primary_selection.init(init.gpa, &wayring_protocol_server.?, &wayring_clients, &wayring_seat_adapter, server.neutralDataDevice());
         wayring_primary_selection_initialized = true;
+        wayring_text_input.init(init.gpa, &wayring_protocol_server.?, &wayring_clients, &wayring_seat_adapter, &wayring_compositor, server.neutralTextInput());
+        wayring_text_input_initialized = true;
         server.setDataDeviceObserver(.{
             .context = &wayring_data_device,
             .transaction_finalize = WayringDataDevice.transactionFinalize,
@@ -435,6 +447,10 @@ pub fn main(init: std.process.Init) !void {
             wayring_data_device_published = true;
             try wayring_primary_selection.publish();
             wayring_primary_selection_published = true;
+            // Text input is production-last and only available with the
+            // presenting generated shell and canonical generated Seat focus.
+            try wayring_text_input.publish();
+            wayring_text_input_published = true;
         }
         wayring_lifecycle = .{
             .clients = &wayring_clients,
@@ -449,6 +465,7 @@ pub fn main(init: std.process.Init) !void {
             .seat = &wayring_seat_adapter,
             .data_device = if (wayring_data_device_initialized) &wayring_data_device else null,
             .primary_selection = if (wayring_primary_selection_initialized) &wayring_primary_selection else null,
+            .text_input = if (wayring_text_input_initialized) &wayring_text_input else null,
         };
         wayring_host = try WayringHost.create(
             init.gpa,
@@ -843,6 +860,7 @@ test {
     _ = @import("wayland/WayringSeatAdapter.zig");
     _ = @import("wayland/WayringDataDevice.zig");
     _ = @import("wayland/WayringPrimarySelection.zig");
+    _ = @import("wayland/WayringTextInput.zig");
     _ = @import("wayland/surface.zig");
     _ = @import("wayland/surface_geometry.zig");
     _ = @import("wayland/region.zig");

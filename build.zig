@@ -122,6 +122,7 @@ pub fn build(b: *std.Build) void {
     // tablet is scanner input only and is not published by the generated host.
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/tablet/tablet-v2.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/cursor-shape/cursor-shape-v1.xml"));
+    generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("unstable/text-input/text-input-unstable-v3.xml"));
     const generated_xdg_source = generate_xdg_protocol.captureStdOut(.{ .basename = "wayring_xdg_protocol.zig" });
     const xdg_protocol = b.createModule(.{
         .root_source_file = generated_xdg_source,

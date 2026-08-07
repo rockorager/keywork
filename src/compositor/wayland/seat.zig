@@ -1081,6 +1081,32 @@ pub fn keyboardFocusedSurface(self: *const Self) ?Surface.Id {
     return focus;
 }
 
+pub const TextInputFocus = struct {
+    surface: Surface.Id,
+    client: ClientRegistry.Id,
+};
+
+/// Canonical resource-free text-input focus for either frontend.
+pub fn textInputFocus(self: *const Self) ?TextInputFocus {
+    if (!self.hasKeyboardCapability() or !self.parent_focused or self.keymap == null)
+        return null;
+    if (self.keyboard_grab) |grab| if (grab.surface) |surface| {
+        if (Surface.resourceFor(self.surface_store, surface) != null) return .{
+            .surface = surface,
+            .client = self.matureSurfaceOwner(surface) orelse return null,
+        };
+    };
+    if (self.generatedKeyboardFocus()) |focus| return .{
+        .surface = focus.surface,
+        .client = focus.client,
+    };
+    const surface = self.matureKeyboardFocus() orelse return null;
+    return .{
+        .surface = surface,
+        .client = self.mature_keyboard_focus_client orelse return null,
+    };
+}
+
 pub fn cursorInfo(self: *const Self) ?CursorInfo {
     const position = self.pointer_position orelse return null;
     if (self.compositor_cursor) |cursor| return .{ .shape = .{

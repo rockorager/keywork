@@ -224,10 +224,12 @@ const InputResource = struct {
 
 fn keyboardFocusChanged(context: *anyopaque, _: ?*wl.Client) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.setFocus(self.seat.keyboardFocusedSurface());
+    self.observeFocus(self.seat.keyboardFocusedSurface());
 }
 
-fn setFocus(self: *Self, next: ?Surface.Id) void {
+/// Tracks mature surface commits only; Server bridges canonical Seat focus to
+/// the neutral owner for both mature and generated frontends.
+fn observeFocus(self: *Self, next: ?Surface.Id) void {
     if (self.observed_surface) |surface| if (next) |surface_id| {
         if (std.meta.eql(surface.handle(), surface_id)) return;
     };
@@ -237,20 +239,9 @@ fn setFocus(self: *Self, next: ?Surface.Id) void {
         const surface = Surface.fromResource(resource);
         surface.addCommitListener(&self.surface_listener) catch {
             resource.postNoMemory();
-            self.owner.setKeyboardFocus(null, null) catch unreachable;
             return;
         };
         self.observed_surface = surface;
-    };
-    if (next != null and self.observed_surface == null) {
-        self.owner.setKeyboardFocus(null, null) catch unreachable;
-        return;
-    }
-    const client = if (next) |surface| self.seat.matureSurfaceOwner(surface) else null;
-    self.owner.setKeyboardFocus(next, client) catch {
-        if (self.observed_surface) |surface| surface.removeCommitListener(&self.surface_listener);
-        self.observed_surface = null;
-        self.owner.setKeyboardFocus(null, null) catch unreachable;
     };
 }
 
