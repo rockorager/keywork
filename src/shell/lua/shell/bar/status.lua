@@ -1,6 +1,7 @@
 local kw = require("keywork")
 local dbus = require("keywork.dbus")
 local log = require("keywork.log")
+local loop = require("keywork.loop")
 local service = require("keywork.service")
 local clock = require("shell.clock")
 local util = require("shell.bar.util")
@@ -11,6 +12,78 @@ local status_pill = util.status_pill
 local UPOWER = "org.freedesktop.UPower"
 local UPOWER_DEVICE = "org.freedesktop.UPower.Device"
 local DISPLAY_DEVICE = "/org/freedesktop/UPower/devices/DisplayDevice"
+
+local function read_cpu_times()
+    local file = io.open("/proc/stat", "r")
+    if not file then
+        return nil
+    end
+    local line = file:read("*l")
+    file:close()
+    if not line or not line:match("^cpu%s") then
+        return nil
+    end
+
+    local fields = {}
+    for value in line:gmatch("%d+") do
+        fields[#fields + 1] = tonumber(value)
+        if #fields == 8 then
+            break
+        end
+    end
+    if #fields < 4 then
+        return nil
+    end
+
+    local total = 0.0
+    for _, value in ipairs(fields) do
+        total = total + value
+    end
+    return {
+        total = total,
+        idle = fields[4] + (fields[5] or 0),
+    }
+end
+
+local function cpu_usage(previous, current)
+    local total = current.total - previous.total
+    local idle = current.idle - previous.idle
+    if total <= 0 then
+        return nil
+    end
+    return math.max(0, math.min(100, math.floor((total - idle) * 100 / total + 0.5)))
+end
+
+local cpu_service = service.define("shell.bar.cpu", function(self)
+    local previous = read_cpu_times()
+    local timer = loop.timer({ interval = 1.0 })
+    for _ in timer:ticks() do
+        local current = read_cpu_times()
+        if current then
+            if previous then
+                local usage = cpu_usage(previous, current)
+                if usage then
+                    self:publish(usage)
+                end
+            end
+            previous = current
+        end
+    end
+end)
+
+local Cpu = kw.component({
+    hot_id = "Cpu",
+    hot_version = 1,
+    start = function(self)
+        self.usage = cpu_service:use(self.scope)
+    end,
+
+    build = function(self)
+        local usage = self.usage and self.usage() or nil
+        local text = usage and tostring(usage) .. "%" or "--%"
+        return status_pill("cpu", "gauge_20_regular", text, self.props.colors.foreground)
+    end,
+})
 
 local function upower_state_name(state)
     if state == 1 then
@@ -121,4 +194,5 @@ local Clock = kw.component({
 return {
     Battery = Battery,
     Clock = Clock,
+    Cpu = Cpu,
 }

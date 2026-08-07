@@ -279,6 +279,7 @@ local function status_pills_story()
                             children = {
                                 bar_util.status_pill("volume", "audio-volume-high", nil, palette.foreground),
                                 bar_util.status_pill("network", "network-wireless-signal-good", nil, palette.foreground),
+                                bar_util.status_pill("cpu", "gauge_20_regular", "14%", palette.foreground),
                                 bar_util.status_pill("battery", "battery-level-80", "82%", palette.foreground),
                             },
                         }),

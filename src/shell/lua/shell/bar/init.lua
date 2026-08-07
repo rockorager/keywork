@@ -178,6 +178,14 @@ function M.network(options)
     end)
 end
 
+---@param options? shell.BarBuiltinOptions
+---@return shell.BarItem
+function M.cpu(options)
+    return builtin(options, "cpu", "cpu", function(context)
+        return status.Cpu({ colors = context.colors })
+    end)
+end
+
 ---@param options? shell.BarBatteryOptions
 ---@return shell.BarItem
 function M.battery(options)
@@ -283,7 +291,7 @@ local function validate_items(items, name, ids)
 end
 
 local function default_status()
-    local items = { M.volume(), M.network(), M.battery(), M.clock() }
+    local items = { M.volume(), M.network(), M.cpu(), M.battery(), M.clock() }
     return M.item({
         id = "status",
         widget = function(context)

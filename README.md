@@ -100,6 +100,7 @@ return shell.app({
             shell.bar.tray({ outputs = "first" }),
             shell.bar.volume(),
             shell.bar.network(),
+            shell.bar.cpu(),
             hostname(),
             shell.bar.battery({ show_percent = true }),
             shell.bar.clock({ format = "%a %b %d  %I:%M %p" }),
@@ -111,8 +112,8 @@ return shell.app({
 Omitted `left` or `right` lists retain that side's built-in defaults; an empty
 list disables it. Items appear on every output by default. Set `outputs` to
 `"first"`, an output name, or a list of output names to limit an item. Built-in
-constructors are `workspaces`, `tray`, `volume`, `network`, `battery`, and
-`clock`. The tray must target exactly one output because the shell owns one
+constructors are `workspaces`, `tray`, `volume`, `network`, `cpu`, `battery`,
+and `clock`. The tray must target exactly one output because the shell owns one
 StatusNotifierWatcher name.
 
 Custom modules return the same item descriptors as the built-ins and build
