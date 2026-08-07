@@ -115,6 +115,7 @@ const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
 const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
+const WayringSessionLock = @import("wayland/WayringSessionLock.zig");
 const Viewporter = @import("wayland/viewporter.zig");
 const InputManager = @import("input_manager.zig");
 const BuiltinKeybindings = @import("builtin_keybindings.zig");
@@ -1501,7 +1502,7 @@ pub fn createWithVirtualOutput(
             .context = self,
             .state_changed = sessionLockStateChanged,
             .output_secure_without_frame = outputSecureWithoutFrame,
-            .repaint = requestRepaint,
+            .repaint = sessionLockRepaint,
         },
     );
     try self.client_registry.addDisconnectListener(.{
@@ -2561,6 +2562,10 @@ fn prepareSeatKeyboard(self: *Self, seat: *Seat, id: NativeInput.DeviceId) void 
 
 fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     const render_output = (self.render_outputs.get(id) orelse return false).*;
+    const retiring_generated_lock = if (self.session_lock_initialized)
+        self.exactEligibleGeneratedSessionLockRootForOutput(render_output.protocol_id)
+    else
+        null;
     finishWindowTransitionsForOutput(self, render_output.protocol_id);
     finishWorkspaceTransitionsForOutput(self, render_output.protocol_id);
     if (self.gamma_control_initialized) self.gamma_control.removeOutput(render_output.protocol_id);
@@ -2600,10 +2605,21 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     self.color_management.refreshPreferred();
     if (self.session_lock_initialized) {
         self.session_lock.outputRemoved(render_output.protocol_id);
-        if (self.session_lock_keyboard_focus != null and
+        if (retiring_generated_lock) |root| {
+            self.cancelGeneratedTouchesInSubtree(root);
+            self.reconcileGeneratedPointerTopology();
+            if (self.session_lock_keyboard_focus != null and
+                std.meta.eql(self.session_lock_keyboard_focus.?, root))
+                self.session_lock_keyboard_focus = null;
+            self.refreshKeyboardFocusReplacingGenerated();
+        } else if (self.session_lock_keyboard_focus != null and
             !self.session_lock_core.ownsMappedSurface(self.session_lock_keyboard_focus.?))
+        {
             self.session_lock_keyboard_focus = null;
+            self.refreshKeyboardFocusReplacingGenerated();
+        }
         self.session_lock.refreshOutputs();
+        requestRepaint(self);
     }
     render_output.clearPendingFrame();
     render_output.backend.deinit();
@@ -4206,6 +4222,11 @@ pub fn neutralLayerShell(self: *Self) *NeutralLayerShell {
     return &self.layer_shell_core;
 }
 
+/// Shared canonical state consumed by session-lock protocol frontends.
+pub fn neutralSessionLock(self: *Self) *NeutralSessionLock {
+    return &self.session_lock_core;
+}
+
 /// Mature placement/focus policy shared by both layer-shell frontends.
 pub fn sharedLayerPolicy(self: *Self) *LayerShell {
     return &self.layer_shell;
@@ -4550,6 +4571,8 @@ fn reconcileGeneratedPointerTopology(self: *Self) void {
                 else
                     self.generatedManagedRootEligible(generated.root, generated.client)),
             .input_popup => self.isGeneratedInputPopup(generated.root) and
+                self.headless_surface_forest.mappedInCompound(state.surface_id, generated.root),
+            .session_lock => self.exactEligibleGeneratedSessionLockRoot(generated.root) != null and
                 self.headless_surface_forest.mappedInCompound(state.surface_id, generated.root),
             .xdg_reserved, .layer_surface, .cursor, .drag_icon => false,
         }
@@ -6121,55 +6144,59 @@ fn damageHeadlessSurfaceBounds(
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| {
         const render_output = entry.value.*;
-        if (!render_output.backend.isHeadless() or !render_output.backend.powered()) continue;
-        const output = self.outputs.get(render_output.protocol_id).?;
-        const output_rect = output.logicalRect();
-        const intersection = rectangle.intersection(output_rect) orelse continue;
-        const physical = damage_geometry.scaleRect(
-            .{
-                .x = intersection.x -| output_rect.x,
-                .y = intersection.y -| output_rect.y,
-                .width = intersection.width,
-                .height = intersection.height,
-            },
-            render_output.backend.renderScale(),
-            render_output.backend.modeSize(),
-        ) orelse continue;
+        self.damageHeadlessSurfaceBoundsForOutput(render_output, rectangle, source_id);
+    }
+}
 
-        var damage = Region.init();
-        defer damage.deinit();
-        damage.setRectangle(physical.x, physical.y, physical.width, physical.height);
-        _ = self.expandHeadlessSurfaceBlurDamage(
-            render_output,
-            output,
-            &damage,
-            source_id,
+fn damageHeadlessSurfaceBoundsForOutput(
+    self: *Self,
+    render_output: *RenderOutput,
+    rectangle: render.Rect,
+    source_id: SurfaceRegistry.Id,
+) void {
+    if (!render_output.backend.isHeadless() or !render_output.backend.powered()) return;
+    const output = self.outputs.get(render_output.protocol_id) orelse return;
+    const output_rect = output.logicalRect();
+    const intersection = rectangle.intersection(output_rect) orelse return;
+    const physical = damage_geometry.scaleRect(
+        .{
+            .x = intersection.x -| output_rect.x,
+            .y = intersection.y -| output_rect.y,
+            .width = intersection.width,
+            .height = intersection.height,
+        },
+        render_output.backend.renderScale(),
+        render_output.backend.modeSize(),
+    ) orelse return;
+
+    var damage = Region.init();
+    defer damage.deinit();
+    damage.setRectangle(physical.x, physical.y, physical.width, physical.height);
+    _ = self.expandHeadlessSurfaceBlurDamage(
+        render_output,
+        output,
+        &damage,
+        source_id,
+    ) catch return self.damageFullOutput(render_output);
+    // The synthetic source has no libwayland root to compare against
+    // mature blur owners. Treat it as lower than every mature scene node;
+    // unresolved out-of-scene owners conservatively invalidate this output.
+    self.expandBackdropBlurDamage(render_output, output, &damage, null) catch
+        return self.damageFullOutput(render_output);
+    var rectangles = damage.rectangleIterator();
+    while (rectangles.next()) |damaged| {
+        render_output.damage.add(
+            damaged.x,
+            damaged.y,
+            @intCast(damaged.width),
+            @intCast(damaged.height),
         ) catch {
             self.damageFullOutput(render_output);
-            continue;
+            break;
         };
-        // The synthetic source has no libwayland root to compare against
-        // mature blur owners. Treat it as lower than every mature scene node;
-        // unresolved out-of-scene owners conservatively invalidate this output.
-        self.expandBackdropBlurDamage(render_output, output, &damage, null) catch {
-            self.damageFullOutput(render_output);
-            continue;
-        };
-        var rectangles = damage.rectangleIterator();
-        while (rectangles.next()) |damaged| {
-            render_output.damage.add(
-                damaged.x,
-                damaged.y,
-                @intCast(damaged.width),
-                @intCast(damaged.height),
-            ) catch {
-                self.damageFullOutput(render_output);
-                break;
-            };
-        } else {
-            render_output.requestFrame();
-            self.scheduleRepaint(render_output);
-        }
+    } else {
+        render_output.requestFrame();
+        self.scheduleRepaint(render_output);
     }
 }
 
@@ -6203,6 +6230,26 @@ fn damageHeadlessCompound(self: *Self, id: SurfaceRegistry.Id) void {
     if (self.managedGeneratedPopupOwner(root)) |popup| {
         if (self.managedGeneratedPopup(root) != null and self.scene.surfaceMapped(root))
             sceneNodeDamage(self, .{ .popup = popup.scene_id });
+        return;
+    }
+    if (self.exactEligibleGeneratedSessionLockRoot(root)) |output_id| {
+        switch (self.headless_surface_forest.subtreeDamageBounds(root)) {
+            .hidden => {},
+            .rect => |bounds| {
+                const output = self.outputs.get(output_id) orelse return;
+                self.damageHeadlessSurfaceBoundsForOutput(
+                    self.renderOutputForProtocol(output_id) orelse return,
+                    bounds.translated(
+                        output.logicalPosition().x,
+                        output.logicalPosition().y,
+                    ),
+                    id,
+                );
+            },
+            .full_damage => self.damageFullOutput(
+                self.renderOutputForProtocol(output_id) orelse return,
+            ),
+        }
         return;
     }
     switch (self.headless_surface_forest.compoundBounds(id)) {
@@ -6285,6 +6332,39 @@ fn exactEligibleGeneratedLayerRoot(self: *Self, root: SurfaceRegistry.Id) ?Scene
     if (!std.meta.eql(owner, snapshot.client)) return null;
     if ((self.headless_surface_forest.state(root) orelse return null).mapped_size == null) return null;
     return scene_id;
+}
+
+/// Proves the complete generated session-lock presentation chain. In
+/// particular, neutral ownership is not inferred from the forest role, and a
+/// retired output cannot leave an otherwise-live generated compound eligible.
+fn exactEligibleGeneratedSessionLockRoot(
+    self: *Self,
+    root: SurfaceRegistry.Id,
+) ?OutputLayout.Id {
+    if (!std.meta.eql(self.headless_surface_forest.compoundRoot(root) orelse return null, root) or
+        self.headless_surface_forest.presentationClass(root) != .session_lock or
+        (self.headless_surface_forest.state(root) orelse return null).mapped_size == null or
+        !self.session_lock_core.isLocked()) return null;
+    const active = self.session_lock_core.activeLock() orelse return null;
+    const owner = self.seat.generatedSurfaceOwner(root) orelse return null;
+    var outputs = self.render_outputs.iterator();
+    while (outputs.next()) |entry| {
+        const render_output = entry.value.*;
+        const snapshot = self.session_lock_core.surfaceForOutput(render_output.protocol_id) orelse continue;
+        if (!snapshot.mapped or !std.meta.eql(snapshot.lock, active) or
+            !std.meta.eql(snapshot.surface, root) or !std.meta.eql(snapshot.client, owner)) continue;
+        return render_output.protocol_id;
+    }
+    return null;
+}
+
+fn exactEligibleGeneratedSessionLockRootForOutput(
+    self: *Self,
+    output_id: OutputLayout.Id,
+) ?SurfaceRegistry.Id {
+    const snapshot = self.session_lock_core.surfaceForOutput(output_id) orelse return null;
+    const proven_output = self.exactEligibleGeneratedSessionLockRoot(snapshot.surface) orelse return null;
+    return if (std.meta.eql(proven_output, output_id)) snapshot.surface else null;
 }
 
 fn sceneGeneratedCompound(self: *Self, root: SurfaceRegistry.Id) bool {
@@ -6392,12 +6472,16 @@ fn rememberSampledSurfaces(self: *Self, output: *RenderOutput) void {
 
 /// Completes only demand whose tagged image survived this accepted output
 /// frame. Taking the thunk clears demand before frontend code can run.
-fn completeSampledHeadlessFrames(self: *Self) void {
+fn completeSampledHeadlessFrames(self: *Self, output_id: OutputLayout.Id) void {
     var callback_timestamp_ms: ?u32 = null;
     var iterator = self.headless_surface_forest.nodeIterator();
     while (iterator.next()) |node| {
         if (self.headless_surface_forest.isCursorRole(node.id)) continue;
         if (!node.frame_demand or !self.renderer.wasSampled(surfaceSampleTag(node.id))) continue;
+        const root = self.headless_surface_forest.compoundRoot(node.id) orelse continue;
+        if (self.headless_surface_forest.presentationClass(root) == .session_lock and
+            !std.meta.eql(self.exactEligibleGeneratedSessionLockRoot(root) orelse continue, output_id))
+            continue;
         const completion = self.headless_surface_forest.takeFrameCompletion(node.id) orelse unreachable;
         const timestamp_ms = callback_timestamp_ms orelse timestamp: {
             const value = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io)).milliseconds();
@@ -6553,6 +6637,12 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     }
 }
 
+fn sessionLockRepaint(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.reconcileGeneratedPointerTopology();
+    requestRepaint(self);
+}
+
 fn sessionLockKeyboardFocus(self: *Self) ?Surface.Id {
     if (self.session_lock_keyboard_focus) |focus| {
         if (self.session_lock_core.ownsMappedSurface(focus)) return focus;
@@ -6563,7 +6653,9 @@ fn sessionLockKeyboardFocus(self: *Self) ?Surface.Id {
 }
 
 fn sessionLockPointerPressed(self: *Self, surface: ?Surface.Id) void {
-    const focus = surface orelse return;
+    const candidate = surface orelse return;
+    const focus = self.headless_surface_forest.compoundRoot(candidate) orelse
+        self.subcompositor.rootSurface(candidate);
     if (!self.session_lock_core.ownsMappedSurface(focus)) return;
     self.session_lock_keyboard_focus = focus;
     requestRepaint(self);
@@ -8459,7 +8551,8 @@ fn touchOrientation(context: *anyopaque, id: i32, orientation: f64) void {
 }
 
 fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
-    return maturePointerFocus(self.pointerFocusExcluding(x, y, null));
+    const focus = self.pointerFocusExcluding(x, y, null);
+    return if (self.session_lock.isLocked()) focus else maturePointerFocus(focus);
 }
 
 fn maturePointerFocus(focus: ?Seat.PointerFocus) ?Seat.PointerFocus {
@@ -8503,6 +8596,26 @@ fn pointerRouteExcluding(
                 .focus = null,
                 .root = null,
             };
+            if (self.headless_surface_forest.presentationClass(info.surface_id) == .session_lock) {
+                const root = self.exactEligibleGeneratedSessionLockRootForOutput(entry.id) orelse
+                    return .{ .focus = null, .root = null };
+                const client = self.seat.generatedSurfaceOwner(root) orelse
+                    return .{ .focus = null, .root = null };
+                var filter: GeneratedInputFilter = .{ .server = self, .root = root };
+                const hit = self.headless_surface_forest.subtreeInputHit(
+                    root,
+                    x - @as(f64, @floatFromInt(info.position.x)),
+                    y - @as(f64, @floatFromInt(info.position.y)),
+                    .{ .context = &filter, .accepts = generatedSurfaceAcceptsInput },
+                ) orelse return .{ .focus = null, .root = null };
+                return generatedPointerRoute(.{
+                    .surface_id = hit.id,
+                    .root = root,
+                    .client = client,
+                    .x = hit.x,
+                    .y = hit.y,
+                });
+            }
             const focus = self.hitTestSurface(info.surface_id, .{
                 .x = info.position.x,
                 .y = info.position.y,
@@ -8753,7 +8866,7 @@ fn headlessPointerFocus(self: *Self, x: f64, y: f64) ?GeneratedPointerFocus {
     switch (self.headless_surface_forest.presentationClass(root) orelse return null) {
         .background => {},
         .managed => if (!self.generatedManagedRootEligible(root, client)) return null,
-        .xdg_reserved, .layer_surface, .cursor, .drag_icon, .input_popup => return null,
+        .xdg_reserved, .layer_surface, .session_lock, .cursor, .drag_icon, .input_popup => return null,
     }
     return .{
         .surface_id = hit.id,
@@ -10313,6 +10426,7 @@ fn handleFrameCallbackTimer(output_context: *RenderOutput) c_int {
     }
     if (output_context.server.completeGeneratedCallbackOnlyFrames(
         output,
+        output_context.protocol_id,
         timestamp.milliseconds(),
     )) {
         log.debug("completed generated callback-only frame callbacks for {s}", .{output.name()});
@@ -10323,6 +10437,7 @@ fn handleFrameCallbackTimer(output_context: *RenderOutput) c_int {
 fn completeGeneratedCallbackOnlyFrames(
     self: *Self,
     output: *Output,
+    output_id: OutputLayout.Id,
     timestamp_ms: u32,
 ) bool {
     var completed = false;
@@ -10330,8 +10445,10 @@ fn completeGeneratedCallbackOnlyFrames(
     while (iterator.next()) |node| {
         if (!node.frame_demand or !output.containsSurface(node.id)) continue;
         const root = self.headless_surface_forest.compoundRoot(node.id) orelse continue;
+        const lock_output = self.exactEligibleGeneratedSessionLockRoot(root);
         if ((!self.exactEligibleGeneratedRoot(root) and !self.exactEligibleGeneratedPopupRoot(root) and
-            self.exactEligibleGeneratedLayerRoot(root) == null) or
+            self.exactEligibleGeneratedLayerRoot(root) == null and
+            (lock_output == null or !std.meta.eql(lock_output.?, output_id))) or
             !self.headless_surface_forest.mappedInCompound(node.id, root)) continue;
         completed = self.headless_surface_forest.completeCallbackOnlyFrame(node.id, timestamp_ms) or completed;
     }
@@ -10345,8 +10462,10 @@ fn scheduleGeneratedCallbackOnlyFrames(self: *Self, render_output: *RenderOutput
         if (!node.frame_demand or !output.containsSurface(node.id) or
             !self.headless_surface_forest.hasCallbackOnlyFrameDemand(node.id)) continue;
         const root = self.headless_surface_forest.compoundRoot(node.id) orelse continue;
+        const lock_output = self.exactEligibleGeneratedSessionLockRoot(root);
         if ((!self.exactEligibleGeneratedRoot(root) and !self.exactEligibleGeneratedPopupRoot(root) and
-            self.exactEligibleGeneratedLayerRoot(root) == null) or
+            self.exactEligibleGeneratedLayerRoot(root) == null and
+            (lock_output == null or !std.meta.eql(lock_output.?, render_output.protocol_id))) or
             !self.headless_surface_forest.mappedInCompound(node.id, root)) continue;
         self.scheduleFrameCallback(render_output);
         return;
@@ -10817,7 +10936,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     }
     self.rememberSampledSurfaces(render_output);
     output.endFrame();
-    self.completeSampledHeadlessFrames();
+    self.completeSampledHeadlessFrames(render_output.protocol_id);
     self.completeSampledGeneratedCursorFrames();
     self.scheduleGeneratedCallbackOnlyFrames(render_output);
     self.color_management.refreshPreferred();
@@ -11119,12 +11238,15 @@ fn presentSessionLockFrame(
     frame.render_output.lock_frame_pending = true;
     self.rememberSampledSurfaces(frame.render_output);
     frame.output.endFrame();
-    self.completeSampledHeadlessFrames();
+    self.completeSampledHeadlessFrames(frame.render_output.protocol_id);
     self.completeSampledGeneratedCursorFrames();
     self.scheduleGeneratedCallbackOnlyFrames(frame.render_output);
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);
-    if (lock_surface) |info| self.submitSurfaceTree(frame.output, info.surface_id);
+    if (lock_surface) |info| {
+        if (self.headless_surface_forest.presentationClass(info.surface_id) != .session_lock)
+            self.submitSurfaceTree(frame.output, info.surface_id);
+    }
     if (frame.render_output.cursor_state == .software or
         frame.render_output.cursor_state == .deactivating)
         self.submitSeatCursor(frame.output, &self.seat, true);
@@ -11155,7 +11277,10 @@ fn renderSessionLockContents(
 ) Renderer.Error!void {
     const lock_surface = self.session_lock.surfaceForOutput(frame.render_output.protocol_id);
     if (lock_surface) |info| {
-        try self.renderSurfaceTree(
+        if (self.headless_surface_forest.presentationClass(info.surface_id) == .session_lock) {
+            if (self.exactEligibleGeneratedSessionLockRootForOutput(frame.render_output.protocol_id)) |root|
+                try self.renderGeneratedCompound(frame, root, info.position.x, info.position.y);
+        } else try self.renderSurfaceTree(
             frame,
             info.surface_id,
             info.position.x,
@@ -11180,7 +11305,17 @@ fn refreshKeyboardFocusReplacingGenerated(self: *Self) void {
 fn refreshKeyboardFocusWithGeneratedRetention(self: *Self, retain_generated: bool) void {
     if (self.session_lock.isLocked()) {
         const focus = self.sessionLockKeyboardFocus();
-        self.applyMatureKeyboardFocus(focus);
+        if (focus) |surface| {
+            if (self.headless_surface_forest.presentationClass(surface) == .session_lock) {
+                if (self.exactEligibleGeneratedSessionLockRoot(surface) == null) {
+                    self.applyMatureKeyboardFocus(null);
+                    self.syncXwaylandFocus(null);
+                    return;
+                }
+                const owner = self.seat.generatedSurfaceOwner(surface) orelse unreachable;
+                _ = self.seat.applyGeneratedKeyboardFocus(.{ .surface = surface, .client = owner }, null);
+            } else self.applyMatureKeyboardFocus(surface);
+        } else self.applyMatureKeyboardFocus(null);
         self.syncXwaylandFocus(null);
         return;
     }
@@ -11393,7 +11528,8 @@ fn submitCursor(self: *Self, output: *Output, info: Seat.CursorInfo) void {
 fn seatCursorInfo(self: *Self, seat: *Seat, locked: bool) ?Seat.CursorInfo {
     if (locked) {
         const surface_id = seat.pointerFocusedSurface() orelse return null;
-        const root = self.subcompositor.rootSurface(surface_id);
+        const root = self.headless_surface_forest.compoundRoot(surface_id) orelse
+            self.subcompositor.rootSurface(surface_id);
         if (!self.session_lock.ownsSurface(root)) return null;
     }
     return seat.cursorInfo();
@@ -11401,7 +11537,8 @@ fn seatCursorInfo(self: *Self, seat: *Seat, locked: bool) ?Seat.CursorInfo {
 
 fn tabletCursorVisible(self: *Self, focus_surface: Surface.Id, locked: bool) bool {
     if (!locked) return true;
-    const root = self.subcompositor.rootSurface(focus_surface);
+    const root = self.headless_surface_forest.compoundRoot(focus_surface) orelse
+        self.subcompositor.rootSurface(focus_surface);
     return self.session_lock.ownsSurface(root);
 }
 
@@ -13258,9 +13395,15 @@ const TestFrameCompletion = struct {
     timestamps_ms: [8]u32 = undefined,
     forest: ?*HeadlessSurfaceForest = null,
     demand_cleared_before_call: bool = true,
+    callback_only: bool = false,
 
     fn frameCompletion(self: *TestFrameCompletion) SurfaceFrameCompletion {
-        return .{ .context = self, .complete = complete };
+        return .{
+            .context = self,
+            .complete = complete,
+            .has_callback_only = hasCallbackOnly,
+            .complete_callback_only = completeCallbackOnly,
+        };
     }
 
     fn complete(context: *anyopaque, id: SurfaceRegistry.Id, timestamp_ms: u32) void {
@@ -13274,6 +13417,59 @@ const TestFrameCompletion = struct {
         self.timestamps_ms[self.count] = timestamp_ms;
         self.count += 1;
     }
+
+    fn hasCallbackOnly(context: *anyopaque, _: SurfaceRegistry.Id) bool {
+        const self: *TestFrameCompletion = @ptrCast(@alignCast(context));
+        return self.callback_only;
+    }
+
+    fn completeCallbackOnly(
+        context: *anyopaque,
+        id: SurfaceRegistry.Id,
+        timestamp_ms: u32,
+    ) SurfaceFrameCompletion.CallbackOnlyResult {
+        const self: *TestFrameCompletion = @ptrCast(@alignCast(context));
+        if (!self.callback_only) return .none;
+        self.callback_only = false;
+        complete(self, id, timestamp_ms);
+        return .drained;
+    }
+};
+
+const TestSessionLockEndpoint = struct {
+    acquired_count: usize = 0,
+    finished_count: usize = 0,
+    configure_count: usize = 0,
+    last_configure: ?NeutralSessionLock.ConfigureToken = null,
+
+    fn lockEndpoint(self: *TestSessionLockEndpoint) NeutralSessionLock.LockEndpoint {
+        return .{ .context = self, .acquired = acquired, .finished = finished };
+    }
+
+    fn surfaceEndpoint(self: *TestSessionLockEndpoint) NeutralSessionLock.SurfaceEndpoint {
+        return .{ .context = self, .configure = configure };
+    }
+
+    fn acquired(context: *anyopaque) void {
+        const self: *TestSessionLockEndpoint = @ptrCast(@alignCast(context));
+        self.acquired_count += 1;
+    }
+
+    fn finished(context: *anyopaque) void {
+        const self: *TestSessionLockEndpoint = @ptrCast(@alignCast(context));
+        self.finished_count += 1;
+    }
+
+    fn configure(
+        context: *anyopaque,
+        _: u32,
+        _: u32,
+        token: NeutralSessionLock.ConfigureToken,
+    ) error{OutOfMemory}!void {
+        const self: *TestSessionLockEndpoint = @ptrCast(@alignCast(context));
+        self.configure_count += 1;
+        self.last_configure = token;
+    }
 };
 
 fn renderPendingTestOutput(server: *Self, output: *RenderOutput) Renderer.Error!void {
@@ -13282,6 +13478,221 @@ fn renderPendingTestOutput(server: *Self, output: *RenderOutput) Renderer.Error!
     output.render_scheduled = false;
     output.repaint_needed = false;
     try server.renderFrame(output);
+}
+
+test "generated session lock subtree has exact rendering damage and callback eligibility" {
+    const server = try Self.createWithVirtualOutput(std.testing.allocator, std.testing.io, .cpu, .headless, null, .{
+        .size = .{ .width = 8, .height = 4 },
+    });
+    defer server.destroy();
+    const output = server.primaryRenderOutput();
+    const client = try server.client_registry.register(.wayring_server);
+    defer server.client_registry.unregister(client);
+    var sink: TestGeneratedSeatSink = .{ .clients = &server.client_registry, .client = client };
+    server.setGeneratedSeatDeliverySink(sink.sink());
+    defer server.clearGeneratedSeatDeliverySink(&sink);
+
+    var completion: TestFrameCompletion = .{ .forest = &server.headless_surface_forest };
+    var root_provider: SyntheticSurfaceProvider = .{ .pixel = 0xff11_2233, .logical_size = .{ .width = 8, .height = 4 } };
+    var child_provider: SyntheticSurfaceProvider = .{ .pixel = 0xff44_5566, .logical_size = .{ .width = 2, .height = 2 } };
+    const root = try server.surface_registry.add(root_provider.provider());
+    const child = try server.surface_registry.add(child_provider.provider());
+    try server.addHeadlessSurface(root, completion.frameCompletion());
+    try server.addHeadlessSurface(child, completion.frameCompletion());
+    defer {
+        server.removeHeadlessSurface(child);
+        server.surface_registry.remove(child);
+        server.removeHeadlessSurface(root);
+        server.surface_registry.remove(root);
+    }
+    try std.testing.expect(server.headless_surface_forest.setRootPresentationClass(root, .session_lock));
+    const initial_stack = [_]WayringCompositor.AppliedStackEntry{ .parent, .{ .child = .{ .id = child, .position = .{ .x = 1, .y = 1 } } } };
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{
+            .{ .id = root, .mapped_size = root_provider.logical_size, .callbacks_committed = true },
+            .{ .id = child, .mapped_size = child_provider.logical_size, .callbacks_committed = true },
+        },
+        .parents = &.{.{ .id = root, .stack = &initial_stack }},
+    });
+
+    var endpoint: TestSessionLockEndpoint = .{};
+    const lock = try server.session_lock_core.createLock(client, endpoint.lockEndpoint());
+    const lock_surface = try server.session_lock_core.createSurface(lock, client, root, client, output.protocol_id, endpoint.surfaceEndpoint());
+    const token = try server.session_lock_core.configure(lock_surface, 8, 4);
+    try server.session_lock_core.ackConfigure(lock_surface, token);
+    try server.session_lock_core.map(lock_surface, 8, 4);
+    defer {
+        if (server.session_lock_core.isLocked()) server.session_lock_core.unlockAndDestroy(lock) catch {};
+        server.session_lock_core.destroySurface(lock_surface);
+        server.session_lock_core.destroyLock(lock);
+    }
+
+    try renderPendingTestOutput(server, output);
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(root)));
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(child)));
+    var generic = server.headless_surface_forest.renderIterator();
+    while (generic.next()) |node| {
+        try std.testing.expect(!std.meta.eql(node.id, root));
+        try std.testing.expect(!std.meta.eql(node.id, child));
+    }
+    resetTestOutputDamage(output);
+    const moved_stack = [_]WayringCompositor.AppliedStackEntry{ .parent, .{ .child = .{ .id = child, .position = .{ .x = 4, .y = 1 } } } };
+    server.applyHeadlessBatch(.{ .surfaces = &.{}, .parents = &.{.{ .id = root, .stack = &moved_stack }} });
+    try std.testing.expect(output.damage.coversRectangle(1, 1, 2, 2));
+    try std.testing.expect(output.damage.coversRectangle(4, 1, 2, 2));
+
+    resetTestOutputDamage(output);
+    server.commitHeadlessSurface(child, null, false);
+    try std.testing.expect(output.damage.coversRectangle(4, 1, 2, 2));
+    server.commitHeadlessSurface(child, child_provider.logical_size, true);
+    try std.testing.expect(output.damage.coversRectangle(4, 1, 2, 2));
+    try renderPendingTestOutput(server, output);
+    const completed = completion.count;
+    completion.callback_only = true;
+    root_provider.available = false;
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{.{ .id = root, .mapped_size = root_provider.logical_size, .callbacks_committed = true }},
+        .parents = &.{},
+    });
+    const protocol_output = server.outputs.get(output.protocol_id).?;
+    protocol_output.beginFrame();
+    try protocol_output.markSurfaceVisible(root);
+    try protocol_output.markSurfaceVisible(child);
+    protocol_output.endFrame();
+    server.scheduleGeneratedCallbackOnlyFrames(output);
+    try std.testing.expect(output.frame_callback_timer != null);
+    try std.testing.expect(server.completeGeneratedCallbackOnlyFrames(server.outputs.get(output.protocol_id).?, output.protocol_id, 77));
+    try std.testing.expectEqual(completed + 1, completion.count);
+    server.session_lock_core.unmap(lock_surface);
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{.{ .id = root, .mapped_size = root_provider.logical_size, .callbacks_committed = true }},
+        .parents = &.{},
+    });
+    try std.testing.expect(!server.completeGeneratedCallbackOnlyFrames(server.outputs.get(output.protocol_id).?, output.protocol_id, 78));
+    try std.testing.expectEqual(completed + 1, completion.count);
+}
+
+test "retiring generated session lock output reconciles input focus and neutral ownership" {
+    const server = try Self.createWithVirtualOutput(std.testing.allocator, std.testing.io, .cpu, .headless, null, .{
+        .size = .{ .width = 4, .height = 4 },
+    });
+    defer server.destroy();
+    const surviving = server.primaryRenderOutput();
+    const retiring_id = try server.addRenderOutput(std.testing.io, .{
+        .kind = .headless,
+        .size = .{ .width = 4, .height = 4 },
+        .position = .{ .x = 4 },
+        .name = "HEADLESS-RETIRING-LOCK",
+        .description = "Keywork retiring session lock test output",
+        .model = "headless",
+    });
+    var retiring_live = true;
+    defer if (retiring_live) std.debug.assert(server.removeRenderOutput(retiring_id));
+    const retiring = server.render_outputs.get(retiring_id).?.*;
+    const client = try server.client_registry.register(.wayring_server);
+    defer server.client_registry.unregister(client);
+    var sink: TestGeneratedSeatSink = .{
+        .clients = &server.client_registry,
+        .client = client,
+        .touch_max_resource_generation = 9,
+    };
+    server.setGeneratedSeatDeliverySink(sink.sink());
+    defer server.clearGeneratedSeatDeliverySink(&sink);
+    server.seat.setPointerAvailable(true);
+    server.seat.setTouchAvailable(true);
+    defer {
+        server.seat.setTouchAvailable(false);
+        server.seat.setPointerAvailable(false);
+    }
+
+    var survivor_provider: SyntheticSurfaceProvider = .{ .pixel = 0xff10_2030, .logical_size = .{ .width = 4, .height = 4 } };
+    var retired_provider: SyntheticSurfaceProvider = .{ .pixel = 0xff40_5060, .logical_size = .{ .width = 4, .height = 4 } };
+    var child_provider: SyntheticSurfaceProvider = .{ .pixel = 0xff70_8090, .logical_size = .{ .width = 2, .height = 2 } };
+    const survivor_root = try server.surface_registry.add(survivor_provider.provider());
+    const retired_root = try server.surface_registry.add(retired_provider.provider());
+    const retired_child = try server.surface_registry.add(child_provider.provider());
+    try server.addHeadlessSurface(survivor_root, null);
+    try server.addHeadlessSurface(retired_root, null);
+    try server.addHeadlessSurface(retired_child, null);
+    defer {
+        server.removeHeadlessSurface(retired_child);
+        server.surface_registry.remove(retired_child);
+        server.removeHeadlessSurface(retired_root);
+        server.surface_registry.remove(retired_root);
+        server.removeHeadlessSurface(survivor_root);
+        server.surface_registry.remove(survivor_root);
+    }
+    try std.testing.expect(server.headless_surface_forest.setRootPresentationClass(survivor_root, .session_lock));
+    try std.testing.expect(server.headless_surface_forest.setRootPresentationClass(retired_root, .session_lock));
+    const retired_stack = [_]WayringCompositor.AppliedStackEntry{ .parent, .{ .child = .{ .id = retired_child, .position = .{ .x = 1, .y = 1 } } } };
+    server.applyHeadlessBatch(.{
+        .surfaces = &.{
+            .{ .id = survivor_root, .mapped_size = survivor_provider.logical_size, .callbacks_committed = false },
+            .{ .id = retired_root, .mapped_size = retired_provider.logical_size, .callbacks_committed = false },
+            .{ .id = retired_child, .mapped_size = child_provider.logical_size, .callbacks_committed = false },
+        },
+        .parents = &.{.{ .id = retired_root, .stack = &retired_stack }},
+    });
+    var endpoint: TestSessionLockEndpoint = .{};
+    const lock = try server.session_lock_core.createLock(client, endpoint.lockEndpoint());
+    const survivor_surface = try server.session_lock_core.createSurface(lock, client, survivor_root, client, surviving.protocol_id, endpoint.surfaceEndpoint());
+    const retired_surface = try server.session_lock_core.createSurface(lock, client, retired_root, client, retiring.protocol_id, endpoint.surfaceEndpoint());
+    for ([_]NeutralSessionLock.LockSurfaceId{ survivor_surface, retired_surface }) |surface| {
+        const token = try server.session_lock_core.configure(surface, 4, 4);
+        try server.session_lock_core.ackConfigure(surface, token);
+        try server.session_lock_core.map(surface, 4, 4);
+    }
+    defer {
+        if (server.session_lock_core.isLocked()) server.session_lock_core.unlockAndDestroy(lock) catch {};
+        server.session_lock_core.destroySurface(retired_surface);
+        server.session_lock_core.destroySurface(survivor_surface);
+        server.session_lock_core.destroyLock(lock);
+    }
+    try server.session_lock_core.outputPresented(surviving.protocol_id);
+    try server.session_lock_core.outputPresented(retiring.protocol_id);
+    try std.testing.expectEqual(@as(usize, 1), endpoint.acquired_count);
+
+    const retired_focus: Seat.PointerFocus = .{
+        .surface_id = retired_child,
+        .x = 0.5,
+        .y = 0.5,
+        .generated = .{ .root = retired_root, .client = client },
+    };
+    server.seat.pointerEnter(5.5, 1.5, retired_focus);
+    pointerButton(retiring, 2, linux_button_left, .pressed);
+    try std.testing.expect(server.seat.implicitPointerGrabActive());
+    const press_serial = sink.last_button_serial.?;
+    try std.testing.expect(server.seat.authority.acceptsAction(client, press_serial));
+    try server.seat.touchDown(3, 17, 5.5, 1.5, retired_focus);
+    _ = server.seat.applyGeneratedKeyboardFocus(.{ .surface = retired_root, .client = client }, null);
+    server.session_lock_keyboard_focus = retired_root;
+    const pointer_before = sink.pointer_event_count;
+    const touch_before = sink.touch_event_count;
+
+    try std.testing.expect(server.removeRenderOutput(retiring_id));
+    retiring_live = false;
+    try std.testing.expect(!server.session_lock_core.ownsMappedSurface(retired_root));
+    try std.testing.expect(server.session_lock_core.ownsMappedSurface(survivor_root));
+    try std.testing.expect(server.session_lock_core.snapshot(retired_surface) != null);
+    try std.testing.expect(!server.seat.implicitPointerGrabActive());
+    try std.testing.expect(!server.seat.authority.acceptsAction(client, press_serial));
+    try std.testing.expectEqual(TestGeneratedSeatSink.TouchTag.cancel, sink.touch_events[touch_before]);
+    try std.testing.expect(sink.pointer_event_count > pointer_before);
+    try std.testing.expectEqual(TestGeneratedSeatSink.PointerTag.leave, sink.pointer_events[pointer_before]);
+    try std.testing.expectEqual(survivor_root, server.seat.generatedKeyboardFocus().?.surface);
+    try std.testing.expectEqual(survivor_root, server.session_lock_keyboard_focus.?);
+
+    const retired_pointer_events = sink.pointer_event_count;
+    const retired_touch_events = sink.touch_event_count;
+    pointerMotion(surviving, 4, 1, 1);
+    pointerAxis(surviving, 5, .vertical_scroll, wl.Fixed.fromInt(1));
+    touchMotion(surviving, 6, 17, 1, 1);
+    touchUp(surviving, 7, 17);
+    try std.testing.expectEqual(retired_touch_events, sink.touch_event_count);
+    for (sink.pointer_surfaces[retired_pointer_events..sink.pointer_event_count]) |surface|
+        try std.testing.expect(!std.meta.eql(surface, retired_child) and !std.meta.eql(surface, retired_root));
+    try renderPendingTestOutput(server, surviving);
+    try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(survivor_root)));
 }
 
 test "applied nested topology paints exact order and completes only sampled child tags" {
@@ -17997,6 +18408,7 @@ const WayringXdgClient = struct {
     expect_data_control: bool = false,
     expect_virtual_keyboard: bool = false,
     expect_layer_shell: bool = false,
+    expect_session_lock: bool = false,
     guessed_data_control_name: ?u32 = null,
     guessed_virtual_keyboard_name: ?u32 = null,
     guessed_data_control_bind_issued: bool = false,
@@ -18004,6 +18416,8 @@ const WayringXdgClient = struct {
     guessed_input_method_bind_issued: bool = false,
     expect_input_method: bool = false,
     guessed_virtual_keyboard_bind_issued: bool = false,
+    guessed_session_lock_name: ?u32 = null,
+    guessed_session_lock_bind_issued: bool = false,
     offense: ?Offense = null,
     activation_role: ?ActivationRole = null,
     activation_exchange: ?*ActivationExchange = null,
@@ -18049,6 +18463,10 @@ const WayringXdgClient = struct {
     layer_shell_version: u32 = 0,
     layer_shell_name: u32 = 0,
     layer_shell_removed: bool = false,
+    session_lock_manager_count: usize = 0,
+    session_lock_manager_version: u32 = 0,
+    session_lock_manager_name: u32 = 0,
+    session_lock_manager_removed: bool = false,
     configure_serial: u32 = 0,
     configure_count: u8 = 0,
     toplevel_configure_count: u8 = 0,
@@ -18097,6 +18515,7 @@ const WayringXdgClient = struct {
         .{ .name = "zwp_input_method_manager_v2", .version = 1 },
         .{ .name = "zwp_virtual_keyboard_manager_v1", .version = 1 },
         .{ .name = "zwlr_layer_shell_v1", .version = 5 },
+        .{ .name = "ext_session_lock_manager_v1", .version = 1 },
     };
 
     fn expectedGlobalCount(self: *const @This()) usize {
@@ -18104,7 +18523,8 @@ const WayringXdgClient = struct {
             @intFromBool(!self.expect_data_control) -
             @intFromBool(!self.expect_input_method) -
             @intFromBool(!self.expect_virtual_keyboard) -
-            @intFromBool(!self.expect_layer_shell);
+            @intFromBool(!self.expect_layer_shell) -
+            @intFromBool(!self.expect_session_lock);
     }
 
     fn expectedGlobal(self: *const @This(), visible_index: usize) ?ExpectedGlobal {
@@ -18120,6 +18540,8 @@ const WayringXdgClient = struct {
                 self.expect_virtual_keyboard
             else if (std.mem.eql(u8, global.name, "zwlr_layer_shell_v1"))
                 self.expect_layer_shell
+            else if (std.mem.eql(u8, global.name, "ext_session_lock_manager_v1"))
+                self.expect_session_lock
             else
                 true;
             if (!present) continue;
@@ -18236,6 +18658,17 @@ const WayringXdgClient = struct {
                 try self.pause(.manager_added);
                 _ = try registry.bind(name, client_zwp.VirtualKeyboardManagerV1, 1);
                 self.guessed_virtual_keyboard_bind_issued = true;
+                expectClientRoundtrip(display) catch return;
+                return error.RestrictedGlobalBindAccepted;
+            }
+            if (self.guessed_session_lock_name) |name| {
+                try expectClientRoundtrip(display);
+                if (!self.globals_exact or self.global_count != self.expectedGlobalCount() or
+                    self.session_lock_manager_count != 0)
+                    return error.RestrictedGlobalAdvertised;
+                try self.pause(.manager_added);
+                _ = try registry.bind(name, client_ext.SessionLockManagerV1, 1);
+                self.guessed_session_lock_bind_issued = true;
                 expectClientRoundtrip(display) catch return;
                 return error.RestrictedGlobalBindAccepted;
             }
@@ -18503,6 +18936,10 @@ const WayringXdgClient = struct {
                     self.layer_shell_version = global.version;
                     self.layer_shell_name = global.name;
                     self.layer_shell = registry.bind(global.name, client_zwlr.LayerShellV1, 5) catch null;
+                } else if (std.mem.eql(u8, interface, "ext_session_lock_manager_v1")) {
+                    self.session_lock_manager_count += 1;
+                    self.session_lock_manager_version = global.version;
+                    self.session_lock_manager_name = global.name;
                 }
                 const index = self.global_count;
                 self.global_count += 1;
@@ -18524,6 +18961,8 @@ const WayringXdgClient = struct {
                     self.virtual_keyboard_manager_removed = true;
                 if (removed.name == self.layer_shell_name)
                     self.layer_shell_removed = true;
+                if (removed.name == self.session_lock_manager_name)
+                    self.session_lock_manager_removed = true;
             },
         }
     }
@@ -19985,6 +20424,7 @@ const MatureSessionLockClient = struct {
     acked_serial: u32 = 0,
     configure_width: u32 = 0,
     configure_height: u32 = 0,
+    pixel: u32 = 0,
 
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
@@ -20037,7 +20477,7 @@ const MatureSessionLockClient = struct {
         if (self.configure_serial == 0 or self.configure_width == 0 or self.configure_height == 0) return error.ConfigureMissing;
         self.acked_serial = self.configure_serial;
         lock_surface.ackConfigure(self.configure_serial);
-        const buffer = try createBuffer(shm, self.configure_width, self.configure_height);
+        const buffer = try createBuffer(shm, self.configure_width, self.configure_height, self.pixel);
         defer buffer.buffer.destroy();
         defer buffer.pool.destroy();
         defer _ = std.os.linux.close(buffer.fd);
@@ -20060,12 +20500,17 @@ const MatureSessionLockClient = struct {
     }
 
     const TestBuffer = struct { fd: std.posix.fd_t, pool: *client_wl.ShmPool, buffer: *client_wl.Buffer };
-    fn createBuffer(shm: *client_wl.Shm, width: u32, height: u32) !TestBuffer {
+    fn createBuffer(shm: *client_wl.Shm, width: u32, height: u32, pixel: u32) !TestBuffer {
         const stride = std.math.mul(u32, width, @sizeOf(u32)) catch return error.ShmSizeOverflow;
         const size = std.math.mul(u32, stride, height) catch return error.ShmSizeOverflow;
         const fd = try std.posix.memfd_create("keywork-mature-session-lock", std.os.linux.MFD.CLOEXEC);
         errdefer _ = std.os.linux.close(fd);
         if (std.os.linux.errno(std.os.linux.ftruncate(fd, size)) != .SUCCESS) return error.ShmResizeFailed;
+        var row: [640]u32 = @splat(pixel);
+        if (width > row.len) return error.TestBufferTooWide;
+        for (0..height) |y|
+            if (std.c.pwrite(fd, @ptrCast(row[0..width].ptr), stride, @intCast(y * @as(usize, stride))) != stride)
+                return error.ShmWriteFailed;
         const pool = try shm.createPool(fd, @intCast(size));
         errdefer pool.destroy();
         return .{ .fd = fd, .pool = pool, .buffer = try pool.createBuffer(0, @intCast(width), @intCast(height), @intCast(stride), .argb8888) };
@@ -20328,6 +20773,21 @@ const MatureWorkspaceClient = struct {
     fn shutdown(self: *@This()) void {
         self.closeWake(true);
         signalWayringCommand(self.command_fd) catch {};
+    }
+};
+
+/// Scanner-generated session-lock client used through the production Wayring
+/// transport. The mature implementation is protocol-identical client code;
+/// this owner fixes the generated E2E's dimensions and distinctive contents.
+const GeneratedSessionLockClient = struct {
+    const Stage = MatureSessionLockClient.Stage;
+    inner: MatureSessionLockClient,
+
+    fn run(self: *@This()) void {
+        self.inner.run();
+    }
+    fn shutdown(self: *@This()) void {
+        self.inner.shutdown();
     }
 };
 
@@ -23361,6 +23821,18 @@ fn waitForGeneratedLayerStage(server: *Self, host: anytype, client: *GeneratedLa
     return error.GeneratedLayerClientTimedOut;
 }
 
+fn waitForGeneratedSessionLockStage(server: *Self, host: anytype, client: *GeneratedSessionLockClient, expected: GeneratedSessionLockClient.Stage) !void {
+    for (0..2_000) |_| {
+        const stage: GeneratedSessionLockClient.Stage = @enumFromInt(client.inner.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.inner.failure orelse error.GeneratedSessionLockClientFailed;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    }
+    return error.GeneratedSessionLockClientTimedOut;
+}
+
 fn waitForMatureSessionLockStage(server: *Self, client: *MatureSessionLockClient, expected: MatureSessionLockClient.Stage) !void {
     for (0..2_000) |_| {
         const stage: MatureSessionLockClient.Stage = @enumFromInt(client.stage.load(.acquire));
@@ -25472,6 +25944,12 @@ test "production generated data device completes the exact profile and supports 
         if (layer_shell.global != null) layer_shell.unpublish();
         layer_shell.deinit();
     }
+    var session_lock: WayringSessionLock = undefined;
+    session_lock.init(std.testing.allocator, &protocol_server, &clients, &compositor, &outputs, server.neutralSessionLock(), linux.getuid());
+    defer {
+        if (session_lock.global != null) session_lock.unpublish();
+        session_lock.deinit();
+    }
 
     const Lifecycle = struct {
         const FatalEvidence = struct {
@@ -25507,6 +25985,7 @@ test "production generated data device completes the exact profile and supports 
         input_method: *WayringInputMethod,
         virtual_keyboard: *WayringVirtualKeyboard,
         layer_shell: *WayringLayerShell,
+        session_lock: *WayringSessionLock,
         generated_client: ?ClientRegistry.Id = null,
         generated_raw: ?*wayring.server.Client = null,
         offender_fatal: ?FatalEvidence = null,
@@ -25527,6 +26006,7 @@ test "production generated data device completes the exact profile and supports 
         }
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            self.session_lock.destroyClientResources(client);
             self.layer_shell.destroyClientResources(client);
             if (client.fatal()) |fatal| {
                 const provenance = client.transportProvenance();
@@ -25590,6 +26070,7 @@ test "production generated data device completes the exact profile and supports 
         .input_method = &input_method,
         .virtual_keyboard = &virtual_keyboard,
         .layer_shell = &layer_shell,
+        .session_lock = &session_lock,
     };
     const GlobalFilter = struct {
         data_control: *WayringDataControl,
@@ -25652,17 +26133,21 @@ test "production generated data device completes the exact profile and supports 
 
     peer.expect_virtual_keyboard = true;
     peer.expect_layer_shell = true;
+    peer.expect_session_lock = true;
     try virtual_keyboard.publish();
     try layer_shell.publish();
+    try session_lock.publish();
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .manager_added);
     try std.testing.expect(peer.globals_exact);
     try std.testing.expect(peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(@as(usize, 1), peer.virtual_keyboard_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.virtual_keyboard_manager_version);
-    try std.testing.expectEqual(@as(usize, 18), peer.global_count);
+    try std.testing.expectEqual(@as(usize, 19), peer.global_count);
     try std.testing.expectEqual(@as(usize, 1), peer.layer_shell_count);
     try std.testing.expectEqual(@as(u32, 5), peer.layer_shell_version);
+    try std.testing.expectEqual(@as(usize, 1), peer.session_lock_manager_count);
+    try std.testing.expectEqual(@as(u32, 1), peer.session_lock_manager_version);
 
     // A same-UID security-context transport gets the public registry but not
     // the privileged data-control global. Keep the direct peer connected so a
@@ -25825,9 +26310,56 @@ test "production generated data device completes the exact profile and supports 
         WayringXdgClient.Stage.manager_added,
         @as(WayringXdgClient.Stage, @enumFromInt(peer.stage.load(.acquire))),
     );
+
+    lifecycle.denied_fatal = null;
+    const raw_denied_lock_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_denied_lock_command) != .SUCCESS) return error.EventFdFailed;
+    const denied_lock_command: std.posix.fd_t = @intCast(raw_denied_lock_command);
+    defer _ = linux.close(denied_lock_command);
+    var denied_lock: WayringXdgClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = denied_host.displayName(),
+        .command_fd = denied_lock_command,
+        .registry_only = true,
+        .expect_text_input = true,
+        .expect_layer_shell = true,
+        .guessed_session_lock_name = peer.session_lock_manager_name,
+    };
+    const denied_lock_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_lock});
+    var denied_lock_joined = false;
+    defer if (!denied_lock_joined) {
+        denied_lock.shutdown();
+        denied_lock_thread.join();
+    };
+    try waitForWayringXdgStage(server, denied_host, &denied_lock, .registry_ready);
+    try std.testing.expect(denied_lock.globals_exact);
+    try std.testing.expectEqual(@as(usize, 15), denied_lock.global_count);
+    try std.testing.expectEqual(@as(usize, 0), denied_lock.session_lock_manager_count);
+    try signalWayringCommand(denied_lock_command);
+    try waitForWayringXdgStage(server, denied_host, &denied_lock, .manager_added);
+    const lock_managers_before = session_lock.managers.items.len;
+    const locks_before = session_lock.locks.items.len;
+    const lock_surfaces_before = session_lock.surfaces.items.len;
+    try signalWayringCommand(denied_lock_command);
+    try waitForWayringXdgStage(server, denied_host, &denied_lock, .disconnected);
+    denied_lock_thread.join();
+    denied_lock_joined = true;
+    try std.testing.expect(denied_lock.guessed_session_lock_bind_issued);
+    try std.testing.expectEqual(lock_managers_before, session_lock.managers.items.len);
+    try std.testing.expectEqual(locks_before, session_lock.locks.items.len);
+    try std.testing.expectEqual(lock_surfaces_before, session_lock.surfaces.items.len);
+    const denied_lock_fatal = lifecycle.denied_fatal orelse return error.RestrictedSessionLockBindFatalMissing;
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.protocol, denied_lock_fatal.kind);
+    try std.testing.expectEqual(@as(?u32, 0), denied_lock_fatal.protocol_code);
+    try std.testing.expectEqualStrings("wl_registry", denied_lock_fatal.interface.?.name);
+    try std.testing.expectEqual(
+        WayringXdgClient.Stage.manager_added,
+        @as(WayringXdgClient.Stage, @enumFromInt(peer.stage.load(.acquire))),
+    );
     try denied_host.destroy();
     denied_host_live = false;
 
+    session_lock.unpublish();
     layer_shell.unpublish();
     virtual_keyboard.unpublish();
     try std.testing.expectEqual(@as(usize, 1), peer.input_method_manager_count);
@@ -25847,6 +26379,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(peer.input_method_manager_removed);
     try std.testing.expect(peer.virtual_keyboard_manager_removed);
     try std.testing.expect(peer.layer_shell_removed);
+    try std.testing.expect(peer.session_lock_manager_removed);
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .disconnected);
     thread.join();
@@ -25863,6 +26396,7 @@ test "production generated data device completes the exact profile and supports 
     try input_method.publish();
     try virtual_keyboard.publish();
     try layer_shell.publish();
+    try session_lock.publish();
 
     const raw_layer_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_layer_command) != .SUCCESS) return error.EventFdFailed;
@@ -25969,6 +26503,75 @@ test "production generated data device completes the exact profile and supports 
         if (host.failure()) |err| return err;
     } else return error.GeneratedLayerCleanupTimedOut;
     try std.testing.expectEqual(layer_fd_baseline, try countMatureDataDeviceFds());
+
+    const raw_lock_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_lock_command) != .SUCCESS) return error.EventFdFailed;
+    const lock_command: std.posix.fd_t = @intCast(raw_lock_command);
+    defer _ = linux.close(lock_command);
+    const lock_fd_baseline = try countMatureDataDeviceFds();
+    var generated_lock: GeneratedSessionLockClient = .{ .inner = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = lock_command,
+        .pixel = 0xff24_68ac,
+    } };
+    const generated_lock_thread = try std.Thread.spawn(.{}, GeneratedSessionLockClient.run, .{&generated_lock});
+    var generated_lock_joined = false;
+    defer if (!generated_lock_joined) {
+        generated_lock.shutdown();
+        generated_lock_thread.join();
+    };
+    try waitForGeneratedSessionLockStage(server, host, &generated_lock, .mapped);
+    try std.testing.expectEqual(@as(usize, 0), generated_lock.inner.locked_count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 640), generated_lock.inner.configure_width);
+    try std.testing.expectEqual(@as(u32, 480), generated_lock.inner.configure_height);
+    try std.testing.expectEqual(generated_lock.inner.configure_serial, generated_lock.inner.acked_serial);
+    try std.testing.expect(server.session_lock_core.isLocked());
+    try std.testing.expect(server.session_lock.isLocked());
+    const generated_lock_snapshot = server.session_lock_core.surfaceForOutput(output.protocol_id) orelse
+        return error.GeneratedSessionLockSurfaceMissing;
+    try std.testing.expect(generated_lock_snapshot.mapped);
+    try std.testing.expectEqual(
+        HeadlessSurfaceForest.PresentationClass.session_lock,
+        server.headless_surface_forest.presentationClass(generated_lock_snapshot.surface).?,
+    );
+    var lock_generic_surfaces = server.headless_surface_forest.renderIterator();
+    while (lock_generic_surfaces.next()) |entry|
+        try std.testing.expect(!std.meta.eql(entry.id, generated_lock_snapshot.surface));
+    try std.testing.expect(server.window_manager.focusedSurface() == null);
+    server.refreshKeyboardFocus();
+    try std.testing.expectEqual(generated_lock_snapshot.surface, server.seat.generatedKeyboardFocus().?.surface);
+    const generated_lock_pixels = try std.testing.allocator.alloc(u32, 640 * 480);
+    defer std.testing.allocator.free(generated_lock_pixels);
+    _ = try server.captureOutput(output.protocol_id, false, .{
+        .size = .{ .width = 640, .height = 480 },
+        .stride_pixels = 640,
+        .pixels = generated_lock_pixels,
+    });
+    try std.testing.expectEqual(@as(u32, 0xff24_68ac), generated_lock_pixels[0]);
+    try renderPendingTestOutput(server, output);
+    try signalWayringCommand(lock_command);
+    try waitForGeneratedSessionLockStage(server, host, &generated_lock, .acquired);
+    try std.testing.expectEqual(@as(usize, 1), generated_lock.inner.locked_count.load(.acquire));
+    try signalWayringCommand(lock_command);
+    try waitForGeneratedSessionLockStage(server, host, &generated_lock, .unlocked);
+    try std.testing.expect(!server.session_lock_core.isLocked());
+    try signalWayringCommand(lock_command);
+    try waitForGeneratedSessionLockStage(server, host, &generated_lock, .disconnected);
+    generated_lock_thread.join();
+    generated_lock_joined = true;
+    for (0..2_000) |_| {
+        if (host.connectionCount() == 0 and server.client_registry.len() == client_baseline and
+            server.surface_registry.len() == surface_baseline and
+            server.compositor.surfaceStore().len() == mature_surface_baseline and
+            server.headless_surface_forest.len() == forest_baseline and
+            session_lock.managers.items.len == 0 and session_lock.locks.items.len == 0 and
+            session_lock.surfaces.items.len == 0) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedSessionLockCleanupTimedOut;
+    try std.testing.expectEqual(lock_fd_baseline, try countMatureDataDeviceFds());
 
     const control_regular_resource_baseline = server.neutralDataDevice().resourceCounts();
     const control_primary_resource_baseline = server.neutralDataDevice().primaryResourceCounts();
@@ -26226,6 +26829,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_input_method = true,
         .expect_virtual_keyboard = true,
         .expect_layer_shell = true,
+        .expect_session_lock = true,
     };
     const primary_watch_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_watch});
     var primary_watch_joined = false;
@@ -26236,6 +26840,7 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringXdgStage(server, host, &primary_watch, .registry_ready);
     try std.testing.expect(primary_watch.globals_exact);
     try std.testing.expectEqual(@as(usize, 1), primary_watch.primary_selection_manager_count);
+    session_lock.unpublish();
     layer_shell.unpublish();
     virtual_keyboard.unpublish();
     input_method.unpublish();
@@ -26247,6 +26852,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(primary_watch.primary_selection_manager_removed);
     try std.testing.expect(primary_watch.input_method_manager_removed);
     try std.testing.expect(primary_watch.layer_shell_removed);
+    try std.testing.expect(primary_watch.session_lock_manager_removed);
     try signalWayringCommand(primary_watch_command);
     try waitForWayringXdgStage(server, host, &primary_watch, .disconnected);
     primary_watch_thread.join();
@@ -26259,6 +26865,7 @@ test "production generated data device completes the exact profile and supports 
     try input_method.publish();
     try virtual_keyboard.publish();
     try layer_shell.publish();
+    try session_lock.publish();
     const raw_primary_rebind_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_primary_rebind_command) != .SUCCESS) return error.EventFdFailed;
     const primary_rebind_command: std.posix.fd_t = @intCast(raw_primary_rebind_command);
@@ -26273,6 +26880,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_input_method = true,
         .expect_virtual_keyboard = true,
         .expect_layer_shell = true,
+        .expect_session_lock = true,
     };
     const primary_rebind_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_rebind});
     var primary_rebind_joined = false;
@@ -26282,7 +26890,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, host, &primary_rebind, .registry_ready);
     try std.testing.expect(primary_rebind.globals_exact);
-    try std.testing.expectEqual(@as(usize, 18), primary_rebind.global_count);
+    try std.testing.expectEqual(@as(usize, 19), primary_rebind.global_count);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.primary_selection_manager_count);
     try std.testing.expectEqual(@as(u32, 1), primary_rebind.primary_selection_manager_version);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.input_method_manager_count);

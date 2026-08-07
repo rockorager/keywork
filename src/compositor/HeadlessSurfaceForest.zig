@@ -65,6 +65,10 @@ pub const PresentationClass = enum {
     xdg_reserved,
     managed,
     layer_surface,
+    /// A permanent generated session-lock role. These roots are deliberately
+    /// absent from normal desktop and layer traversal; the session-lock owner
+    /// is the only policy allowed to select them for presentation or input.
+    session_lock,
     cursor,
     drag_icon,
     input_popup,
@@ -327,9 +331,10 @@ pub fn setRootPresentationClass(
     if (target.placement != .root) return false;
     const allowed = switch (target.presentation_class) {
         .background => true,
-        .xdg_reserved => class == .background or class == .xdg_reserved or class == .managed or class == .layer_surface,
+        .xdg_reserved => class == .background or class == .xdg_reserved or class == .managed or class == .layer_surface or class == .session_lock,
         .managed => class == .managed,
         .layer_surface => class == .layer_surface,
+        .session_lock => class == .session_lock,
         .cursor => class == .cursor,
         .drag_icon => class == .drag_icon,
         .input_popup => class == .input_popup,
@@ -480,6 +485,7 @@ pub const RenderIterator = struct {
                 self.next_root = root_node.root_next;
                 if (root_node.presentation_class == .xdg_reserved or
                     root_node.presentation_class == .layer_surface or
+                    root_node.presentation_class == .session_lock or
                     root_node.presentation_class == .input_popup or
                     (root_node.presentation_class == .managed and !self.include_managed)) continue;
                 self.owner = root;
@@ -646,7 +652,7 @@ pub fn compoundBounds(
 ) CompoundBounds {
     const root = self.compoundRoot(id) orelse return .hidden;
     const class = self.nodeConst(root).?.presentation_class;
-    if (class == .xdg_reserved or class == .managed or class == .layer_surface) return .hidden;
+    if (class == .xdg_reserved or class == .managed or class == .layer_surface or class == .session_lock) return .hidden;
     return self.geometryBounds(id);
 }
 

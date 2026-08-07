@@ -21,6 +21,7 @@ const WayringTextInput = @import("wayland/WayringTextInput.zig");
 const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
 const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
 const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
+const WayringSessionLock = @import("wayland/WayringSessionLock.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
@@ -241,6 +242,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_layer_shell: WayringLayerShell = undefined;
     var wayring_layer_shell_initialized = false;
     var wayring_layer_shell_published = false;
+    var wayring_session_lock: WayringSessionLock = undefined;
+    var wayring_session_lock_initialized = false;
+    var wayring_session_lock_published = false;
     const WayringLifecycle = struct {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
@@ -259,6 +263,7 @@ pub fn main(init: std.process.Init) !void {
         input_method: ?*WayringInputMethod,
         virtual_keyboard: ?*WayringVirtualKeyboard,
         layer_shell: ?*WayringLayerShell,
+        session_lock: ?*WayringSessionLock,
 
         fn globalVisible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
             return if (self.data_control) |data_control| data_control.globalFilter(client, global) else global.visibility() != .restricted;
@@ -273,6 +278,7 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            if (self.session_lock) |generated_session_lock| generated_session_lock.destroyClientResources(client);
             if (self.layer_shell) |layer_shell| layer_shell.destroyClientResources(client);
             if (self.virtual_keyboard) |keyboard| keyboard.destroyClientResources(client);
             if (self.input_method) |input_method| input_method.destroyClientResources(client);
@@ -300,6 +306,10 @@ pub fn main(init: std.process.Init) !void {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
         if (wayring_protocol_server) |*protocol_server| protocol_server.clearGlobalFilter();
+        if (wayring_session_lock_initialized) {
+            if (wayring_session_lock_published) wayring_session_lock.unpublish();
+            wayring_session_lock.deinit();
+        }
         if (wayring_layer_shell_initialized) {
             if (wayring_layer_shell_published) wayring_layer_shell.unpublish();
             wayring_layer_shell.deinit();
@@ -506,6 +516,16 @@ pub fn main(init: std.process.Init) !void {
                 server.neutralLayerShell(),
             );
             wayring_layer_shell_initialized = true;
+            wayring_session_lock.init(
+                init.gpa,
+                &wayring_protocol_server.?,
+                &wayring_clients,
+                &wayring_compositor,
+                &wayring_outputs,
+                server.neutralSessionLock(),
+                std.os.linux.getuid(),
+            );
+            wayring_session_lock_initialized = true;
         }
         wayring_xdg_decoration.init(init.gpa, &wayring_protocol_server.?, &wayring_xdg_shell, server.neutralXdgShell());
         wayring_xdg_decoration_initialized = true;
@@ -569,6 +589,10 @@ pub fn main(init: std.process.Init) !void {
             // presenting headless generated shell/output profile.
             try wayring_layer_shell.publish();
             wayring_layer_shell_published = true;
+            // Restricted lock ownership is published after every public
+            // generated-shell global.
+            try wayring_session_lock.publish();
+            wayring_session_lock_published = true;
         }
         wayring_lifecycle = .{
             .clients = &wayring_clients,
@@ -588,6 +612,7 @@ pub fn main(init: std.process.Init) !void {
             .input_method = if (wayring_input_method_initialized) &wayring_input_method else null,
             .virtual_keyboard = if (wayring_virtual_keyboard_initialized) &wayring_virtual_keyboard else null,
             .layer_shell = if (wayring_layer_shell_initialized) &wayring_layer_shell else null,
+            .session_lock = if (wayring_session_lock_initialized) &wayring_session_lock else null,
         };
         wayring_protocol_server.?.setGlobalFilter(
             WayringLifecycle,
