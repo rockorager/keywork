@@ -16,6 +16,7 @@ const Server = @import("Server.zig");
 pub const Options = struct {
     max_objects: usize = 4096,
     credentials: ?Client.Credentials = null,
+    transport_provenance: Client.TransportProvenance = .unknown,
 };
 
 const callback_interface: wire.Interface = .{ .name = "wl_callback", .version = 1 };
@@ -63,6 +64,7 @@ pub fn create(allocator: std.mem.Allocator, server: *Server, options: Options) !
         .connection = .init(allocator, .{
             .max_objects = options.max_objects,
             .credentials = options.credentials,
+            .transport_provenance = options.transport_provenance,
             .protocol_log_sink = server.protocolLogSink(),
         }),
         .display = undefined,

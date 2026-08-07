@@ -25,6 +25,10 @@ pub const ClientLifecycle = struct {
     destroy_resources: *const fn (*anyopaque, *server.Client) void,
 };
 
+pub const Options = struct {
+    transport_provenance: server.Client.TransportProvenance = .direct,
+};
+
 const AcceptanceFault = enum { reserve, wrapper };
 const AddConnectionResult = enum { published, rejected };
 
@@ -78,12 +82,26 @@ pub fn create(
     runtime_directory: []const u8,
     lifecycle: ClientLifecycle,
 ) !*WayringHost {
+    return createWithOptions(allocator, event_loop, protocol_server, runtime_directory, lifecycle, .{});
+}
+
+/// Test-capable creation path for a server-owned transport provenance.
+pub fn createWithOptions(
+    allocator: std.mem.Allocator,
+    event_loop: *wl.EventLoop,
+    protocol_server: *server.Server,
+    runtime_directory: []const u8,
+    lifecycle: ClientLifecycle,
+    options: Options,
+) !*WayringHost {
     const self = try allocator.create(WayringHost);
     errdefer allocator.destroy(self);
     self.* = undefined;
     self.allocator = allocator;
     self.lifecycle = lifecycle;
-    self.transport = try wayring.io_uring.Server.listenAuto(allocator, protocol_server, runtime_directory);
+    self.transport = try wayring.io_uring.Server.listenAutoWithOptions(allocator, protocol_server, runtime_directory, .{
+        .transport_provenance = options.transport_provenance,
+    });
     errdefer self.transport.deinit() catch {};
     self.ring = try linux.IoUring.init(submission_capacity, 0);
     errdefer self.ring.deinit();

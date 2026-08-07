@@ -19,6 +19,13 @@ pub const Credentials = struct {
     gid: std.os.linux.gid_t,
 };
 
+/// Server-assigned origin of the transport that accepted this client.
+pub const TransportProvenance = enum {
+    unknown,
+    direct,
+    security_context,
+};
+
 pub const ProtocolDirection = enum { request, event };
 
 pub const ProtocolMessage = struct {
@@ -44,6 +51,7 @@ pub const ProtocolLogSink = struct {
 pub const Options = struct {
     max_objects: usize = 4096,
     credentials: ?Credentials = null,
+    transport_provenance: TransportProvenance = .unknown,
     protocol_log_sink: ?ProtocolLogSink = null,
 };
 
@@ -100,6 +108,7 @@ input: wire.Input,
 output: wire.Output,
 objects: ObjectMap,
 credentials_value: ?Credentials,
+transport_provenance_value: TransportProvenance,
 protocol_log_sink: ?ProtocolLogSink,
 fatal_state: Fatal = .{},
 dispatching: bool = false,
@@ -120,6 +129,7 @@ pub fn init(allocator: std.mem.Allocator, options: Options) Client {
         .output = .init(allocator),
         .objects = .init(allocator, .{ .max_objects = options.max_objects }),
         .credentials_value = options.credentials,
+        .transport_provenance_value = options.transport_provenance,
         .protocol_log_sink = options.protocol_log_sink,
     };
 }
@@ -156,6 +166,11 @@ pub fn objectCount(self: *const Client) usize {
 /// Consumers remain responsible for any authorization decision.
 pub fn credentials(self: *const Client) ?Credentials {
     return self.credentials_value;
+}
+
+/// Returns immutable provenance assigned by the accepting server transport.
+pub fn transportProvenance(self: *const Client) TransportProvenance {
+    return self.transport_provenance_value;
 }
 
 pub fn addDestroyObserver(
