@@ -244,6 +244,7 @@ fn createDevice(self: *WayringDataDevice, manager: *Manager, id: u32) !void {
     // The generated endpoint must therefore be fully materialized first.
     value.id = try self.canonical.createDevice(self.clients.id(manager.client) orelse return error.InvalidClient, .{
         .context = value,
+        .selection_prepare = deviceSelectionPrepare,
         .selection = deviceSelection,
         .drag_enter_prepare = deviceDragPrepare,
         .drag_enter_abort = deviceDragAbort,
@@ -379,61 +380,32 @@ fn sourceForObject(self: *WayringDataDevice, client: *wayring.server.Client, obj
     return null;
 }
 
-fn deviceSelection(context: *anyopaque, offer_id: ?DataDevice.OfferId) error{OutOfMemory}!void {
+fn deviceSelectionPrepare(context: *anyopaque, offer_id: ?DataDevice.OfferId) error{OutOfMemory}!void {
     const device: *Device = @ptrCast(@alignCast(context));
     const canonical_id = offer_id orelse {
-        protocol.wl_data_device.@"send:selection"(&device.resource, null) catch return error.OutOfMemory;
+        try device.owner.stageEvent(device.client, &device.resource.runtime, 5, &protocol.wl_data_device.event_messages[5], &.{.{ .object = null }}, 12, &.{});
         return;
     };
-    const offer = device.owner.createOffer(device, canonical_id) catch return error.OutOfMemory;
-    errdefer device.owner.destroyOffer(offer);
-    const info = device.owner.canonical.offerInfo(canonical_id) orelse return error.OutOfMemory;
+    const offer = device.owner.createOffer(device, canonical_id) catch return transactionOutOfMemory(device.client, &device.resource.runtime);
+    const info = device.owner.canonical.offerInfo(canonical_id) orelse return transactionOutOfMemory(device.client, &device.resource.runtime);
     const mime_types = if (info.source) |source|
-        device.owner.canonical.sourceMimeTypes(source) catch return error.OutOfMemory
+        device.owner.canonical.sourceMimeTypes(source) catch return transactionOutOfMemory(device.client, &device.resource.runtime)
     else
         &.{};
-    const event_count = std.math.add(usize, mime_types.len, 2) catch return error.OutOfMemory;
-    const events = device.owner.allocator.alloc(wayring.server.Client.PreparedEvent, event_count) catch return error.OutOfMemory;
-    defer device.owner.allocator.free(events);
-    const values = device.owner.allocator.alloc(wire.Value, event_count) catch return error.OutOfMemory;
-    defer device.owner.allocator.free(values);
-    var maximum_bytes: usize = 24;
+    try device.owner.stageEvent(device.client, &device.resource.runtime, 0, &protocol.wl_data_device.event_messages[0], &.{.{ .new_id = .{ .typed = offer.resource.id() } }}, 12, &.{offer});
     for (mime_types) |mime| {
-        const terminated = std.math.add(usize, mime.len, 1) catch return error.OutOfMemory;
+        const terminated = std.math.add(usize, mime.len, 1) catch return transactionOutOfMemory(device.client, &device.resource.runtime);
         const padded = std.mem.alignForward(usize, terminated, 4);
-        const message_bytes = std.math.add(usize, 12, padded) catch return error.OutOfMemory;
-        if (message_bytes > wire.max_message_size) return error.OutOfMemory;
-        maximum_bytes = std.math.add(usize, maximum_bytes, message_bytes) catch return error.OutOfMemory;
+        const message_bytes = std.math.add(usize, 12, padded) catch return transactionOutOfMemory(device.client, &device.resource.runtime);
+        if (message_bytes > wire.max_message_size) return transactionOutOfMemory(device.client, &device.resource.runtime);
+        try device.owner.stageEvent(device.client, &offer.resource.runtime, 0, &protocol.wl_data_offer.event_messages[0], &.{.{ .string = mime }}, message_bytes, &.{});
     }
-    const prepared = device.client.prepareEvents(maximum_bytes) catch return error.OutOfMemory;
-    var prepared_live = true;
-    defer if (prepared_live) device.client.cancelPreparedEvents(prepared);
+    try device.owner.stageEvent(device.client, &device.resource.runtime, 5, &protocol.wl_data_device.event_messages[5], &.{.{ .object = offer.resource.id() }}, 12, &.{});
+}
 
-    values[0] = .{ .new_id = .{ .typed = offer.resource.id() } };
-    events[0] = .{
-        .resource = &device.resource.runtime,
-        .opcode = 0,
-        .descriptor = &protocol.wl_data_device.event_messages[0],
-        .values = values[0..1],
-    };
-    for (mime_types, 0..) |mime, index| {
-        values[index + 1] = .{ .string = mime };
-        events[index + 1] = .{
-            .resource = &offer.resource.runtime,
-            .opcode = 0,
-            .descriptor = &protocol.wl_data_offer.event_messages[0],
-            .values = values[index + 1 .. index + 2],
-        };
-    }
-    values[event_count - 1] = .{ .object = offer.resource.id() };
-    events[event_count - 1] = .{
-        .resource = &device.resource.runtime,
-        .opcode = 5,
-        .descriptor = &protocol.wl_data_device.event_messages[5],
-        .values = values[event_count - 1 .. event_count],
-    };
-    device.client.emitPreparedEvents(prepared, events) catch return error.OutOfMemory;
-    prepared_live = false;
+fn deviceSelection(_: *anyopaque, _: ?DataDevice.OfferId) error{OutOfMemory}!void {
+    // Generated selection events are emitted by transactionCommit only after
+    // the canonical selection/focus mutation succeeds.
 }
 
 /// Listener callbacks supplied when constructing the canonical owner. They
@@ -972,6 +944,15 @@ fn discardEvents(client: *wayring.server.Client) !void {
     while (try client.beginSend()) |batch| try client.completeSend(batch.token, batch.bytes.len);
 }
 
+fn bindTestGlobal(host: *wayring.server.Server, client: *wayring.server.Client, name: []const u8, id: u32, version: u32) !void {
+    var iterator = host.iterator();
+    while (iterator.next()) |global| if (std.mem.eql(u8, global.interface().name, name)) return testSend(client, 2, 0, &protocol.wl_registry.request_messages[0], &.{
+        .{ .uint = global.name() },
+        .{ .new_id = .{ .generic = .{ .interface = name, .version = version, .id = id } } },
+    });
+    return error.MissingGlobal;
+}
+
 const DataDeviceFixture = struct {
     host: wayring.server.Server,
     clients: ClientRegistry,
@@ -1049,12 +1030,7 @@ const DataDeviceFixture = struct {
         return self.managed.client();
     }
     fn bind(self: *@This(), name: []const u8, id: u32, version: u32) !void {
-        var iterator = self.host.iterator();
-        while (iterator.next()) |global| if (std.mem.eql(u8, global.interface().name, name)) return testSend(self.client(), 2, 0, &protocol.wl_registry.request_messages[0], &.{
-            .{ .uint = global.name() },
-            .{ .new_id = .{ .generic = .{ .interface = name, .version = version, .id = id } } },
-        });
-        return error.MissingGlobal;
+        return bindTestGlobal(&self.host, self.client(), name, id, version);
     }
     fn noopChanged(_: *anyopaque) void {}
     fn noopCursor(_: *anyopaque, _: SeatDelivery.CursorRequest) SeatDelivery.CursorRequestResult {
@@ -1165,6 +1141,208 @@ test "prepared generated action stays invisible until atomic commit and abort le
     try std.testing.expectEqual(@as(usize, 12), batch.bytes.len);
     try client.completeSend(batch.token, batch.bytes.len);
     try std.testing.expect((try client.beginSend()) == null);
+}
+
+test "generated selection batches every device per client and aborts late publication without wire" {
+    const Failure = enum { replacement_stage, replacement_finalize, source_teardown_stage, source_teardown_finalize };
+    inline for (std.meta.tags(Failure)) |failure| {
+        var fixture: DataDeviceFixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const client = fixture.client();
+
+        try testSend(client, 4, 0, &protocol.wl_data_device_manager.request_messages[0], &.{.{ .new_id = .{ .typed = 5 } }});
+        try testSend(client, 5, 0, &protocol.wl_data_source.request_messages[0], &.{.{ .string = "text/plain" }});
+        try testSend(client, 4, 1, &protocol.wl_data_device_manager.request_messages[1], &.{ .{ .new_id = .{ .typed = 6 } }, .{ .object = 3 } });
+        try testSend(client, 4, 1, &protocol.wl_data_device_manager.request_messages[1], &.{ .{ .new_id = .{ .typed = 7 } }, .{ .object = 3 } });
+        try fixture.canonical.setFocus(fixture.client_id);
+        try discardEvents(client);
+        const source_id = fixture.adapter.sources.items[0].id;
+
+        switch (failure) {
+            .replacement_stage, .replacement_finalize => {
+                // One complete data_offer/MIME/selection fragment for the
+                // first device prepares before the second device fails.
+                if (failure == .replacement_stage)
+                    fixture.adapter.failStageAfterForTest(3)
+                else
+                    fixture.adapter.failFinalizeForTest();
+                try std.testing.expectError(error.OutOfMemory, fixture.canonical.setExternalSelection(source_id));
+                try std.testing.expect(!fixture.canonical.hasSelection());
+                try std.testing.expectEqual(@as(usize, 0), fixture.adapter.offers.items.len);
+            },
+            .source_teardown_stage, .source_teardown_finalize => {
+                try fixture.canonical.setExternalSelection(source_id);
+                try discardEvents(client);
+                // Null publication has one event per device. The first is
+                // staged, but neither may become visible when the second fails.
+                if (failure == .source_teardown_stage)
+                    fixture.adapter.failStageAfterForTest(1)
+                else
+                    fixture.adapter.failFinalizeForTest();
+                try testSend(client, 5, 1, &protocol.wl_data_source.request_messages[1], &.{});
+                try std.testing.expect(!fixture.canonical.hasSelection());
+                try std.testing.expectError(error.InvalidSource, fixture.canonical.sourceActions(source_id));
+                try std.testing.expectEqual(@as(usize, 0), fixture.adapter.sources.items.len);
+                try std.testing.expectEqual(fixture.adapter.offers.items.len, fixture.canonical.resourceCounts().offers);
+                for (fixture.adapter.offers.items) |offer|
+                    try std.testing.expect(fixture.canonical.offerInfo(offer.id).?.source == null);
+            },
+        }
+        try std.testing.expect(client.fatal() != null);
+        try std.testing.expectEqual(@as(usize, 0), fixture.adapter.staged_events.items.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.adapter.prepared_clients.items.len);
+
+        var saw_terminal = false;
+        while (try client.beginSend()) |batch| {
+            var offset: usize = 0;
+            while (offset < batch.bytes.len) {
+                const object_id = std.mem.readInt(u32, batch.bytes[offset..][0..4], .little);
+                const size_opcode = std.mem.readInt(u32, batch.bytes[offset + 4 ..][0..4], .little);
+                const message_size: usize = @intCast(size_opcode >> 16);
+                // wl_display terminal OOM is permitted; no data-device,
+                // data-offer, or MIME event from the aborted batch is.
+                try std.testing.expectEqual(@as(u32, 1), object_id);
+                saw_terminal = true;
+                offset += message_size;
+            }
+            try client.completeSend(batch.token, batch.bytes.len);
+        }
+        try std.testing.expect(saw_terminal);
+    }
+}
+
+test "selection teardown OOM terminalizes destination but leaves source owner live" {
+    var fixture: DataDeviceFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const source_client = fixture.client();
+
+    var destination_managed = try wayring.server.CoreClient.create(std.testing.allocator, &fixture.host, .{});
+    const destination = destination_managed.client();
+    const destination_id = try fixture.mapped.register(destination);
+    defer {
+        fixture.adapter.destroyClientResources(destination);
+        fixture.seat.destroyClientResources(destination);
+        fixture.compositor.destroyClientResources(destination);
+        _ = fixture.authority.clientDisconnected(destination_id);
+        fixture.mapped.unregister(destination);
+        destination_managed.destroy();
+    }
+    try testSend(destination, 1, 1, &protocol.wl_display.request_messages[1], &.{.{ .new_id = .{ .typed = 2 } }});
+    try discardEvents(destination);
+    try bindTestGlobal(&fixture.host, destination, "wl_seat", 3, protocol.wl_seat.interface.version);
+    try bindTestGlobal(&fixture.host, destination, "wl_data_device_manager", 4, 3);
+    try discardEvents(destination);
+
+    var peer_managed = try wayring.server.CoreClient.create(std.testing.allocator, &fixture.host, .{});
+    const peer = peer_managed.client();
+    const peer_id = try fixture.mapped.register(peer);
+    defer {
+        fixture.adapter.destroyClientResources(peer);
+        fixture.seat.destroyClientResources(peer);
+        fixture.compositor.destroyClientResources(peer);
+        _ = fixture.authority.clientDisconnected(peer_id);
+        fixture.mapped.unregister(peer);
+        peer_managed.destroy();
+    }
+    try testSend(peer, 1, 1, &protocol.wl_display.request_messages[1], &.{.{ .new_id = .{ .typed = 2 } }});
+    try discardEvents(peer);
+    try bindTestGlobal(&fixture.host, peer, "wl_seat", 3, protocol.wl_seat.interface.version);
+    try bindTestGlobal(&fixture.host, peer, "wl_data_device_manager", 4, 3);
+    try testSend(peer, 4, 1, &protocol.wl_data_device_manager.request_messages[1], &.{ .{ .new_id = .{ .typed = 5 } }, .{ .object = 3 } });
+    try discardEvents(peer);
+
+    try testSend(source_client, 4, 0, &protocol.wl_data_device_manager.request_messages[0], &.{.{ .new_id = .{ .typed = 5 } }});
+    try testSend(source_client, 5, 0, &protocol.wl_data_source.request_messages[0], &.{.{ .string = "text/plain" }});
+    try testSend(destination, 4, 1, &protocol.wl_data_device_manager.request_messages[1], &.{ .{ .new_id = .{ .typed = 5 } }, .{ .object = 3 } });
+    try testSend(destination, 4, 1, &protocol.wl_data_device_manager.request_messages[1], &.{ .{ .new_id = .{ .typed = 6 } }, .{ .object = 3 } });
+    try fixture.canonical.setFocus(destination_id);
+    const source_id = fixture.adapter.sources.items[0].id;
+    try fixture.canonical.setExternalSelection(source_id);
+    try discardEvents(destination);
+    try discardEvents(source_client);
+
+    fixture.adapter.failStageAfterForTest(1);
+    try testSend(source_client, 5, 1, &protocol.wl_data_source.request_messages[1], &.{});
+    try std.testing.expect(source_client.fatal() == null);
+    try std.testing.expect(destination.fatal() != null);
+    try std.testing.expect(!fixture.canonical.hasSelection());
+    try std.testing.expectError(error.InvalidSource, fixture.canonical.sourceActions(source_id));
+    try std.testing.expectEqual(@as(usize, 0), fixture.adapter.sources.items.len);
+    try std.testing.expectEqual(fixture.adapter.offers.items.len, fixture.canonical.resourceCounts().offers);
+    for (fixture.adapter.offers.items) |offer|
+        try std.testing.expect(fixture.canonical.offerInfo(offer.id).?.source == null);
+
+    var saw_terminal = false;
+    while (try destination.beginSend()) |batch| {
+        var offset: usize = 0;
+        while (offset < batch.bytes.len) {
+            const object_id = std.mem.readInt(u32, batch.bytes[offset..][0..4], .little);
+            const size_opcode = std.mem.readInt(u32, batch.bytes[offset + 4 ..][0..4], .little);
+            try std.testing.expectEqual(@as(u32, 1), object_id);
+            saw_terminal = true;
+            offset += @intCast(size_opcode >> 16);
+        }
+        try destination.completeSend(batch.token, batch.bytes.len);
+    }
+    try std.testing.expect(saw_terminal);
+
+    fixture.adapter.destroyClientResources(destination);
+    fixture.seat.destroyClientResources(destination);
+    try std.testing.expectEqual(@as(usize, 1), fixture.canonical.resourceCounts().devices);
+    try std.testing.expectEqual(@as(usize, 0), fixture.canonical.resourceCounts().offers);
+
+    // The request caller/source owner remains usable, and unaffected peer C
+    // receives a coherent later selection after B has been retired.
+    try testSend(source_client, 4, 0, &protocol.wl_data_device_manager.request_messages[0], &.{.{ .new_id = .{ .typed = 6 } }});
+    try testSend(source_client, 6, 0, &protocol.wl_data_source.request_messages[0], &.{.{ .string = "text/plain" }});
+    try fixture.canonical.setFocus(peer_id);
+    try discardEvents(peer);
+    try fixture.canonical.setExternalSelection(fixture.adapter.sources.items[0].id);
+    try std.testing.expect(fixture.canonical.hasSelection());
+    try std.testing.expect(source_client.fatal() == null);
+    try std.testing.expect(peer.fatal() == null);
+    var peer_bytes: std.ArrayList(u8) = .empty;
+    defer peer_bytes.deinit(std.testing.allocator);
+    while (try peer.beginSend()) |batch| {
+        try peer_bytes.appendSlice(std.testing.allocator, batch.bytes);
+        try peer.completeSend(batch.token, batch.bytes.len);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, peer_bytes.items, "text/plain") != null);
+}
+
+test "focused generated device initial selection publication aborts atomically" {
+    var fixture: DataDeviceFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const client = fixture.client();
+
+    try testSend(client, 4, 0, &protocol.wl_data_device_manager.request_messages[0], &.{.{ .new_id = .{ .typed = 5 } }});
+    try testSend(client, 5, 0, &protocol.wl_data_source.request_messages[0], &.{.{ .string = "text/plain" }});
+    try fixture.canonical.setFocus(fixture.client_id);
+    try fixture.canonical.setExternalSelection(fixture.adapter.sources.items[0].id);
+    try discardEvents(client);
+
+    fixture.adapter.failStageAfterForTest(2);
+    try testSend(client, 4, 1, &protocol.wl_data_device_manager.request_messages[1], &.{ .{ .new_id = .{ .typed = 6 } }, .{ .object = 3 } });
+    try std.testing.expect(client.fatal() != null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.adapter.devices.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.adapter.offers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.canonical.resourceCounts().devices);
+    try std.testing.expectEqual(@as(usize, 0), fixture.canonical.resourceCounts().offers);
+    try std.testing.expect(fixture.canonical.hasSelection());
+
+    while (try client.beginSend()) |batch| {
+        var offset: usize = 0;
+        while (offset < batch.bytes.len) {
+            const object_id = std.mem.readInt(u32, batch.bytes[offset..][0..4], .little);
+            const size_opcode = std.mem.readInt(u32, batch.bytes[offset + 4 ..][0..4], .little);
+            try std.testing.expectEqual(@as(u32, 1), object_id);
+            offset += @intCast(size_opcode >> 16);
+        }
+        try client.completeSend(batch.token, batch.bytes.len);
+    }
 }
 
 test "generated source destruction aborts failed teardown bytes but always retires canonical drag" {
