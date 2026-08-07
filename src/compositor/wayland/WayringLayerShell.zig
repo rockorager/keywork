@@ -143,22 +143,22 @@ fn managerRequest(resource: *protocol.zwlr_layer_shell_v1.Resource, request: pro
 const CreateError = error{ OutOfMemory, InvalidLayer, Role, AlreadyConstructed, InvalidSurface, InvalidOutput, InvalidNamespace };
 fn create(self: *WayringLayerShell, manager: *Manager, object_id: u32, surface_object: u32, output_object: ?u32, layer_raw: u32, namespace: []const u8) CreateError!void {
     if (layer_raw > 3) return error.InvalidLayer;
+    const output = if (output_object) |id| self.outputs.outputIdForResource(manager.client, id) orelse return error.InvalidOutput else self.policy.resolveDefaultOutput();
     if (!std.unicode.utf8ValidateSlice(namespace)) return error.InvalidNamespace;
     const surface = self.compositor.surfaceId(manager.client, surface_object) orelse return error.InvalidSurface;
-    const content = self.compositor.xdgContentState(surface) orelse return error.InvalidSurface;
-    if (content.has_pending_attachment or content.has_committed_buffer) return error.AlreadyConstructed;
-    const output = if (output_object) |id| self.outputs.outputIdForResource(manager.client, id) orelse return error.InvalidOutput else self.policy.resolveDefaultOutput();
     const client_id = self.clients.id(manager.client) orelse return error.InvalidSurface;
-
-    try self.children.ensureUnusedCapacity(self.allocator, 1);
-    const child = try self.allocator.create(Child);
-    errdefer self.allocator.destroy(child);
     const reservation = self.compositor.reserveLayerRoot(manager.client, surface) catch |err| return switch (err) {
         error.RoleConflict, error.AlreadyReserved, error.NotRoot => error.Role,
         error.NotLive, error.WrongClient, error.StaleReservation, error.HandlerAlreadyAttached, error.HandlerMismatch => error.InvalidSurface,
         error.GenerationExhausted => error.OutOfMemory,
     };
     errdefer self.compositor.abortLayerRoot(reservation) catch {};
+    const content = self.compositor.xdgContentState(surface) orelse return error.InvalidSurface;
+    if (content.has_pending_attachment or content.has_committed_buffer) return error.AlreadyConstructed;
+
+    try self.children.ensureUnusedCapacity(self.allocator, 1);
+    const child = try self.allocator.create(Child);
+    errdefer self.allocator.destroy(child);
     child.* = .{ .owner = self, .client = manager.client, .generation = self.generation() catch return error.OutOfMemory, .resource = .init(self.allocator, object_id, manager.resource.version(), .client, manager.client.ownerHooks()), .surface = surface, .reservation = reservation, .policy_id = undefined, .core_id = undefined };
     errdefer {
         child.resource.destroy();
