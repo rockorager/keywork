@@ -91,6 +91,17 @@ pub fn resolveDefaultOutput(self: *Self) OutputLayout.Id {
     return self.outputForUnspecifiedSurface();
 }
 
+/// Returns the canonical Scene identity only while the policy, neutral core,
+/// and Scene entry still agree on this exact surface generation.
+pub fn sceneForSurface(self: *Self, surface: SurfaceRegistry.Id) ?Scene.LayerSurfaceId {
+    const state = self.findSurface(surface) orelse return null;
+    const snapshot = self.core.snapshot(state.core_id) orelse return null;
+    if (!std.meta.eql(snapshot.surface, surface)) return null;
+    const scene_surface = self.scene.layerSurface(state.scene_id) orelse return null;
+    if (!std.meta.eql(scene_surface.surface_id, surface)) return null;
+    return state.scene_id;
+}
+
 /// Atomically publishes canonical policy and Scene ownership for a frontend
 /// that has already reserved its permanent surface role.
 pub fn registerPreparedSurface(self: *Self, client: ClientRegistry.Id, output: OutputLayout.Id, namespace: []const u8, layer: Core.Layer, endpoint: Core.Endpoint, frontend: Frontend) Core.CreateError!Registration {

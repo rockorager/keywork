@@ -5077,8 +5077,15 @@ fn layerSurfaceNodeBounds(self: *Self, id: Scene.LayerSurfaceId) ?render.Rect {
     const layer_surface = self.scene.layerSurface(id) orelse return null;
     // Unlike windows, layer surfaces retain no geometry once their buffer is
     // gone, so an unresolvable tree must escalate to a full repaint.
-    const tree = self.subcompositor.treeBounds(layer_surface.surface_id) orelse return null;
-    var bounds: ?render.Rect = treeBoundsRect(tree).translated(
+    const tree_rect = if (self.exactEligibleGeneratedLayerRoot(layer_surface.surface_id) != null)
+        switch (self.headless_surface_forest.subtreeDamageBounds(layer_surface.surface_id)) {
+            .hidden => return null,
+            .rect => |rect| rect,
+            .full_damage => return null,
+        }
+    else
+        treeBoundsRect(self.subcompositor.treeBounds(layer_surface.surface_id) orelse return null);
+    var bounds: ?render.Rect = tree_rect.translated(
         layer_surface.position.x,
         layer_surface.position.y,
     );
@@ -6128,6 +6135,10 @@ fn damageHeadlessCompound(self: *Self, id: SurfaceRegistry.Id) void {
         sceneNodeDamage(self, .{ .window = window.scene_id });
         return;
     }
+    if (self.exactEligibleGeneratedLayerRoot(root)) |layer_id| {
+        sceneNodeDamage(self, .{ .layer_surface = layer_id });
+        return;
+    }
     if (self.managedGeneratedPopupOwner(root)) |popup| {
         if (self.managedGeneratedPopup(root) != null and self.scene.surfaceMapped(root))
             sceneNodeDamage(self, .{ .popup = popup.scene_id });
@@ -6198,6 +6209,27 @@ fn exactEligibleGeneratedPopupRoot(self: *Self, root: SurfaceRegistry.Id) bool {
     if (self.managedGeneratedPopup(root) != null)
         return self.headless_surface_forest.state(root).?.mapped_size != null;
     return false;
+}
+
+fn exactEligibleGeneratedLayerRoot(self: *Self, root: SurfaceRegistry.Id) ?Scene.LayerSurfaceId {
+    if (!std.meta.eql(self.headless_surface_forest.compoundRoot(root) orelse return null, root) or
+        self.headless_surface_forest.presentationClass(root) != .layer_surface) return null;
+    const neutral_id = self.layer_shell_core.surfaceFor(root) orelse return null;
+    const snapshot = self.layer_shell_core.snapshot(neutral_id) orelse return null;
+    if (!snapshot.mapped or !std.meta.eql(snapshot.surface, root)) return null;
+    const scene_id = self.layer_shell.sceneForSurface(root) orelse return null;
+    const scene_surface = self.scene.layerSurface(scene_id) orelse return null;
+    if (!scene_surface.mapped or !std.meta.eql(scene_surface.surface_id, root)) return null;
+    const owner = self.seat.generatedSurfaceOwner(root) orelse return null;
+    if (!std.meta.eql(owner, snapshot.client)) return null;
+    if ((self.headless_surface_forest.state(root) orelse return null).mapped_size == null) return null;
+    return scene_id;
+}
+
+fn sceneGeneratedCompound(self: *Self, root: SurfaceRegistry.Id) bool {
+    return self.managedGeneratedWindow(root) != null or
+        self.managedGeneratedPopup(root) != null or
+        self.exactEligibleGeneratedLayerRoot(root) != null;
 }
 
 fn expandHeadlessSurfaceBlurDamage(
@@ -7220,8 +7252,9 @@ fn routeTouchDown(
             null) |generated_root|
         {
             self.window_manager.pointerButton(null, .pressed);
-            self.layer_shell.pointerPressed(null);
-            if (first_touch and self.managedGeneratedPopup(generated_root) == null)
+            self.layer_shell.pointerPressed(generated_root);
+            if (first_touch and self.managedGeneratedPopup(generated_root) == null and
+                self.exactEligibleGeneratedLayerRoot(generated_root) == null)
                 _ = self.focusGeneratedSurface(generated_root);
             requestRepaint(self);
         } else {
@@ -7851,7 +7884,9 @@ fn pointerButtonForSeat(
     self.window_manager.pointerButton(if (generated_popup) null else root, state);
     if (replace_generated) self.refreshKeyboardFocusReplacingGenerated();
     if (state == .pressed) {
-        const focused = if (seat.pointerFocusedSurface()) |surface_id|
+        const focused = if (route.generated) |generated|
+            generated.root
+        else if (seat.pointerFocusedSurface()) |surface_id|
             self.subcompositor.rootSurface(surface_id)
         else
             null;
@@ -7859,7 +7894,8 @@ fn pointerButtonForSeat(
         if (seat == &self.seat and button == linux_button_left and
             !seat.hasPressedPointerButtons())
         {
-            if (route.generated != null and !generated_popup)
+            if (route.generated != null and !generated_popup and
+                self.exactEligibleGeneratedLayerRoot(route.generated.?.root) == null)
                 _ = self.focusGeneratedSurface(route.generated.?.root);
         }
         requestRepaint(self);
@@ -8273,9 +8309,10 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
         requestRepaint(self);
     } else if (route.generated) |generated| {
         self.window_manager.pointerButton(null, .pressed);
-        self.layer_shell.pointerPressed(null);
+        self.layer_shell.pointerPressed(generated.root);
         if (first_touch and self.managedGeneratedPopup(generated.root) == null and
-            !self.isGeneratedInputPopup(generated.root))
+            !self.isGeneratedInputPopup(generated.root) and
+            self.exactEligibleGeneratedLayerRoot(generated.root) == null)
             _ = self.focusGeneratedSurface(generated.root);
         requestRepaint(self);
     } else {
@@ -8494,11 +8531,11 @@ fn scenePointerRoute(
             y,
         )) |focus| return self.maturePointerRoute(focus);
     }
-    if (self.hitTestLayerPopups(x, y)) |focus| return self.maturePointerRoute(focus);
-    if (self.hitTestLayer(.overlay, x, y)) |focus| return self.maturePointerRoute(focus);
+    if (self.hitTestLayerPopups(x, y)) |route| return route;
+    if (self.hitTestLayer(.overlay, x, y)) |route| return route;
     const fullscreen = excludeScene(self.topFullscreenAtPoint(x, y), excluded_window);
     if (fullscreen == null) {
-        if (self.hitTestLayer(.top, x, y)) |focus| return self.maturePointerRoute(focus);
+        if (self.hitTestLayer(.top, x, y)) |route| return route;
     }
     var nodes = self.scene.reverseNodeIterator();
     while (nodes.next()) |entry| switch (entry) {
@@ -8532,8 +8569,8 @@ fn scenePointerRoute(
     };
     if (fullscreen != null) return null;
     if (self.headlessPointerFocus(x, y)) |focus| return generatedPointerRoute(focus);
-    if (self.hitTestLayer(.bottom, x, y)) |focus| return self.maturePointerRoute(focus);
-    if (self.hitTestLayer(.background, x, y)) |focus| return self.maturePointerRoute(focus);
+    if (self.hitTestLayer(.bottom, x, y)) |route| return route;
+    if (self.hitTestLayer(.background, x, y)) |route| return route;
     return null;
 }
 
@@ -8697,7 +8734,7 @@ fn topFullscreenForOutput(self: *Self, output_rect: render.Rect) ?Scene.Iterator
     return null;
 }
 
-fn hitTestLayerPopups(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
+fn hitTestLayerPopups(self: *Self, x: f64, y: f64) ?PointerRoute {
     inline for (.{
         Scene.Layer.overlay,
         Scene.Layer.top,
@@ -8709,6 +8746,24 @@ fn hitTestLayerPopups(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
             var popups = self.scene.reverseLayerPopupIterator(root.id);
             while (popups.next()) |entry| {
                 if (!entry.popup.mapped) continue;
+                if (self.managedGeneratedPopup(entry.popup.surface_id)) |info| {
+                    const geometry = entry.popup.content_geometry orelse Scene.ContentGeometry{
+                        .size = (self.headless_surface_forest.state(entry.popup.surface_id) orelse continue).mapped_size orelse continue,
+                    };
+                    var filter: GeneratedInputFilter = .{ .server = self, .root = entry.popup.surface_id };
+                    const hit = self.headless_surface_forest.subtreeInputHit(
+                        entry.popup.surface_id,
+                        x - @as(f64, @floatFromInt(entry.position.x -| geometry.offset.x)),
+                        y - @as(f64, @floatFromInt(entry.position.y -| geometry.offset.y)),
+                        .{ .context = &filter, .accepts = generatedSurfaceAcceptsInput },
+                    ) orelse continue;
+                    return self.pointerRouteForFocus(.{
+                        .surface_id = hit.id,
+                        .x = hit.x,
+                        .y = hit.y,
+                        .generated = .{ .root = entry.popup.surface_id, .client = info.client },
+                    });
+                }
                 const buffer = Surface.currentBuffer(
                     self.compositor.surfaceStore(),
                     entry.popup.surface_id,
@@ -8719,24 +8774,40 @@ fn hitTestLayerPopups(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
                 if (self.hitTestSurface(entry.popup.surface_id, .{
                     .x = entry.position.x -| geometry.offset.x,
                     .y = entry.position.y -| geometry.offset.y,
-                }, x, y)) |focus| return focus;
+                }, x, y)) |focus| return self.maturePointerRoute(focus);
             }
         }
     }
     return null;
 }
 
-fn hitTestLayer(self: *Self, layer: Scene.Layer, x: f64, y: f64) ?Seat.PointerFocus {
+fn hitTestLayer(self: *Self, layer: Scene.Layer, x: f64, y: f64) ?PointerRoute {
     var surfaces = self.scene.reverseLayerSurfaceIterator(layer);
     while (surfaces.next()) |entry| {
         const layer_surface = entry.layer_surface;
         if (!layer_surface.mapped) continue;
+        if (self.exactEligibleGeneratedLayerRoot(layer_surface.surface_id) != null) {
+            const client = self.seat.generatedSurfaceOwner(layer_surface.surface_id) orelse continue;
+            var filter: GeneratedInputFilter = .{ .server = self, .root = layer_surface.surface_id };
+            const hit = self.headless_surface_forest.subtreeInputHit(
+                layer_surface.surface_id,
+                x - @as(f64, @floatFromInt(layer_surface.position.x)),
+                y - @as(f64, @floatFromInt(layer_surface.position.y)),
+                .{ .context = &filter, .accepts = generatedSurfaceAcceptsInput },
+            ) orelse continue;
+            return self.pointerRouteForFocus(.{
+                .surface_id = hit.id,
+                .x = hit.x,
+                .y = hit.y,
+                .generated = .{ .root = layer_surface.surface_id, .client = client },
+            });
+        }
         if (self.hitTestSurface(
             layer_surface.surface_id,
             layer_surface.position,
             x,
             y,
-        )) |focus| return focus;
+        )) |focus| return self.maturePointerRoute(focus);
     }
     return null;
 }
@@ -10089,9 +10160,7 @@ fn addSurfaceTreeBounds(
     y: i32,
     bounds: *?render.Rect,
 ) error{Overflow}!void {
-    if (self.managedGeneratedWindow(surface_id) != null or
-        self.managedGeneratedPopup(surface_id) != null)
-    {
+    if (self.sceneGeneratedCompound(surface_id)) {
         const subtree = self.headless_surface_forest.subtreeBounds(surface_id) orelse return;
         const rect = subtree.translated(x, y);
         bounds.* = if (bounds.*) |current|
@@ -10162,7 +10231,8 @@ fn completeGeneratedCallbackOnlyFrames(
     while (iterator.next()) |node| {
         if (!node.frame_demand or !output.containsSurface(node.id)) continue;
         const root = self.headless_surface_forest.compoundRoot(node.id) orelse continue;
-        if ((!self.exactEligibleGeneratedRoot(root) and !self.exactEligibleGeneratedPopupRoot(root)) or
+        if ((!self.exactEligibleGeneratedRoot(root) and !self.exactEligibleGeneratedPopupRoot(root) and
+            self.exactEligibleGeneratedLayerRoot(root) == null) or
             !self.headless_surface_forest.mappedInCompound(node.id, root)) continue;
         completed = self.headless_surface_forest.completeCallbackOnlyFrame(node.id, timestamp_ms) or completed;
     }
@@ -10176,7 +10246,8 @@ fn scheduleGeneratedCallbackOnlyFrames(self: *Self, render_output: *RenderOutput
         if (!node.frame_demand or !output.containsSurface(node.id) or
             !self.headless_surface_forest.hasCallbackOnlyFrameDemand(node.id)) continue;
         const root = self.headless_surface_forest.compoundRoot(node.id) orelse continue;
-        if ((!self.exactEligibleGeneratedRoot(root) and !self.exactEligibleGeneratedPopupRoot(root)) or
+        if ((!self.exactEligibleGeneratedRoot(root) and !self.exactEligibleGeneratedPopupRoot(root) and
+            self.exactEligibleGeneratedLayerRoot(root) == null) or
             !self.headless_surface_forest.mappedInCompound(node.id, root)) continue;
         self.scheduleFrameCallback(render_output);
         return;
@@ -11014,18 +11085,29 @@ fn refreshKeyboardFocusWithGeneratedRetention(self: *Self, retain_generated: boo
         self.syncXwaylandFocus(null);
         return;
     }
-    if (self.xdg_shell_core.popupKeyboardFocus()) |root| {
-        if (self.managedGeneratedPopup(root)) |popup| {
-            _ = self.seat.applyGeneratedKeyboardFocus(.{ .surface = root, .client = popup.client }, null);
+    const popup_focus = self.xdg_shell_core.popupKeyboardFocus();
+    const layer_focus = self.layer_shell.keyboardFocus(popup_focus);
+    if (layer_focus) |surface| {
+        if (self.generatedLayerKeyboardFocus(surface)) |focus| {
+            _ = self.seat.applyGeneratedKeyboardFocus(focus, null);
             self.syncXwaylandFocus(null);
             return;
         }
     }
-    const default_focus = self.maturePolicyKeyboardFocus();
+    if (popup_focus) |root| {
+        if (self.xdg_shell_core.popupRootLayerSurface(root) == null) if (self.managedGeneratedPopup(root)) |popup| {
+            _ = self.seat.applyGeneratedKeyboardFocus(.{ .surface = root, .client = popup.client }, null);
+            self.syncXwaylandFocus(null);
+            return;
+        };
+    }
+    const default_focus = layer_focus orelse
+        self.xwayland_override_redirect_focus orelse
+        self.window_manager.focusedSurface() orelse self.scene.focusedSurface();
     if (retain_generated and generatedFocusPolicyAllows(
         false,
         self.xdg_shell_core.hasPopupGrab(),
-        self.layer_shell.keyboardFocus(self.xdg_shell_core.popupKeyboardFocus()) != null,
+        layer_focus != null,
         self.xwayland_override_redirect_focus != null,
     )) if (self.seat.generatedKeyboardFocus()) |focus| {
         const root = self.headless_surface_forest.compoundRoot(focus.surface);
@@ -11042,7 +11124,7 @@ fn refreshKeyboardFocusWithGeneratedRetention(self: *Self, retain_generated: boo
     if (generatedFocusPolicyAllows(
         false,
         self.xdg_shell_core.hasPopupGrab(),
-        self.layer_shell.keyboardFocus(self.xdg_shell_core.popupKeyboardFocus()) != null,
+        layer_focus != null,
         self.xwayland_override_redirect_focus != null,
     )) if (self.window_manager.focusedSurface()) |root| {
         if (self.seat.generatedSurfaceOwner(root)) |client| {
@@ -11058,6 +11140,17 @@ fn refreshKeyboardFocusWithGeneratedRetention(self: *Self, retain_generated: boo
     };
     self.applyMatureKeyboardFocus(default_focus);
     self.syncXwaylandFocus(default_focus);
+}
+
+fn generatedLayerKeyboardFocus(self: *Self, surface: SurfaceRegistry.Id) ?Seat.GeneratedKeyboardFocus {
+    if (self.exactEligibleGeneratedLayerRoot(surface) != null) {
+        return .{ .surface = surface, .client = self.seat.generatedSurfaceOwner(surface) orelse return null };
+    }
+    const popup = self.managedGeneratedPopup(surface) orelse return null;
+    const layer_scene = self.xdg_shell_core.popupRootLayerSurface(surface) orelse return null;
+    const layer_root = (self.scene.layerSurface(layer_scene) orelse return null).surface_id;
+    if (self.exactEligibleGeneratedLayerRoot(layer_root) == null) return null;
+    return .{ .surface = surface, .client = popup.client };
 }
 
 fn maturePolicyKeyboardFocus(self: *Self) ?Surface.Id {
@@ -11397,7 +11490,10 @@ fn submitLayerSurfaces(self: *Self, output: *Output, layer: Scene.Layer) void {
     var surfaces = self.scene.layerSurfaceIterator(layer);
     while (surfaces.next()) |entry| {
         if (entry.layer_surface.mapped) {
-            self.submitSurfaceTree(output, entry.layer_surface.surface_id);
+            if (self.exactEligibleGeneratedLayerRoot(entry.layer_surface.surface_id) != null)
+                self.submitGeneratedCompound(output, entry.layer_surface.surface_id)
+            else
+                self.submitSurfaceTree(output, entry.layer_surface.surface_id);
         }
     }
 }
@@ -11414,13 +11510,12 @@ fn renderLayerPopups(self: *Self, frame: *const OutputFrame) Renderer.Error!void
             var popups = self.scene.layerPopupIterator(root.id);
             while (popups.next()) |entry| {
                 if (!entry.popup.mapped) continue;
-                const buffer = Surface.currentBuffer(
-                    self.compositor.surfaceStore(),
-                    entry.popup.surface_id,
-                ) orelse continue;
-                const geometry = entry.popup.content_geometry orelse Scene.ContentGeometry{
-                    .size = buffer.logical_size,
-                };
+                const generated = self.managedGeneratedPopup(entry.popup.surface_id) != null;
+                const size = if (generated)
+                    (self.headless_surface_forest.state(entry.popup.surface_id) orelse continue).mapped_size orelse continue
+                else
+                    (Surface.currentBuffer(self.compositor.surfaceStore(), entry.popup.surface_id) orelse continue).logical_size;
+                const geometry = entry.popup.content_geometry orelse Scene.ContentGeometry{ .size = size };
                 try self.renderSurfaceTree(
                     frame,
                     entry.popup.surface_id,
@@ -11445,7 +11540,11 @@ fn submitLayerPopups(self: *Self, output: *Output) void {
         while (roots.next()) |root| {
             var popups = self.scene.layerPopupIterator(root.id);
             while (popups.next()) |entry| {
-                if (entry.popup.mapped) self.submitSurfaceTree(output, entry.popup.surface_id);
+                if (!entry.popup.mapped) continue;
+                if (self.exactEligibleGeneratedPopupRoot(entry.popup.surface_id))
+                    self.submitGeneratedCompound(output, entry.popup.surface_id)
+                else
+                    self.submitSurfaceTree(output, entry.popup.surface_id);
             }
         }
     }
@@ -11998,9 +12097,7 @@ fn renderSurfaceTreeCapture(
     rounded_clip: ?render.RoundedClip,
     clip: ?render.Rect,
 ) Renderer.Error!?u32 {
-    if (self.managedGeneratedWindow(surface_id) != null or
-        self.managedGeneratedPopup(surface_id) != null)
-    {
+    if (self.sceneGeneratedCompound(surface_id)) {
         if (self.generatedManagedBlurBounds(
             frame,
             surface_id,
@@ -12049,9 +12146,7 @@ fn renderSurfaceTreeContents(
     clip: ?render.Rect,
     capture_id: ?u32,
 ) Renderer.Error!void {
-    if (self.managedGeneratedWindow(surface_id) != null or
-        self.managedGeneratedPopup(surface_id) != null)
-    {
+    if (self.sceneGeneratedCompound(surface_id)) {
         var iterator = self.headless_surface_forest.subtreeRenderIterator(surface_id);
         while (iterator.next()) |entry| {
             const render_state = self.surface_registry.renderState(entry.id) orelse continue;
@@ -24966,6 +25061,21 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(LayerShell.Rect{ .x = 0, .y = 3, .width = 640, .height = 477 }, server.layer_shell.usableArea());
     try std.testing.expectEqual(LayerShell.FocusClass.exclusive, server.layer_shell.focusClass());
     try std.testing.expectEqual(server.layer_shell_core.snapshot(default_id).?.surface, server.layer_shell.keyboardFocus(null).?);
+
+    server.refreshKeyboardFocus();
+    try std.testing.expectEqual(default_surface, server.seat.generatedKeyboardFocus().?.surface);
+    const generated_layer_pixels = try std.testing.allocator.alloc(u32, 640 * 480);
+    defer std.testing.allocator.free(generated_layer_pixels);
+    _ = try server.captureOutput(output.protocol_id, false, .{
+        .size = .{ .width = 640, .height = 480 },
+        .stride_pixels = 640,
+        .pixels = generated_layer_pixels,
+    });
+    try std.testing.expectEqual(@as(u32, 0xff65_4321), generated_layer_pixels[2 * 640 + 3]);
+    const generated_layer_route = server.scenePointerRoute(3.5, 2.5, null) orelse
+        return error.GeneratedLayerPointerFocusMissing;
+    try std.testing.expectEqual(default_surface, generated_layer_route.focus.?.surface_id);
+    try std.testing.expectEqual(default_surface, generated_layer_route.generated.?.root);
 
     try signalWayringCommand(layer_command);
     try waitForGeneratedLayerStage(server, host, &generated_layer, .unmapped);
