@@ -39,6 +39,7 @@ const PointerConstraints = @import("wayland/pointer_constraints.zig");
 const PointerWarp = @import("wayland/pointer_warp.zig");
 const IdleInhibit = @import("wayland/idle_inhibit.zig");
 const KeyboardShortcutsInhibit = @import("wayland/keyboard_shortcuts_inhibit.zig");
+const NeutralIdleNotification = @import("IdleNotification.zig");
 const IdleNotify = @import("wayland/idle_notify.zig");
 const Seat = @import("wayland/seat.zig");
 const SeatDelivery = @import("SeatDelivery.zig");
@@ -354,6 +355,7 @@ pointer_constraints: PointerConstraints,
 pointer_warp: PointerWarp,
 idle_inhibit: IdleInhibit,
 keyboard_shortcuts_inhibit: KeyboardShortcutsInhibit,
+idle_notification: NeutralIdleNotification,
 idle_notify: IdleNotify,
 idle_notify_initialized: bool,
 compositor: Compositor,
@@ -1189,6 +1191,7 @@ pub fn createWithVirtualOutput(
         .pointer_warp = undefined,
         .idle_inhibit = undefined,
         .keyboard_shortcuts_inhibit = undefined,
+        .idle_notification = undefined,
         .idle_notify = undefined,
         .idle_notify_initialized = false,
         .compositor = undefined,
@@ -1612,7 +1615,24 @@ pub fn createWithVirtualOutput(
     errdefer self.subcompositor.deinit();
     self.scene.init(allocator);
     errdefer self.scene.deinit();
-    try self.idle_notify.init(allocator, io, display, .{
+    self.idle_notification = NeutralIdleNotification.init(
+        allocator,
+        &self.client_registry,
+        self.idle_notify.clock(),
+        self.idle_notify.scheduler(),
+    );
+    errdefer self.idle_notification.deinit();
+    try self.client_registry.addDisconnectListener(.{
+        .context = &self.idle_notification,
+        .notify = idleNotificationClientDisconnected,
+    });
+    errdefer self.client_registry.removeDisconnectListener(&self.idle_notification);
+    try self.transient_seat.addSeatListener(.{
+        .context = &self.idle_notification,
+        .removed = idleNotificationSeatDestroyed,
+    });
+    errdefer self.transient_seat.removeSeatListener(&self.idle_notification);
+    try self.idle_notify.init(allocator, io, display, &self.idle_notification, .{
         .context = self,
         .failed = idleNotifyFailed,
     });
@@ -2162,6 +2182,7 @@ pub fn destroy(self: *Self) void {
     self.workspace_initialized = false;
     self.virtual_pointer.deinit();
     self.virtual_keyboard.deinit();
+    self.transient_seat.removeSeatListener(&self.idle_notification);
     self.transient_seat.deinit();
     self.input_method.deinit();
     self.seat.removeKeyboardFocusListener(self);
@@ -2176,6 +2197,8 @@ pub fn destroy(self: *Self) void {
     self.xdg_activation.deinit();
     self.idle_notify.deinit();
     self.idle_notify_initialized = false;
+    self.client_registry.removeDisconnectListener(&self.idle_notification);
+    self.idle_notification.deinit();
     self.layer_shell.deinit();
     self.layer_shell_initialized = false;
     self.layer_shell_core.deinit();
@@ -6430,6 +6453,16 @@ fn idleInhibitorsChanged(context: *anyopaque) void {
 fn idleNotifyFailed(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.terminate();
+}
+
+fn idleNotificationClientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
+    const idle_notification: *NeutralIdleNotification = @ptrCast(@alignCast(context));
+    idle_notification.clientDisconnected(client);
+}
+
+fn idleNotificationSeatDestroyed(context: *anyopaque, seat: *Seat) void {
+    const idle_notification: *NeutralIdleNotification = @ptrCast(@alignCast(context));
+    idle_notification.seatDestroyed(NeutralIdleNotification.SeatRef.fromPointer(seat));
 }
 
 fn refreshIdleInhibition(self: *Self) void {
@@ -14128,6 +14161,79 @@ test "production mature session lock v1 covers output, acquires, renders, and un
     try std.testing.expectEqual(fd_baseline, try countMatureDataDeviceFds());
 }
 
+test "production ext idle notifier v2 idles resumes and re-idles after pointer activity" {
+    const linux = std.os.linux;
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(std.testing.allocator, "/tmp/keywork-mature-idle-{d}-{x}", .{ linux.getpid(), @intFromPtr(&marker) }, 0);
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS) return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+    const previous_runtime = if (libc.getenv("XDG_RUNTIME_DIR")) |value| try std.testing.allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer {
+        if (previous_runtime) |value| {
+            _ = libc.setenv("XDG_RUNTIME_DIR", value, 1);
+            std.testing.allocator.free(value);
+        } else _ = libc.unsetenv("XDG_RUNTIME_DIR");
+    }
+    if (libc.setenv("XDG_RUNTIME_DIR", runtime_directory, 1) != 0) return error.RuntimeEnvironmentFailed;
+
+    const server = try Self.createWithVirtualOutput(std.testing.allocator, std.testing.io, .cpu, .headless, null, .{ .size = .{ .width = 64, .height = 64 }, .refresh_millihertz = 1 });
+    defer server.destroy();
+    const socket_name = try server.listen();
+    const client_baseline = server.client_registry.len();
+    const notification_baseline = server.idle_notification.len();
+    const raw_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_command) != .SUCCESS) return error.EventFdFailed;
+    const command_fd: std.posix.fd_t = @intCast(raw_command);
+    defer _ = linux.close(command_fd);
+    const fd_baseline = try countMatureDataDeviceFds();
+    var client: MatureIdleNotifyClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = socket_name,
+        .command_fd = command_fd,
+    };
+    const thread = try std.Thread.spawn(.{}, MatureIdleNotifyClient.run, .{&client});
+    var joined = false;
+    defer if (!joined) {
+        client.shutdown();
+        thread.join();
+    };
+
+    try waitForMatureIdleNotifyStage(server, &client, .idled);
+    try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
+    try std.testing.expectEqual(notification_baseline + 1, server.idle_notification.len());
+    try std.testing.expectEqual(@as(usize, 1), client.notifier_global_count);
+    try std.testing.expectEqual(@as(u32, 2), client.notifier_global_version);
+    try std.testing.expectEqual(@as(u8, 1), client.idled_count);
+
+    const output = server.primaryRenderOutput();
+    pointerMotion(output, 1, 0.5, 0.5);
+    pointerFrame(output);
+    try signalWayringCommand(command_fd);
+    try waitForMatureIdleNotifyStage(server, &client, .resumed);
+    try std.testing.expectEqual(@as(u8, 1), client.resumed_count);
+
+    try signalWayringCommand(command_fd);
+    try waitForMatureIdleNotifyStage(server, &client, .reidled);
+    try std.testing.expectEqual(@as(u8, 2), client.idled_count);
+    try std.testing.expectEqual(notification_baseline + 1, server.idle_notification.len());
+
+    try signalWayringCommand(command_fd);
+    try waitForMatureIdleNotifyStage(server, &client, .destroyed);
+    try std.testing.expectEqual(notification_baseline, server.idle_notification.len());
+    try signalWayringCommand(command_fd);
+    try waitForMatureIdleNotifyStage(server, &client, .disconnected);
+    thread.join();
+    joined = true;
+    for (0..2_000) |_| {
+        if (server.client_registry.len() == client_baseline) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+    } else return error.MatureIdleNotifyCleanupTimedOut;
+    try std.testing.expectEqual(notification_baseline, server.idle_notification.len());
+    try std.testing.expectEqual(fd_baseline, try countMatureDataDeviceFds());
+}
+
 test "production mature data device v3 serves two canonical socket clients" {
     const linux = std.os.linux;
     var marker: u8 = 0;
@@ -19454,6 +19560,122 @@ const MatureLayerClient = struct {
     }
 };
 
+const MatureIdleNotifyClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_ext = wayland.client.ext;
+    const Stage = enum(u8) { starting, idled, resumed, reidled, destroyed, disconnected, failed };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    seat: ?*client_wl.Seat = null,
+    notifier: ?*client_ext.IdleNotifierV1 = null,
+    notifier_global_count: usize = 0,
+    notifier_global_version: u32 = 0,
+    idled_count: u8 = 0,
+    resumed_count: u8 = 0,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}/{s}", .{ self.runtime_directory, self.display_name }, 0);
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake) != .SUCCESS) return error.WakeFdFailed;
+        const wake: i32 = @intCast(raw_wake);
+        if (self.wake_fd.cmpxchgStrong(-1, wake, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        if (self.notifier_global_count != 1 or self.notifier_global_version != 2)
+            return error.IdleNotifierVisibilityMismatch;
+        const seat = self.seat orelse return error.SeatMissing;
+        defer seat.release();
+        const notifier = self.notifier orelse return error.IdleNotifierMissing;
+        defer notifier.destroy();
+        if (notifier.getVersion() != 2) return error.IdleNotifierVersionMismatch;
+        const notification = try notifier.getIdleNotification(20, seat);
+        notification.setListener(*@This(), notificationEvent, self);
+        while (self.idled_count == 0)
+            if (display.dispatch() != .SUCCESS) return error.WaylandDispatchFailed;
+        try self.pause(.idled);
+        try expectClientRoundtrip(display);
+        if (self.resumed_count != 1) return error.ResumedMissing;
+        try self.pause(.resumed);
+        while (self.idled_count != 2)
+            if (display.dispatch() != .SUCCESS) return error.WaylandDispatchFailed;
+        try self.pause(.reidled);
+        notification.destroy();
+        try expectClientRoundtrip(display);
+        try self.pause(.destroyed);
+    }
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_seat") and self.seat == null) {
+                    self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 9)) catch null;
+                } else if (std.mem.eql(u8, interface, "ext_idle_notifier_v1")) {
+                    self.notifier_global_count += 1;
+                    self.notifier_global_version = global.version;
+                    if (self.notifier == null)
+                        self.notifier = registry.bind(global.name, client_ext.IdleNotifierV1, 2) catch null;
+                }
+            },
+            .global_remove => {},
+        }
+    }
+
+    fn notificationEvent(_: *client_ext.IdleNotificationV1, event: client_ext.IdleNotificationV1.Event, self: *@This()) void {
+        switch (event) {
+            .idled => self.idled_count += 1,
+            .resumed => self.resumed_count += 1,
+        }
+    }
+
+    fn pause(self: *@This(), value: Stage) !void {
+        self.stage.store(@intFromEnum(value), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+
+    fn closeWake(self: *@This(), replace: bool) void {
+        const value = self.wake_fd.swap(if (replace) -2 else -1, .acq_rel);
+        if (value >= 0) {
+            if (replace) _ = std.os.linux.shutdown(value, std.os.linux.SHUT.RDWR);
+            _ = std.os.linux.close(value);
+        }
+    }
+
+    fn shutdown(self: *@This()) void {
+        self.closeWake(true);
+        signalWayringCommand(self.command_fd) catch {};
+    }
+};
+
 /// Exercises the scanner-generated layer-shell client API against the
 /// production Wayring adapter. Both output selection paths deliberately live
 /// on one connection so object and canonical output identities are shared.
@@ -22795,6 +23017,17 @@ fn waitForMatureLayerStage(server: *Self, client: *MatureLayerClient, expected: 
         server.display.flushClients();
     }
     return error.MatureLayerClientTimedOut;
+}
+
+fn waitForMatureIdleNotifyStage(server: *Self, client: *MatureIdleNotifyClient, expected: MatureIdleNotifyClient.Stage) !void {
+    for (0..2_000) |_| {
+        const stage: MatureIdleNotifyClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure.?;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+    }
+    return error.MatureIdleNotifyClientTimedOut;
 }
 
 fn waitForGeneratedLayerStage(server: *Self, host: anytype, client: *GeneratedLayerClient, expected: GeneratedLayerClient.Stage) !void {

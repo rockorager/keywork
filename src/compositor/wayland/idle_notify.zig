@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const NeutralIdleNotification = @import("../IdleNotification.zig");
 const Seat = @import("seat.zig");
 
 const ext = wayland.server.ext;
@@ -14,8 +15,8 @@ allocator: std.mem.Allocator,
 io: std.Io,
 global: *wl.Global,
 timer: *wl.EventSource,
-notifications: std.ArrayList(*Notification),
-inhibited: bool,
+core: *NeutralIdleNotification,
+timer_generation: NeutralIdleNotification.TimerGeneration,
 listener: Listener,
 
 pub const Listener = struct {
@@ -28,6 +29,7 @@ pub fn init(
     allocator: std.mem.Allocator,
     io: std.Io,
     display: *wl.Server,
+    core: *NeutralIdleNotification,
     listener: Listener,
 ) !void {
     self.* = .{
@@ -35,11 +37,10 @@ pub fn init(
         .io = io,
         .global = undefined,
         .timer = undefined,
-        .notifications = .empty,
-        .inhibited = false,
+        .core = core,
+        .timer_generation = 0,
         .listener = listener,
     };
-    errdefer self.notifications.deinit(allocator);
     self.timer = try display.getEventLoop().addTimer(*Self, handleTimer, self);
     errdefer self.timer.remove();
     self.global = try wl.Global.create(display, ext.IdleNotifierV1, 2, *Self, self, bind);
@@ -47,30 +48,24 @@ pub fn init(
 
 pub fn deinit(self: *Self) void {
     self.timer.remove();
-    std.debug.assert(self.notifications.items.len == 0);
     self.global.destroy();
-    self.notifications.deinit(self.allocator);
     self.* = undefined;
 }
 
+pub fn clock(self: *Self) NeutralIdleNotification.Clock {
+    return .{ .context = self, .now = now };
+}
+
+pub fn scheduler(self: *Self) NeutralIdleNotification.Scheduler {
+    return .{ .context = self, .arm = armTimer };
+}
+
 pub fn notifyActivity(self: *Self, seat: *Seat) void {
-    const timestamp = now(self.io);
-    for (self.notifications.items) |notification| {
-        if (notification.seat != seat) continue;
-        notification.setIdle(false);
-        notification.restart(timestamp);
-    }
-    self.scheduleTimer() catch self.fail();
+    self.core.observeActivity(NeutralIdleNotification.SeatRef.fromPointer(seat)) catch self.fail();
 }
 
 pub fn setInhibited(self: *Self, inhibited: bool) void {
-    if (self.inhibited == inhibited) return;
-    self.inhibited = inhibited;
-    for (self.notifications.items) |notification| {
-        if (!notification.obey_inhibitors) continue;
-        notification.setIdle(false);
-    }
-    self.scheduleTimer() catch self.fail();
+    self.core.setInhibited(inhibited) catch self.fail();
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -113,6 +108,11 @@ fn createNotification(
     seat_resource: *wl.Seat,
     obey_inhibitors: bool,
 ) void {
+    const seat = Seat.fromResource(seat_resource);
+    const client = seat.matureClientId(notifier.getClient()) orelse {
+        notifier.postNoMemory();
+        return;
+    };
     const resource = ext.IdleNotificationV1.create(
         notifier.getClient(),
         notifier.getVersion(),
@@ -129,20 +129,24 @@ fn createNotification(
     notification.* = .{
         .manager = self,
         .resource = resource,
-        .seat = Seat.fromResource(seat_resource),
-        .timeout_ms = timeout_ms,
-        .deadline = deadline(now(self.io), timeout_ms),
-        .obey_inhibitors = obey_inhibitors,
-        .idle = false,
+        .core_id = undefined,
     };
-    self.notifications.append(self.allocator, notification) catch {
+    notification.core_id = self.core.create(
+        client,
+        NeutralIdleNotification.SeatRef.fromPointer(seat),
+        timeout_ms,
+        obey_inhibitors,
+        notification.endpoint(),
+    ) catch |err| {
         self.allocator.destroy(notification);
-        resource.postNoMemory();
+        switch (err) {
+            error.OutOfMemory, error.InvalidClient => resource.postNoMemory(),
+            error.ScheduleFailed, error.TimerGenerationExhausted => self.fail(),
+        }
         resource.destroy();
         return;
     };
     resource.setHandler(*Notification, handleNotificationRequest, handleNotificationDestroy, notification);
-    self.scheduleTimer() catch self.fail();
 }
 
 fn handleNotificationRequest(
@@ -157,42 +161,24 @@ fn handleNotificationRequest(
 
 fn handleNotificationDestroy(_: *ext.IdleNotificationV1, notification: *Notification) void {
     const manager = notification.manager;
-    for (manager.notifications.items, 0..) |candidate, index| {
-        if (candidate != notification) continue;
-        _ = manager.notifications.orderedRemove(index);
-        manager.allocator.destroy(notification);
-        manager.scheduleTimer() catch manager.fail();
-        return;
-    }
-    unreachable;
+    manager.core.destroy(notification.core_id);
+    manager.allocator.destroy(notification);
 }
 
 fn handleTimer(self: *Self) c_int {
-    self.scheduleTimer() catch self.fail();
+    _ = self.core.timerFired(self.timer_generation) catch self.fail();
     return 0;
 }
 
-fn scheduleTimer(self: *Self) std.posix.UnexpectedError!void {
-    const timestamp = now(self.io);
-    var earliest: ?i96 = null;
-    for (self.notifications.items) |notification| {
-        // Inhibition suppresses delivery without pausing elapsed inactivity.
-        if (notification.idle or (self.inhibited and notification.obey_inhibitors)) continue;
-        const notification_deadline = notification.deadline;
-        if (notification_deadline <= timestamp) {
-            notification.setIdle(true);
-            continue;
-        }
-        earliest = if (earliest) |current|
-            @min(current, notification_deadline)
-        else
-            notification_deadline;
-    }
-    const next = earliest orelse {
-        try self.timer.timerUpdate(0);
-        return;
-    };
-    try self.timer.timerUpdate(delayMilliseconds(timestamp, next));
+fn armTimer(
+    context: *anyopaque,
+    delay: NeutralIdleNotification.TimerDelay,
+    generation: NeutralIdleNotification.TimerGeneration,
+) error{ScheduleFailed}!void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.timer.timerUpdate(if (delay) |nanoseconds| delayMilliseconds(nanoseconds) else 0) catch
+        return error.ScheduleFailed;
+    self.timer_generation = generation;
 }
 
 fn fail(self: *Self) void {
@@ -200,49 +186,51 @@ fn fail(self: *Self) void {
     self.listener.failed(self.listener.context);
 }
 
-fn now(io: std.Io) i96 {
-    return std.Io.Clock.awake.now(io).nanoseconds;
+fn now(context: *anyopaque) NeutralIdleNotification.Timestamp {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return std.Io.Clock.awake.now(self.io).nanoseconds;
 }
 
-fn deadline(timestamp: i96, timeout_ms: u32) i96 {
-    return timestamp + @as(i96, timeout_ms) * std.time.ns_per_ms;
-}
-
-fn delayMilliseconds(timestamp: i96, target: i96) c_int {
-    std.debug.assert(target > timestamp);
-    const nanoseconds = target - timestamp;
-    const milliseconds = @divFloor(nanoseconds + std.time.ns_per_ms - 1, std.time.ns_per_ms);
+fn delayMilliseconds(nanoseconds: NeutralIdleNotification.Timestamp) c_int {
+    std.debug.assert(nanoseconds > 0);
+    const milliseconds = @divFloor(nanoseconds - 1, std.time.ns_per_ms) + 1;
     return @intCast(@min(milliseconds, std.math.maxInt(c_int)));
 }
 
 const Notification = struct {
     manager: *Self,
     resource: *ext.IdleNotificationV1,
-    seat: *Seat,
-    timeout_ms: u32,
-    deadline: i96,
-    obey_inhibitors: bool,
-    idle: bool,
+    core_id: NeutralIdleNotification.Id,
 
-    fn restart(self: *Notification, timestamp: i96) void {
-        self.deadline = deadline(timestamp, self.timeout_ms);
+    fn endpoint(self: *Notification) NeutralIdleNotification.Endpoint {
+        return .{
+            .context = self,
+            .idled = sendIdled,
+            .resumed = sendResumed,
+            .close = close,
+        };
     }
 
-    fn setIdle(self: *Notification, idle: bool) void {
-        if (self.idle == idle) return;
-        if (idle) {
-            self.resource.sendIdled();
-        } else {
-            self.resource.sendResumed();
-        }
-        self.idle = idle;
+    fn sendIdled(context: *anyopaque) void {
+        const self: *Notification = @ptrCast(@alignCast(context));
+        self.resource.sendIdled();
+    }
+
+    fn sendResumed(context: *anyopaque) void {
+        const self: *Notification = @ptrCast(@alignCast(context));
+        self.resource.sendResumed();
+    }
+
+    fn close(context: *anyopaque) void {
+        const self: *Notification = @ptrCast(@alignCast(context));
+        self.resource.destroy();
     }
 };
 
 test "idle deadlines round timer delays up to the next millisecond" {
-    try std.testing.expectEqual(@as(c_int, 1), delayMilliseconds(100, 101));
+    try std.testing.expectEqual(@as(c_int, 1), delayMilliseconds(1));
     try std.testing.expectEqual(
         @as(c_int, 2),
-        delayMilliseconds(100, 100 + std.time.ns_per_ms + 1),
+        delayMilliseconds(std.time.ns_per_ms + 1),
     );
 }
