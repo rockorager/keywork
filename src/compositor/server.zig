@@ -63,6 +63,7 @@ const XwaylandShell = @import("wayland/xwayland_shell.zig");
 const XwaylandServer = @import("xwayland/server.zig");
 const Xwm = @import("xwayland/xwm.zig");
 const Workspace = @import("wayland/workspace.zig");
+const NeutralWorkspace = @import("Workspace.zig");
 const NeutralTextInput = @import("TextInput.zig");
 const TextInput = @import("wayland/text_input.zig");
 const InputMethod = @import("wayland/input_method.zig");
@@ -412,6 +413,7 @@ xwayland_windows: std.AutoHashMapUnmanaged(Xwm.WindowId, XwaylandWindow),
 xwayland_client_stack: std.ArrayList(Xwm.WindowId),
 xwayland_override_redirect_focus: ?Surface.Id,
 workspace: Workspace,
+neutral_workspace: NeutralWorkspace,
 workspace_initialized: bool,
 neutral_text_input: NeutralTextInput,
 text_input: TextInput,
@@ -1247,6 +1249,7 @@ pub fn createWithVirtualOutput(
         .xwayland_client_stack = .empty,
         .xwayland_override_redirect_focus = null,
         .workspace = undefined,
+        .neutral_workspace = undefined,
         .workspace_initialized = false,
         .neutral_text_input = undefined,
         .text_input = undefined,
@@ -1276,6 +1279,8 @@ pub fn createWithVirtualOutput(
     };
     errdefer self.layer_shell_core.deinit();
     errdefer self.client_registry.deinit();
+    self.neutral_workspace = NeutralWorkspace.init(allocator, &self.client_registry);
+    errdefer self.neutral_workspace.deinit();
     self.mature_clients.init(allocator, display, &self.client_registry);
     errdefer self.mature_clients.deinit();
     errdefer self.surface_registry.deinit();
@@ -1805,7 +1810,7 @@ pub fn createWithVirtualOutput(
         .{ .context = self, .event = virtualPointerEvent },
     );
     errdefer self.virtual_pointer.deinit();
-    try self.workspace.init(allocator, display, &self.security_context, &self.outputs);
+    try self.workspace.init(allocator, display, &self.security_context, &self.outputs, &self.mature_clients, &self.neutral_workspace);
     self.workspace_initialized = true;
     errdefer {
         self.workspace.deinit();
@@ -1890,7 +1895,8 @@ pub fn createWithVirtualOutput(
     errdefer self.xdg_session_management.deinit();
     self.workspace.setActivationListener(.{
         .context = self,
-        .activate = workspaceActivationRequested,
+        .prepare = workspaceActivationRequested,
+        .finish = workspaceActivationFinished,
     });
     errdefer self.workspace.clearActivationListener();
     try self.foreign_toplevel_list.init(
@@ -2180,6 +2186,7 @@ pub fn destroy(self: *Self) void {
     self.window_manager_initialized = false;
     self.workspace.deinit();
     self.workspace_initialized = false;
+    self.neutral_workspace.deinit();
     self.virtual_pointer.deinit();
     self.virtual_keyboard.deinit();
     self.transient_seat.removeSeatListener(&self.idle_notification);
@@ -6480,10 +6487,16 @@ fn idleInhibitorSurfaceVisible(context: *anyopaque, surface_id: Surface.Id) bool
     return self.scene.surfaceMapped(root);
 }
 
-fn workspaceActivationRequested(context: *anyopaque, output: OutputLayout.Id, number: u8) bool {
+fn workspaceActivationRequested(context: *anyopaque, intents: []const NeutralWorkspace.Intent) ?bool {
     const self: *Self = @ptrCast(@alignCast(context));
-    if (!self.window_manager_initialized) return false;
-    return self.window_manager.activateWorkspaceFromProtocol(output, number);
+    if (!self.window_manager_initialized) return null;
+    return self.window_manager.prepareWorkspacesActivationFromProtocol(intents);
+}
+
+fn workspaceActivationFinished(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    std.debug.assert(self.window_manager_initialized);
+    self.window_manager.finishWorkspaceActivationFromProtocol();
 }
 
 fn xdgActivationRequested(
@@ -14234,6 +14247,97 @@ test "production ext idle notifier v2 idles resumes and re-idles after pointer a
     try std.testing.expectEqual(fd_baseline, try countMatureDataDeviceFds());
 }
 
+test "production mature ext workspace v1 snapshots activates and survives child destruction" {
+    const linux = std.os.linux;
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(std.testing.allocator, "/tmp/keywork-mature-workspace-{d}-{x}", .{ linux.getpid(), @intFromPtr(&marker) }, 0);
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS) return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+    const previous_runtime = if (libc.getenv("XDG_RUNTIME_DIR")) |value| try std.testing.allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer {
+        if (previous_runtime) |value| {
+            _ = libc.setenv("XDG_RUNTIME_DIR", value, 1);
+            std.testing.allocator.free(value);
+        } else _ = libc.unsetenv("XDG_RUNTIME_DIR");
+    }
+    if (libc.setenv("XDG_RUNTIME_DIR", runtime_directory, 1) != 0) return error.RuntimeEnvironmentFailed;
+    const server = try Self.createWithVirtualOutput(std.testing.allocator, std.testing.io, .cpu, .headless, null, .{ .size = .{ .width = 320, .height = 240 }, .refresh_millihertz = 1 });
+    defer server.destroy();
+    const socket_name = try server.listen();
+    const raw_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_command) != .SUCCESS) return error.EventFdFailed;
+    const command_fd: std.posix.fd_t = @intCast(raw_command);
+    defer _ = linux.close(command_fd);
+    const fd_baseline = try countMatureDataDeviceFds();
+    var client: MatureWorkspaceClient = .{ .runtime_directory = runtime_directory, .display_name = socket_name, .command_fd = command_fd };
+    const thread = try std.Thread.spawn(.{}, MatureWorkspaceClient.run, .{&client});
+    var joined = false;
+    defer if (!joined) {
+        client.shutdown();
+        thread.join();
+    };
+
+    try waitForMatureWorkspaceStage(server, &client, .initial);
+    try std.testing.expectEqual(@as(usize, 1), client.manager_global_count);
+    try std.testing.expectEqual(@as(u32, 1), client.manager_global_version);
+    try std.testing.expectEqual(@as(usize, 1), client.group_count);
+    try std.testing.expectEqual(@as(usize, 1), client.output_enter_count);
+    try std.testing.expectEqual(@as(usize, 1), client.workspace_count);
+    try std.testing.expectEqual(@as(usize, 1), client.done_count);
+    try std.testing.expectEqualStrings("1", client.names[0][0..client.name_lens[0]]);
+    try std.testing.expectEqual(@as(u32, 0), client.coordinates[0]);
+    try std.testing.expect(client.active[0] and client.activate_capable[0]);
+
+    try signalWayringCommand(command_fd);
+    try waitForMatureWorkspaceStage(server, &client, .mapped);
+    server.window_manager.settleConfigureTransactionForTest();
+    const focused_surface = server.window_manager.focusedSurface() orelse return error.MatureWorkspaceFocusMissing;
+    const output = server.primaryRenderOutput().protocol_id;
+    try std.testing.expect(server.neutral_workspace.snapshot(output).?.occupied[0]);
+
+    server.window_manager.switchWorkspace(2);
+    try renderPendingTestOutput(server, server.primaryRenderOutput());
+    try renderPendingTestOutput(server, server.primaryRenderOutput());
+    try signalWayringCommand(command_fd);
+    try waitForMatureWorkspaceStage(server, &client, .second_workspace);
+    try std.testing.expectEqual(@as(usize, 2), client.workspace_count);
+    try std.testing.expectEqualStrings("2", client.names[1][0..client.name_lens[1]]);
+    try std.testing.expectEqual(@as(u8, 2), server.neutral_workspace.snapshot(server.primaryRenderOutput().protocol_id).?.active);
+    try std.testing.expect(client.active[1]);
+    try std.testing.expect(server.window_manager.focusedSurface() == null);
+    try signalWayringCommand(command_fd);
+    try waitForMatureWorkspaceStage(server, &client, .activated);
+    try std.testing.expectEqual(@as(u8, 1), server.neutral_workspace.snapshot(output).?.active);
+    try std.testing.expect(client.active[0] and client.removed[1]);
+    try std.testing.expectEqual(focused_surface, server.window_manager.focusedSurface().?);
+    try signalWayringCommand(command_fd);
+    try waitForMatureWorkspaceStage(server, &client, .child_destroyed);
+    // The child was destroyed before this canonical update. Reconciliation must
+    // never retain or call its dead resource. Occupied workspace 1 gets a fresh
+    // handle generation, as does previously removed workspace 2.
+    server.window_manager.switchWorkspace(2);
+    try renderPendingTestOutput(server, server.primaryRenderOutput());
+    try renderPendingTestOutput(server, server.primaryRenderOutput());
+    try signalWayringCommand(command_fd);
+    try waitForMatureWorkspaceStage(server, &client, .readvertised);
+    try std.testing.expectEqual(@as(usize, 4), client.workspace_count);
+    try std.testing.expectEqual(@as(u8, 2), server.neutral_workspace.snapshot(output).?.active);
+    try std.testing.expect(client.active[3]);
+    try signalWayringCommand(command_fd);
+    try waitForMatureWorkspaceStage(server, &client, .finished);
+    try signalWayringCommand(command_fd);
+    try waitForMatureWorkspaceStage(server, &client, .disconnected);
+    thread.join();
+    joined = true;
+    for (0..2_000) |_| {
+        if (server.client_registry.len() == 0 and
+            try countMatureDataDeviceFds() == fd_baseline) break;
+        try server.eventLoop().dispatch(1);
+    } else return error.MatureWorkspaceCleanupTimedOut;
+    try std.testing.expectEqual(fd_baseline, try countMatureDataDeviceFds());
+}
+
 test "production mature data device v3 serves two canonical socket clients" {
     const linux = std.os.linux;
     var marker: u8 = 0;
@@ -20012,6 +20116,221 @@ const MatureSessionLockClient = struct {
     }
 };
 
+const MatureWorkspaceClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_ext = wayland.client.ext;
+    const client_xdg = wayland.client.xdg;
+    const Stage = enum(u8) { starting, connected, registry, initial, mapped, second_workspace, activated, child_destroyed, readvertised, finished, disconnected, failed };
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    shm: ?*client_wl.Shm = null,
+    wm_base: ?*client_xdg.WmBase = null,
+    manager: ?*client_ext.WorkspaceManagerV1 = null,
+    output: ?*client_wl.Output = null,
+    configure_serial: u32 = 0,
+    manager_global_count: usize = 0,
+    manager_global_version: u32 = 0,
+    group_count: usize = 0,
+    output_enter_count: usize = 0,
+    workspace_count: usize = 0,
+    done_count: usize = 0,
+    finished_count: usize = 0,
+    groups: [2]?*client_ext.WorkspaceGroupHandleV1 = .{ null, null },
+    workspaces: [4]?*client_ext.WorkspaceHandleV1 = .{ null, null, null, null },
+    names: [4][8]u8 = @splat(@splat(0)),
+    name_lens: [4]usize = @splat(0),
+    coordinates: [4]u32 = @splat(std.math.maxInt(u32)),
+    active: [4]bool = @splat(false),
+    activate_capable: [4]bool = @splat(false),
+    removed: [4]bool = @splat(false),
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}/{s}", .{ self.runtime_directory, self.display_name }, 0);
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake) != .SUCCESS) return error.WakeFdFailed;
+        const wake: i32 = @intCast(raw_wake);
+        if (self.wake_fd.cmpxchgStrong(-1, wake, .acq_rel, .acquire)) |_| return error.ClientShutdown;
+        defer self.closeWake(false);
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        self.stage.store(@intFromEnum(Stage.connected), .release);
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        self.stage.store(@intFromEnum(Stage.registry), .release);
+        try expectClientRoundtrip(display);
+        const manager = self.manager orelse return error.WorkspaceManagerMissing;
+        // Registry callback binds are ordered before this second sync.
+        try expectClientRoundtrip(display);
+        if (self.output == null or self.done_count != 1 or self.workspace_count != 1) return error.InitialWorkspaceSnapshotMismatch;
+        try self.pause(.initial);
+
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        defer compositor.destroy();
+        const shm = self.shm orelse return error.ShmMissing;
+        defer shm.release();
+        const wm_base = self.wm_base orelse return error.XdgWmBaseMissing;
+        defer wm_base.destroy();
+        wm_base.setListener(*@This(), wmBaseEvent, self);
+        const surface = try compositor.createSurface();
+        defer surface.destroy();
+        const xdg_surface = try wm_base.getXdgSurface(surface);
+        defer xdg_surface.destroy();
+        xdg_surface.setListener(*@This(), xdgSurfaceEvent, self);
+        const toplevel = try xdg_surface.getToplevel();
+        defer toplevel.destroy();
+        toplevel.setListener(*@This(), toplevelEvent, self);
+        toplevel.setAppId("org.keywork.workspace-test");
+        surface.commit();
+        while (self.configure_serial == 0) try expectClientRoundtrip(display);
+        const buffer = try createClipboardBuffer(shm, 0xff4d_78cc);
+        defer buffer.buffer.destroy();
+        defer buffer.pool.destroy();
+        defer _ = std.os.linux.close(buffer.fd);
+        surface.attach(buffer.buffer, 0, 0);
+        surface.damageBuffer(0, 0, 1, 1);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        try self.pause(.mapped);
+
+        while (self.workspace_count < 2 or self.done_count < 2) try expectClientRoundtrip(display);
+        self.stage.store(@intFromEnum(Stage.second_workspace), .release);
+        try waitForWayringCommand(self.command_fd);
+        const first = self.workspaces[0] orelse return error.FirstWorkspaceMissing;
+        first.activate();
+        manager.commit();
+        while (!self.active[0] or self.done_count < 3) try expectClientRoundtrip(display);
+        try self.pause(.activated);
+        first.destroy();
+        try expectClientRoundtrip(display);
+        try self.pause(.child_destroyed);
+        while (self.workspace_count < 3 or self.done_count < 4) try expectClientRoundtrip(display);
+        try self.pause(.readvertised);
+        manager.stop();
+        while (self.finished_count == 0) try expectClientRoundtrip(display);
+        self.stage.store(@intFromEnum(Stage.finished), .release);
+        try waitForWayringCommand(self.command_fd);
+        for (&self.workspaces) |*workspace| if (workspace.*) |value| {
+            if (value != first) value.destroy();
+            workspace.* = null;
+        };
+        for (&self.groups) |*group| if (group.*) |value| {
+            value.destroy();
+            group.* = null;
+        };
+        if (self.output) |output| output.release();
+        try expectClientRoundtrip(display);
+    }
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, @min(global.version, 7)) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, @min(global.version, 4)) catch null else if (std.mem.eql(u8, interface, "ext_workspace_manager_v1")) {
+                    self.manager_global_count += 1;
+                    self.manager_global_version = global.version;
+                    self.manager = registry.bind(global.name, client_ext.WorkspaceManagerV1, 1) catch null;
+                    if (self.manager) |manager| manager.setListener(*@This(), managerEvent, self);
+                }
+            },
+            .global_remove => {},
+        }
+    }
+    fn wmBaseEvent(wm_base: *client_xdg.WmBase, event: client_xdg.WmBase.Event, _: *@This()) void {
+        switch (event) {
+            .ping => |ping| wm_base.pong(ping.serial),
+        }
+    }
+    fn xdgSurfaceEvent(xdg_surface: *client_xdg.Surface, event: client_xdg.Surface.Event, self: *@This()) void {
+        switch (event) {
+            .configure => |configure| {
+                self.configure_serial = configure.serial;
+                xdg_surface.ackConfigure(configure.serial);
+            },
+        }
+    }
+    fn toplevelEvent(_: *client_xdg.Toplevel, _: client_xdg.Toplevel.Event, _: *@This()) void {}
+    fn managerEvent(_: *client_ext.WorkspaceManagerV1, event: client_ext.WorkspaceManagerV1.Event, self: *@This()) void {
+        switch (event) {
+            .workspace_group => |value| {
+                const index = self.group_count;
+                if (index < self.groups.len) self.groups[index] = value.workspace_group;
+                self.group_count += 1;
+                value.workspace_group.setListener(*@This(), groupEvent, self);
+            },
+            .workspace => |value| {
+                const index = self.workspace_count;
+                if (index < self.workspaces.len) self.workspaces[index] = value.workspace;
+                self.workspace_count += 1;
+                value.workspace.setListener(*@This(), workspaceEvent, self);
+            },
+            .done => self.done_count += 1,
+            .finished => self.finished_count += 1,
+        }
+    }
+    fn groupEvent(_: *client_ext.WorkspaceGroupHandleV1, event: client_ext.WorkspaceGroupHandleV1.Event, self: *@This()) void {
+        switch (event) {
+            .output_enter => self.output_enter_count += 1,
+            else => {},
+        }
+    }
+    fn workspaceIndex(self: *@This(), resource: *client_ext.WorkspaceHandleV1) ?usize {
+        for (self.workspaces, 0..) |candidate, index| if (candidate == resource) return index;
+        return null;
+    }
+    fn workspaceEvent(resource: *client_ext.WorkspaceHandleV1, event: client_ext.WorkspaceHandleV1.Event, self: *@This()) void {
+        const index = self.workspaceIndex(resource) orelse return;
+        switch (event) {
+            .name => |value| {
+                const name = std.mem.span(value.name);
+                self.name_lens[index] = @min(name.len, self.names[index].len);
+                @memcpy(self.names[index][0..self.name_lens[index]], name[0..self.name_lens[index]]);
+            },
+            .coordinates => |value| if (value.coordinates.size == @sizeOf(u32)) {
+                self.coordinates[index] = @as(*align(1) const u32, @ptrCast(value.coordinates.data)).*;
+            },
+            .state => |value| self.active[index] = value.state.active,
+            .capabilities => |value| self.activate_capable[index] = value.capabilities.activate,
+            .removed => self.removed[index] = true,
+            else => {},
+        }
+    }
+    fn pause(self: *@This(), value: Stage) !void {
+        self.stage.store(@intFromEnum(value), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+    fn closeWake(self: *@This(), replace: bool) void {
+        const value = self.wake_fd.swap(if (replace) -2 else -1, .acq_rel);
+        if (value >= 0) {
+            if (replace) _ = std.os.linux.shutdown(value, std.os.linux.SHUT.RDWR);
+            _ = std.os.linux.close(value);
+        }
+    }
+    fn shutdown(self: *@This()) void {
+        self.closeWake(true);
+        signalWayringCommand(self.command_fd) catch {};
+    }
+};
+
 const MatureDataDeviceClient = struct {
     const client_wl = wayland.client.wl;
     const client_ext = wayland.client.ext;
@@ -23051,6 +23370,23 @@ fn waitForMatureSessionLockStage(server: *Self, client: *MatureSessionLockClient
         server.display.flushClients();
     }
     return error.MatureSessionLockClientTimedOut;
+}
+
+fn waitForMatureWorkspaceStage(server: *Self, client: *MatureWorkspaceClient, expected: MatureWorkspaceClient.Stage) !void {
+    for (0..20_000) |_| {
+        const stage: MatureWorkspaceClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == .failed) return client.failure orelse error.MatureWorkspaceClientFailed;
+        if (stage == expected) return;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+    }
+    const timed_out_stage: MatureWorkspaceClient.Stage = @enumFromInt(client.stage.load(.acquire));
+    return switch (timed_out_stage) {
+        .starting => error.MatureWorkspaceConnectTimedOut,
+        .connected => error.MatureWorkspaceRegistryTimedOut,
+        .registry => error.MatureWorkspaceRoundtripTimedOut,
+        else => error.MatureWorkspaceClientTimedOut,
+    };
 }
 
 fn waitForWayringDndStage(

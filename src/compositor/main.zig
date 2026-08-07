@@ -952,6 +952,7 @@ test {
     _ = @import("FrameStatistics.zig");
     _ = @import("HeadlessSurfaceForest.zig");
     _ = @import("SurfaceRegistry.zig");
+    _ = @import("Workspace.zig");
     _ = @import("input_configuration.zig");
     _ = @import("output_configuration.zig");
     _ = @import("region.zig");
