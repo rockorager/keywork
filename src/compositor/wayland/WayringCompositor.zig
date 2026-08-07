@@ -164,7 +164,14 @@ pub const CursorListener = struct {
     removed: *const fn (*anyopaque, SurfaceId) void,
 };
 
+pub const DragIconListener = struct {
+    context: *anyopaque,
+    committed: *const fn (*anyopaque, SurfaceId, i32, i32) void,
+    removed: *const fn (*anyopaque, SurfaceId) void,
+};
+
 pub const CursorRoleResult = enum { assigned, already_cursor, role_conflict, not_live, wrong_client };
+pub const DragIconRoleResult = enum { assigned, already_drag_icon, role_conflict, not_live, wrong_client };
 
 const UpdateToken = struct {
     surface: SurfaceId,
@@ -184,7 +191,7 @@ const FrameCallback = struct {
 };
 
 const Surface = struct {
-    const Role = enum { none, subsurface, cursor, xdg_toplevel, xdg_popup };
+    const Role = enum { none, subsurface, cursor, drag_icon, xdg_toplevel, xdg_popup };
     resource: core.wl_surface.Resource,
     id: SurfaceId,
     destroying: bool = false,
@@ -452,6 +459,7 @@ protocol_server: *server.Server,
 surface_registry: *SurfaceRegistry,
 presentation_listener: ?PresentationListener,
 cursor_listener: ?CursorListener = null,
+drag_icon_listener: ?DragIconListener = null,
 global: *const server.Server.Global,
 subcompositor_global: *const server.Server.Global,
 shm: Shm,
@@ -716,8 +724,33 @@ pub fn assignCursorRole(self: *WayringCompositor, client: *const server.Client, 
             break :blk .assigned;
         },
         .cursor => .already_cursor,
-        .subsurface, .xdg_toplevel, .xdg_popup => .role_conflict,
+        .subsurface, .drag_icon, .xdg_toplevel, .xdg_popup => .role_conflict,
     };
+}
+
+pub fn assignDragIconRole(self: *WayringCompositor, client: *const server.Client, id: SurfaceId) DragIconRoleResult {
+    const surface = self.surfaceForId(id) orelse return .not_live;
+    if (surface.destroying or surface.resource.runtime.state() != .live) return .not_live;
+    if ((self.clientForResource(&surface.resource.runtime) orelse return .not_live) != client) return .wrong_client;
+    if (surface.xdg_association != null) return .role_conflict;
+    return switch (surface.role) {
+        .none => blk: {
+            surface.role = .drag_icon;
+            self.notifyPresentationClass(id, .drag_icon);
+            break :blk .assigned;
+        },
+        .drag_icon => .already_drag_icon,
+        .subsurface, .cursor, .xdg_toplevel, .xdg_popup => .role_conflict,
+    };
+}
+
+pub fn setDragIconListener(self: *WayringCompositor, listener: ?DragIconListener) void {
+    self.drag_icon_listener = listener;
+}
+
+pub fn isDragIconRole(self: *const WayringCompositor, id: SurfaceId) bool {
+    const surface = self.surfaceForId(id) orelse return false;
+    return surface.role == .drag_icon;
 }
 
 pub fn surfaceRoleIsCursor(self: *const WayringCompositor, id: SurfaceId) bool {
@@ -741,7 +774,7 @@ pub fn reserveXdgRoot(
     if (surface.relationship != null or surface.active_subsurface != null) return error.NotRoot;
     switch (surface.role) {
         .none, .xdg_toplevel, .xdg_popup => {},
-        .subsurface, .cursor => return error.RoleConflict,
+        .subsurface, .cursor, .drag_icon => return error.RoleConflict,
     }
     if (surface.xdg_association != null) return error.AlreadyReserved;
     const generation = self.next_xdg_generation orelse return error.GenerationExhausted;
@@ -832,7 +865,7 @@ pub fn permanentXdgRole(self: *const WayringCompositor, id: SurfaceId) ?XdgRole 
     return switch (surface.role) {
         .xdg_toplevel => .toplevel,
         .xdg_popup => .popup,
-        .none, .subsurface, .cursor => null,
+        .none, .subsurface, .cursor, .drag_icon => null,
     };
 }
 
@@ -2254,8 +2287,13 @@ fn publishPreparedCommit(
     surface.current_transform = prepared.transform;
     surface.current_offset_x = prepared.offset_x;
     surface.current_offset_y = prepared.offset_y;
-    if (surface.role == .cursor) if (self.cursor_listener) |listener|
-        listener.committed(listener.context, surface.id, prepared.offset_x, prepared.offset_y);
+    switch (surface.role) {
+        .cursor => if (self.cursor_listener) |listener|
+            listener.committed(listener.context, surface.id, prepared.offset_x, prepared.offset_y),
+        .drag_icon => if (self.drag_icon_listener) |listener|
+            listener.committed(listener.context, surface.id, prepared.offset_x, prepared.offset_y),
+        else => {},
+    }
 
     // Offset is applied protocol metadata for this content update. Phase 2's
     // roleless root policy intentionally keeps rendering at the global origin;
@@ -2415,8 +2453,11 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
         surface.xdg_association = null;
         if (handler) |live| live.surface_destroyed(live.context, surface.id);
     }
-    if (surface.role == .cursor) if (self.cursor_listener) |listener|
-        listener.removed(listener.context, surface.id);
+    switch (surface.role) {
+        .cursor => if (self.cursor_listener) |listener| listener.removed(listener.context, surface.id),
+        .drag_icon => if (self.drag_icon_listener) |listener| listener.removed(listener.context, surface.id),
+        else => {},
+    }
     self.discardSurfaceQueue(surface);
     if (surface.relationship) |relationship| if (self.surfaceForId(relationship.identity.parent)) |parent| {
         for (parent.children.items, 0..) |entry, index| if (std.meta.eql(entry.identity, relationship.identity)) {
