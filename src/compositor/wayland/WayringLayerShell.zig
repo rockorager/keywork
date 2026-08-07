@@ -149,12 +149,11 @@ fn create(self: *WayringLayerShell, manager: *Manager, object_id: u32, surface_o
     const client_id = self.clients.id(manager.client) orelse return error.InvalidSurface;
     const reservation = self.compositor.reserveLayerRoot(manager.client, surface) catch |err| return switch (err) {
         error.RoleConflict, error.AlreadyReserved, error.NotRoot => error.Role,
+        error.AlreadyConstructed => error.AlreadyConstructed,
         error.NotLive, error.WrongClient, error.StaleReservation, error.HandlerAlreadyAttached, error.HandlerMismatch => error.InvalidSurface,
         error.GenerationExhausted => error.OutOfMemory,
     };
     errdefer self.compositor.abortLayerRoot(reservation) catch {};
-    const content = self.compositor.xdgContentState(surface) orelse return error.InvalidSurface;
-    if (content.has_pending_attachment or content.has_committed_buffer) return error.AlreadyConstructed;
 
     try self.children.ensureUnusedCapacity(self.allocator, 1);
     const child = try self.allocator.create(Child);

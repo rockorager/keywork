@@ -149,6 +149,7 @@ pub const LayerError = error{
     WrongClient,
     NotRoot,
     RoleConflict,
+    AlreadyConstructed,
     AlreadyReserved,
     GenerationExhausted,
     StaleReservation,
@@ -957,9 +958,14 @@ pub fn reserveLayerRoot(self: *WayringCompositor, client: *const server.Client, 
     if ((self.clientForResource(&surface.resource.runtime) orelse return error.NotLive) != client)
         return error.WrongClient;
     if (surface.relationship != null or surface.active_subsurface != null) return error.NotRoot;
-    if ((surface.role != .none and surface.role != .layer_surface) or
-        surface.xdg_association != null or surface.layer_association != null)
+    if ((surface.role != .none and surface.role != .layer_surface) or surface.xdg_association != null)
         return error.RoleConflict;
+    // Mature layer-shell permits the permanent layer role through its initial
+    // role check, then gives existing content precedence over the live role
+    // handler conflict. Keep that ordering before mutating the association.
+    if (surface.has_pending_attachment or surface.current_logical_size != null)
+        return error.AlreadyConstructed;
+    if (surface.layer_association != null) return error.RoleConflict;
     const generation = self.next_layer_generation orelse return error.GenerationExhausted;
     self.next_layer_generation = if (generation == std.math.maxInt(u64)) null else generation + 1;
     const reservation: LayerReservation = .{
@@ -8133,6 +8139,30 @@ test "layer root reservation is permanent after release and abort is reversible"
     try std.testing.expect(second.generation > first.generation);
     var probe: TestXdgCommitHandler = .{};
     try compositor.attachLayerCommitHandler(second, probe.handler());
+
+    // A content-free duplicate reaches the live association conflict. Pending
+    // or committed content instead wins exactly as in the mature frontend,
+    // without replacing the existing reservation or commit handler.
+    try std.testing.expectError(error.RoleConflict, compositor.reserveLayerRoot(client, id));
+    const surface = compositor.surfaceForId(id).?;
+    surface.has_pending_attachment = true;
+    try std.testing.expectError(error.AlreadyConstructed, compositor.reserveLayerRoot(client, id));
+    try std.testing.expect(compositor.hasLayerReservation(second));
+    surface.has_pending_attachment = false;
+    surface.current_logical_size = .{ .width = 1, .height = 1 };
+    try std.testing.expectError(error.AlreadyConstructed, compositor.reserveLayerRoot(client, id));
+    try std.testing.expect(compositor.hasLayerReservation(second));
+    surface.current_logical_size = null;
+
+    // A different permanent role retains role precedence even when content is
+    // pending, matching mature assigned-role validation.
+    try createSurfaceResource(client, 3, 5);
+    const cursor = compositor.surfaceId(client, 5).?;
+    try std.testing.expectEqual(CursorRoleResult.assigned, compositor.assignCursorRole(client, cursor));
+    compositor.surfaceForId(cursor).?.has_pending_attachment = true;
+    try std.testing.expectError(error.RoleConflict, compositor.reserveLayerRoot(client, cursor));
+    compositor.surfaceForId(cursor).?.has_pending_attachment = false;
+
     try commitSurfaceResource(client, 4);
     try std.testing.expectEqual(@as(usize, 1), probe.preparations);
     try std.testing.expectEqual(@as(usize, 1), probe.validations);
@@ -8146,8 +8176,8 @@ test "layer root reservation is permanent after release and abort is reversible"
     try compositor.abortLayerRoot(replacement);
     try std.testing.expectEqual(Surface.Role.layer_surface, compositor.surfaceForId(id).?.role);
 
-    try createSurfaceResource(client, 3, 5);
-    const destroyed = try compositor.reserveLayerRoot(client, compositor.surfaceId(client, 5).?);
+    try createSurfaceResource(client, 3, 6);
+    const destroyed = try compositor.reserveLayerRoot(client, compositor.surfaceId(client, 6).?);
     try compositor.attachLayerCommitHandler(destroyed, probe.handler());
     compositor.destroyClientResources(client);
     try std.testing.expectEqual(@as(usize, 1), probe.surface_destroys);
