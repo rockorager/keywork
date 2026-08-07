@@ -16,6 +16,12 @@ const NeutralXdgShell = @import("XdgShell.zig");
 const GtkShell = @import("wayland/gtk_shell.zig");
 const XdgForeign = @import("wayland/xdg_foreign.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
+const NeutralLayerShell = @import("LayerShell.zig");
+
+fn layerOutputValid(context: *anyopaque, id: @import("output_layout.zig").Id) bool {
+    const outputs: *OutputLayout = @ptrCast(@alignCast(context));
+    return outputs.get(id) != null;
+}
 const SinglePixelBuffer = @import("wayland/single_pixel_buffer.zig");
 const ContentType = @import("wayland/content_type.zig");
 const ColorManagement = @import("wayland/color_management.zig");
@@ -353,6 +359,7 @@ xdg_shell_core: NeutralXdgShell,
 xdg_shell: XdgShell,
 gtk_shell: GtkShell,
 xdg_foreign: XdgForeign,
+layer_shell_core: NeutralLayerShell,
 layer_shell: LayerShell,
 layer_shell_initialized: bool,
 seat: Seat,
@@ -1185,6 +1192,7 @@ pub fn createWithVirtualOutput(
         .xdg_shell = undefined,
         .gtk_shell = undefined,
         .xdg_foreign = undefined,
+        .layer_shell_core = undefined,
         .layer_shell = undefined,
         .layer_shell_initialized = false,
         .seat = undefined,
@@ -1257,10 +1265,12 @@ pub fn createWithVirtualOutput(
         .xwayland_display_listener = null,
         .wayring_default_output_listener = null,
     };
+    errdefer self.layer_shell_core.deinit();
     errdefer self.client_registry.deinit();
     self.mature_clients.init(allocator, display, &self.client_registry);
     errdefer self.mature_clients.deinit();
     errdefer self.surface_registry.deinit();
+    self.layer_shell_core = NeutralLayerShell.init(allocator, &self.client_registry, &self.surface_registry, &self.outputs, layerOutputValid);
     errdefer self.headless_surface_forest.deinit();
     errdefer self.routed_touches.deinit(allocator);
     errdefer self.routed_gestures.deinit(allocator);
@@ -1628,6 +1638,8 @@ pub fn createWithVirtualOutput(
         &self.xdg_shell,
         &self.xdg_shell_core,
         self.compositor.surfaceStore(),
+        &self.layer_shell_core,
+        &self.mature_clients,
     );
     self.layer_shell_initialized = true;
     errdefer {
@@ -2145,6 +2157,7 @@ pub fn destroy(self: *Self) void {
     self.idle_notify_initialized = false;
     self.layer_shell.deinit();
     self.layer_shell_initialized = false;
+    self.layer_shell_core.deinit();
     self.xdg_foreign.deinit();
     self.xdg_shell.deinit();
     self.xdg_shell_core.deinit();
@@ -13779,6 +13792,101 @@ test "headless surfaces preserve mapping damage and ordered replacement" {
     try std.testing.expectEqual(@as(usize, 0), server.headless_surface_forest.len());
 }
 
+test "production mature layer shell v5 maps, reserves, unmaps, and remaps" {
+    const linux = std.os.linux;
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(std.testing.allocator, "/tmp/keywork-mature-layer-{d}-{x}", .{ linux.getpid(), @intFromPtr(&marker) }, 0);
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS) return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+    const previous_runtime = if (libc.getenv("XDG_RUNTIME_DIR")) |value| try std.testing.allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer {
+        if (previous_runtime) |value| {
+            _ = libc.setenv("XDG_RUNTIME_DIR", value, 1);
+            std.testing.allocator.free(value);
+        } else _ = libc.unsetenv("XDG_RUNTIME_DIR");
+    }
+    if (libc.setenv("XDG_RUNTIME_DIR", runtime_directory, 1) != 0) return error.RuntimeEnvironmentFailed;
+
+    const server = try Self.createWithVirtualOutput(std.testing.allocator, std.testing.io, .cpu, .headless, null, .{ .size = .{ .width = 640, .height = 480 }, .refresh_millihertz = 1 });
+    defer server.destroy();
+    const socket_name = try server.listen();
+    const surface_baseline = server.compositor.surfaceStore().len();
+    const registry_baseline = server.surface_registry.len();
+    const raw_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_command) != .SUCCESS) return error.EventFdFailed;
+    const command_fd: std.posix.fd_t = @intCast(raw_command);
+    defer _ = linux.close(command_fd);
+    const fd_baseline = try countMatureDataDeviceFds();
+    var client: MatureLayerClient = .{ .runtime_directory = runtime_directory, .display_name = socket_name, .command_fd = command_fd };
+    const thread = try std.Thread.spawn(.{}, MatureLayerClient.run, .{&client});
+    var joined = false;
+    defer if (!joined) {
+        client.shutdown();
+        thread.join();
+    };
+
+    try waitForMatureLayerStage(server, &client, .mapped);
+    try std.testing.expectEqual(@as(usize, 1), server.client_registry.len());
+    try std.testing.expect(client.configure_serial != 0);
+    try std.testing.expectEqual(client.configure_serial, client.acked_serial);
+    try std.testing.expect(client.explicit_acked_serial != 0);
+    var core_snapshot: ?NeutralLayerShell.Snapshot = null;
+    var explicit_snapshot: ?NeutralLayerShell.Snapshot = null;
+    var core_id: ?NeutralLayerShell.LayerSurfaceId = null;
+    var scene_surface: ?*Scene.LayerSurface = null;
+    var layers = server.scene.layerSurfaceIterator(.top);
+    while (layers.next()) |entry| {
+        const id = server.layer_shell_core.surfaceFor(entry.layer_surface.surface_id) orelse continue;
+        const candidate = server.layer_shell_core.snapshot(id) orelse continue;
+        if (std.mem.eql(u8, candidate.namespace, "org.keywork.mature-layer-explicit")) {
+            explicit_snapshot = candidate;
+        } else if (std.mem.eql(u8, candidate.namespace, "org.keywork.mature-layer")) {
+            scene_surface = entry.layer_surface;
+            core_id = id;
+            core_snapshot = candidate;
+        }
+    }
+    const explicit = explicit_snapshot orelse return error.ExplicitLayerSnapshotMissing;
+    try std.testing.expectEqual(server.primaryRenderOutput().protocol_id, explicit.output);
+    try std.testing.expect(explicit.configured and !explicit.mapped);
+    const snapshot = core_snapshot orelse return error.LayerSnapshotMissing;
+    try std.testing.expectEqual(server.primaryRenderOutput().protocol_id, snapshot.output);
+    try std.testing.expect(snapshot.mapped and snapshot.configured and !snapshot.awaiting_initial_commit);
+    try std.testing.expectEqualStrings("org.keywork.mature-layer", snapshot.namespace);
+    try std.testing.expectEqual(NeutralLayerShell.Layer.top, snapshot.current.layer);
+    try std.testing.expectEqual(@as(i32, 20), snapshot.current.exclusive_zone);
+    try std.testing.expectEqual(NeutralLayerShell.KeyboardInteractivity.exclusive, snapshot.current.keyboard_interactivity);
+    const scene_state = scene_surface orelse return error.LayerSceneMissing;
+    try std.testing.expect(scene_state.mapped);
+    try std.testing.expectEqual(Scene.Layer.top, scene_state.layer);
+    try std.testing.expectEqual(Scene.Position{ .x = 270, .y = 0 }, scene_state.position);
+    try std.testing.expectEqual(LayerShell.Rect{ .x = 0, .y = 20, .width = 640, .height = 460 }, server.layer_shell.usableArea());
+    try std.testing.expectEqual(LayerShell.FocusClass.exclusive, server.layer_shell.focusClass());
+    try std.testing.expectEqual(snapshot.surface, server.layer_shell.keyboardFocus(null).?);
+
+    try signalWayringCommand(command_fd);
+    try waitForMatureLayerStage(server, &client, .unmapped);
+    try std.testing.expect(!server.layer_shell_core.snapshot(core_id.?).?.mapped);
+    try std.testing.expect(!scene_state.mapped);
+    try std.testing.expectEqual(LayerShell.Rect{ .x = 0, .y = 0, .width = 640, .height = 480 }, server.layer_shell.usableArea());
+    try signalWayringCommand(command_fd);
+    try waitForMatureLayerStage(server, &client, .remapped);
+    try std.testing.expect(scene_state.mapped);
+    try std.testing.expectEqual(LayerShell.Rect{ .x = 0, .y = 20, .width = 640, .height = 460 }, server.layer_shell.usableArea());
+
+    try signalWayringCommand(command_fd);
+    try waitForMatureLayerStage(server, &client, .disconnected);
+    thread.join();
+    joined = true;
+    for (0..2_000) |_| {
+        if (server.client_registry.len() == 0 and server.compositor.surfaceStore().len() == surface_baseline) break;
+        try server.eventLoop().dispatch(1);
+    } else return error.MatureLayerCleanupTimedOut;
+    try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
+    try std.testing.expectEqual(fd_baseline, try countMatureDataDeviceFds());
+}
+
 test "production mature data device v3 serves two canonical socket clients" {
     const linux = std.os.linux;
     var marker: u8 = 0;
@@ -18899,6 +19007,167 @@ const WayringSeatClient = struct {
     }
 };
 
+const MatureLayerClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_zwlr = wayland.client.zwlr;
+    const Stage = enum(u8) { starting, mapped, unmapped, remapped, disconnected, failed };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    shm: ?*client_wl.Shm = null,
+    output: ?*client_wl.Output = null,
+    shell: ?*client_zwlr.LayerShellV1 = null,
+    configure_serial: u32 = 0,
+    acked_serial: u32 = 0,
+    explicit_acked_serial: u32 = 0,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}/{s}", .{ self.runtime_directory, self.display_name }, 0);
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer {
+            if (fd_owned) _ = std.os.linux.close(fd);
+        }
+        const raw_wake = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake) != .SUCCESS) return error.WakeFdFailed;
+        const wake: i32 = @intCast(raw_wake);
+        if (self.wake_fd.cmpxchgStrong(-1, wake, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        defer compositor.destroy();
+        const shm = self.shm orelse return error.ShmMissing;
+        defer shm.release();
+        const output = self.output orelse return error.OutputMissing;
+        defer output.release();
+        const shell = self.shell orelse return error.LayerShellMissing;
+        defer shell.destroy();
+        if (shell.getVersion() != 5) return error.LayerShellVersionMismatch;
+        const explicit_surface = try compositor.createSurface();
+        defer explicit_surface.destroy();
+        const explicit_layer = try shell.getLayerSurface(explicit_surface, output, .top, "org.keywork.mature-layer-explicit");
+        defer explicit_layer.destroy();
+        explicit_layer.setListener(*@This(), layerEvent, self);
+        explicit_layer.setSize(1, 1);
+        explicit_surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.configure_serial == 0) return error.ExplicitConfigureMissing;
+        self.explicit_acked_serial = self.configure_serial;
+        explicit_layer.ackConfigure(self.configure_serial);
+        self.configure_serial = 0;
+        const surface = try compositor.createSurface();
+        defer surface.destroy();
+        const layer = try shell.getLayerSurface(surface, null, .top, "org.keywork.mature-layer");
+        defer layer.destroy();
+        layer.setListener(*@This(), layerEvent, self);
+        layer.setSize(100, 20);
+        layer.setAnchor(.{ .top = true });
+        layer.setExclusiveZone(20);
+        layer.setKeyboardInteractivity(.exclusive);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.configure_serial == 0) return error.ConfigureMissing;
+        self.acked_serial = self.configure_serial;
+        layer.ackConfigure(self.configure_serial);
+        const buffer = try createBuffer(shm);
+        defer buffer.buffer.destroy();
+        defer buffer.pool.destroy();
+        defer _ = std.os.linux.close(buffer.fd);
+        surface.attach(buffer.buffer, 0, 0);
+        surface.damageBuffer(0, 0, 100, 20);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        try self.pause(.mapped);
+
+        surface.attach(null, 0, 0);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        try self.pause(.unmapped);
+        self.configure_serial = 0;
+        layer.setSize(100, 20);
+        layer.setAnchor(.{ .top = true });
+        layer.setExclusiveZone(20);
+        layer.setKeyboardInteractivity(.exclusive);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.configure_serial == 0) return error.RemapConfigureMissing;
+        self.acked_serial = self.configure_serial;
+        layer.ackConfigure(self.configure_serial);
+        surface.attach(buffer.buffer, 0, 0);
+        surface.damageBuffer(0, 0, 100, 20);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        try self.pause(.remapped);
+    }
+
+    const TestBuffer = struct { fd: std.posix.fd_t, pool: *client_wl.ShmPool, buffer: *client_wl.Buffer };
+    fn createBuffer(shm: *client_wl.Shm) !TestBuffer {
+        const size = 100 * 20 * @sizeOf(u32);
+        const fd = try std.posix.memfd_create("keywork-mature-layer", std.os.linux.MFD.CLOEXEC);
+        errdefer _ = std.os.linux.close(fd);
+        if (std.os.linux.errno(std.os.linux.ftruncate(fd, size)) != .SUCCESS) return error.ShmResizeFailed;
+        const pool = try shm.createPool(fd, size);
+        errdefer pool.destroy();
+        return .{ .fd = fd, .pool = pool, .buffer = try pool.createBuffer(0, 100, 20, 400, .argb8888) };
+    }
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, @min(global.version, 4)) catch null else if (std.mem.eql(u8, interface, "zwlr_layer_shell_v1")) self.shell = registry.bind(global.name, client_zwlr.LayerShellV1, 5) catch null;
+            },
+            .global_remove => {},
+        }
+    }
+    fn layerEvent(_: *client_zwlr.LayerSurfaceV1, event: client_zwlr.LayerSurfaceV1.Event, self: *@This()) void {
+        switch (event) {
+            .configure => |configure| self.configure_serial = configure.serial,
+            .closed => {},
+        }
+    }
+    fn pause(self: *@This(), value: Stage) !void {
+        self.stage.store(@intFromEnum(value), .release);
+        var count: u64 = 0;
+        if (std.os.linux.read(self.command_fd, @ptrCast(&count), @sizeOf(u64)) != @sizeOf(u64)) return error.CommandReadFailed;
+    }
+    fn closeWake(self: *@This(), replace: bool) void {
+        const value = self.wake_fd.swap(if (replace) -2 else -1, .acq_rel);
+        if (value >= 0) {
+            if (replace) _ = std.os.linux.shutdown(value, std.os.linux.SHUT.RDWR);
+            _ = std.os.linux.close(value);
+        }
+    }
+    fn shutdown(self: *@This()) void {
+        self.closeWake(true);
+        signalWayringCommand(self.command_fd) catch {};
+    }
+};
+
 const MatureDataDeviceClient = struct {
     const client_wl = wayland.client.wl;
     const client_ext = wayland.client.ext;
@@ -21893,6 +22162,17 @@ fn waitForMatureDataDeviceStage(
         server.display.flushClients();
     }
     return error.MatureDataDeviceClientTimedOut;
+}
+
+fn waitForMatureLayerStage(server: *Self, client: *MatureLayerClient, expected: MatureLayerClient.Stage) !void {
+    for (0..2_000) |_| {
+        const stage: MatureLayerClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure.?;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+    }
+    return error.MatureLayerClientTimedOut;
 }
 
 fn waitForWayringDndStage(

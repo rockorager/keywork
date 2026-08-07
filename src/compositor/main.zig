@@ -1041,6 +1041,7 @@ test {
     _ = @import("wayland/gtk_shell.zig");
     _ = @import("xdg_popup_placement.zig");
     _ = @import("XdgShell.zig");
+    _ = @import("LayerShell.zig");
     _ = @import("wayland/xdg_shell.zig");
     _ = @import("wayland/layer_shell.zig");
     _ = @import("control.zig");
