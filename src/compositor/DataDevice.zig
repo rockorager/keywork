@@ -53,6 +53,7 @@ pub const ToplevelDragHandler = struct {
 
 pub const DeviceEndpoint = struct {
     context: *anyopaque,
+    selection_prepare: ?*const fn (*anyopaque, ?OfferId) error{OutOfMemory}!void = null,
     selection: *const fn (*anyopaque, ?OfferId) error{OutOfMemory}!void,
     drag_enter_prepare: *const fn (*anyopaque, SurfaceRegistry.Id, f64, f64, ?OfferId) error{OutOfMemory}!DragPreparation,
     drag_enter_abort: ?*const fn (*anyopaque) void = null,
@@ -337,9 +338,15 @@ pub fn createDevice(self: *DataDevice, owner: ClientRegistry.Id, endpoint: Devic
         }) catch return error.OutOfMemory
     else
         null else null else null;
-    if (self.focused_client != null and std.meta.eql(self.focused_client.?, owner))
-        try endpoint.selection(endpoint.context, selection_offer);
-    if (self.drag) |drag| if (drag.target) |target| if (std.meta.eql(target.client, owner)) {
+    const receives_selection = self.focused_client != null and std.meta.eql(self.focused_client.?, owner);
+    if (receives_selection) if (endpoint.selection_prepare) |prepare| prepare(endpoint.context, selection_offer) catch {
+        self.abortTransaction();
+        return error.OutOfMemory;
+    };
+    const receives_drag = if (self.drag) |drag| if (drag.target) |target| std.meta.eql(target.client, owner) else false else false;
+    if (receives_drag) {
+        const drag = self.drag.?;
+        const target = drag.target.?;
         const prepared = endpoint.drag_enter_prepare(endpoint.context, target.surface, target.x, target.y, drag_offer) catch {
             self.abortTransaction();
             return error.OutOfMemory;
@@ -349,10 +356,25 @@ pub fn createDevice(self: *DataDevice, owner: ClientRegistry.Id, endpoint: Devic
             self.abortTransaction();
             return error.OutOfMemory;
         };
+        if (receives_selection) endpoint.selection(endpoint.context, selection_offer) catch {
+            if (endpoint.drag_enter_abort) |abort| abort(endpoint.context);
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
         if (prepared.legacy_copy) self.commitLegacyOffer(drag_offer.?);
         endpoint.drag_enter(endpoint.context, target.surface, target.x, target.y, drag_offer);
         self.commitTransaction();
-    };
+    } else if (receives_selection) {
+        self.finalizeTransaction() catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+        endpoint.selection(endpoint.context, selection_offer) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+        self.commitTransaction();
+    }
     return id;
 }
 
@@ -422,9 +444,10 @@ pub fn setFocus(self: *DataDevice, client: ?ClientRegistry.Id) Error!void {
     errdefer self.removePublication(publication);
     if (client != null and self.selection != null)
         try self.stageSelectionOffers(client.?, self.selection.?, publication);
-    try self.publishSelectionBatch(client, publication);
+    try self.prepareSelectionBatch(client, publication);
     self.invalidateSelectionOffers(publication);
     self.focused_client = client;
+    self.commitTransaction();
 }
 
 pub fn setSelection(self: *DataDevice, device_id: DeviceId, source_id: ?SourceId, serial: ClientRegistry.Serial) Error!void {
@@ -468,13 +491,14 @@ fn replaceSelection(self: *DataDevice, source: ?SourceId, order: SeatAuthority.O
     errdefer self.removePublication(publication);
     if (self.focused_client != null and source != null)
         try self.stageSelectionOffers(self.focused_client.?, source.?, publication);
-    try self.publishSelectionBatch(self.focused_client, publication);
+    try self.prepareSelectionBatch(self.focused_client, publication);
     const old = self.selection;
     self.selection = source;
     self.selection_order = order;
     self.selection_generation +%= 1;
     self.invalidateSelectionOffers(publication);
     self.listener.selection_changed(self.listener.context);
+    self.commitTransaction();
     if (cancel_old and old != null) if (self.sources.get(old.?)) |state| {
         const callback = state.endpoint.selection_cancelled orelse state.endpoint.cancelled;
         callback(state.endpoint.context);
@@ -493,7 +517,7 @@ fn stageSelectionOffers(self: *DataDevice, client: ClientRegistry.Id, source: So
     };
 }
 
-fn publishSelectionBatch(self: *DataDevice, client: ?ClientRegistry.Id, publication: u64) error{OutOfMemory}!void {
+fn prepareSelectionBatch(self: *DataDevice, client: ?ClientRegistry.Id, publication: u64) error{OutOfMemory}!void {
     var devices = self.devices.iterator();
     while (devices.next()) |entry| if (client != null and std.meta.eql(entry.value.owner, client.?)) {
         var offer: ?OfferId = null;
@@ -505,7 +529,30 @@ fn publishSelectionBatch(self: *DataDevice, client: ?ClientRegistry.Id, publicat
             offer = candidate.id;
             break;
         };
-        try entry.value.endpoint.selection(entry.value.endpoint.context, offer);
+        if (entry.value.endpoint.selection_prepare) |prepare| prepare(entry.value.endpoint.context, offer) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+    };
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return error.OutOfMemory;
+    };
+    devices = self.devices.iterator();
+    while (devices.next()) |entry| if (client != null and std.meta.eql(entry.value.owner, client.?)) {
+        var offer: ?OfferId = null;
+        var offers = self.offers.iterator();
+        while (offers.next()) |candidate| if (candidate.value.kind == .selection and
+            candidate.value.publication == publication and candidate.value.device != null and
+            std.meta.eql(candidate.value.device.?, entry.id))
+        {
+            offer = candidate.id;
+            break;
+        };
+        entry.value.endpoint.selection(entry.value.endpoint.context, offer) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
     };
 }
 
