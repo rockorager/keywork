@@ -141,9 +141,14 @@ const ExpectedProtocolError = struct {
 /// frontend. The observer owns no lifecycle state.
 pub const DataDeviceObserver = struct {
     context: *anyopaque,
+    transaction_finalize: *const fn (*anyopaque) error{OutOfMemory}!void,
+    transaction_commit: *const fn (*anyopaque) void,
+    transaction_abort: *const fn (*anyopaque) void,
     offer_rolled_back: *const fn (*anyopaque, NeutralDataDevice.OfferId) void,
     offer_mime_offered: *const fn (*anyopaque, NeutralDataDevice.OfferId, []const u8) void,
+    offer_source_actions_preflight: *const fn (*anyopaque, NeutralDataDevice.OfferId, NeutralDataDevice.Actions) error{OutOfMemory}!void,
     offer_source_actions_changed: *const fn (*anyopaque, NeutralDataDevice.OfferId, NeutralDataDevice.Actions) void,
+    offer_action_preflight: *const fn (*anyopaque, NeutralDataDevice.OfferId, NeutralDataDevice.Actions) error{OutOfMemory}!void,
     offer_action_changed: *const fn (*anyopaque, NeutralDataDevice.OfferId, NeutralDataDevice.Actions) void,
 };
 var expected_protocol_error: if (builtin.is_test) ?ExpectedProtocolError else void =
@@ -1594,12 +1599,17 @@ pub fn createWithVirtualOutput(
         self.seat.dataDeviceAuthority(),
         .{
             .context = self,
+            .transaction_finalize = dataDeviceTransactionFinalize,
+            .transaction_commit = dataDeviceTransactionCommit,
+            .transaction_abort = dataDeviceTransactionAbort,
             .selection_changed = dataDeviceSelectionChanged,
             .drag_changed = dataDeviceDragChanged,
             .mime_offered = dataDeviceMimeOffered,
             .offer_rolled_back = dataDeviceOfferRolledBack,
             .offer_mime_offered = dataDeviceOfferMimeOffered,
+            .offer_source_actions_preflight = dataDeviceOfferSourceActionsPreflight,
             .offer_source_actions_changed = dataDeviceOfferSourceActionsChanged,
+            .offer_action_preflight = dataDeviceOfferActionPreflight,
             .offer_action_changed = dataDeviceOfferActionChanged,
             .external_drag_start = dataDeviceExternalDragStart,
             .retained_source_destroyed = dragExternalSourceDestroyed,
@@ -7648,6 +7658,31 @@ fn dataDeviceOfferRolledBack(context: *anyopaque, offer: NeutralDataDevice.Offer
     self.mature_data_device.neutralOfferRolledBack(offer);
     if (self.data_device_observer) |observer|
         observer.offer_rolled_back(observer.context, offer);
+}
+
+fn dataDeviceTransactionFinalize(context: *anyopaque) error{OutOfMemory}!void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.data_device_observer) |observer| try observer.transaction_finalize(observer.context);
+}
+
+fn dataDeviceTransactionCommit(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.data_device_observer) |observer| observer.transaction_commit(observer.context);
+}
+
+fn dataDeviceTransactionAbort(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.data_device_observer) |observer| observer.transaction_abort(observer.context);
+}
+
+fn dataDeviceOfferSourceActionsPreflight(context: *anyopaque, offer: NeutralDataDevice.OfferId, actions: NeutralDataDevice.Actions) error{OutOfMemory}!void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.data_device_observer) |observer| try observer.offer_source_actions_preflight(observer.context, offer, actions);
+}
+
+fn dataDeviceOfferActionPreflight(context: *anyopaque, offer: NeutralDataDevice.OfferId, actions: NeutralDataDevice.Actions) error{OutOfMemory}!void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.data_device_observer) |observer| try observer.offer_action_preflight(observer.context, offer, actions);
 }
 
 fn dataDeviceOfferMimeOffered(context: *anyopaque, offer: NeutralDataDevice.OfferId, mime_type: []const u8) void {
@@ -21312,9 +21347,14 @@ test "production Wayring XDG publication accepts a real registry client and surv
     defer data_device.deinit();
     server.setDataDeviceObserver(.{
         .context = &data_device,
+        .transaction_finalize = WayringDataDevice.transactionFinalize,
+        .transaction_commit = WayringDataDevice.transactionCommit,
+        .transaction_abort = WayringDataDevice.transactionAbort,
         .offer_rolled_back = WayringDataDevice.offerRolledBack,
         .offer_mime_offered = WayringDataDevice.offerMimeOffered,
+        .offer_source_actions_preflight = WayringDataDevice.offerSourceActionsPreflight,
         .offer_source_actions_changed = WayringDataDevice.offerSourceActionsChanged,
+        .offer_action_preflight = WayringDataDevice.offerActionPreflight,
         .offer_action_changed = WayringDataDevice.offerActionChanged,
     });
     defer server.setDataDeviceObserver(null);
@@ -21810,9 +21850,14 @@ test "production generated data device completes the exact profile and supports 
     }
     server.setDataDeviceObserver(.{
         .context = &data_device,
+        .transaction_finalize = WayringDataDevice.transactionFinalize,
+        .transaction_commit = WayringDataDevice.transactionCommit,
+        .transaction_abort = WayringDataDevice.transactionAbort,
         .offer_rolled_back = WayringDataDevice.offerRolledBack,
         .offer_mime_offered = WayringDataDevice.offerMimeOffered,
+        .offer_source_actions_preflight = WayringDataDevice.offerSourceActionsPreflight,
         .offer_source_actions_changed = WayringDataDevice.offerSourceActionsChanged,
+        .offer_action_preflight = WayringDataDevice.offerActionPreflight,
         .offer_action_changed = WayringDataDevice.offerActionChanged,
     });
     defer server.setDataDeviceObserver(null);
@@ -22534,10 +22579,10 @@ test "production generated data device completes the exact profile and supports 
         @as(f64, @floatFromInt(generated_peer_position.y)) + 0.5,
     );
     pointerFrame(output);
-    try signalWayringCommand(generated_source_command);
     try signalWayringCommand(generated_peer_command);
-    try waitForWayringDndStage(server, host, &generated_source, .events_drained);
     try waitForWayringDndStage(server, host, &generated_peer, .events_drained);
+    try signalWayringCommand(generated_source_command);
+    try waitForWayringDndStage(server, host, &generated_source, .events_drained);
     try std.testing.expectEqualSlices(
         WayringDndClient.TargetEvent,
         &.{ .data_offer, .offer_mime, .source_actions, .action, .enter, .motion, .action },
@@ -22545,7 +22590,7 @@ test "production generated data device completes the exact profile and supports 
     );
     try std.testing.expectEqualSlices(
         WayringDndClient.SourceEvent,
-        &.{ .target, .action, .action, .target },
+        &.{ .target, .action, .action, .target, .send },
         generated_source.events[0..generated_source.event_count],
     );
     try signalWayringCommand(generated_source_command);

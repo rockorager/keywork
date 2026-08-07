@@ -327,9 +327,14 @@ pub fn main(init: std.process.Init) !void {
         wayring_data_device_initialized = true;
         server.setDataDeviceObserver(.{
             .context = &wayring_data_device,
+            .transaction_finalize = WayringDataDevice.transactionFinalize,
+            .transaction_commit = WayringDataDevice.transactionCommit,
+            .transaction_abort = WayringDataDevice.transactionAbort,
             .offer_rolled_back = WayringDataDevice.offerRolledBack,
             .offer_mime_offered = WayringDataDevice.offerMimeOffered,
+            .offer_source_actions_preflight = WayringDataDevice.offerSourceActionsPreflight,
             .offer_source_actions_changed = WayringDataDevice.offerSourceActionsChanged,
+            .offer_action_preflight = WayringDataDevice.offerActionPreflight,
             .offer_action_changed = WayringDataDevice.offerActionChanged,
         });
         wayring_cursor_shape.init(

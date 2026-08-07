@@ -31,11 +31,16 @@ pub const Actions = packed struct(u32) {
 pub const SourceEndpoint = struct {
     context: *anyopaque,
     send: *const fn (*anyopaque, []const u8, std.posix.fd_t) void,
+    target_preflight: ?*const fn (*anyopaque, ?[]const u8) error{OutOfMemory}!void = null,
     target: *const fn (*anyopaque, ?[]const u8) void,
+    action_preflight: ?*const fn (*anyopaque, Actions) error{OutOfMemory}!void = null,
     action: *const fn (*anyopaque, Actions) void,
+    cancelled_preflight: ?*const fn (*anyopaque) error{OutOfMemory}!void = null,
     cancelled: *const fn (*anyopaque) void,
     selection_cancelled: ?*const fn (*anyopaque) void = null,
+    drop_performed_preflight: ?*const fn (*anyopaque) error{OutOfMemory}!void = null,
     drop_performed: *const fn (*anyopaque) void,
+    finished_preflight: ?*const fn (*anyopaque) error{OutOfMemory}!void = null,
     finished: *const fn (*anyopaque) void,
 };
 
@@ -49,10 +54,14 @@ pub const ToplevelDragHandler = struct {
 pub const DeviceEndpoint = struct {
     context: *anyopaque,
     selection: *const fn (*anyopaque, ?OfferId) error{OutOfMemory}!void,
-    drag_enter_prepare: *const fn (*anyopaque, ?OfferId) error{OutOfMemory}!DragPreparation,
+    drag_enter_prepare: *const fn (*anyopaque, SurfaceRegistry.Id, f64, f64, ?OfferId) error{OutOfMemory}!DragPreparation,
+    drag_enter_abort: ?*const fn (*anyopaque) void = null,
     drag_enter: *const fn (*anyopaque, SurfaceRegistry.Id, f64, f64, ?OfferId) void,
+    drag_motion_preflight: ?*const fn (*anyopaque, u32, f64, f64) error{OutOfMemory}!void = null,
     drag_motion: *const fn (*anyopaque, u32, f64, f64) void,
+    drag_leave_preflight: ?*const fn (*anyopaque) error{OutOfMemory}!void = null,
     drag_leave: *const fn (*anyopaque) void,
+    drag_drop_preflight: ?*const fn (*anyopaque) error{OutOfMemory}!void = null,
     drag_drop: *const fn (*anyopaque) void,
 };
 
@@ -62,12 +71,17 @@ pub const DragPreparation = struct {
 
 pub const Listener = struct {
     context: *anyopaque,
+    transaction_finalize: ?*const fn (*anyopaque) error{OutOfMemory}!void = null,
+    transaction_commit: ?*const fn (*anyopaque) void = null,
+    transaction_abort: ?*const fn (*anyopaque) void = null,
     selection_changed: *const fn (*anyopaque) void,
     drag_changed: *const fn (*anyopaque) void,
     mime_offered: ?*const fn (*anyopaque, SourceId, []const u8) void = null,
     offer_rolled_back: ?*const fn (*anyopaque, OfferId) void = null,
     offer_mime_offered: ?*const fn (*anyopaque, OfferId, []const u8) void = null,
+    offer_source_actions_preflight: ?*const fn (*anyopaque, OfferId, Actions) error{OutOfMemory}!void = null,
     offer_source_actions_changed: ?*const fn (*anyopaque, OfferId, Actions) void = null,
+    offer_action_preflight: ?*const fn (*anyopaque, OfferId, Actions) error{OutOfMemory}!void = null,
     offer_action_changed: ?*const fn (*anyopaque, OfferId, Actions) void = null,
     external_drag_start: ?*const fn (*anyopaque) ?ExternalDragStart = null,
     retained_source_destroyed: ?*const fn (*anyopaque, u64) void = null,
@@ -249,9 +263,20 @@ pub fn setSourceActions(self: *DataDevice, id: SourceId, actions: Actions) Error
     const source = self.sources.get(id) orelse return error.InvalidSource;
     if (source.actions_declared) return error.ActionsAlreadySet;
     if (source.used) return error.SourceAlreadyUsed;
+    var offers = self.offers.iterator();
+    while (offers.next()) |entry| if (entry.value.source != null and std.meta.eql(entry.value.source.?, id))
+        if (self.listener.offer_source_actions_preflight) |prepare| prepare(self.listener.context, entry.id, actions) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return error.OutOfMemory;
+    };
     source.actions = actions;
     source.actions_declared = true;
     self.notifySourceActions(id, actions);
+    self.commitTransaction();
 }
 
 pub fn setToplevelDragHandler(self: *DataDevice, id: SourceId, handler: ToplevelDragHandler) Error!void {
@@ -296,9 +321,18 @@ pub fn createDevice(self: *DataDevice, owner: ClientRegistry.Id, endpoint: Devic
     if (self.focused_client != null and std.meta.eql(self.focused_client.?, owner))
         try endpoint.selection(endpoint.context, selection_offer);
     if (self.drag) |drag| if (drag.target) |target| if (std.meta.eql(target.client, owner)) {
-        const prepared = try endpoint.drag_enter_prepare(endpoint.context, drag_offer);
+        const prepared = endpoint.drag_enter_prepare(endpoint.context, target.surface, target.x, target.y, drag_offer) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+        self.finalizeTransaction() catch {
+            if (endpoint.drag_enter_abort) |abort| abort(endpoint.context);
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
         if (prepared.legacy_copy) self.commitLegacyOffer(drag_offer.?);
         endpoint.drag_enter(endpoint.context, target.surface, target.x, target.y, drag_offer);
+        self.commitTransaction();
     };
     return id;
 }
@@ -642,10 +676,33 @@ pub fn updateExternalSourceActions(self: *DataDevice, source_id: SourceId, actio
     if (!actions.valid()) return error.InvalidActionMask;
     const source = self.sources.get(source_id) orelse return error.InvalidSource;
     if (source.owner != null) return error.InvalidSource;
+    var offers = self.offers.iterator();
+    while (offers.next()) |entry| if (entry.value.source != null and std.meta.eql(entry.value.source.?, source_id)) {
+        if (self.listener.offer_source_actions_preflight) |prepare| prepare(self.listener.context, entry.id, actions) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+        const offer = entry.value;
+        if (offer.kind != .drag or !offer.active) continue;
+        const selected = selectAction(actions, offer.destination_actions, offer.preferred_action);
+        if (@as(u32, @bitCast(selected)) == @as(u32, @bitCast(offer.selected_action))) continue;
+        if (self.listener.offer_action_preflight) |prepare| prepare(self.listener.context, entry.id, selected) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+        if (source.endpoint.action_preflight) |prepare| prepare(source.endpoint.context, selected) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+    };
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return error.OutOfMemory;
+    };
     source.actions = actions;
     source.actions_declared = true;
     self.notifySourceActions(source_id, actions);
-    var offers = self.offers.iterator();
+    offers = self.offers.iterator();
     while (offers.next()) |entry| {
         const offer = entry.value;
         if (offer.source == null or !std.meta.eql(offer.source.?, source_id) or
@@ -656,14 +713,28 @@ pub fn updateExternalSourceActions(self: *DataDevice, source_id: SourceId, actio
         self.notifyOfferAction(entry.id, selected);
         source.endpoint.action(source.endpoint.context, selected);
     }
+    self.commitTransaction();
 }
 
 pub fn externalTargetStatus(self: *DataDevice, generation: u64, accepted: bool, selected: Actions) void {
     const drag = self.drag orelse return;
     if (drag.generation != generation) return;
     const source = self.sources.get(drag.source orelse return) orelse return;
+    if (!accepted) if (source.endpoint.target_preflight) |prepare| prepare(source.endpoint.context, null) catch {
+        self.abortTransaction();
+        return;
+    };
+    if (source.endpoint.action_preflight) |prepare| prepare(source.endpoint.context, if (accepted) selected else .{}) catch {
+        self.abortTransaction();
+        return;
+    };
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return;
+    };
     if (!accepted) source.endpoint.target(source.endpoint.context, null);
     source.endpoint.action(source.endpoint.context, if (accepted) selected else .{});
+    self.commitTransaction();
 }
 
 pub fn dropOnExternalTarget(self: *DataDevice, generation: u64, accepted: bool) bool {
@@ -676,6 +747,19 @@ pub fn dropOnExternalTarget(self: *DataDevice, generation: u64, accepted: bool) 
     };
     const source = self.sources.get(source_id) orelse return false;
     if (accepted) {
+        if (source.endpoint.drop_performed_preflight) |prepare| prepare(source.endpoint.context) catch {
+            self.abortTransaction();
+            return false;
+        };
+    } else if (source.endpoint.cancelled_preflight) |prepare| prepare(source.endpoint.context) catch {
+        self.abortTransaction();
+        return false;
+    };
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return false;
+    };
+    if (accepted) {
         source.endpoint.drop_performed(source.endpoint.context);
         self.retained = .{ .generation = generation, .source = source_id };
     } else {
@@ -684,6 +768,7 @@ pub fn dropOnExternalTarget(self: *DataDevice, generation: u64, accepted: bool) 
     self.endToplevel(source_id);
     invalidateGeneration(self, generation);
     self.drag = null;
+    self.commitTransaction();
     self.listener.drag_changed(self.listener.context);
     return accepted;
 }
@@ -759,10 +844,24 @@ pub fn enter(self: *DataDevice, target: Target) Error!void {
             batch.appendAssumeCapacity(.{ .device = entry.id, .offer = offer });
         }
     }
+    // A target switch is one publication transaction. Stage the old target's
+    // reset/leave first so its wire order precedes the new target's offer and
+    // enter sequence, while still committing both sides atomically.
+    if (self.drag.?.target) |old| {
+        if (self.drag.?.source) |id| if (self.sources.get(id)) |source| {
+            if (source.endpoint.target_preflight) |prepare| prepare(source.endpoint.context, null) catch return self.abortEnter(target.client, batch.items);
+            if (source.endpoint.action_preflight) |prepare| prepare(source.endpoint.context, .{}) catch return self.abortEnter(target.client, batch.items);
+        };
+        devices = self.devices.iterator();
+        while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, old.client))
+            if (entry.value.endpoint.drag_leave_preflight) |prepare| prepare(entry.value.endpoint.context) catch return self.abortEnter(target.client, batch.items);
+    }
     if (self.drag.?.source != null) {
         for (batch.items) |*item| {
             const device = self.devices.get(item.device) orelse unreachable;
-            item.preparation = device.endpoint.drag_enter_prepare(device.endpoint.context, item.offer) catch {
+            item.preparation = device.endpoint.drag_enter_prepare(device.endpoint.context, target.surface, target.x, target.y, item.offer) catch {
+                self.abortEnterPreparations(batch.items);
+                if (self.listener.transaction_abort) |abort| abort(self.listener.context);
                 self.rollbackEnterBatch(batch.items);
                 return error.OutOfMemory;
             };
@@ -770,10 +869,27 @@ pub fn enter(self: *DataDevice, target: Target) Error!void {
     } else {
         devices = self.devices.iterator();
         while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, target.client)) {
-            _ = entry.value.endpoint.drag_enter_prepare(entry.value.endpoint.context, null) catch return error.OutOfMemory;
+            _ = entry.value.endpoint.drag_enter_prepare(entry.value.endpoint.context, target.surface, target.x, target.y, null) catch {
+                self.abortClientEnterPreparations(target.client);
+                if (self.listener.transaction_abort) |abort| abort(self.listener.context);
+                return error.OutOfMemory;
+            };
         };
     }
-    self.leave();
+    if (self.drag.?.source) |source_id| {
+        const source = self.sources.get(source_id) orelse unreachable;
+        for (batch.items) |item| if (item.preparation.legacy_copy) {
+            const selected = selectAction(source.actions, .{ .copy = true }, .{ .copy = true });
+            if (self.listener.offer_action_preflight) |prepare| prepare(self.listener.context, item.offer, selected) catch return self.abortEnter(target.client, batch.items);
+            if (source.endpoint.action_preflight) |prepare| prepare(source.endpoint.context, selected) catch return self.abortEnter(target.client, batch.items);
+        };
+    }
+    if (self.listener.transaction_finalize) |finalize| finalize(self.listener.context) catch {
+        if (self.listener.transaction_abort) |abort| abort(self.listener.context);
+        self.rollbackEnterBatch(batch.items);
+        return error.OutOfMemory;
+    };
+    self.leaveCommitted();
     self.drag.?.target = target;
     if (self.drag.?.source != null) {
         for (batch.items) |item| {
@@ -789,6 +905,25 @@ pub fn enter(self: *DataDevice, target: Target) Error!void {
             entry.value.endpoint.drag_enter(entry.value.endpoint.context, target.surface, target.x, target.y, null);
         };
     }
+    if (self.listener.transaction_commit) |commit| commit(self.listener.context);
+}
+
+fn abortEnter(self: *DataDevice, client: ClientRegistry.Id, batch: anytype) error{OutOfMemory} {
+    self.abortClientEnterPreparations(client);
+    self.abortTransaction();
+    self.rollbackEnterBatch(batch);
+    return error.OutOfMemory;
+}
+
+fn abortEnterPreparations(self: *DataDevice, batch: anytype) void {
+    for (batch) |item| if (self.devices.get(item.device)) |device|
+        if (device.endpoint.drag_enter_abort) |abort| abort(device.endpoint.context);
+}
+
+fn abortClientEnterPreparations(self: *DataDevice, client: ClientRegistry.Id) void {
+    var devices = self.devices.iterator();
+    while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, client))
+        if (entry.value.endpoint.drag_enter_abort) |abort| abort(entry.value.endpoint.context);
 }
 
 fn rollbackEnterBatch(self: *DataDevice, batch: anytype) void {
@@ -830,11 +965,22 @@ fn commitLegacyOffer(self: *DataDevice, id: OfferId) void {
 
 pub fn motion(self: *DataDevice, time: u32, x: f64, y: f64) void {
     if (self.drag == null or self.drag.?.target == null) return;
-    self.drag.?.target.?.x = x;
-    self.drag.?.target.?.y = y;
     const client = self.drag.?.target.?.client;
     var devices = self.devices.iterator();
+    while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, client))
+        if (entry.value.endpoint.drag_motion_preflight) |prepare| prepare(entry.value.endpoint.context, time, x, y) catch {
+            self.abortTransaction();
+            return;
+        };
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return;
+    };
+    self.drag.?.target.?.x = x;
+    self.drag.?.target.?.y = y;
+    devices = self.devices.iterator();
     while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, client)) entry.value.endpoint.drag_motion(entry.value.endpoint.context, time, x, y);
+    self.commitTransaction();
 }
 
 pub fn currentTarget(self: *const DataDevice) ?Target {
@@ -851,6 +997,33 @@ pub fn leave(self: *DataDevice) void {
     if (self.drag == null or self.drag.?.target == null) return;
     const client = self.drag.?.target.?.client;
     if (self.drag.?.source) |id| if (self.sources.get(id)) |source| {
+        if (source.endpoint.target_preflight) |prepare| prepare(source.endpoint.context, null) catch {
+            self.abortTransaction();
+            return;
+        };
+        if (source.endpoint.action_preflight) |prepare| prepare(source.endpoint.context, .{}) catch {
+            self.abortTransaction();
+            return;
+        };
+    };
+    var devices = self.devices.iterator();
+    while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, client))
+        if (entry.value.endpoint.drag_leave_preflight) |prepare| prepare(entry.value.endpoint.context) catch {
+            self.abortTransaction();
+            return;
+        };
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return;
+    };
+    self.leaveCommitted();
+    self.commitTransaction();
+}
+
+fn leaveCommitted(self: *DataDevice) void {
+    if (self.drag == null or self.drag.?.target == null) return;
+    const client = self.drag.?.target.?.client;
+    if (self.drag.?.source) |id| if (self.sources.get(id)) |source| {
         source.endpoint.target(source.endpoint.context, null);
         source.endpoint.action(source.endpoint.context, .{});
     };
@@ -864,13 +1037,32 @@ pub fn leave(self: *DataDevice) void {
     self.drag.?.target = null;
 }
 
+fn finalizeTransaction(self: *DataDevice) error{OutOfMemory}!void {
+    if (self.listener.transaction_finalize) |finalize| try finalize(self.listener.context);
+}
+fn commitTransaction(self: *DataDevice) void {
+    if (self.listener.transaction_commit) |commit| commit(self.listener.context);
+}
+fn abortTransaction(self: *DataDevice) void {
+    if (self.listener.transaction_abort) |abort| abort(self.listener.context);
+}
+
 pub fn accept(self: *DataDevice, offer_id: OfferId, mime: ?[]const u8) Error!void {
     const offer = self.offers.get(offer_id) orelse return error.InvalidOffer;
     if (offer.kind != .drag or (!offer.active and !offer.dropped)) return error.InvalidOffer;
     const source = self.sources.get(offer.source orelse return error.InvalidSource) orelse return error.InvalidSource;
     const accepted_mime = if (mime) |value| hasMime(source, value) else false;
+    if (source.endpoint.target_preflight) |prepare| prepare(source.endpoint.context, if (accepted_mime) mime else null) catch {
+        self.abortTransaction();
+        return error.OutOfMemory;
+    };
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return error.OutOfMemory;
+    };
     if (!offer.implicit_copy) offer.accepted = accepted_mime;
     source.endpoint.target(source.endpoint.context, if (accepted_mime) mime else null);
+    self.commitTransaction();
 }
 
 pub fn setOfferActions(self: *DataDevice, offer_id: OfferId, actions: Actions, preferred: Actions) Error!void {
@@ -885,16 +1077,32 @@ pub fn setOfferActions(self: *DataDevice, offer_id: OfferId, actions: Actions, p
     {
         return error.InvalidPreferredAction;
     }
+    const selected = selectAction(source.actions, actions, preferred);
+    const changed = @as(u32, @bitCast(selected)) != @as(u32, @bitCast(offer.selected_action));
+    if (changed) {
+        if (!offer.dropped) if (self.listener.offer_action_preflight) |prepare| prepare(self.listener.context, offer_id, selected) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+        if (source.endpoint.action_preflight) |prepare| prepare(source.endpoint.context, selected) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+    }
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return error.OutOfMemory;
+    };
     offer.destination_actions = actions;
     offer.preferred_action = preferred;
-    const selected = selectAction(source.actions, actions, preferred);
-    if (@as(u32, @bitCast(selected)) != @as(u32, @bitCast(offer.selected_action))) {
+    if (changed) {
         offer.selected_action = selected;
         // Ask may be resolved after drop. At that point only the source gets
         // the final action; the destination must not receive another action.
         if (!offer.dropped) self.notifyOfferAction(offer_id, selected);
         source.endpoint.action(source.endpoint.context, selected);
     }
+    self.commitTransaction();
 }
 
 pub fn receive(self: *DataDevice, offer_id: OfferId, mime: []const u8, fd: std.posix.fd_t) Error!void {
@@ -912,28 +1120,58 @@ pub fn drop(self: *DataDevice) void {
         return;
     };
     var accepted = drag.source == null;
-    if (drag.source) |id| if (self.sources.get(id)) |source| source.endpoint.drop_performed(source.endpoint.context);
     var offers = self.offers.iterator();
     while (offers.next()) |entry| if (entry.value.kind == .drag and entry.value.drag_generation == drag.generation and entry.value.active) {
-        entry.value.active = false;
         accepted = accepted or (entry.value.accepted and !entry.value.selected_action.empty());
     };
+    if (drag.source) |id| if (self.sources.get(id)) |source| {
+        if (source.endpoint.drop_performed_preflight) |prepare| prepare(source.endpoint.context) catch {
+            self.abortTransaction();
+            return;
+        };
+        if (!accepted) if (source.endpoint.cancelled_preflight) |prepare| prepare(source.endpoint.context) catch {
+            self.abortTransaction();
+            return;
+        };
+    };
+    var devices = self.devices.iterator();
+    while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, target.client)) {
+        if (accepted) if (entry.value.endpoint.drag_drop_preflight) |prepare| prepare(entry.value.endpoint.context) catch {
+            self.abortTransaction();
+            return;
+        };
+        if (entry.value.endpoint.drag_leave_preflight) |prepare| prepare(entry.value.endpoint.context) catch {
+            self.abortTransaction();
+            return;
+        };
+    };
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return;
+    };
+    offers = self.offers.iterator();
+    while (offers.next()) |entry| {
+        if (entry.value.kind == .drag and entry.value.drag_generation == drag.generation and entry.value.active)
+            entry.value.active = false;
+    }
     offers = self.offers.iterator();
     while (offers.next()) |entry| {
         if (entry.value.kind == .drag and entry.value.drag_generation == drag.generation)
             entry.value.dropped = accepted;
     }
     if (drag.source) |id| if (self.sources.get(id)) |source| {
+        source.endpoint.drop_performed(source.endpoint.context);
         if (!accepted) source.endpoint.cancelled(source.endpoint.context);
         self.endToplevel(id);
     };
-    var devices = self.devices.iterator();
+    devices = self.devices.iterator();
     while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, target.client)) {
         if (accepted) entry.value.endpoint.drag_drop(entry.value.endpoint.context);
         entry.value.endpoint.drag_leave(entry.value.endpoint.context);
     };
     self.drag = null;
     if (!accepted) invalidateGeneration(self, drag.generation);
+    self.commitTransaction();
     self.listener.drag_changed(self.listener.context);
 }
 
@@ -941,9 +1179,18 @@ pub fn finish(self: *DataDevice, offer_id: OfferId) Error!void {
     const offer = self.offers.get(offer_id) orelse return error.InvalidOffer;
     if (offer.kind != .drag or !offer.dropped or !offer.accepted or offer.selected_action.empty() or offer.selected_action.ask or offer.finished) return error.InvalidFinish;
     const source = self.sources.get(offer.source orelse return error.InvalidFinish) orelse return error.InvalidFinish;
+    if (source.endpoint.finished_preflight) |prepare| prepare(source.endpoint.context) catch {
+        self.abortTransaction();
+        return error.OutOfMemory;
+    };
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return error.OutOfMemory;
+    };
     offer.finished = true;
     source.endpoint.finished(source.endpoint.context);
     invalidateGeneration(self, offer.drag_generation);
+    self.commitTransaction();
 }
 
 pub fn destroyOffer(self: *DataDevice, id: OfferId) void {
@@ -953,23 +1200,46 @@ pub fn destroyOffer(self: *DataDevice, id: OfferId) void {
 /// `legacy_finish` preserves pre-v3 completion when the adapter retires the
 /// last dropped offer without an explicit finish request.
 pub fn retireOffer(self: *DataDevice, id: OfferId, legacy_finish: bool) void {
-    const offer = self.offers.remove(id) orelse return;
-    if (offer.kind != .drag or !offer.dropped or offer.finished or offer.source == null) return;
+    const offer = self.offers.get(id) orelse return;
+    if (offer.kind != .drag or !offer.dropped or offer.finished or offer.source == null) {
+        _ = self.offers.remove(id);
+        return;
+    }
     var offers = self.offers.iterator();
     while (offers.next()) |candidate| {
         if (candidate.value.kind == .drag and
             candidate.value.drag_generation == offer.drag_generation and
             candidate.value.dropped and !candidate.value.finished and
-            candidate.value.source != null) return;
-    }
-    if (self.sources.get(offer.source.?)) |source| {
-        if (legacy_finish) {
-            source.endpoint.finished(source.endpoint.context);
-        } else {
-            source.endpoint.cancelled(source.endpoint.context);
+            candidate.value.source != null and !std.meta.eql(candidate.id, id))
+        {
+            _ = self.offers.remove(id);
+            return;
         }
     }
-    invalidateGeneration(self, offer.drag_generation);
+    const source = self.sources.get(offer.source.?);
+    if (source) |value| {
+        if (legacy_finish) {
+            if (value.endpoint.finished_preflight) |prepare| prepare(value.endpoint.context) catch {
+                self.abortTransaction();
+                return;
+            };
+        } else if (value.endpoint.cancelled_preflight) |prepare| prepare(value.endpoint.context) catch {
+            self.abortTransaction();
+            return;
+        };
+    }
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return;
+    };
+    const removed = self.offers.remove(id) orelse unreachable;
+    if (source) |value| if (legacy_finish) {
+        value.endpoint.finished(value.endpoint.context);
+    } else {
+        value.endpoint.cancelled(value.endpoint.context);
+    };
+    invalidateGeneration(self, removed.drag_generation);
+    self.commitTransaction();
 }
 
 pub fn cancelDrag(self: *DataDevice) void {
@@ -984,11 +1254,39 @@ fn cancelDragWithoutSource(self: *DataDevice) void {
 }
 fn cancelDragImpl(self: *DataDevice, notify: bool) void {
     const drag = self.drag orelse return;
+    if (drag.target) |target| {
+        if (drag.source) |id| if (self.sources.get(id)) |source| {
+            if (source.endpoint.target_preflight) |prepare| prepare(source.endpoint.context, null) catch {
+                self.abortTransaction();
+                return;
+            };
+            if (source.endpoint.action_preflight) |prepare| prepare(source.endpoint.context, .{}) catch {
+                self.abortTransaction();
+                return;
+            };
+        };
+        var devices = self.devices.iterator();
+        while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, target.client))
+            if (entry.value.endpoint.drag_leave_preflight) |prepare| prepare(entry.value.endpoint.context) catch {
+                self.abortTransaction();
+                return;
+            };
+    }
+    if (notify and drag.source != null) if (self.sources.get(drag.source.?)) |source|
+        if (source.endpoint.cancelled_preflight) |prepare| prepare(source.endpoint.context) catch {
+            self.abortTransaction();
+            return;
+        };
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return;
+    };
     if (drag.source) |id| self.endToplevel(id);
-    self.leave();
+    self.leaveCommitted();
     if (notify and drag.source != null) if (self.sources.get(drag.source.?)) |source| source.endpoint.cancelled(source.endpoint.context);
     invalidateGeneration(self, drag.generation);
     self.drag = null;
+    self.commitTransaction();
     self.listener.drag_changed(self.listener.context);
 }
 
@@ -1021,8 +1319,24 @@ pub fn retainForExternalTarget(self: *DataDevice, generation: u64) Error!void {
 pub fn finishRetained(self: *DataDevice, generation: u64, performed: bool) void {
     const retained = self.retained orelse return;
     if (retained.generation != generation) return;
-    if (self.sources.get(retained.source)) |source| if (performed) source.endpoint.finished(source.endpoint.context) else source.endpoint.cancelled(source.endpoint.context);
+    if (self.sources.get(retained.source)) |source| {
+        if (performed) {
+            if (source.endpoint.finished_preflight) |prepare| prepare(source.endpoint.context) catch {
+                self.abortTransaction();
+                return;
+            };
+        } else if (source.endpoint.cancelled_preflight) |prepare| prepare(source.endpoint.context) catch {
+            self.abortTransaction();
+            return;
+        };
+        self.finalizeTransaction() catch {
+            self.abortTransaction();
+            return;
+        };
+        if (performed) source.endpoint.finished(source.endpoint.context) else source.endpoint.cancelled(source.endpoint.context);
+    }
     self.retained = null;
+    self.commitTransaction();
     self.listener.drag_changed(self.listener.context);
 }
 
@@ -1096,7 +1410,7 @@ test "selection authorization, publication, transfer, and replacement are canoni
             const self: *@This() = @ptrCast(@alignCast(context));
             self.selection_offer = offer;
         }
-        fn prepareEnter(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!DragPreparation {
+        fn prepareEnter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) error{OutOfMemory}!DragPreparation {
             return .{};
         }
         fn enter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) void {}
@@ -1200,6 +1514,7 @@ test "drag lifecycle rejects cross-client and stale IDs and finishes negotiated 
         enters: usize = 0,
         leaves: usize = 0,
         device_drops: usize = 0,
+        fail_action_preflight: bool = false,
 
         fn send(_: *anyopaque, _: []const u8, _: std.posix.fd_t) void {}
         fn target(context: *anyopaque, _: ?[]const u8) void {
@@ -1209,6 +1524,10 @@ test "drag lifecycle rejects cross-client and stale IDs and finishes negotiated 
         fn action(context: *anyopaque, _: Actions) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.actions += 1;
+        }
+        fn actionPreflight(context: *anyopaque, _: Actions) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.fail_action_preflight) return error.OutOfMemory;
         }
         fn cancelled(context: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -1223,7 +1542,7 @@ test "drag lifecycle rejects cross-client and stale IDs and finishes negotiated 
             self.finishes += 1;
         }
         fn selection(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
-        fn prepareEnter(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!DragPreparation {
+        fn prepareEnter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) error{OutOfMemory}!DragPreparation {
             return .{};
         }
         fn enter(context: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, offer: ?OfferId) void {
@@ -1261,6 +1580,7 @@ test "drag lifecycle rejects cross-client and stale IDs and finishes negotiated 
         .context = &observer,
         .send = Observer.send,
         .target = Observer.target,
+        .action_preflight = Observer.actionPreflight,
         .action = Observer.action,
         .cancelled = Observer.cancelled,
         .drop_performed = Observer.dropped,
@@ -1289,6 +1609,12 @@ test "drag lifecycle rejects cross-client and stale IDs and finishes negotiated 
     try data_device.enter(.{ .surface = target, .client = target_client, .x = 4, .y = 5 });
     const offer = observer.offer.?;
     try data_device.accept(offer, "text/plain");
+    observer.fail_action_preflight = true;
+    const actions_before_failure = observer.actions;
+    try std.testing.expectError(error.OutOfMemory, data_device.setOfferActions(offer, .{ .copy = true, .move = true }, .{ .move = true }));
+    try std.testing.expectEqual(Actions{}, data_device.offerInfo(offer).?.selected_action);
+    try std.testing.expectEqual(actions_before_failure, observer.actions);
+    observer.fail_action_preflight = false;
     try data_device.setOfferActions(offer, .{ .copy = true, .move = true }, .{ .move = true });
     try std.testing.expectEqual(Actions{ .move = true }, data_device.offerInfo(offer).?.selected_action);
     data_device.drop();
@@ -1378,7 +1704,7 @@ test "disconnect retires endpoints without callbacks" {
             self.callbacks += 1;
         }
         fn selection(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
-        fn prepareEnter(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!DragPreparation {
+        fn prepareEnter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) error{OutOfMemory}!DragPreparation {
             return .{};
         }
         fn enter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) void {}
@@ -1476,7 +1802,7 @@ const RegressionFixture = struct {
             self.selection_offer = offer;
             self.selections += 1;
         }
-        fn prepareEnter(context: *anyopaque, offer: ?OfferId) error{OutOfMemory}!DragPreparation {
+        fn prepareEnter(context: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, offer: ?OfferId) error{OutOfMemory}!DragPreparation {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.drag_offer = offer;
             self.enter_prepares += 1;
@@ -1847,7 +2173,7 @@ test "device publication failure rolls IDs offers and selection back" {
 test "device ID registration allocation failure leaves no canonical state" {
     const Endpoint = struct {
         fn selection(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
-        fn prepareEnter(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!DragPreparation {
+        fn prepareEnter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) error{OutOfMemory}!DragPreparation {
             return .{};
         }
         fn enter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) void {}

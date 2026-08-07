@@ -22,7 +22,21 @@ const manager_version = 4;
 
 const Manager = struct { owner: *WayringDataDevice, client: *wayring.server.Client, resource: protocol.wl_data_device_manager.Resource };
 const Source = struct { owner: *WayringDataDevice, client: *wayring.server.Client, resource: protocol.wl_data_source.Resource, id: DataDevice.SourceId };
-const Device = struct { owner: *WayringDataDevice, client: *wayring.server.Client, resource: protocol.wl_data_device.Resource, id: DataDevice.DeviceId, enter_serial: u32 = 0 };
+const Device = struct {
+    owner: *WayringDataDevice,
+    client: *wayring.server.Client,
+    resource: protocol.wl_data_device.Resource,
+    id: DataDevice.DeviceId,
+    enter_serial: u32 = 0,
+};
+const StagedEvents = struct {
+    client: *wayring.server.Client,
+    events: []wayring.server.Client.PreparedEvent,
+    values: []wire.Value,
+    offers: []const *Offer,
+    maximum_bytes: usize,
+};
+const PreparedClient = struct { client: *wayring.server.Client, batch: wire.PreparedBatch, events: []wayring.server.Client.PreparedEvent };
 const Offer = struct { owner: *WayringDataDevice, client: *wayring.server.Client, resource: protocol.wl_data_offer.Resource, id: DataDevice.OfferId, device: ?*Device, enter_serial: u32 = 0, published: bool = false };
 
 allocator: std.mem.Allocator,
@@ -36,6 +50,8 @@ managers: std.ArrayList(*Manager) = .empty,
 sources: std.ArrayList(*Source) = .empty,
 devices: std.ArrayList(*Device) = .empty,
 offers: std.ArrayList(*Offer) = .empty,
+staged_events: std.ArrayList(StagedEvents) = .empty,
+prepared_clients: std.ArrayList(PreparedClient) = .empty,
 
 pub fn init(
     self: *WayringDataDevice,
@@ -67,6 +83,8 @@ pub fn deinit(self: *WayringDataDevice) void {
     self.sources.deinit(self.allocator);
     self.devices.deinit(self.allocator);
     self.offers.deinit(self.allocator);
+    self.staged_events.deinit(self.allocator);
+    self.prepared_clients.deinit(self.allocator);
     if (self.compositor) |compositor| compositor.setDragIconListener(null);
     self.* = undefined;
 }
@@ -167,11 +185,16 @@ fn createSource(self: *WayringDataDevice, manager: *Manager, id: u32) !void {
     const canonical_id = try self.canonical.createSource(self.clients.id(manager.client) orelse return error.InvalidClient, .{
         .context = value,
         .send = sourceSend,
+        .target_preflight = sourceTargetPreflight,
         .target = sourceTarget,
+        .action_preflight = sourceActionPreflight,
         .action = sourceAction,
+        .cancelled_preflight = sourceCancelledPreflight,
         .cancelled = sourceCancelled,
-        .selection_cancelled = sourceCancelled,
+        .selection_cancelled = sourceSelectionCancelled,
+        .drop_performed_preflight = sourceDropPreflight,
         .drop_performed = sourceDrop,
+        .finished_preflight = sourceFinishedPreflight,
         .finished = sourceFinished,
     }, .{ .actions = if (manager.resource.version() < 3) .{ .copy = true } else .{} });
     errdefer self.canonical.destroySource(canonical_id);
@@ -192,6 +215,7 @@ fn sourceRequest(_: *protocol.wl_data_source.Resource, request: protocol.wl_data
         .set_actions => |args| value.owner.canonical.setSourceActions(value.id, fromWireActions(args.dnd_actions)) catch |err| switch (err) {
             error.InvalidActionMask => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_source.@"error".invalid_action_mask), "invalid drag-and-drop action mask"),
             error.ActionsAlreadySet, error.SourceAlreadyUsed => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_source.@"error".invalid_source), "data source is already in use or actions were already set"),
+            error.OutOfMemory => value.client.postOutOfMemory(&value.resource.runtime, "preparing generated source actions"),
             else => {},
         },
     }
@@ -219,9 +243,13 @@ fn createDevice(self: *WayringDataDevice, manager: *Manager, id: u32) !void {
         .context = value,
         .selection = deviceSelection,
         .drag_enter_prepare = deviceDragPrepare,
+        .drag_enter_abort = deviceDragAbort,
         .drag_enter = deviceDragEnter,
+        .drag_motion_preflight = deviceDragMotionPreflight,
         .drag_motion = deviceDragMotion,
+        .drag_leave_preflight = deviceDragLeavePreflight,
         .drag_leave = deviceDragLeave,
+        .drag_drop_preflight = deviceDragDropPreflight,
         .drag_drop = deviceDragDrop,
     });
     errdefer self.canonical.destroyDevice(value.id);
@@ -312,18 +340,25 @@ fn offerRequest(_: *protocol.wl_data_offer.Resource, request: protocol.wl_data_o
     switch (request) {
         .accept => |args| {
             if (info) |offer| if (offer.active and args.serial != value.enter_serial) return;
-            value.owner.canonical.accept(value.id, args.mime_type) catch {};
+            value.owner.canonical.accept(value.id, args.mime_type) catch |err| switch (err) {
+                error.OutOfMemory => value.client.postOutOfMemory(&value.resource.runtime, "preparing generated offer acceptance"),
+                else => {},
+            };
         },
         .receive => |args| {
             defer _ = std.c.close(args.fd);
             value.owner.canonical.receive(value.id, args.mime_type, args.fd) catch {};
         },
         .destroy => value.owner.destroyOffer(value),
-        .finish => value.owner.canonical.finish(value.id) catch value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_finish), "drag-and-drop offer cannot be finished"),
+        .finish => value.owner.canonical.finish(value.id) catch |err| switch (err) {
+            error.OutOfMemory => value.client.postOutOfMemory(&value.resource.runtime, "preparing generated offer finish"),
+            else => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_finish), "drag-and-drop offer cannot be finished"),
+        },
         .set_actions => |args| value.owner.canonical.setOfferActions(value.id, fromWireActions(args.dnd_actions), fromWireActions(args.preferred_action)) catch |err| switch (err) {
             error.InvalidActionMask => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_action_mask), "invalid drag-and-drop action mask"),
             error.InvalidPreferredAction => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_action), "invalid preferred drag-and-drop action"),
             error.InvalidOffer => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_offer), "actions are invalid for this offer"),
+            error.OutOfMemory => value.client.postOutOfMemory(&value.resource.runtime, "preparing generated offer actions"),
             else => {},
         },
     }
@@ -400,7 +435,7 @@ fn deviceSelection(context: *anyopaque, offer_id: ?DataDevice.OfferId) error{Out
 /// provide rollback and late-MIME delivery without moving semantics here.
 pub fn offerRolledBack(context: *anyopaque, id: DataDevice.OfferId) void {
     const self: *WayringDataDevice = @ptrCast(@alignCast(context));
-    for (self.offers.items) |value| if (std.meta.eql(value.id, id)) return self.destroyOffer(value);
+    for (self.offers.items) |value| if (std.meta.eql(value.id, id)) return self.destroyOfferResource(value, false);
 }
 pub fn offerMimeOffered(context: *anyopaque, id: DataDevice.OfferId, mime: []const u8) void {
     const self: *WayringDataDevice = @ptrCast(@alignCast(context));
@@ -412,16 +447,26 @@ pub fn offerMimeOffered(context: *anyopaque, id: DataDevice.OfferId, mime: []con
     };
 }
 pub fn offerSourceActionsChanged(context: *anyopaque, id: DataDevice.OfferId, actions: DataDevice.Actions) void {
+    _ = context;
+    _ = id;
+    _ = actions;
+}
+pub fn offerSourceActionsPreflight(context: *anyopaque, id: DataDevice.OfferId, actions: DataDevice.Actions) error{OutOfMemory}!void {
     const self: *WayringDataDevice = @ptrCast(@alignCast(context));
     const value = findOffer(self, id) orelse return;
     if (value.published and value.resource.version() >= 3)
-        protocol.wl_data_offer.@"send:source_actions"(&value.resource, toWireActions(actions)) catch {};
+        try self.stageEvent(value.client, &value.resource.runtime, 1, &protocol.wl_data_offer.event_messages[1], &.{.{ .uint = toWireActions(actions) }}, 12, &.{});
 }
 pub fn offerActionChanged(context: *anyopaque, id: DataDevice.OfferId, actions: DataDevice.Actions) void {
+    _ = context;
+    _ = id;
+    _ = actions;
+}
+pub fn offerActionPreflight(context: *anyopaque, id: DataDevice.OfferId, actions: DataDevice.Actions) error{OutOfMemory}!void {
     const self: *WayringDataDevice = @ptrCast(@alignCast(context));
     const value = findOffer(self, id) orelse return;
     if (value.published and value.resource.version() >= 3)
-        protocol.wl_data_offer.@"send:action"(&value.resource, toWireActions(actions)) catch {};
+        try self.stageEvent(value.client, &value.resource.runtime, 2, &protocol.wl_data_offer.event_messages[2], &.{.{ .uint = toWireActions(actions) }}, 12, &.{});
 }
 
 fn sourceSend(context: *anyopaque, mime: []const u8, fd: std.posix.fd_t) void {
@@ -430,68 +475,239 @@ fn sourceSend(context: *anyopaque, mime: []const u8, fd: std.posix.fd_t) void {
         value.client.postOutOfMemory(&value.resource.runtime, "queueing generated source send");
 }
 fn sourceTarget(context: *anyopaque, mime: ?[]const u8) void {
+    _ = context;
+    _ = mime;
+}
+fn sourceTargetPreflight(context: *anyopaque, mime: ?[]const u8) error{OutOfMemory}!void {
     const value: *Source = @ptrCast(@alignCast(context));
-    protocol.wl_data_source.@"send:target"(&value.resource, mime) catch
-        value.client.postOutOfMemory(&value.resource.runtime, "queueing generated source target");
+    try value.owner.stageEvent(value.client, &value.resource.runtime, 0, &protocol.wl_data_source.event_messages[0], &.{.{ .string = mime }}, 12 + if (mime) |text| std.mem.alignForward(usize, text.len + 1, 4) else 0, &.{});
 }
 fn sourceCancelled(context: *anyopaque) void {
+    _ = context;
+}
+fn sourceSelectionCancelled(context: *anyopaque) void {
     const value: *Source = @ptrCast(@alignCast(context));
     protocol.wl_data_source.@"send:cancelled"(&value.resource) catch
-        value.client.postOutOfMemory(&value.resource.runtime, "queueing generated source cancellation");
+        value.client.postOutOfMemory(&value.resource.runtime, "queueing generated selection cancellation");
+}
+fn sourceCancelledPreflight(context: *anyopaque) error{OutOfMemory}!void {
+    const value: *Source = @ptrCast(@alignCast(context));
+    try value.owner.stageEvent(value.client, &value.resource.runtime, 1, &protocol.wl_data_source.event_messages[1], &.{}, 8, &.{});
 }
 fn sourceAction(context: *anyopaque, actions: DataDevice.Actions) void {
+    _ = context;
+    _ = actions;
+}
+fn sourceActionPreflight(context: *anyopaque, actions: DataDevice.Actions) error{OutOfMemory}!void {
     const value: *Source = @ptrCast(@alignCast(context));
-    if (value.resource.version() >= 3) protocol.wl_data_source.@"send:action"(&value.resource, toWireActions(actions)) catch value.client.postOutOfMemory(&value.resource.runtime, "queueing generated source action");
+    if (value.resource.version() >= 3) try value.owner.stageEvent(value.client, &value.resource.runtime, 5, &protocol.wl_data_source.event_messages[5], &.{.{ .uint = toWireActions(actions) }}, 12, &.{});
 }
 fn sourceDrop(context: *anyopaque) void {
+    _ = context;
+}
+fn sourceDropPreflight(context: *anyopaque) error{OutOfMemory}!void {
     const value: *Source = @ptrCast(@alignCast(context));
-    if (value.resource.version() >= 3) protocol.wl_data_source.@"send:dnd_drop_performed"(&value.resource) catch
-        value.client.postOutOfMemory(&value.resource.runtime, "queueing generated source drop");
+    if (value.resource.version() >= 3) try value.owner.stageEvent(value.client, &value.resource.runtime, 3, &protocol.wl_data_source.event_messages[3], &.{}, 8, &.{});
 }
 fn sourceFinished(context: *anyopaque) void {
-    const value: *Source = @ptrCast(@alignCast(context));
-    if (value.resource.version() >= 3) protocol.wl_data_source.@"send:dnd_finished"(&value.resource) catch
-        value.client.postOutOfMemory(&value.resource.runtime, "queueing generated source finish");
+    _ = context;
 }
-fn deviceDragPrepare(context: *anyopaque, id: ?DataDevice.OfferId) error{OutOfMemory}!DataDevice.DragPreparation {
+fn sourceFinishedPreflight(context: *anyopaque) error{OutOfMemory}!void {
+    const value: *Source = @ptrCast(@alignCast(context));
+    if (value.resource.version() >= 3) try value.owner.stageEvent(value.client, &value.resource.runtime, 4, &protocol.wl_data_source.event_messages[4], &.{}, 8, &.{});
+}
+fn deviceDragPrepare(context: *anyopaque, surface_id: SurfaceRegistry.Id, x: f64, y: f64, id: ?DataDevice.OfferId) error{OutOfMemory}!DataDevice.DragPreparation {
     const device: *Device = @ptrCast(@alignCast(context));
     const serial = device.owner.protocol_server.nextSerial() catch {
         device.client.postImplementationError(&device.resource.runtime, "generated data-device serial exhausted");
         return error.OutOfMemory;
     };
     device.enter_serial = serial;
-    if (id) |offer_id| {
-        const offer = device.owner.createOffer(device, offer_id) catch return error.OutOfMemory;
-        offer.enter_serial = serial;
+    const endpoint = (device.owner.compositor orelse return error.OutOfMemory).surfaceEndpoint(surface_id) orelse return error.OutOfMemory;
+    const offer = if (id) |offer_id| device.owner.createOffer(device, offer_id) catch return error.OutOfMemory else null;
+    errdefer if (offer) |value| device.owner.destroyOfferResource(value, false);
+    if (offer) |value| value.enter_serial = serial;
+    const info = if (id) |offer_id| device.owner.canonical.offerInfo(offer_id) orelse return error.OutOfMemory else null;
+    const mime_types = if (info) |value| if (value.source) |source| device.owner.canonical.sourceMimeTypes(source) catch return error.OutOfMemory else &.{} else &.{};
+    const modern = offer != null and device.resource.version() >= 3;
+    const event_count = 1 + (if (offer != null) @as(usize, 1) + mime_types.len + (if (modern) @as(usize, 2) else 0) else 0);
+    const value_count = 5 + (event_count - 1);
+    const events = device.owner.allocator.alloc(wayring.server.Client.PreparedEvent, event_count) catch return error.OutOfMemory;
+    errdefer device.owner.allocator.free(events);
+    const values = device.owner.allocator.alloc(wire.Value, value_count) catch return error.OutOfMemory;
+    errdefer device.owner.allocator.free(values);
+    var maximum_bytes: usize = 32;
+    if (offer != null) maximum_bytes += 12;
+    for (mime_types) |mime| maximum_bytes = std.math.add(usize, maximum_bytes, 12 + std.mem.alignForward(usize, mime.len + 1, 4)) catch return error.OutOfMemory;
+    if (modern) maximum_bytes += 24;
+    var event_index: usize = 0;
+    var value_index: usize = 0;
+    if (offer) |value| {
+        values[value_index] = .{ .new_id = .{ .typed = value.resource.id() } };
+        events[event_index] = .{ .resource = &device.resource.runtime, .opcode = 0, .descriptor = &protocol.wl_data_device.event_messages[0], .values = values[value_index .. value_index + 1] };
+        event_index += 1;
+        value_index += 1;
+        for (mime_types) |mime| {
+            values[value_index] = .{ .string = mime };
+            events[event_index] = .{ .resource = &value.resource.runtime, .opcode = 0, .descriptor = &protocol.wl_data_offer.event_messages[0], .values = values[value_index .. value_index + 1] };
+            event_index += 1;
+            value_index += 1;
+        }
+        if (modern) {
+            values[value_index] = .{ .uint = toWireActions(device.owner.canonical.sourceActions(info.?.source.?) catch return error.OutOfMemory) };
+            events[event_index] = .{ .resource = &value.resource.runtime, .opcode = 1, .descriptor = &protocol.wl_data_offer.event_messages[1], .values = values[value_index .. value_index + 1] };
+            event_index += 1;
+            value_index += 1;
+            values[value_index] = .{ .uint = toWireActions(info.?.selected_action) };
+            events[event_index] = .{ .resource = &value.resource.runtime, .opcode = 2, .descriptor = &protocol.wl_data_offer.event_messages[2], .values = values[value_index .. value_index + 1] };
+            event_index += 1;
+            value_index += 1;
+        }
     }
+    values[value_index + 0] = .{ .uint = serial };
+    values[value_index + 1] = .{ .object = endpoint.resource.id() };
+    values[value_index + 2] = .{ .fixed = fixed(x) };
+    values[value_index + 3] = .{ .fixed = fixed(y) };
+    values[value_index + 4] = .{ .object = if (offer) |value| value.resource.id() else null };
+    events[event_index] = .{ .resource = &device.resource.runtime, .opcode = 1, .descriptor = &protocol.wl_data_device.event_messages[1], .values = values[value_index .. value_index + 5] };
+    const offers = device.owner.allocator.alloc(*Offer, if (offer == null) 0 else 1) catch return error.OutOfMemory;
+    errdefer device.owner.allocator.free(offers);
+    if (offer) |value| offers[0] = value;
+    device.owner.staged_events.append(device.owner.allocator, .{
+        .client = device.client,
+        .events = events,
+        .values = values,
+        .offers = offers,
+        .maximum_bytes = maximum_bytes,
+    }) catch return error.OutOfMemory;
     return .{ .legacy_copy = id != null and device.resource.version() < 3 };
 }
-fn deviceDragEnter(context: *anyopaque, surface_id: SurfaceRegistry.Id, x: f64, y: f64, id: ?DataDevice.OfferId) void {
+fn deviceDragAbort(context: *anyopaque) void {
     const device: *Device = @ptrCast(@alignCast(context));
-    const endpoint = (device.owner.compositor orelse return).surfaceEndpoint(surface_id) orelse return;
-    const offer = if (id) |offer_id| findOffer(device.owner, offer_id) else null;
-    if (offer) |value| publishOffer(value, device) catch {
-        device.client.postOutOfMemory(&device.resource.runtime, "publishing generated drag offer");
-        return;
+    _ = device;
+}
+fn deviceDragEnter(context: *anyopaque, surface_id: SurfaceRegistry.Id, x: f64, y: f64, id: ?DataDevice.OfferId) void {
+    _ = context;
+    _ = surface_id;
+    _ = x;
+    _ = y;
+    _ = id;
+}
+
+pub fn transactionFinalize(context: *anyopaque) error{OutOfMemory}!void {
+    const self: *WayringDataDevice = @ptrCast(@alignCast(context));
+    std.debug.assert(self.prepared_clients.items.len == 0);
+    var index: usize = 0;
+    while (index < self.staged_events.items.len) {
+        const client = self.staged_events.items[index].client;
+        var already_prepared = false;
+        for (self.prepared_clients.items) |prepared| if (prepared.client == client) {
+            already_prepared = true;
+            break;
+        };
+        if (already_prepared) {
+            index += 1;
+            continue;
+        }
+        var event_count: usize = 0;
+        var maximum_bytes: usize = 0;
+        for (self.staged_events.items) |staged| if (staged.client == client) {
+            event_count = std.math.add(usize, event_count, staged.events.len) catch return error.OutOfMemory;
+            maximum_bytes = std.math.add(usize, maximum_bytes, staged.maximum_bytes) catch return error.OutOfMemory;
+        };
+        const events = self.allocator.alloc(wayring.server.Client.PreparedEvent, event_count) catch return error.OutOfMemory;
+        var next: usize = 0;
+        for (self.staged_events.items) |staged| if (staged.client == client) {
+            @memcpy(events[next .. next + staged.events.len], staged.events);
+            next += staged.events.len;
+        };
+        const batch = client.prepareEvents(maximum_bytes) catch {
+            self.allocator.free(events);
+            return error.OutOfMemory;
+        };
+        self.prepared_clients.append(self.allocator, .{ .client = client, .batch = batch, .events = events }) catch {
+            client.cancelPreparedEvents(batch);
+            self.allocator.free(events);
+            return error.OutOfMemory;
+        };
+        index += 1;
+    }
+}
+
+fn stageEvent(
+    self: *WayringDataDevice,
+    client: *wayring.server.Client,
+    resource: *wayring.server.Resource,
+    opcode: u16,
+    descriptor: *const wire.MessageDescriptor,
+    source_values: []const wire.Value,
+    maximum_bytes: usize,
+    offers: []const *Offer,
+) error{OutOfMemory}!void {
+    const events = self.allocator.alloc(wayring.server.Client.PreparedEvent, 1) catch return error.OutOfMemory;
+    errdefer self.allocator.free(events);
+    const values = self.allocator.dupe(wire.Value, source_values) catch return error.OutOfMemory;
+    errdefer self.allocator.free(values);
+    const offer_copy = self.allocator.dupe(*Offer, offers) catch return error.OutOfMemory;
+    errdefer self.allocator.free(offer_copy);
+    events[0] = .{ .resource = resource, .opcode = opcode, .descriptor = descriptor, .values = values };
+    self.staged_events.append(self.allocator, .{ .client = client, .events = events, .values = values, .offers = offer_copy, .maximum_bytes = maximum_bytes }) catch return error.OutOfMemory;
+}
+
+pub fn transactionCommit(context: *anyopaque) void {
+    const self: *WayringDataDevice = @ptrCast(@alignCast(context));
+    for (self.prepared_clients.items) |prepared| for (prepared.events) |event| {
+        if (event.values.len != event.descriptor.arguments.len)
+            std.debug.panic("prepared event opcode {d}: {d} values for {d} arguments", .{ event.opcode, event.values.len, event.descriptor.arguments.len });
     };
-    const serial = if (offer) |value| value.enter_serial else device.enter_serial;
-    protocol.wl_data_device.@"send:enter"(&device.resource, serial, endpoint.resource.id(), fixed(x), fixed(y), if (offer) |value| value.resource.id() else null) catch
-        device.client.postOutOfMemory(&device.resource.runtime, "queueing generated drag enter");
+    for (self.prepared_clients.items) |prepared| prepared.client.emitPreparedEvents(prepared.batch, prepared.events) catch unreachable;
+    for (self.staged_events.items) |staged| {
+        for (staged.offers) |offer| offer.published = true;
+    }
+    self.clearTransaction(false);
+}
+
+pub fn transactionAbort(context: *anyopaque) void {
+    const self: *WayringDataDevice = @ptrCast(@alignCast(context));
+    self.clearTransaction(true);
+}
+
+fn clearTransaction(self: *WayringDataDevice, cancel: bool) void {
+    for (self.prepared_clients.items) |prepared| {
+        if (cancel) prepared.client.cancelPreparedEvents(prepared.batch);
+        self.allocator.free(prepared.events);
+    }
+    self.prepared_clients.clearRetainingCapacity();
+    for (self.staged_events.items) |staged| {
+        self.allocator.free(staged.events);
+        self.allocator.free(staged.values);
+        self.allocator.free(staged.offers);
+    }
+    self.staged_events.clearRetainingCapacity();
 }
 fn deviceDragMotion(context: *anyopaque, time: u32, x: f64, y: f64) void {
+    _ = context;
+    _ = time;
+    _ = x;
+    _ = y;
+}
+fn deviceDragMotionPreflight(context: *anyopaque, time: u32, x: f64, y: f64) error{OutOfMemory}!void {
     const device: *Device = @ptrCast(@alignCast(context));
-    protocol.wl_data_device.@"send:motion"(&device.resource, time, fixed(x), fixed(y)) catch
-        device.client.postOutOfMemory(&device.resource.runtime, "queueing generated drag motion");
+    try device.owner.stageEvent(device.client, &device.resource.runtime, 3, &protocol.wl_data_device.event_messages[3], &.{ .{ .uint = time }, .{ .fixed = fixed(x) }, .{ .fixed = fixed(y) } }, 20, &.{});
 }
 fn deviceDragLeave(context: *anyopaque) void {
+    _ = context;
+}
+fn deviceDragLeavePreflight(context: *anyopaque) error{OutOfMemory}!void {
     const device: *Device = @ptrCast(@alignCast(context));
-    protocol.wl_data_device.@"send:leave"(&device.resource) catch
-        device.client.postOutOfMemory(&device.resource.runtime, "queueing generated drag leave");
+    try device.owner.stageEvent(device.client, &device.resource.runtime, 2, &protocol.wl_data_device.event_messages[2], &.{}, 8, &.{});
 }
 fn deviceDragDrop(context: *anyopaque) void {
+    _ = context;
+}
+fn deviceDragDropPreflight(context: *anyopaque) error{OutOfMemory}!void {
     const device: *Device = @ptrCast(@alignCast(context));
-    protocol.wl_data_device.@"send:drop"(&device.resource) catch
-        device.client.postOutOfMemory(&device.resource.runtime, "queueing generated drag drop");
+    try device.owner.stageEvent(device.client, &device.resource.runtime, 4, &protocol.wl_data_device.event_messages[4], &.{}, 8, &.{});
 }
 
 fn findOffer(self: *WayringDataDevice, id: DataDevice.OfferId) ?*Offer {
@@ -524,11 +740,15 @@ fn fixed(value: f64) i32 {
 }
 
 fn destroyOffer(self: *WayringDataDevice, value: *Offer) void {
+    self.destroyOfferResource(value, true);
+}
+
+fn destroyOfferResource(self: *WayringDataDevice, value: *Offer, retire_canonical: bool) void {
     for (self.offers.items, 0..) |item, i| if (item == value) {
         _ = self.offers.swapRemove(i);
         break;
     };
-    self.canonical.retireOffer(value.id, value.resource.version() < 3);
+    if (retire_canonical) self.canonical.retireOffer(value.id, value.resource.version() < 3);
     value.resource.destroy();
     value.resource.deinit();
     self.allocator.destroy(value);
@@ -745,10 +965,17 @@ const DataDeviceFixture = struct {
         try self.seat.publish();
         self.canonical = .init(std.testing.allocator, &self.clients, &self.surfaces, &self.authority, .{
             .context = &self.adapter,
+            .transaction_finalize = transactionFinalize,
+            .transaction_commit = transactionCommit,
+            .transaction_abort = transactionAbort,
             .selection_changed = noopChanged,
             .drag_changed = noopChanged,
             .offer_rolled_back = offerRolledBack,
             .offer_mime_offered = offerMimeOffered,
+            .offer_source_actions_preflight = offerSourceActionsPreflight,
+            .offer_source_actions_changed = offerSourceActionsChanged,
+            .offer_action_preflight = offerActionPreflight,
+            .offer_action_changed = offerActionChanged,
         });
         self.adapter.init(std.testing.allocator, &self.host, &self.mapped, &self.seat, &self.canonical, &self.compositor);
         try self.adapter.publish();
@@ -876,6 +1103,31 @@ test "focused late device materializes before synchronous selection publication"
     const counts = fixture.canonical.resourceCounts();
     try std.testing.expectEqual(@as(usize, 1), counts.devices);
     try std.testing.expectEqual(@as(usize, 1), counts.offers);
+}
+
+test "prepared generated action stays invisible until atomic commit and abort leaves no wire" {
+    var fixture: DataDeviceFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const client = fixture.client();
+
+    try testSend(client, 4, 0, &protocol.wl_data_device_manager.request_messages[0], &.{.{ .new_id = .{ .typed = 5 } }});
+    try discardEvents(client);
+    const source = fixture.adapter.sources.items[0];
+
+    try sourceActionPreflight(source, .{ .copy = true });
+    try std.testing.expect((try client.beginSend()) == null);
+    transactionAbort(&fixture.adapter);
+    try std.testing.expect((try client.beginSend()) == null);
+
+    try sourceActionPreflight(source, .{ .move = true });
+    try transactionFinalize(&fixture.adapter);
+    try std.testing.expect((try client.beginSend()) == null);
+    transactionCommit(&fixture.adapter);
+    const batch = (try client.beginSend()).?;
+    try std.testing.expectEqual(@as(usize, 12), batch.bytes.len);
+    try client.completeSend(batch.token, batch.bytes.len);
+    try std.testing.expect((try client.beginSend()) == null);
 }
 
 test "generated start_drag assigns a permanent icon role and follows surface lifecycle" {

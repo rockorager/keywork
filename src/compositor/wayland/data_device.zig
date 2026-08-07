@@ -376,7 +376,7 @@ fn deviceSelection(context: *anyopaque, offer_id: ?OfferId) error{OutOfMemory}!v
     device.resource.sendSelection(offer.resource);
 }
 
-fn devicePrepareEnter(context: *anyopaque, offer_id: ?OfferId) error{OutOfMemory}!NeutralDataDevice.DragPreparation {
+fn devicePrepareEnter(context: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, offer_id: ?OfferId) error{OutOfMemory}!NeutralDataDevice.DragPreparation {
     const device: *DeviceResource = @ptrCast(@alignCast(context));
     if (offer_id) |id| _ = OfferResource.materialize(device.manager, id, device) catch return error.OutOfMemory;
     return .{ .legacy_copy = offer_id != null and device.resource.getVersion() < 3 };
@@ -731,9 +731,9 @@ test "mature offer resources follow the exact neutral drag enter batch" {
             fail_prepare: bool = false,
 
             fn selection(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
-            fn prepare(context: *anyopaque, offer: ?OfferId) error{OutOfMemory}!NeutralDataDevice.DragPreparation {
+            fn prepare(context: *anyopaque, surface: SurfaceRegistry.Id, x: f64, y: f64, offer: ?OfferId) error{OutOfMemory}!NeutralDataDevice.DragPreparation {
                 const self: *@This() = @ptrCast(@alignCast(context));
-                const prepared = try devicePrepareEnter(self.device, offer);
+                const prepared = try devicePrepareEnter(self.device, surface, x, y, offer);
                 if (self.fail_prepare) return error.OutOfMemory;
                 return prepared;
             }
