@@ -82,6 +82,24 @@ pub const PointerIdentity = struct {
     capability_generation: SeatDelivery.ResourceGeneration,
 };
 
+/// Resolves an exact live generated wl_seat to its neutral client. This is
+/// deliberately narrower than exposing the generated resource: consumers can
+/// validate same-client seat arguments without retaining protocol pointers.
+pub fn seatClientIdentity(
+    self: *const WayringSeatAdapter,
+    client: *wayring.server.Client,
+    object_id: u32,
+) ?ClientRegistry.Id {
+    if (client.fatal() != null) return null;
+    const installed = client.lookup(object_id) orelse return null;
+    for (self.seats.items) |seat_resource| {
+        if (seat_resource.client == client and seat_resource.resource.id() == object_id and
+            installed == &seat_resource.resource.runtime and seat_resource.resource.runtime.state() == .live)
+            return self.clients.id(client);
+    }
+    return null;
+}
+
 pub fn init(
     allocator: std.mem.Allocator,
     protocol_server: *wayring.server.Server,

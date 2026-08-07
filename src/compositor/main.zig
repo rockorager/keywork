@@ -784,6 +784,7 @@ test {
     _ = @import("wayland/WayringHost.zig");
     _ = @import("wayland/WayringOutput.zig");
     _ = @import("wayland/WayringSeatAdapter.zig");
+    _ = @import("wayland/WayringDataDevice.zig");
     _ = @import("wayland/surface.zig");
     _ = @import("wayland/surface_geometry.zig");
     _ = @import("wayland/region.zig");

@@ -93,6 +93,7 @@ const Surface = @import("wayland/surface.zig");
 const MatureClients = @import("wayland/MatureClients.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
+const WayringDataDevice = @import("wayland/WayringDataDevice.zig");
 const WayringCursorShape = @import("wayland/WayringCursorShape.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
@@ -134,6 +135,15 @@ const ExpectedProtocolError = struct {
     code: u32,
     matches: usize = 0,
     wrong_identity: bool = false,
+};
+
+/// Additional canonical offer notifications used only by unpublished
+/// generated-front-end tests. Production construction and dispatch are
+/// unchanged, and the observer owns no lifecycle state.
+pub const TestDataDeviceObserver = struct {
+    context: *anyopaque,
+    offer_rolled_back: *const fn (*anyopaque, NeutralDataDevice.OfferId) void,
+    offer_mime_offered: *const fn (*anyopaque, NeutralDataDevice.OfferId, []const u8) void,
 };
 var expected_protocol_error: if (builtin.is_test) ?ExpectedProtocolError else void =
     if (builtin.is_test) null else {};
@@ -311,6 +321,7 @@ routed_touches: std.ArrayList(RoutedTouch),
 next_touch_id: u31,
 data_device: NeutralDataDevice,
 mature_data_device: WaylandDataDevice,
+test_data_device_observer: if (builtin.is_test) ?TestDataDeviceObserver else void = if (builtin.is_test) null else {},
 xdg_toplevel_drag: XdgToplevelDrag,
 xdg_toplevel_icon: XdgToplevelIcon,
 xdg_dialog: XdgDialog,
@@ -3887,6 +3898,17 @@ pub fn dataDeviceResourceSnapshot(self: *const Self) DataDeviceResourceSnapshot 
         .has_selection = self.data_device.hasSelection(),
         .dragging = self.data_device.isDragging(),
     };
+}
+
+/// Canonical clipboard owner used by unpublished generated adapters in tests.
+pub fn neutralDataDevice(self: *Self) *NeutralDataDevice {
+    if (!builtin.is_test) unreachable;
+    return &self.data_device;
+}
+
+pub fn setTestDataDeviceObserver(self: *Self, observer: ?TestDataDeviceObserver) void {
+    if (!builtin.is_test) unreachable;
+    self.test_data_device_observer = observer;
 }
 
 /// Neutral XDG semantic owner used by unpublished generated adapters.
@@ -7615,11 +7637,15 @@ fn dataDeviceMimeOffered(context: *anyopaque, source: NeutralDataDevice.SourceId
 fn dataDeviceOfferRolledBack(context: *anyopaque, offer: NeutralDataDevice.OfferId) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.mature_data_device.neutralOfferRolledBack(offer);
+    if (builtin.is_test) if (self.test_data_device_observer) |observer|
+        observer.offer_rolled_back(observer.context, offer);
 }
 
 fn dataDeviceOfferMimeOffered(context: *anyopaque, offer: NeutralDataDevice.OfferId, mime_type: []const u8) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.mature_data_device.neutralOfferMime(offer, mime_type);
+    if (builtin.is_test) if (self.test_data_device_observer) |observer|
+        observer.offer_mime_offered(observer.context, offer, mime_type);
 }
 
 fn dataDeviceOfferSourceActionsChanged(context: *anyopaque, offer: NeutralDataDevice.OfferId, actions: NeutralDataDevice.Actions) void {
@@ -13334,7 +13360,6 @@ test "production mature data device v3 serves two canonical socket clients" {
     }
     if (libc.setenv("XDG_RUNTIME_DIR", runtime_directory, 1) != 0)
         return error.RuntimeEnvironmentFailed;
-
     const server = try Self.createWithVirtualOutput(
         std.testing.allocator,
         std.testing.io,
@@ -16736,6 +16761,8 @@ const WayringXdgClient = struct {
         mode_changed,
         frame_done,
         registry_ready,
+        manager_added,
+        manager_removed,
         disconnected,
         failed,
     };
@@ -16750,6 +16777,7 @@ const WayringXdgClient = struct {
     display_name: []const u8,
     command_fd: std.posix.fd_t,
     registry_only: bool = false,
+    registry_watch_data_device: bool = false,
     offense: ?Offense = null,
     activation_role: ?ActivationRole = null,
     activation_exchange: ?*ActivationExchange = null,
@@ -16765,6 +16793,9 @@ const WayringXdgClient = struct {
     activation: ?*client_xdg.ActivationV1 = null,
     global_count: usize = 0,
     globals_exact: bool = true,
+    data_device_manager_count: usize = 0,
+    data_device_manager_version: u32 = 0,
+    data_device_manager_removed: bool = false,
     configure_serial: u32 = 0,
     configure_count: u8 = 0,
     toplevel_configure_count: u8 = 0,
@@ -16862,6 +16893,15 @@ const WayringXdgClient = struct {
         defer if (activation_live) activation.destroy();
         if (self.registry_only) {
             try self.pause(.registry_ready);
+            if (self.registry_watch_data_device) {
+                try expectClientRoundtrip(display);
+                if (self.data_device_manager_count != 1 or self.data_device_manager_version != 3)
+                    return error.UnexpectedDataDeviceManagerProfile;
+                try self.pause(.manager_added);
+                try expectClientRoundtrip(display);
+                if (!self.data_device_manager_removed) return error.DataDeviceManagerRemovalMissing;
+                try self.pause(.manager_removed);
+            }
             activation.destroy();
             activation_live = false;
             decoration_manager.destroy();
@@ -17077,13 +17117,18 @@ const WayringXdgClient = struct {
         switch (event) {
             .global => |global| {
                 const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_data_device_manager")) {
+                    self.data_device_manager_count += 1;
+                    self.data_device_manager_version = global.version;
+                    return;
+                }
                 const index = self.global_count;
                 self.global_count += 1;
                 if (index >= expected_globals.len or !std.mem.eql(u8, interface, expected_globals[index].name) or
                     global.version != expected_globals[index].version) self.globals_exact = false;
                 if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, 6) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, 4) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, 11) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, 7) catch null else if (std.mem.eql(u8, interface, "zxdg_decoration_manager_v1")) self.decoration_manager = registry.bind(global.name, client_zxdg.DecorationManagerV1, 2) catch null else if (std.mem.eql(u8, interface, "xdg_activation_v1")) self.activation = registry.bind(global.name, client_xdg.ActivationV1, 1) catch null;
             },
-            .global_remove => {},
+            .global_remove => self.data_device_manager_removed = self.data_device_manager_count != 0,
         }
     }
 
@@ -18154,6 +18199,655 @@ const MatureDataDeviceClient = struct {
     }
 };
 
+/// Socket client used by mixed-front-end clipboard tests.  This deliberately
+/// owns its connection and protocol objects instead of borrowing the much
+/// broader `MatureDataDeviceClient` (which also exercises data-control and
+/// drag-and-drop).
+const GeneratedClipboardClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_xdg = wayland.client.xdg;
+    const Stage = enum(u8) {
+        starting,
+        ready,
+        generated_selected,
+        generated_late,
+        generated_sent,
+        mature_received,
+        generated_cancelled,
+        mature_selected,
+        mature_late,
+        mature_sent,
+        generated_received,
+        mature_replaced,
+        cleared,
+        disconnected,
+        failed,
+    };
+    const Event = enum { data_offer, initial_mime, selection, late_mime, send, cancelled };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    shm: ?*client_wl.Shm = null,
+    seat: ?*client_wl.Seat = null,
+    wm_base: ?*client_xdg.WmBase = null,
+    manager: ?*client_wl.DataDeviceManager = null,
+    surface_object_id: u32 = 0,
+    keyboard_serial: u32 = 0,
+    configure_serial: u32 = 0,
+    offer: ?*client_wl.DataOffer = null,
+    source: ?*client_wl.DataSource = null,
+    events: [16]Event = undefined,
+    event_count: usize = 0,
+    received: [64]u8 = undefined,
+    received_len: usize = 0,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(
+            std.heap.page_allocator,
+            "{s}/{s}",
+            .{ self.runtime_directory, self.display_name },
+            0,
+        );
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        defer compositor.destroy();
+        const shm = self.shm orelse return error.ShmMissing;
+        defer shm.release();
+        const seat = self.seat orelse return error.SeatMissing;
+        defer seat.release();
+        const wm_base = self.wm_base orelse return error.XdgWmBaseMissing;
+        defer wm_base.destroy();
+        wm_base.setListener(*@This(), wmBaseEvent, self);
+        const manager = self.manager orelse return error.DataDeviceManagerMissing;
+        defer manager.release();
+        const keyboard = try seat.getKeyboard();
+        defer keyboard.release();
+        keyboard.setListener(*@This(), keyboardEvent, self);
+        const device = try manager.getDataDevice(seat);
+        var device_live = true;
+        defer if (device_live) device.release();
+        device.setListener(*@This(), deviceEvent, self);
+        const surface = try compositor.createSurface();
+        self.surface_object_id = surface.getId();
+        defer surface.destroy();
+        const xdg_surface = try wm_base.getXdgSurface(surface);
+        defer xdg_surface.destroy();
+        xdg_surface.setListener(*@This(), xdgSurfaceEvent, self);
+        const toplevel = try xdg_surface.getToplevel();
+        defer toplevel.destroy();
+        toplevel.setListener(*@This(), toplevelEvent, self);
+        toplevel.setAppId("org.keywork.clipboard-generated");
+        surface.commit();
+        while (self.configure_serial == 0) try expectClientRoundtrip(display);
+        const buffer = try createClipboardBuffer(shm, 0xff19_75d2);
+        defer buffer.buffer.destroy();
+        defer buffer.pool.destroy();
+        defer _ = std.os.linux.close(buffer.fd);
+        surface.attach(buffer.buffer, 0, 0);
+        surface.damageBuffer(0, 0, 1, 1);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        try self.pause(.ready);
+
+        try expectClientRoundtrip(display);
+        if (self.keyboard_serial == 0) return error.GeneratedFocusSerialMissing;
+        const stale = try manager.createDataSource();
+        defer stale.destroy();
+        stale.offer(MatureClipboardClient.mime_type);
+        device.setSelection(stale, self.keyboard_serial ^ 0x8000_0000);
+        const source = try manager.createDataSource();
+        self.source = source;
+        defer source.destroy();
+        source.setListener(*@This(), sourceEvent, self);
+        source.offer(MatureClipboardClient.mime_type);
+        device.setSelection(source, self.keyboard_serial);
+        try expectClientRoundtrip(display);
+        try self.pause(.generated_selected);
+        source.offer(MatureClipboardClient.late_mime_type);
+        try expectClientRoundtrip(display);
+        try self.pause(.generated_late);
+        while (self.eventIndex(.send) == null) try expectClientRoundtrip(display);
+        try self.pause(.generated_sent);
+
+        try expectClientRoundtrip(display);
+        if (self.eventIndex(.cancelled) == null) return error.GeneratedCancellationMissing;
+        try self.pause(.generated_cancelled);
+        self.event_count = 0;
+        while (self.eventIndex(.selection) == null) try expectClientRoundtrip(display);
+        const data_offer = self.eventIndex(.data_offer).?;
+        const initial_mime = self.eventIndex(.initial_mime).?;
+        const selection = self.eventIndex(.selection).?;
+        if (!(data_offer < initial_mime and initial_mime < selection))
+            return error.GeneratedOfferOrderInvalid;
+        try self.pause(.mature_selected);
+        while (self.eventIndex(.late_mime) == null) try expectClientRoundtrip(display);
+        const late_mime = self.eventIndex(.late_mime).?;
+        if (!(selection < late_mime))
+            return error.GeneratedOfferOrderInvalid;
+        try self.pause(.mature_late);
+
+        const retained = self.offer orelse return error.GeneratedOfferMissing;
+        device.release();
+        device_live = false;
+        var pipe: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&pipe) != 0) return error.PipeFailed;
+        var read_open = true;
+        defer if (read_open) {
+            _ = std.os.linux.close(pipe[0]);
+        };
+        retained.receive(MatureClipboardClient.mime_type, pipe[1]);
+        try closeMatureTransferFd(pipe[1]);
+        try expectClientRoundtrip(display);
+        self.received_len = try readMatureTransfer(pipe[0], &self.received);
+        try closeMatureTransferFd(pipe[0]);
+        read_open = false;
+        if (!std.mem.eql(u8, self.received[0..self.received_len], MatureClipboardClient.mature_bytes))
+            return error.GeneratedClipboardBytesMismatch;
+        try self.pause(.generated_received);
+        retained.destroy();
+        self.offer = null;
+        try expectClientRoundtrip(display);
+        try self.pause(.cleared);
+    }
+
+    fn append(self: *@This(), event: Event) void {
+        if (self.event_count == self.events.len) return;
+        self.events[self.event_count] = event;
+        self.event_count += 1;
+    }
+    fn eventIndex(self: *const @This(), wanted: Event) ?usize {
+        for (self.events[0..self.event_count], 0..) |event, index| if (event == wanted) return index;
+        return null;
+    }
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, @min(global.version, 7)) catch null else if (std.mem.eql(u8, interface, "wl_data_device_manager")) self.manager = registry.bind(global.name, client_wl.DataDeviceManager, 3) catch null;
+            },
+            .global_remove => {},
+        }
+    }
+    fn wmBaseEvent(wm_base: *client_xdg.WmBase, event: client_xdg.WmBase.Event, _: *@This()) void {
+        switch (event) {
+            .ping => |ping| wm_base.pong(ping.serial),
+        }
+    }
+    fn xdgSurfaceEvent(xdg_surface: *client_xdg.Surface, event: client_xdg.Surface.Event, self: *@This()) void {
+        switch (event) {
+            .configure => |configure| {
+                self.configure_serial = configure.serial;
+                xdg_surface.ackConfigure(configure.serial);
+            },
+        }
+    }
+    fn toplevelEvent(_: *client_xdg.Toplevel, _: client_xdg.Toplevel.Event, _: *@This()) void {}
+    fn keyboardEvent(_: *client_wl.Keyboard, event: client_wl.Keyboard.Event, self: *@This()) void {
+        switch (event) {
+            .keymap => |keymap| _ = std.os.linux.close(keymap.fd),
+            .enter => |enter| self.keyboard_serial = enter.serial,
+            else => {},
+        }
+    }
+    fn deviceEvent(_: *client_wl.DataDevice, event: client_wl.DataDevice.Event, self: *@This()) void {
+        switch (event) {
+            .data_offer => |data| {
+                self.offer = data.id;
+                data.id.setListener(*@This(), offerEvent, self);
+                self.append(.data_offer);
+            },
+            .selection => self.append(.selection),
+            else => {},
+        }
+    }
+    fn offerEvent(_: *client_wl.DataOffer, event: client_wl.DataOffer.Event, self: *@This()) void {
+        switch (event) {
+            .offer => |offer| {
+                const mime = std.mem.span(offer.mime_type);
+                self.append(if (std.mem.eql(u8, mime, MatureClipboardClient.late_mime_type)) .late_mime else .initial_mime);
+            },
+            else => {},
+        }
+    }
+    fn sourceEvent(_: *client_wl.DataSource, event: client_wl.DataSource.Event, self: *@This()) void {
+        switch (event) {
+            .send => |send| {
+                if (std.c.fcntl(send.fd, std.posix.F.GETFD) < 0) {
+                    self.failure = error.GeneratedSendFdClosed;
+                    return;
+                }
+                const bytes = MatureClipboardClient.generated_bytes;
+                if (std.c.write(send.fd, bytes.ptr, bytes.len) != bytes.len) {
+                    self.failure = error.GeneratedSendFailed;
+                    return;
+                }
+                closeMatureTransferFd(send.fd) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                self.append(.send);
+            },
+            .cancelled => self.append(.cancelled),
+            else => {},
+        }
+    }
+    fn pause(self: *@This(), value: Stage) !void {
+        self.stage.store(@intFromEnum(value), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+    fn closeWake(self: *@This(), shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(-2, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+    fn shutdown(self: *@This()) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
+/// Independent generated client that proves a terminal data-device fault is
+/// isolated by the production host from valid clipboard peers.
+const GeneratedDragOffender = struct {
+    const client_wl = wayland.client.wl;
+    const Stage = enum(u8) { starting, ready, disconnected, failed };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    seat: ?*client_wl.Seat = null,
+    manager: ?*client_wl.DataDeviceManager = null,
+    surface_object_id: u32 = 0,
+    device_object_id: u32 = 0,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(
+            std.heap.page_allocator,
+            "{s}/{s}",
+            .{ self.runtime_directory, self.display_name },
+            0,
+        );
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        defer compositor.destroy();
+        const seat = self.seat orelse return error.SeatMissing;
+        defer seat.release();
+        const manager = self.manager orelse return error.DataDeviceManagerMissing;
+        defer manager.release();
+        const device = try manager.getDataDevice(seat);
+        self.device_object_id = device.getId();
+        defer device.release();
+        const surface = try compositor.createSurface();
+        self.surface_object_id = surface.getId();
+        defer surface.destroy();
+        try expectClientRoundtrip(display);
+        try self.pause(.ready);
+
+        device.startDrag(null, surface, null, 1);
+        expectClientRoundtrip(display) catch return;
+        return error.ExpectedImplementationFailure;
+    }
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null else if (std.mem.eql(u8, interface, "wl_data_device_manager")) self.manager = registry.bind(global.name, client_wl.DataDeviceManager, 3) catch null;
+            },
+            .global_remove => {},
+        }
+    }
+
+    fn pause(self: *@This(), value: Stage) !void {
+        self.stage.store(@intFromEnum(value), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+    fn closeWake(self: *@This(), shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(-2, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+    fn shutdown(self: *@This()) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
+/// The libwayland-side peer for mixed-front-end clipboard tests.  Its state is
+/// intentionally separate from both `GeneratedClipboardClient` and
+/// `MatureDataDeviceClient`, so either side can be torn down independently.
+const MatureClipboardClient = struct {
+    const client_wl = wayland.client.wl;
+    const Stage = GeneratedClipboardClient.Stage;
+    const Event = GeneratedClipboardClient.Event;
+    const mime_type: [:0]const u8 = "text/plain;charset=utf-8";
+    const late_mime_type: [:0]const u8 = "text/html";
+    const stale_mime_type: [:0]const u8 = "application/x-keywork-stale";
+    const generated_bytes = "generated-to-mature clipboard\n";
+    const mature_bytes = "mature-to-generated clipboard\n";
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    shm: ?*client_wl.Shm = null,
+    seat: ?*client_wl.Seat = null,
+    manager: ?*client_wl.DataDeviceManager = null,
+    surface_object_id: u32 = 0,
+    keyboard_serial: u32 = 0,
+    offer: ?*client_wl.DataOffer = null,
+    source: ?*client_wl.DataSource = null,
+    events: [16]Event = undefined,
+    event_count: usize = 0,
+    received: [64]u8 = undefined,
+    received_len: usize = 0,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}/{s}", .{ self.runtime_directory, self.display_name }, 0);
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        defer compositor.destroy();
+        const shm = self.shm orelse return error.ShmMissing;
+        defer shm.release();
+        const seat = self.seat orelse return error.SeatMissing;
+        defer seat.release();
+        const manager = self.manager orelse return error.DataDeviceManagerMissing;
+        defer manager.release();
+        const keyboard = try seat.getKeyboard();
+        defer keyboard.release();
+        keyboard.setListener(*@This(), keyboardEvent, self);
+        const device = try manager.getDataDevice(seat);
+        var device_live = true;
+        defer if (device_live) device.release();
+        device.setListener(*@This(), deviceEvent, self);
+        const surface = try compositor.createSurface();
+        self.surface_object_id = surface.getId();
+        defer surface.destroy();
+        const buffer = try createClipboardBuffer(shm, 0xffd2_7519);
+        defer buffer.buffer.destroy();
+        defer buffer.pool.destroy();
+        defer _ = std.os.linux.close(buffer.fd);
+        surface.attach(buffer.buffer, 0, 0);
+        surface.damageBuffer(0, 0, 1, 1);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        try self.pause(.ready);
+
+        while (self.eventIndex(.selection) == null) try expectClientRoundtrip(display);
+        const data_offer = self.eventIndex(.data_offer).?;
+        const initial_mime = self.eventIndex(.initial_mime).?;
+        const selection = self.eventIndex(.selection).?;
+        if (!(data_offer < initial_mime and initial_mime < selection))
+            return error.MatureOfferOrderInvalid;
+        try self.pause(.generated_selected);
+        while (self.eventIndex(.late_mime) == null) try expectClientRoundtrip(display);
+        const late_mime = self.eventIndex(.late_mime).?;
+        if (!(selection < late_mime))
+            return error.MatureOfferOrderInvalid;
+        try self.pause(.generated_late);
+        const retained = self.offer orelse return error.MatureOfferMissing;
+        device.release();
+        device_live = false;
+        var pipe: [2]std.posix.fd_t = undefined;
+        if (std.c.pipe(&pipe) != 0) return error.PipeFailed;
+        var read_open = true;
+        defer if (read_open) {
+            _ = std.os.linux.close(pipe[0]);
+        };
+        retained.receive(mime_type, pipe[1]);
+        try closeMatureTransferFd(pipe[1]);
+        try expectClientRoundtrip(display);
+        self.received_len = try readMatureTransfer(pipe[0], &self.received);
+        try closeMatureTransferFd(pipe[0]);
+        read_open = false;
+        if (!std.mem.eql(u8, self.received[0..self.received_len], generated_bytes))
+            return error.MatureClipboardBytesMismatch;
+        try self.pause(.mature_received);
+        retained.destroy();
+        self.offer = null;
+        self.event_count = 0;
+
+        const replacement_device = try manager.getDataDevice(seat);
+        defer replacement_device.release();
+        replacement_device.setListener(*@This(), deviceEvent, self);
+        try expectClientRoundtrip(display);
+        if (self.keyboard_serial == 0) return error.MatureFocusSerialMissing;
+        const stale = try manager.createDataSource();
+        defer stale.destroy();
+        stale.offer(mime_type);
+        replacement_device.setSelection(stale, self.keyboard_serial ^ 0x8000_0000);
+        const source = try manager.createDataSource();
+        self.source = source;
+        defer source.destroy();
+        source.setListener(*@This(), sourceEvent, self);
+        source.offer(mime_type);
+        replacement_device.setSelection(source, self.keyboard_serial);
+        try expectClientRoundtrip(display);
+        try self.pause(.mature_selected);
+        source.offer(late_mime_type);
+        try expectClientRoundtrip(display);
+        try self.pause(.mature_late);
+        while (self.eventIndex(.send) == null) try expectClientRoundtrip(display);
+        try self.pause(.mature_sent);
+
+        const replacement = try manager.createDataSource();
+        defer replacement.destroy();
+        replacement.setListener(*@This(), sourceEvent, self);
+        replacement.offer(mime_type);
+        replacement_device.setSelection(replacement, self.keyboard_serial);
+        try expectClientRoundtrip(display);
+        if (self.eventIndex(.cancelled) == null) return error.MatureCancellationMissing;
+        try self.pause(.mature_replaced);
+        replacement_device.setSelection(null, self.keyboard_serial);
+        try expectClientRoundtrip(display);
+        try self.pause(.cleared);
+    }
+
+    fn append(self: *@This(), event: Event) void {
+        if (self.event_count == self.events.len) return;
+        self.events[self.event_count] = event;
+        self.event_count += 1;
+    }
+    fn eventIndex(self: *const @This(), wanted: Event) ?usize {
+        for (self.events[0..self.event_count], 0..) |event, index| if (event == wanted) return index;
+        return null;
+    }
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null else if (std.mem.eql(u8, interface, "wl_data_device_manager")) self.manager = registry.bind(global.name, client_wl.DataDeviceManager, 3) catch null;
+            },
+            .global_remove => {},
+        }
+    }
+    fn keyboardEvent(_: *client_wl.Keyboard, event: client_wl.Keyboard.Event, self: *@This()) void {
+        switch (event) {
+            .keymap => |keymap| _ = std.os.linux.close(keymap.fd),
+            .enter => |enter| self.keyboard_serial = enter.serial,
+            else => {},
+        }
+    }
+    fn deviceEvent(_: *client_wl.DataDevice, event: client_wl.DataDevice.Event, self: *@This()) void {
+        switch (event) {
+            .data_offer => |data| {
+                self.offer = data.id;
+                data.id.setListener(*@This(), offerEvent, self);
+                self.append(.data_offer);
+            },
+            .selection => self.append(.selection),
+            else => {},
+        }
+    }
+    fn offerEvent(_: *client_wl.DataOffer, event: client_wl.DataOffer.Event, self: *@This()) void {
+        switch (event) {
+            .offer => |offer| self.append(if (std.mem.eql(u8, std.mem.span(offer.mime_type), late_mime_type)) .late_mime else .initial_mime),
+            else => {},
+        }
+    }
+    fn sourceEvent(_: *client_wl.DataSource, event: client_wl.DataSource.Event, self: *@This()) void {
+        switch (event) {
+            .send => |send| {
+                if (std.c.fcntl(send.fd, std.posix.F.GETFD) < 0) {
+                    self.failure = error.MatureSendFdClosed;
+                    return;
+                }
+                const bytes = mature_bytes;
+                if (std.c.write(send.fd, bytes.ptr, bytes.len) != bytes.len) {
+                    self.failure = error.MatureSendFailed;
+                    return;
+                }
+                closeMatureTransferFd(send.fd) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                self.append(.send);
+            },
+            .cancelled => self.append(.cancelled),
+            else => {},
+        }
+    }
+    fn pause(self: *@This(), value: Stage) !void {
+        self.stage.store(@intFromEnum(value), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+    fn closeWake(self: *@This(), shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(-2, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+    fn shutdown(self: *@This()) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
+const ClipboardBuffer = struct {
+    fd: std.posix.fd_t,
+    pool: *wayland.client.wl.ShmPool,
+    buffer: *wayland.client.wl.Buffer,
+};
+
+fn createClipboardBuffer(shm: *wayland.client.wl.Shm, pixel: u32) !ClipboardBuffer {
+    const fd = try std.posix.memfd_create("keywork-mixed-clipboard", std.os.linux.MFD.CLOEXEC);
+    errdefer _ = std.os.linux.close(fd);
+    if (std.os.linux.errno(std.os.linux.ftruncate(fd, @sizeOf(u32))) != .SUCCESS)
+        return error.ShmResizeFailed;
+    if (std.c.pwrite(fd, @ptrCast(&pixel), @sizeOf(u32), 0) != @sizeOf(u32))
+        return error.ShmWriteFailed;
+    const pool = try shm.createPool(fd, @sizeOf(u32));
+    errdefer pool.destroy();
+    return .{
+        .fd = fd,
+        .pool = pool,
+        .buffer = try pool.createBuffer(0, 1, 1, @sizeOf(u32), .argb8888),
+    };
+}
+
 fn readMatureTransfer(fd: std.posix.fd_t, buffer: []u8) !usize {
     var offset: usize = 0;
     while (offset < buffer.len) {
@@ -18602,6 +19296,43 @@ fn waitForMatureDataDeviceStage(
         server.display.flushClients();
     }
     return error.MatureDataDeviceClientTimedOut;
+}
+
+fn waitForClipboardStage(server: *Self, host: anytype, client: anytype, expected: GeneratedClipboardClient.Stage) !void {
+    for (0..2_000) |_| {
+        const stage: GeneratedClipboardClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) {
+            std.debug.print("clipboard client failed while waiting for {t}: {t}\n", .{ expected, client.failure.? });
+            return client.failure.?;
+        }
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    }
+    std.debug.print("clipboard timeout waiting for {t}, current {t}\n", .{
+        expected,
+        @as(GeneratedClipboardClient.Stage, @enumFromInt(client.stage.load(.acquire))),
+    });
+    std.debug.print("clipboard events: {d}, serial: {d}\n", .{ client.event_count, client.keyboard_serial });
+    return error.ClipboardClientTimedOut;
+}
+
+fn waitForGeneratedDragOffenderStage(
+    server: *Self,
+    host: anytype,
+    client: *GeneratedDragOffender,
+    expected: GeneratedDragOffender.Stage,
+) !void {
+    for (0..2_000) |_| {
+        const stage: GeneratedDragOffender.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure.?;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    }
+    return error.GeneratedDragOffenderTimedOut;
 }
 
 fn wayringSurfaceWithPixel(server: *Self, pixel: u32) ?SurfaceRegistry.Id {
@@ -20264,6 +20995,522 @@ test "production Wayring XDG publication accepts a real registry client and surv
     rebind_joined = true;
     try waitForWayringDisconnect(server, host, &compositor);
     try std.testing.expect(host.failure() == null);
+    try host.destroy();
+    host_live = false;
+}
+
+test "unpublished generated data device augments the exact production profile" {
+    const WayringHost = @import("wayland/WayringHost.zig");
+    const wayring = @import("wayring");
+    const wayring_protocol = @import("wayring-protocol");
+    const linux = std.os.linux;
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/tmp/keywork-wayring-data-profile-{d}-{x}",
+        .{ linux.getpid(), @intFromPtr(&marker) },
+        0,
+    );
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS)
+        return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+    const previous_runtime = if (libc.getenv("XDG_RUNTIME_DIR")) |value|
+        try std.testing.allocator.dupeZ(u8, std.mem.span(value))
+    else
+        null;
+    defer {
+        if (previous_runtime) |value| {
+            _ = libc.setenv("XDG_RUNTIME_DIR", value, 1);
+            std.testing.allocator.free(value);
+        } else {
+            _ = libc.unsetenv("XDG_RUNTIME_DIR");
+        }
+    }
+    if (libc.setenv("XDG_RUNTIME_DIR", runtime_directory, 1) != 0)
+        return error.RuntimeEnvironmentFailed;
+
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 640, .height = 480 }, .refresh_millihertz = 1 },
+    );
+    defer server.destroy();
+    const mature_socket_name = try server.listen();
+    const keymap_fd = try std.posix.memfd_create("keywork-mixed-clipboard-keymap", linux.MFD.CLOEXEC);
+    const keymap = "keymap\x00\x00";
+    if (linux.errno(linux.ftruncate(keymap_fd, keymap.len)) != .SUCCESS)
+        return error.KeymapResizeFailed;
+    if (std.c.pwrite(keymap_fd, keymap.ptr, keymap.len, 0) != keymap.len)
+        return error.KeymapWriteFailed;
+    server.seat.setKeymap(.xkb_v1, keymap_fd, keymap.len);
+    server.seat.setRepeatInfo(0, 500);
+    server.seat.setKeyboardAvailable(true);
+    server.seat.setPointerAvailable(true);
+    const client_baseline = server.client_registry.len();
+    const surface_baseline = server.surface_registry.len();
+    const mature_surface_baseline = server.compositor.surfaceStore().len();
+    const forest_baseline = server.headless_surface_forest.len();
+    const resource_baseline = server.dataDeviceResourceSnapshot();
+
+    var protocol_server: wayring.server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    var clients: WayringClients = undefined;
+    clients.init(std.testing.allocator, server.clientRegistry());
+    defer clients.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(
+        std.testing.allocator,
+        &protocol_server,
+        server.surfaceRegistry(),
+        server.wayringPresentationListener(),
+    );
+    defer compositor.deinit();
+    var seat: WayringSeatAdapter = .init(
+        std.testing.allocator,
+        &protocol_server,
+        &clients,
+        &compositor,
+        server.generatedSeatRequestSink(),
+        server.generatedSeatName(),
+    );
+    defer seat.deinit();
+    server.setGeneratedSeatDeliverySink(seat.sink());
+    defer server.clearGeneratedSeatDeliverySink(&seat);
+    try seat.publish();
+    defer seat.unpublish();
+    var outputs: WayringOutput = undefined;
+    try outputs.init(
+        std.testing.allocator,
+        &protocol_server,
+        server.wayringOutputLayout().?,
+        &compositor,
+    );
+    defer outputs.deinit();
+    var xdg: WayringXdgShell = undefined;
+    xdg.init(
+        std.testing.allocator,
+        &protocol_server,
+        server.neutralXdgShell(),
+        &clients,
+        &compositor,
+        &outputs,
+    );
+    defer xdg.deinit();
+    xdg.setSeatAdapter(&seat);
+    try xdg.publish();
+    defer xdg.unpublish();
+    var viewporter: WayringViewporter = undefined;
+    viewporter.init(std.testing.allocator, &protocol_server, &compositor);
+    defer viewporter.deinit();
+    try viewporter.publish();
+    defer viewporter.unpublish();
+    var fractional_scale: WayringFractionalScale = undefined;
+    try fractional_scale.init(
+        std.testing.allocator,
+        &protocol_server,
+        &compositor,
+        &outputs,
+        server.wayringOutputLayout().?,
+        server.wayringDefaultOutputId().?,
+    );
+    defer fractional_scale.deinit();
+    try fractional_scale.publish();
+    defer fractional_scale.unpublish();
+    var cursor_shape: WayringCursorShape = undefined;
+    cursor_shape.init(
+        std.testing.allocator,
+        &protocol_server,
+        &seat,
+        server.generatedCursorShape(),
+        server.generatedSeatRequestSink(),
+    );
+    defer cursor_shape.deinit();
+    try cursor_shape.publish();
+    defer cursor_shape.unpublish();
+    var decoration: WayringXdgDecoration = undefined;
+    decoration.init(std.testing.allocator, &protocol_server, &xdg, server.neutralXdgShell());
+    defer decoration.deinit();
+    try decoration.publish();
+    defer decoration.unpublish();
+    var activation: WayringXdgActivation = undefined;
+    activation.init(std.testing.allocator, &protocol_server, &seat, &xdg, server.xdgActivationOwner());
+    defer activation.deinit();
+    try activation.publish();
+    defer activation.unpublish();
+
+    var data_device: WayringDataDevice = undefined;
+    data_device.init(
+        std.testing.allocator,
+        &protocol_server,
+        &clients,
+        &seat,
+        server.neutralDataDevice(),
+    );
+    defer {
+        if (data_device.global != null) data_device.uninstallUnpublishedForTest();
+        data_device.deinit();
+    }
+    server.setTestDataDeviceObserver(.{
+        .context = &data_device,
+        .offer_rolled_back = WayringDataDevice.offerRolledBack,
+        .offer_mime_offered = WayringDataDevice.offerMimeOffered,
+    });
+    defer server.setTestDataDeviceObserver(null);
+
+    const Lifecycle = struct {
+        const FatalEvidence = struct {
+            kind: wayring.server.Fatal.Kind,
+            object_id: u32,
+            opcode: ?u16,
+            protocol_code: ?u32,
+            interface: ?*const wayring.wire.Interface,
+            message: ?*const wayring.wire.MessageDescriptor,
+            detail_buffer: [wayring.server.Fatal.max_detail_len]u8 = undefined,
+            detail_len: usize = 0,
+
+            fn detail(self: *const @This()) []const u8 {
+                return self.detail_buffer[0..self.detail_len];
+            }
+        };
+
+        clients: *WayringClients,
+        compositor: *WayringCompositor,
+        outputs: *WayringOutput,
+        seat: *WayringSeatAdapter,
+        xdg: *WayringXdgShell,
+        viewporter: *WayringViewporter,
+        fractional_scale: *WayringFractionalScale,
+        cursor_shape: *WayringCursorShape,
+        decoration: *WayringXdgDecoration,
+        activation: *WayringXdgActivation,
+        data_device: *WayringDataDevice,
+        generated_client: ?ClientRegistry.Id = null,
+        offender_fatal: ?FatalEvidence = null,
+        fatal_count: usize = 0,
+
+        fn accepted(context: *anyopaque, client: *wayring.server.Client) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.generated_client = try self.clients.register(client);
+            errdefer self.clients.unregister(client);
+            try self.seat.trackClient(client);
+        }
+        fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (client.fatal()) |fatal| if (fatal.kind == .implementation) {
+                self.fatal_count += 1;
+                if (self.offender_fatal == null) {
+                    var evidence: FatalEvidence = .{
+                        .kind = fatal.kind,
+                        .object_id = fatal.object_id,
+                        .opcode = fatal.opcode,
+                        .protocol_code = fatal.protocol_code,
+                        .interface = fatal.interface,
+                        .message = fatal.message,
+                    };
+                    const detail = fatal.detail();
+                    @memcpy(evidence.detail_buffer[0..detail.len], detail);
+                    evidence.detail_len = detail.len;
+                    self.offender_fatal = evidence;
+                }
+            };
+            self.data_device.destroyClientResources(client);
+            self.activation.destroyClientResources(client);
+            self.decoration.destroyClientResources(client);
+            self.cursor_shape.destroyClientResources(client);
+            self.fractional_scale.destroyClientResources(client);
+            self.viewporter.destroyClientResources(client);
+            self.xdg.destroyClientResources(client);
+            self.seat.destroyClientResources(client);
+            self.outputs.destroyClientResources(client);
+            self.compositor.destroyClientResources(client);
+            if (self.clients.id(client) != null) self.clients.unregister(client);
+        }
+    };
+    var lifecycle: Lifecycle = .{
+        .clients = &clients,
+        .compositor = &compositor,
+        .outputs = &outputs,
+        .seat = &seat,
+        .xdg = &xdg,
+        .viewporter = &viewporter,
+        .fractional_scale = &fractional_scale,
+        .cursor_shape = &cursor_shape,
+        .decoration = &decoration,
+        .activation = &activation,
+        .data_device = &data_device,
+    };
+    const host = try WayringHost.create(
+        std.testing.allocator,
+        server.eventLoop(),
+        &protocol_server,
+        runtime_directory,
+        .{
+            .context = &lifecycle,
+            .accepted = Lifecycle.accepted,
+            .destroy_resources = Lifecycle.destroy,
+        },
+    );
+    var host_live = true;
+    defer if (host_live) host.destroy() catch {};
+
+    const raw_command_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_command_fd) != .SUCCESS) return error.EventFdFailed;
+    const command_fd: std.posix.fd_t = @intCast(raw_command_fd);
+    defer _ = linux.close(command_fd);
+    var peer: WayringXdgClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = command_fd,
+        .registry_only = true,
+        .registry_watch_data_device = true,
+    };
+    const thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&peer});
+    var joined = false;
+    defer if (!joined) {
+        peer.shutdown();
+        thread.join();
+    };
+    try waitForWayringXdgStage(server, host, &peer, .registry_ready);
+    try std.testing.expect(peer.globals_exact);
+    try std.testing.expectEqual(WayringXdgClient.expected_globals.len, peer.global_count);
+    try std.testing.expectEqual(@as(usize, 0), peer.data_device_manager_count);
+    try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
+
+    try data_device.installUnpublishedForTest();
+    try signalWayringCommand(command_fd);
+    try waitForWayringXdgStage(server, host, &peer, .manager_added);
+    try std.testing.expectEqual(@as(usize, 1), peer.data_device_manager_count);
+    try std.testing.expectEqual(@as(u32, 3), peer.data_device_manager_version);
+    try std.testing.expect(peer.globals_exact);
+
+    data_device.uninstallUnpublishedForTest();
+    try signalWayringCommand(command_fd);
+    try waitForWayringXdgStage(server, host, &peer, .manager_removed);
+    try std.testing.expect(peer.data_device_manager_removed);
+    try signalWayringCommand(command_fd);
+    try waitForWayringXdgStage(server, host, &peer, .disconnected);
+    thread.join();
+    joined = true;
+    try waitForWayringDisconnect(server, host, &compositor);
+    try std.testing.expectEqual(client_baseline, server.client_registry.len());
+    try std.testing.expectEqual(surface_baseline, server.surface_registry.len());
+    try std.testing.expectEqual(resource_baseline, server.dataDeviceResourceSnapshot());
+
+    try data_device.installUnpublishedForTest();
+    const raw_generated_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    const raw_mature_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    const raw_offender_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_generated_command) != .SUCCESS or
+        linux.errno(raw_mature_command) != .SUCCESS or
+        linux.errno(raw_offender_command) != .SUCCESS)
+        return error.EventFdFailed;
+    const generated_command: std.posix.fd_t = @intCast(raw_generated_command);
+    const mature_command: std.posix.fd_t = @intCast(raw_mature_command);
+    const offender_command: std.posix.fd_t = @intCast(raw_offender_command);
+    defer _ = linux.close(generated_command);
+    defer _ = linux.close(mature_command);
+    defer _ = linux.close(offender_command);
+    const fd_baseline = try countMatureDataDeviceFds();
+    var generated: GeneratedClipboardClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = generated_command,
+    };
+    var mature: MatureClipboardClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = mature_socket_name,
+        .command_fd = mature_command,
+    };
+    const generated_thread = try std.Thread.spawn(.{}, GeneratedClipboardClient.run, .{&generated});
+    const mature_thread = try std.Thread.spawn(.{}, MatureClipboardClient.run, .{&mature});
+    var generated_joined = false;
+    var mature_joined = false;
+    defer if (!generated_joined) {
+        generated.shutdown();
+        generated_thread.join();
+    };
+    defer if (!mature_joined) {
+        mature.shutdown();
+        mature_thread.join();
+    };
+    try waitForClipboardStage(server, host, &generated, .ready);
+    try waitForClipboardStage(server, host, &mature, .ready);
+    const valid_generated_client = lifecycle.generated_client.?;
+    const state_before_offense = server.dataDeviceResourceSnapshot();
+    try std.testing.expect(server.neutralDataDevice().dragIcon() == null);
+    try std.testing.expectEqual(@as(usize, 1), host.connectionCount());
+    try std.testing.expectEqual(client_baseline + 2, server.client_registry.len());
+
+    var offender: GeneratedDragOffender = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = offender_command,
+    };
+    const offender_thread = try std.Thread.spawn(.{}, GeneratedDragOffender.run, .{&offender});
+    var offender_joined = false;
+    defer if (!offender_joined) {
+        offender.shutdown();
+        offender_thread.join();
+    };
+    try waitForGeneratedDragOffenderStage(server, host, &offender, .ready);
+    try std.testing.expect(offender.surface_object_id != 0);
+    try std.testing.expect(offender.device_object_id != 0);
+    try std.testing.expectEqual(@as(usize, 2), host.connectionCount());
+    try std.testing.expectEqual(client_baseline + 3, server.client_registry.len());
+    try std.testing.expectEqual(
+        GeneratedClipboardClient.Stage.ready,
+        @as(GeneratedClipboardClient.Stage, @enumFromInt(generated.stage.load(.acquire))),
+    );
+    try std.testing.expectEqual(
+        GeneratedClipboardClient.Stage.ready,
+        @as(GeneratedClipboardClient.Stage, @enumFromInt(mature.stage.load(.acquire))),
+    );
+    try signalWayringCommand(offender_command);
+    try waitForGeneratedDragOffenderStage(server, host, &offender, .disconnected);
+    offender_thread.join();
+    offender_joined = true;
+    for (0..2_000) |_| {
+        if (host.connectionCount() == 1 and server.client_registry.len() == client_baseline + 2 and
+            lifecycle.offender_fatal != null) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedDragOffenderCleanupTimedOut;
+    const fatal = lifecycle.offender_fatal.?;
+    try std.testing.expectEqual(@as(usize, 1), lifecycle.fatal_count);
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.implementation, fatal.kind);
+    try std.testing.expectEqual(offender.device_object_id, fatal.object_id);
+    try std.testing.expect(fatal.opcode == null);
+    try std.testing.expect(fatal.protocol_code == null);
+    try std.testing.expect(fatal.interface == &wayring_protocol.wl_data_device.interface);
+    try std.testing.expect(fatal.message == null);
+    try std.testing.expectEqualStrings("wl_data_device", fatal.interface.?.name);
+    try std.testing.expectEqualStrings("drag-and-drop is not implemented", fatal.detail());
+    try std.testing.expectEqual(state_before_offense, server.dataDeviceResourceSnapshot());
+    try std.testing.expect(server.neutralDataDevice().dragIcon() == null);
+    try std.testing.expectEqual(
+        GeneratedClipboardClient.Stage.ready,
+        @as(GeneratedClipboardClient.Stage, @enumFromInt(generated.stage.load(.acquire))),
+    );
+    try std.testing.expectEqual(
+        GeneratedClipboardClient.Stage.ready,
+        @as(GeneratedClipboardClient.Stage, @enumFromInt(mature.stage.load(.acquire))),
+    );
+    try std.testing.expect(host.failure() == null);
+
+    const generated_surface = wayringSurfaceWithPixel(server, 0xff19_75d2) orelse
+        return error.GeneratedClipboardSurfaceMissing;
+    var mature_surface: ?Surface.Id = null;
+    var surfaces = server.compositor.surfaceStore().iterator();
+    while (surfaces.next()) |entry| {
+        const state = server.surface_registry.renderState(entry.id) orelse continue;
+        if (state.buffer.pixels.len == 1 and state.buffer.pixels[0] == 0xffd2_7519)
+            mature_surface = entry.id;
+    }
+    const mature_surface_id = mature_surface orelse return error.MatureClipboardSurfaceMissing;
+    const mature_scene = try server.scene.addShellSurface(mature_surface_id);
+    var mature_scene_live = true;
+    defer if (mature_scene_live) {
+        server.scene.setShellSurfaceMapped(mature_scene, false);
+        server.scene.removeShellSurface(mature_scene);
+    };
+    server.scene.setShellSurfacePosition(mature_scene, .{ .x = 20, .y = 0 });
+    server.scene.setShellSurfaceMapped(mature_scene, true);
+
+    const generation_before_a = server.neutralDataDevice().selectionGeneration();
+    try std.testing.expect(server.focusGeneratedSurface(generated_surface));
+    try server.neutralDataDevice().setFocus(valid_generated_client);
+    try server.seat.parentKeyboardEnter(&.{});
+    try signalWayringCommand(generated_command);
+    try waitForClipboardStage(server, host, &generated, .generated_selected);
+    try std.testing.expectEqual(generation_before_a + 1, server.neutralDataDevice().selectionGeneration());
+    _ = server.seat.applyMatureKeyboardFocus(mature_surface_id);
+    try server.seat.parentKeyboardEnter(&.{});
+    try signalWayringCommand(mature_command);
+    try waitForClipboardStage(server, host, &mature, .generated_selected);
+    try signalWayringCommand(generated_command);
+    try waitForClipboardStage(server, host, &generated, .generated_late);
+    try signalWayringCommand(mature_command);
+    try waitForClipboardStage(server, host, &mature, .generated_late);
+    try signalWayringCommand(generated_command);
+    try signalWayringCommand(mature_command);
+    try waitForClipboardStage(server, host, &mature, .mature_received);
+    try waitForClipboardStage(server, host, &generated, .generated_sent);
+    try std.testing.expectEqualStrings(
+        MatureClipboardClient.generated_bytes,
+        mature.received[0..mature.received_len],
+    );
+
+    const generation_before_b = server.neutralDataDevice().selectionGeneration();
+    try signalWayringCommand(mature_command);
+    try waitForClipboardStage(server, host, &mature, .mature_selected);
+    try std.testing.expectEqual(generation_before_b + 1, server.neutralDataDevice().selectionGeneration());
+    try signalWayringCommand(generated_command);
+    try waitForClipboardStage(server, host, &generated, .generated_cancelled);
+    try std.testing.expect(server.focusGeneratedSurface(generated_surface));
+    try server.neutralDataDevice().setFocus(valid_generated_client);
+    try server.seat.parentKeyboardEnter(&.{});
+    try signalWayringCommand(generated_command);
+    try waitForClipboardStage(server, host, &generated, .mature_selected);
+    try signalWayringCommand(mature_command);
+    try waitForClipboardStage(server, host, &mature, .mature_late);
+    try signalWayringCommand(generated_command);
+    try waitForClipboardStage(server, host, &generated, .mature_late);
+    try signalWayringCommand(generated_command);
+    try signalWayringCommand(mature_command);
+    try waitForClipboardStage(server, host, &generated, .generated_received);
+    try waitForClipboardStage(server, host, &mature, .mature_sent);
+    try std.testing.expectEqualStrings(
+        MatureClipboardClient.mature_bytes,
+        generated.received[0..generated.received_len],
+    );
+    try signalWayringCommand(generated_command);
+    try waitForClipboardStage(server, host, &generated, .cleared);
+    try signalWayringCommand(mature_command);
+    try waitForClipboardStage(server, host, &mature, .mature_replaced);
+    try signalWayringCommand(mature_command);
+    try waitForClipboardStage(server, host, &mature, .cleared);
+
+    server.scene.setShellSurfaceMapped(mature_scene, false);
+    server.scene.removeShellSurface(mature_scene);
+    mature_scene_live = false;
+    try signalWayringCommand(generated_command);
+    try signalWayringCommand(mature_command);
+    try waitForClipboardStage(server, host, &generated, .disconnected);
+    try waitForClipboardStage(server, host, &mature, .disconnected);
+    generated_thread.join();
+    generated_joined = true;
+    mature_thread.join();
+    mature_joined = true;
+    for (0..2_000) |_| {
+        const snapshot = server.dataDeviceResourceSnapshot();
+        if (host.connectionCount() == 0 and server.client_registry.len() == client_baseline and
+            server.surface_registry.len() == surface_baseline and
+            server.compositor.surfaceStore().len() == mature_surface_baseline and
+            server.headless_surface_forest.len() == forest_baseline and
+            snapshot.neutral.sources == resource_baseline.neutral.sources and
+            snapshot.neutral.devices == resource_baseline.neutral.devices and
+            snapshot.neutral.offers == resource_baseline.neutral.offers and
+            snapshot.mature.sources == resource_baseline.mature.sources and
+            snapshot.mature.devices == resource_baseline.mature.devices and
+            snapshot.mature.offers == resource_baseline.mature.offers and
+            snapshot.has_selection == resource_baseline.has_selection and
+            snapshot.dragging == resource_baseline.dragging) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.MixedClipboardCleanupTimedOut;
+    const final = server.dataDeviceResourceSnapshot();
+    try std.testing.expect(final.selection_generation >= resource_baseline.selection_generation);
+    try std.testing.expect(server.scene.topWindowSurface() == null);
+    try std.testing.expect(server.seat.generatedKeyboardFocus() == null);
+    try std.testing.expect(server.seat.matureKeyboardFocus() == null);
+    try std.testing.expectEqual(fd_baseline, try countMatureDataDeviceFds());
+    data_device.uninstallUnpublishedForTest();
     try host.destroy();
     host_live = false;
 }
