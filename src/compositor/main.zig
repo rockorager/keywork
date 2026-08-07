@@ -249,14 +249,8 @@ pub fn main(init: std.process.Init) !void {
         text_input: ?*WayringTextInput,
         data_control: ?*WayringDataControl,
         input_method: ?*WayringInputMethod,
-        expected_uid: std.os.linux.uid_t,
-
         fn globalVisible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
-            if (self.data_control) |data_control|
-                if (!data_control.globalFilter(client, global)) return false;
-            if (!std.mem.eql(u8, global.interface().name, "zwp_input_method_manager_v2")) return true;
-            const credentials = client.credentials() orelse return false;
-            return credentials.uid == self.expected_uid;
+            return if (self.data_control) |data_control| data_control.globalFilter(client, global) else global.visibility() != .restricted;
         }
 
         fn accepted(erased: *anyopaque, client: *wayring.server.Client) !void {
@@ -400,7 +394,7 @@ pub fn main(init: std.process.Init) !void {
             server.canonicalSeat(),
             server.neutralTextInput(),
             &wayring_compositor,
-            .{ .expected_uid = std.c.geteuid() },
+            std.os.linux.getuid(),
             server.generatedInputMethodLayout(),
         );
         wayring_input_method_initialized = true;
@@ -542,7 +536,6 @@ pub fn main(init: std.process.Init) !void {
             .text_input = if (wayring_text_input_initialized) &wayring_text_input else null,
             .data_control = if (wayring_data_control_initialized) &wayring_data_control else null,
             .input_method = if (wayring_input_method_initialized) &wayring_input_method else null,
-            .expected_uid = std.c.geteuid(),
         };
         wayring_protocol_server.?.setGlobalFilter(
             WayringLifecycle,

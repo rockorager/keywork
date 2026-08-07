@@ -17344,6 +17344,7 @@ const WayringXdgClient = struct {
     const client_ext = wayland.client.ext;
     const client_xdg = wayland.client.xdg;
     const client_zxdg = wayland.client.zxdg;
+    const client_zwp = wayland.client.zwp;
     const Stage = enum(u8) {
         starting,
         initial_commit_ready,
@@ -17380,6 +17381,8 @@ const WayringXdgClient = struct {
     expect_data_control: bool = false,
     guessed_data_control_name: ?u32 = null,
     guessed_data_control_bind_issued: bool = false,
+    guessed_input_method_name: ?u32 = null,
+    guessed_input_method_bind_issued: bool = false,
     expect_input_method: bool = false,
     offense: ?Offense = null,
     activation_role: ?ActivationRole = null,
@@ -17542,6 +17545,17 @@ const WayringXdgClient = struct {
                 // restricted manager for a derived transport.
                 self.data_control_manager = try registry.bind(name, client_ext.DataControlManagerV1, 1);
                 self.guessed_data_control_bind_issued = true;
+                expectClientRoundtrip(display) catch return;
+                return error.RestrictedGlobalBindAccepted;
+            }
+            if (self.guessed_input_method_name) |name| {
+                try expectClientRoundtrip(display);
+                if (!self.globals_exact or self.global_count != self.expectedGlobalCount() or
+                    self.input_method_manager_count != 0)
+                    return error.RestrictedGlobalAdvertised;
+                try self.pause(.manager_added);
+                _ = try registry.bind(name, client_zwp.InputMethodManagerV2, 1);
+                self.guessed_input_method_bind_issued = true;
                 expectClientRoundtrip(display) catch return;
                 return error.RestrictedGlobalBindAccepted;
             }
@@ -23665,7 +23679,8 @@ test "production generated data device completes the exact profile and supports 
         .offer_mime_offered = WayringDataControl.offerMimeOffered,
     });
     defer server.setDataControlObserver(null);
-    // Privileged data-control is the final production global.
+    // Restricted globals follow the public profile in deterministic owner
+    // order: data control, then input method.
     try data_control.publish();
     var input_method: WayringInputMethod = undefined;
     input_method.init(
@@ -23676,7 +23691,7 @@ test "production generated data device completes the exact profile and supports 
         server.canonicalSeat(),
         server.neutralTextInput(),
         &compositor,
-        .{ .expected_uid = std.c.geteuid() },
+        linux.getuid(),
         server.generatedInputMethodLayout(),
     );
     defer {
@@ -23806,15 +23821,11 @@ test "production generated data device completes the exact profile and supports 
     };
     const GlobalFilter = struct {
         data_control: *WayringDataControl,
-        expected_uid: std.os.linux.uid_t,
         fn visible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
-            if (!self.data_control.globalFilter(client, global)) return false;
-            if (!std.mem.eql(u8, global.interface().name, "zwp_input_method_manager_v2")) return true;
-            const credentials = client.credentials() orelse return false;
-            return credentials.uid == self.expected_uid;
+            return self.data_control.globalFilter(client, global);
         }
     };
-    var global_filter: GlobalFilter = .{ .data_control = &data_control, .expected_uid = std.c.geteuid() };
+    var global_filter: GlobalFilter = .{ .data_control = &data_control };
     protocol_server.setGlobalFilter(GlobalFilter, &global_filter, GlobalFilter.visible);
     defer protocol_server.clearGlobalFilter();
     const host = try WayringHost.create(
@@ -23932,6 +23943,53 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqualStrings("wl_registry", denied_fatal.interface.?.name);
     try std.testing.expectEqualStrings("invalid wl_registry.bind", denied_fatal.detail());
     try std.testing.expectEqual(before_denied_bind, server.dataDeviceResourceSnapshot());
+    try std.testing.expectEqual(
+        WayringXdgClient.Stage.registry_ready,
+        @as(WayringXdgClient.Stage, @enumFromInt(peer.stage.load(.acquire))),
+    );
+    try waitForWayringDisconnect(server, denied_host, &compositor);
+
+    // Repeat the authentic bypass against the independently rechecked input
+    // method binder. The first offender is already gone, while the trusted
+    // direct peer remains connected and unaffected.
+    lifecycle.denied_fatal = null;
+    const raw_denied_method_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_denied_method_command) != .SUCCESS) return error.EventFdFailed;
+    const denied_method_command: std.posix.fd_t = @intCast(raw_denied_method_command);
+    defer _ = linux.close(denied_method_command);
+    var denied_method: WayringXdgClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = denied_host.displayName(),
+        .command_fd = denied_method_command,
+        .registry_only = true,
+        .expect_text_input = true,
+        .guessed_input_method_name = peer.input_method_manager_name,
+    };
+    const denied_method_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_method});
+    var denied_method_joined = false;
+    defer if (!denied_method_joined) {
+        denied_method.shutdown();
+        denied_method_thread.join();
+    };
+    try waitForWayringXdgStage(server, denied_host, &denied_method, .registry_ready);
+    try std.testing.expect(denied_method.globals_exact);
+    try std.testing.expectEqual(@as(usize, 14), denied_method.global_count);
+    try std.testing.expectEqual(@as(usize, 0), denied_method.input_method_manager_count);
+    const method_managers_before_denied_bind = input_method.managers.items.len;
+    try signalWayringCommand(denied_method_command);
+    try waitForWayringXdgStage(server, denied_host, &denied_method, .manager_added);
+    try signalWayringCommand(denied_method_command);
+    try waitForWayringXdgStage(server, denied_host, &denied_method, .disconnected);
+    denied_method_thread.join();
+    denied_method_joined = true;
+    try std.testing.expect(denied_method.guessed_input_method_bind_issued);
+    try std.testing.expectEqual(method_managers_before_denied_bind, input_method.managers.items.len);
+    const denied_method_fatal = lifecycle.denied_fatal orelse return error.RestrictedBindFatalMissing;
+    try std.testing.expectEqual(wayring.server.Client.TransportProvenance.security_context, denied_method_fatal.transport_provenance);
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.protocol, denied_method_fatal.kind);
+    try std.testing.expectEqual(@as(?u32, 0), denied_method_fatal.protocol_code);
+    try std.testing.expectEqualStrings("wl_registry", denied_method_fatal.interface.?.name);
+    try std.testing.expectEqualStrings("invalid wl_registry.bind", denied_method_fatal.detail());
     try std.testing.expectEqual(
         WayringXdgClient.Stage.registry_ready,
         @as(WayringXdgClient.Stage, @enumFromInt(peer.stage.load(.acquire))),

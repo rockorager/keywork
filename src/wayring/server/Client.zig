@@ -173,6 +173,14 @@ pub fn transportProvenance(self: *const Client) TransportProvenance {
     return self.transport_provenance_value;
 }
 
+/// Authorizes a privileged compositor-local client from immutable transport
+/// metadata. Same-UID clients accepted through a security context are not
+/// equivalent to a client accepted directly by the compositor socket.
+pub fn isAuthorizedDirectPeer(self: *const Client, authorized_uid: std.os.linux.uid_t) bool {
+    const peer = self.credentials_value orelse return false;
+    return peer.uid == authorized_uid and self.transport_provenance_value == .direct;
+}
+
 pub fn addDestroyObserver(
     self: *Client,
     comptime Context: type,
