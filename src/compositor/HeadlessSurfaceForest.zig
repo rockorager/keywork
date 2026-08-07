@@ -64,6 +64,7 @@ pub const PresentationClass = enum {
     background,
     xdg_reserved,
     managed,
+    layer_surface,
     cursor,
     drag_icon,
     input_popup,
@@ -326,8 +327,9 @@ pub fn setRootPresentationClass(
     if (target.placement != .root) return false;
     const allowed = switch (target.presentation_class) {
         .background => true,
-        .xdg_reserved => class == .background or class == .xdg_reserved or class == .managed,
+        .xdg_reserved => class == .background or class == .xdg_reserved or class == .managed or class == .layer_surface,
         .managed => class == .managed,
+        .layer_surface => class == .layer_surface,
         .cursor => class == .cursor,
         .drag_icon => class == .drag_icon,
         .input_popup => class == .input_popup,
@@ -477,6 +479,7 @@ pub const RenderIterator = struct {
                 const root_node = self.forest.nodeConst(root) orelse return null;
                 self.next_root = root_node.root_next;
                 if (root_node.presentation_class == .xdg_reserved or
+                    root_node.presentation_class == .layer_surface or
                     root_node.presentation_class == .input_popup or
                     (root_node.presentation_class == .managed and !self.include_managed)) continue;
                 self.owner = root;
@@ -643,7 +646,7 @@ pub fn compoundBounds(
 ) CompoundBounds {
     const root = self.compoundRoot(id) orelse return .hidden;
     const class = self.nodeConst(root).?.presentation_class;
-    if (class == .xdg_reserved or class == .managed) return .hidden;
+    if (class == .xdg_reserved or class == .managed or class == .layer_surface) return .hidden;
     return self.geometryBounds(id);
 }
 

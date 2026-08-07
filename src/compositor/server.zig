@@ -111,6 +111,7 @@ const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
+const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
 const Viewporter = @import("wayland/viewporter.zig");
 const InputManager = @import("input_manager.zig");
 const BuiltinKeybindings = @import("builtin_keybindings.zig");
@@ -4139,6 +4140,16 @@ pub fn neutralXdgShell(self: *Self) *NeutralXdgShell {
     return &self.xdg_shell_core;
 }
 
+/// Shared canonical state consumed by the generated layer-shell frontend.
+pub fn neutralLayerShell(self: *Self) *NeutralLayerShell {
+    return &self.layer_shell_core;
+}
+
+/// Mature placement/focus policy shared by both layer-shell frontends.
+pub fn sharedLayerPolicy(self: *Self) *LayerShell {
+    return &self.layer_shell;
+}
+
 /// Frontend-neutral activation token and expiry owner.
 pub fn xdgActivationOwner(self: *Self) *XdgActivation {
     return &self.xdg_activation;
@@ -4479,7 +4490,7 @@ fn reconcileGeneratedPointerTopology(self: *Self) void {
                     self.generatedManagedRootEligible(generated.root, generated.client)),
             .input_popup => self.isGeneratedInputPopup(generated.root) and
                 self.headless_surface_forest.mappedInCompound(state.surface_id, generated.root),
-            .xdg_reserved, .cursor, .drag_icon => false,
+            .xdg_reserved, .layer_surface, .cursor, .drag_icon => false,
         }
     else
         false;
@@ -8606,7 +8617,7 @@ fn headlessPointerFocus(self: *Self, x: f64, y: f64) ?GeneratedPointerFocus {
     switch (self.headless_surface_forest.presentationClass(root) orelse return null) {
         .background => {},
         .managed => if (!self.generatedManagedRootEligible(root, client)) return null,
-        .xdg_reserved, .cursor, .drag_icon, .input_popup => return null,
+        .xdg_reserved, .layer_surface, .cursor, .drag_icon, .input_popup => return null,
     }
     return .{
         .surface_id = hit.id,
@@ -17508,6 +17519,7 @@ const WayringXdgClient = struct {
     const client_xdg = wayland.client.xdg;
     const client_zxdg = wayland.client.zxdg;
     const client_zwp = wayland.client.zwp;
+    const client_zwlr = wayland.client.zwlr;
     const Stage = enum(u8) {
         starting,
         initial_commit_ready,
@@ -17544,6 +17556,7 @@ const WayringXdgClient = struct {
     expect_text_input: bool = false,
     expect_data_control: bool = false,
     expect_virtual_keyboard: bool = false,
+    expect_layer_shell: bool = false,
     guessed_data_control_name: ?u32 = null,
     guessed_virtual_keyboard_name: ?u32 = null,
     guessed_data_control_bind_issued: bool = false,
@@ -17565,6 +17578,7 @@ const WayringXdgClient = struct {
     decoration_manager: ?*client_zxdg.DecorationManagerV1 = null,
     activation: ?*client_xdg.ActivationV1 = null,
     data_control_manager: ?*client_ext.DataControlManagerV1 = null,
+    layer_shell: ?*client_zwlr.LayerShellV1 = null,
     global_count: usize = 0,
     globals_exact: bool = true,
     data_device_manager_count: usize = 0,
@@ -17591,6 +17605,10 @@ const WayringXdgClient = struct {
     virtual_keyboard_manager_version: u32 = 0,
     virtual_keyboard_manager_name: u32 = 0,
     virtual_keyboard_manager_removed: bool = false,
+    layer_shell_count: usize = 0,
+    layer_shell_version: u32 = 0,
+    layer_shell_name: u32 = 0,
+    layer_shell_removed: bool = false,
     configure_serial: u32 = 0,
     configure_count: u8 = 0,
     toplevel_configure_count: u8 = 0,
@@ -17619,7 +17637,8 @@ const WayringXdgClient = struct {
     activated_surface_sequence: u8 = 0,
     activated_ack_sequence: u8 = 0,
 
-    const expected_globals = [_]struct { name: []const u8, version: u32 }{
+    const ExpectedGlobal = struct { name: []const u8, version: u32 };
+    const expected_globals = [_]ExpectedGlobal{
         .{ .name = "wl_compositor", .version = 6 },
         .{ .name = "wl_shm", .version = 1 },
         .{ .name = "wl_subcompositor", .version = 1 },
@@ -17637,13 +17656,37 @@ const WayringXdgClient = struct {
         .{ .name = "ext_data_control_manager_v1", .version = 1 },
         .{ .name = "zwp_input_method_manager_v2", .version = 1 },
         .{ .name = "zwp_virtual_keyboard_manager_v1", .version = 1 },
+        .{ .name = "zwlr_layer_shell_v1", .version = 5 },
     };
 
     fn expectedGlobalCount(self: *const @This()) usize {
         return expected_globals.len - @intFromBool(!self.expect_text_input) -
             @intFromBool(!self.expect_data_control) -
             @intFromBool(!self.expect_input_method) -
-            @intFromBool(!self.expect_virtual_keyboard);
+            @intFromBool(!self.expect_virtual_keyboard) -
+            @intFromBool(!self.expect_layer_shell);
+    }
+
+    fn expectedGlobal(self: *const @This(), visible_index: usize) ?ExpectedGlobal {
+        var index: usize = 0;
+        for (expected_globals) |global| {
+            const present = if (std.mem.eql(u8, global.name, "zwp_text_input_manager_v3"))
+                self.expect_text_input
+            else if (std.mem.eql(u8, global.name, "ext_data_control_manager_v1"))
+                self.expect_data_control
+            else if (std.mem.eql(u8, global.name, "zwp_input_method_manager_v2"))
+                self.expect_input_method
+            else if (std.mem.eql(u8, global.name, "zwp_virtual_keyboard_manager_v1"))
+                self.expect_virtual_keyboard
+            else if (std.mem.eql(u8, global.name, "zwlr_layer_shell_v1"))
+                self.expect_layer_shell
+            else
+                true;
+            if (!present) continue;
+            if (index == visible_index) return global;
+            index += 1;
+        }
+        return null;
     }
 
     fn run(self: *@This()) void {
@@ -17703,13 +17746,18 @@ const WayringXdgClient = struct {
         var activation_live = true;
         defer if (activation_live) activation.destroy();
         defer if (self.data_control_manager) |manager| manager.destroy();
+        defer if (self.layer_shell) |manager| manager.destroy();
         if (self.registry_only) {
             try self.pause(.registry_ready);
             if (self.registry_watch_virtual_keyboard) {
                 try expectClientRoundtrip(display);
-                if (!self.globals_exact or self.global_count != self.expectedGlobalCount() + 1 or
+                if (!self.globals_exact or self.global_count != self.expectedGlobalCount() or
                     self.virtual_keyboard_manager_count != 1 or !self.generated_virtual_keyboard_seen)
                     return error.VirtualKeyboardGlobalMismatch;
+                // The layer-shell bind is emitted by the registry callback
+                // during the preceding sync. Materialize it before the test
+                // is allowed to withdraw the dynamically published global.
+                if (self.layer_shell != null) try expectClientRoundtrip(display);
                 try self.pause(.manager_added);
             }
             if (self.guessed_data_control_name) |name| {
@@ -18010,11 +18058,17 @@ const WayringXdgClient = struct {
                     self.virtual_keyboard_manager_count += 1;
                     self.virtual_keyboard_manager_version = global.version;
                     self.virtual_keyboard_manager_name = global.name;
+                } else if (std.mem.eql(u8, interface, "zwlr_layer_shell_v1")) {
+                    self.layer_shell_count += 1;
+                    self.layer_shell_version = global.version;
+                    self.layer_shell_name = global.name;
+                    self.layer_shell = registry.bind(global.name, client_zwlr.LayerShellV1, 5) catch null;
                 }
                 const index = self.global_count;
                 self.global_count += 1;
-                if (index >= expected_globals.len or !std.mem.eql(u8, interface, expected_globals[index].name) or
-                    global.version != expected_globals[index].version) self.globals_exact = false;
+                const expected = self.expectedGlobal(index);
+                if (expected == null or !std.mem.eql(u8, interface, expected.?.name) or
+                    global.version != expected.?.version) self.globals_exact = false;
                 if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, 6) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, 4) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, 11) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, 7) catch null else if (std.mem.eql(u8, interface, "zxdg_decoration_manager_v1")) self.decoration_manager = registry.bind(global.name, client_zxdg.DecorationManagerV1, 2) catch null else if (std.mem.eql(u8, interface, "xdg_activation_v1")) self.activation = registry.bind(global.name, client_xdg.ActivationV1, 1) catch null;
             },
             .global_remove => |removed| {
@@ -18028,6 +18082,8 @@ const WayringXdgClient = struct {
                     self.input_method_manager_removed = true;
                 if (removed.name == self.virtual_keyboard_manager_name)
                     self.virtual_keyboard_manager_removed = true;
+                if (removed.name == self.layer_shell_name)
+                    self.layer_shell_removed = true;
             },
         }
     }
@@ -19165,6 +19221,189 @@ const MatureLayerClient = struct {
     fn shutdown(self: *@This()) void {
         self.closeWake(true);
         signalWayringCommand(self.command_fd) catch {};
+    }
+};
+
+/// Exercises the scanner-generated layer-shell client API against the
+/// production Wayring adapter. Both output selection paths deliberately live
+/// on one connection so object and canonical output identities are shared.
+const GeneratedLayerClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_zwlr = wayland.client.zwlr;
+    const Stage = enum(u8) { starting, mapped, unmapped, remapped, disconnected, failed };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    shm: ?*client_wl.Shm = null,
+    output: ?*client_wl.Output = null,
+    shell: ?*client_zwlr.LayerShellV1 = null,
+    explicit_layer: ?*client_zwlr.LayerSurfaceV1 = null,
+    default_layer: ?*client_zwlr.LayerSurfaceV1 = null,
+    explicit_serial: u32 = 0,
+    default_serial: u32 = 0,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}/{s}", .{ self.runtime_directory, self.display_name }, 0);
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake) != .SUCCESS) return error.WakeFdFailed;
+        const wake: i32 = @intCast(raw_wake);
+        if (self.wake_fd.cmpxchgStrong(-1, wake, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        const compositor = self.compositor orelse return error.CompositorMissing;
+        defer compositor.destroy();
+        const shm = self.shm orelse return error.ShmMissing;
+        defer shm.release();
+        const output = self.output orelse return error.OutputMissing;
+        defer output.release();
+        const shell = self.shell orelse return error.LayerShellMissing;
+        defer shell.destroy();
+        if (shell.getVersion() != 5) return error.LayerShellVersionMismatch;
+
+        const explicit_surface = try compositor.createSurface();
+        defer explicit_surface.destroy();
+        const explicit_layer = try shell.getLayerSurface(explicit_surface, output, .overlay, "org.keywork.generated-layer-explicit");
+        self.explicit_layer = explicit_layer;
+        defer explicit_layer.destroy();
+        explicit_layer.setListener(*@This(), layerEvent, self);
+        explicit_layer.setSize(1, 1);
+        explicit_layer.setAnchor(.{ .bottom = true, .right = true });
+        explicit_surface.commit();
+
+        const surface = try compositor.createSurface();
+        defer surface.destroy();
+        const layer = try shell.getLayerSurface(surface, null, .bottom, "org.keywork.generated-layer-default");
+        self.default_layer = layer;
+        defer layer.destroy();
+        layer.setListener(*@This(), layerEvent, self);
+        // Cover every request added after v1 while making the final state easy
+        // to distinguish in the canonical model and Scene.
+        layer.setSize(1, 1);
+        layer.setAnchor(.{ .top = true, .left = true });
+        layer.setExclusiveZone(1);
+        layer.setMargin(2, 0, 0, 3);
+        layer.setKeyboardInteractivity(.on_demand);
+        layer.setKeyboardInteractivity(.exclusive);
+        layer.setLayer(.top);
+        layer.setExclusiveEdge(.{ .top = true });
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.explicit_serial == 0 or self.default_serial == 0) return error.ConfigureMissing;
+        explicit_layer.ackConfigure(self.explicit_serial);
+        layer.ackConfigure(self.default_serial);
+
+        const explicit_buffer = try createBuffer(shm, 0xff21_4365);
+        defer explicit_buffer.buffer.destroy();
+        defer explicit_buffer.pool.destroy();
+        defer _ = std.os.linux.close(explicit_buffer.fd);
+        const buffer = try createBuffer(shm, 0xff65_4321);
+        defer buffer.buffer.destroy();
+        defer buffer.pool.destroy();
+        defer _ = std.os.linux.close(buffer.fd);
+        explicit_surface.attach(explicit_buffer.buffer, 0, 0);
+        explicit_surface.damageBuffer(0, 0, 1, 1);
+        explicit_surface.commit();
+        surface.attach(buffer.buffer, 0, 0);
+        surface.damageBuffer(0, 0, 1, 1);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        try self.pause(.mapped);
+
+        surface.attach(null, 0, 0);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        try self.pause(.unmapped);
+        self.default_serial = 0;
+        layer.setSize(1, 1);
+        layer.setAnchor(.{ .top = true, .left = true });
+        layer.setExclusiveZone(1);
+        layer.setMargin(2, 0, 0, 3);
+        layer.setKeyboardInteractivity(.exclusive);
+        layer.setLayer(.top);
+        layer.setExclusiveEdge(.{ .top = true });
+        surface.commit();
+        try expectClientRoundtrip(display);
+        if (self.default_serial == 0) return error.RemapConfigureMissing;
+        layer.ackConfigure(self.default_serial);
+        surface.attach(buffer.buffer, 0, 0);
+        surface.damageBuffer(0, 0, 1, 1);
+        surface.commit();
+        try expectClientRoundtrip(display);
+        try self.pause(.remapped);
+    }
+
+    const TestBuffer = struct { fd: std.posix.fd_t, pool: *client_wl.ShmPool, buffer: *client_wl.Buffer };
+    fn createBuffer(shm: *client_wl.Shm, pixel: u32) !TestBuffer {
+        const fd = try std.posix.memfd_create("keywork-generated-layer", std.os.linux.MFD.CLOEXEC);
+        errdefer _ = std.os.linux.close(fd);
+        if (std.os.linux.errno(std.os.linux.ftruncate(fd, 4)) != .SUCCESS) return error.ShmResizeFailed;
+        if (std.c.pwrite(fd, @ptrCast(&pixel), 4, 0) != 4) return error.ShmWriteFailed;
+        const pool = try shm.createPool(fd, 4);
+        errdefer pool.destroy();
+        return .{ .fd = fd, .pool = pool, .buffer = try pool.createBuffer(0, 1, 1, 4, .argb8888) };
+    }
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, @min(global.version, 4)) catch null else if (std.mem.eql(u8, interface, "zwlr_layer_shell_v1")) self.shell = registry.bind(global.name, client_zwlr.LayerShellV1, 5) catch null;
+            },
+            .global_remove => {},
+        }
+    }
+    fn layerEvent(resource: *client_zwlr.LayerSurfaceV1, event: client_zwlr.LayerSurfaceV1.Event, self: *@This()) void {
+        switch (event) {
+            .configure => |configure| if (resource == self.explicit_layer) {
+                self.explicit_serial = configure.serial;
+            } else if (resource == self.default_layer) {
+                self.default_serial = configure.serial;
+            },
+            .closed => {},
+        }
+    }
+    fn pause(self: *@This(), value: Stage) !void {
+        self.stage.store(@intFromEnum(value), .release);
+        try waitForWayringCommand(self.command_fd);
+    }
+    fn closeWake(self: *@This(), shutdown_requested: bool) void {
+        const value = self.wake_fd.swap(if (shutdown_requested) -2 else -1, .acq_rel);
+        if (value < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(value, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(value);
+    }
+    fn shutdown(self: *@This()) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
     }
 };
 
@@ -22175,6 +22414,18 @@ fn waitForMatureLayerStage(server: *Self, client: *MatureLayerClient, expected: 
     return error.MatureLayerClientTimedOut;
 }
 
+fn waitForGeneratedLayerStage(server: *Self, host: anytype, client: *GeneratedLayerClient, expected: GeneratedLayerClient.Stage) !void {
+    for (0..2_000) |_| {
+        const stage: GeneratedLayerClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure orelse error.GeneratedLayerClientFailed;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    }
+    return error.GeneratedLayerClientTimedOut;
+}
+
 fn waitForWayringDndStage(
     server: *Self,
     host: anytype,
@@ -24243,6 +24494,21 @@ test "production generated data device completes the exact profile and supports 
         if (virtual_keyboard.global != null) virtual_keyboard.unpublish();
         virtual_keyboard.deinit();
     }
+    var layer_shell: WayringLayerShell = undefined;
+    layer_shell.init(
+        std.testing.allocator,
+        &protocol_server,
+        &clients,
+        &compositor,
+        &outputs,
+        &xdg,
+        server.sharedLayerPolicy(),
+        server.neutralLayerShell(),
+    );
+    defer {
+        if (layer_shell.global != null) layer_shell.unpublish();
+        layer_shell.deinit();
+    }
 
     const Lifecycle = struct {
         const FatalEvidence = struct {
@@ -24277,6 +24543,7 @@ test "production generated data device completes the exact profile and supports 
         data_control: *WayringDataControl,
         input_method: *WayringInputMethod,
         virtual_keyboard: *WayringVirtualKeyboard,
+        layer_shell: *WayringLayerShell,
         generated_client: ?ClientRegistry.Id = null,
         generated_raw: ?*wayring.server.Client = null,
         offender_fatal: ?FatalEvidence = null,
@@ -24297,6 +24564,7 @@ test "production generated data device completes the exact profile and supports 
         }
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            self.layer_shell.destroyClientResources(client);
             if (client.fatal()) |fatal| {
                 const provenance = client.transportProvenance();
                 const destination: ?*?FatalEvidence = if (provenance == .security_context)
@@ -24358,6 +24626,7 @@ test "production generated data device completes the exact profile and supports 
         .data_control = &data_control,
         .input_method = &input_method,
         .virtual_keyboard = &virtual_keyboard,
+        .layer_shell = &layer_shell,
     };
     const GlobalFilter = struct {
         data_control: *WayringDataControl,
@@ -24418,14 +24687,19 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(!peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
 
+    peer.expect_virtual_keyboard = true;
+    peer.expect_layer_shell = true;
     try virtual_keyboard.publish();
+    try layer_shell.publish();
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .manager_added);
     try std.testing.expect(peer.globals_exact);
     try std.testing.expect(peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(@as(usize, 1), peer.virtual_keyboard_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.virtual_keyboard_manager_version);
-    try std.testing.expectEqual(@as(usize, 17), peer.global_count);
+    try std.testing.expectEqual(@as(usize, 18), peer.global_count);
+    try std.testing.expectEqual(@as(usize, 1), peer.layer_shell_count);
+    try std.testing.expectEqual(@as(u32, 5), peer.layer_shell_version);
 
     // A same-UID security-context transport gets the public registry but not
     // the privileged data-control global. Keep the direct peer connected so a
@@ -24454,6 +24728,7 @@ test "production generated data device completes the exact profile and supports 
         .command_fd = denied_command,
         .registry_only = true,
         .expect_text_input = true,
+        .expect_layer_shell = true,
     };
     const denied_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied});
     var denied_joined = false;
@@ -24463,18 +24738,20 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, denied_host, &denied, .registry_ready);
     try std.testing.expect(denied.globals_exact);
-    try std.testing.expectEqual(@as(usize, 14), denied.global_count);
+    try std.testing.expectEqual(@as(usize, 15), denied.global_count);
+    try std.testing.expectEqual(@as(usize, 1), denied.layer_shell_count);
+    try std.testing.expectEqual(@as(u32, 5), denied.layer_shell_version);
     try std.testing.expectEqual(@as(usize, 0), denied.data_control_manager_count);
     const before_denied_bind = server.dataDeviceResourceSnapshot();
     data_control.unpublish();
     try data_control.publish();
     // Global names are allocated monotonically by the protocol server. No
     // other publication occurs between these two operations.
-    denied.guessed_data_control_name = peer.virtual_keyboard_manager_name + 1;
+    denied.guessed_data_control_name = peer.layer_shell_name + 1;
     try signalWayringCommand(denied_command);
     try waitForWayringXdgStage(server, denied_host, &denied, .manager_added);
     try std.testing.expect(denied.globals_exact);
-    try std.testing.expectEqual(@as(usize, 14), denied.global_count);
+    try std.testing.expectEqual(@as(usize, 15), denied.global_count);
     try std.testing.expectEqual(@as(usize, 0), denied.data_control_manager_count);
     try std.testing.expect(denied.data_control_manager == null);
     const managers_before_denied_bind = data_control.managers.items.len;
@@ -24512,6 +24789,7 @@ test "production generated data device completes the exact profile and supports 
         .command_fd = denied_method_command,
         .registry_only = true,
         .expect_text_input = true,
+        .expect_layer_shell = true,
         .guessed_input_method_name = peer.input_method_manager_name,
     };
     const denied_method_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_method});
@@ -24522,7 +24800,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, denied_host, &denied_method, .registry_ready);
     try std.testing.expect(denied_method.globals_exact);
-    try std.testing.expectEqual(@as(usize, 14), denied_method.global_count);
+    try std.testing.expectEqual(@as(usize, 15), denied_method.global_count);
     try std.testing.expectEqual(@as(usize, 0), denied_method.input_method_manager_count);
     const method_managers_before_denied_bind = input_method.managers.items.len;
     try signalWayringCommand(denied_method_command);
@@ -24551,6 +24829,7 @@ test "production generated data device completes the exact profile and supports 
         .command_fd = denied_virtual_command,
         .registry_only = true,
         .expect_text_input = true,
+        .expect_layer_shell = true,
         .guessed_virtual_keyboard_name = peer.virtual_keyboard_manager_name,
     };
     const denied_virtual_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_virtual});
@@ -24561,7 +24840,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, denied_host, &denied_virtual, .registry_ready);
     try std.testing.expect(denied_virtual.globals_exact);
-    try std.testing.expectEqual(@as(usize, 14), denied_virtual.global_count);
+    try std.testing.expectEqual(@as(usize, 15), denied_virtual.global_count);
     try std.testing.expectEqual(@as(usize, 0), denied_virtual.virtual_keyboard_manager_count);
     try signalWayringCommand(denied_virtual_command);
     try waitForWayringXdgStage(server, denied_host, &denied_virtual, .manager_added);
@@ -24586,6 +24865,7 @@ test "production generated data device completes the exact profile and supports 
     try denied_host.destroy();
     denied_host_live = false;
 
+    layer_shell.unpublish();
     virtual_keyboard.unpublish();
     try std.testing.expectEqual(@as(usize, 1), peer.input_method_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.input_method_manager_version);
@@ -24603,6 +24883,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(peer.data_control_manager_removed);
     try std.testing.expect(peer.input_method_manager_removed);
     try std.testing.expect(peer.virtual_keyboard_manager_removed);
+    try std.testing.expect(peer.layer_shell_removed);
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .disconnected);
     thread.join();
@@ -24618,6 +24899,98 @@ test "production generated data device completes the exact profile and supports 
     try data_control.publish();
     try input_method.publish();
     try virtual_keyboard.publish();
+    try layer_shell.publish();
+
+    const raw_layer_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_layer_command) != .SUCCESS) return error.EventFdFailed;
+    const layer_command: std.posix.fd_t = @intCast(raw_layer_command);
+    defer _ = linux.close(layer_command);
+    const layer_fd_baseline = try countMatureDataDeviceFds();
+    var generated_layer: GeneratedLayerClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = layer_command,
+    };
+    const generated_layer_thread = try std.Thread.spawn(.{}, GeneratedLayerClient.run, .{&generated_layer});
+    var generated_layer_joined = false;
+    defer if (!generated_layer_joined) {
+        generated_layer.shutdown();
+        generated_layer_thread.join();
+    };
+    try waitForGeneratedLayerStage(server, host, &generated_layer, .mapped);
+    try std.testing.expectEqual(@as(usize, 1), host.connectionCount());
+    try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
+    try std.testing.expect(generated_layer.explicit_serial != 0);
+    try std.testing.expect(generated_layer.default_serial != 0);
+    try std.testing.expect(generated_layer.explicit_serial != generated_layer.default_serial);
+
+    var generated_default_id: ?NeutralLayerShell.LayerSurfaceId = null;
+    var generated_default_scene: ?*Scene.LayerSurface = null;
+    var generated_explicit_seen = false;
+    inline for (.{ Scene.Layer.top, Scene.Layer.overlay }) |scene_layer| {
+        var layer_surfaces = server.scene.layerSurfaceIterator(scene_layer);
+        while (layer_surfaces.next()) |entry| {
+            const id = server.layer_shell_core.surfaceFor(entry.layer_surface.surface_id) orelse continue;
+            const snapshot = server.layer_shell_core.snapshot(id) orelse continue;
+            if (std.mem.eql(u8, snapshot.namespace, "org.keywork.generated-layer-explicit")) {
+                generated_explicit_seen = true;
+                try std.testing.expectEqual(output.protocol_id, snapshot.output);
+                try std.testing.expect(snapshot.mapped and snapshot.configured);
+                try std.testing.expectEqual(Scene.Layer.overlay, entry.layer_surface.layer);
+            } else if (std.mem.eql(u8, snapshot.namespace, "org.keywork.generated-layer-default")) {
+                generated_default_id = id;
+                generated_default_scene = entry.layer_surface;
+                try std.testing.expectEqual(output.protocol_id, snapshot.output);
+                try std.testing.expect(snapshot.mapped and snapshot.configured and !snapshot.awaiting_initial_commit);
+                try std.testing.expectEqual(NeutralLayerShell.Layer.top, snapshot.current.layer);
+                try std.testing.expectEqual(NeutralLayerShell.KeyboardInteractivity.exclusive, snapshot.current.keyboard_interactivity);
+                try std.testing.expectEqual(NeutralLayerShell.Anchor{ .top = true }, snapshot.current.exclusive_edge);
+                try std.testing.expectEqual(@as(i32, 1), snapshot.current.exclusive_zone);
+            }
+        }
+    }
+    try std.testing.expect(generated_explicit_seen);
+    const default_id = generated_default_id orelse return error.GeneratedLayerSnapshotMissing;
+    const default_scene = generated_default_scene orelse return error.GeneratedLayerSceneMissing;
+    const default_surface = server.layer_shell_core.snapshot(default_id).?.surface;
+    try std.testing.expectEqual(
+        HeadlessSurfaceForest.PresentationClass.layer_surface,
+        server.headless_surface_forest.presentationClass(default_surface).?,
+    );
+    var generic_surfaces = server.headless_surface_forest.renderIterator();
+    while (generic_surfaces.next()) |entry|
+        try std.testing.expect(!std.meta.eql(entry.id, default_surface));
+    try std.testing.expect(default_scene.mapped);
+    try std.testing.expectEqual(Scene.Layer.top, default_scene.layer);
+    try std.testing.expectEqual(Scene.Position{ .x = 3, .y = 2 }, default_scene.position);
+    try std.testing.expectEqual(LayerShell.Rect{ .x = 0, .y = 3, .width = 640, .height = 477 }, server.layer_shell.usableArea());
+    try std.testing.expectEqual(LayerShell.FocusClass.exclusive, server.layer_shell.focusClass());
+    try std.testing.expectEqual(server.layer_shell_core.snapshot(default_id).?.surface, server.layer_shell.keyboardFocus(null).?);
+
+    try signalWayringCommand(layer_command);
+    try waitForGeneratedLayerStage(server, host, &generated_layer, .unmapped);
+    try std.testing.expect(!server.layer_shell_core.snapshot(default_id).?.mapped);
+    try std.testing.expect(!default_scene.mapped);
+    try std.testing.expectEqual(LayerShell.Rect{ .x = 0, .y = 0, .width = 640, .height = 480 }, server.layer_shell.usableArea());
+    try signalWayringCommand(layer_command);
+    try waitForGeneratedLayerStage(server, host, &generated_layer, .remapped);
+    try std.testing.expect(server.layer_shell_core.snapshot(default_id).?.mapped);
+    try std.testing.expect(default_scene.mapped);
+    try std.testing.expectEqual(LayerShell.Rect{ .x = 0, .y = 3, .width = 640, .height = 477 }, server.layer_shell.usableArea());
+    try signalWayringCommand(layer_command);
+    try waitForGeneratedLayerStage(server, host, &generated_layer, .disconnected);
+    generated_layer_thread.join();
+    generated_layer_joined = true;
+    for (0..2_000) |_| {
+        if (host.connectionCount() == 0 and server.client_registry.len() == client_baseline and
+            server.surface_registry.len() == surface_baseline and
+            server.compositor.surfaceStore().len() == mature_surface_baseline and
+            server.headless_surface_forest.len() == forest_baseline) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedLayerCleanupTimedOut;
+    try std.testing.expectEqual(layer_fd_baseline, try countMatureDataDeviceFds());
 
     const control_regular_resource_baseline = server.neutralDataDevice().resourceCounts();
     const control_primary_resource_baseline = server.neutralDataDevice().primaryResourceCounts();
@@ -24874,6 +25247,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_data_control = true,
         .expect_input_method = true,
         .expect_virtual_keyboard = true,
+        .expect_layer_shell = true,
     };
     const primary_watch_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_watch});
     var primary_watch_joined = false;
@@ -24884,6 +25258,7 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringXdgStage(server, host, &primary_watch, .registry_ready);
     try std.testing.expect(primary_watch.globals_exact);
     try std.testing.expectEqual(@as(usize, 1), primary_watch.primary_selection_manager_count);
+    layer_shell.unpublish();
     virtual_keyboard.unpublish();
     input_method.unpublish();
     data_control.unpublish();
@@ -24893,6 +25268,7 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringXdgStage(server, host, &primary_watch, .manager_removed);
     try std.testing.expect(primary_watch.primary_selection_manager_removed);
     try std.testing.expect(primary_watch.input_method_manager_removed);
+    try std.testing.expect(primary_watch.layer_shell_removed);
     try signalWayringCommand(primary_watch_command);
     try waitForWayringXdgStage(server, host, &primary_watch, .disconnected);
     primary_watch_thread.join();
@@ -24904,6 +25280,7 @@ test "production generated data device completes the exact profile and supports 
     try data_control.publish();
     try input_method.publish();
     try virtual_keyboard.publish();
+    try layer_shell.publish();
     const raw_primary_rebind_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_primary_rebind_command) != .SUCCESS) return error.EventFdFailed;
     const primary_rebind_command: std.posix.fd_t = @intCast(raw_primary_rebind_command);
@@ -24917,6 +25294,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_data_control = true,
         .expect_input_method = true,
         .expect_virtual_keyboard = true,
+        .expect_layer_shell = true,
     };
     const primary_rebind_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_rebind});
     var primary_rebind_joined = false;
@@ -24926,7 +25304,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, host, &primary_rebind, .registry_ready);
     try std.testing.expect(primary_rebind.globals_exact);
-    try std.testing.expectEqual(@as(usize, 17), primary_rebind.global_count);
+    try std.testing.expectEqual(@as(usize, 18), primary_rebind.global_count);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.primary_selection_manager_count);
     try std.testing.expectEqual(@as(u32, 1), primary_rebind.primary_selection_manager_version);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.input_method_manager_count);
