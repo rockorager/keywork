@@ -14417,7 +14417,8 @@ test "canonical generated keyboard delivery preserves focus aggregation authorit
     defer server.seat.setKeyboardAvailable(false);
     var virtual_owner: u8 = 0;
     try server.seat.createVirtualKeyboard(&virtual_owner);
-    defer server.seat.destroyVirtualKeyboard(&virtual_owner);
+    var virtual_owner_live = true;
+    defer if (virtual_owner_live) server.seat.destroyVirtualKeyboard(&virtual_owner);
     const virtual_keymap_fd = try std.posix.memfd_create("keywork-seat-virtual-test", std.os.linux.MFD.CLOEXEC);
     const virtual_keymap = "keymap\x00";
     if (std.os.linux.errno(std.os.linux.ftruncate(virtual_keymap_fd, virtual_keymap.len)) != .SUCCESS or
@@ -14426,7 +14427,8 @@ test "canonical generated keyboard delivery preserves focus aggregation authorit
     try server.seat.setVirtualKeyboardKeymap(&virtual_owner, virtual_keymap_fd, virtual_keymap.len);
     var virtual_owner_b: u8 = 0;
     try server.seat.createVirtualKeyboard(&virtual_owner_b);
-    defer server.seat.destroyVirtualKeyboard(&virtual_owner_b);
+    var virtual_owner_b_live = true;
+    defer if (virtual_owner_b_live) server.seat.destroyVirtualKeyboard(&virtual_owner_b);
     const virtual_keymap_b_fd = try std.posix.memfd_create("keywork-seat-virtual-test-b", std.os.linux.MFD.CLOEXEC);
     if (std.os.linux.errno(std.os.linux.ftruncate(virtual_keymap_b_fd, virtual_keymap.len)) != .SUCCESS or
         std.c.pwrite(virtual_keymap_b_fd, virtual_keymap.ptr, virtual_keymap.len, 0) != virtual_keymap.len)
@@ -14542,6 +14544,19 @@ test "canonical generated keyboard delivery preserves focus aggregation authorit
     try std.testing.expectEqual(TestGeneratedSeatSink.KeyboardTag.leave, sink.keyboard_events[mature_transition]);
     try std.testing.expectEqual(client_b, sink.keyboard_clients[mature_transition]);
     try std.testing.expect(server.seat.generatedKeyboardFocus() == null);
+
+    try std.testing.expect(server.focusGeneratedSurface(root_b));
+    const teardown_start = sink.keyboard_event_count;
+    server.seat.setKeyboardAvailable(false);
+    server.seat.destroyVirtualKeyboard(&virtual_owner_b);
+    virtual_owner_b_live = false;
+    try std.testing.expectEqual(teardown_start, sink.keyboard_event_count);
+    server.seat.destroyVirtualKeyboard(&virtual_owner);
+    virtual_owner_live = false;
+    try std.testing.expectEqual(teardown_start + 1, sink.keyboard_event_count);
+    try std.testing.expectEqual(TestGeneratedSeatSink.KeyboardTag.leave, sink.keyboard_events[teardown_start]);
+    try std.testing.expectEqual(client_b, sink.keyboard_clients[teardown_start]);
+    try std.testing.expect(server.seat.deliverySnapshot().capabilities.keyboard.available == false);
 
     server.client_registry.unregister(client_b);
     client_b_live = false;

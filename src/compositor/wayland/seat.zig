@@ -1197,13 +1197,15 @@ pub fn destroyVirtualKeyboard(self: *Self, owner: *anyopaque) void {
     const index = self.virtualKeyboardIndex(owner) orelse unreachable;
     const old_capability = self.hasKeyboardCapability();
     self.releaseVirtualKeyboard(owner);
+    const removing_final_provider = old_capability and !self.keyboard_available and
+        self.virtual_keyboards.items[index].has_keymap and self.virtualKeyboardCount() == 1;
+    if (removing_final_provider and self.parent_focused) self.sendLeave();
     var removed = self.virtual_keyboards.orderedRemove(index);
     if (removed.deferred_keymap) |keymap| keymap.file.close(self.io);
     removed.pressed_keys.deinit(self.allocator);
     const changed = self.delivery.setCapability(.keyboard, self.keyboardCapabilityAvailable());
     std.debug.assert(changed == (old_capability != self.hasKeyboardCapability()));
     if (!changed) return;
-    if (old_capability and !self.hasKeyboardCapability() and self.parent_focused) self.sendLeave();
     self.broadcastCapabilities();
     self.notifyKeyboardFocus();
 }
