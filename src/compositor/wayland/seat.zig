@@ -279,10 +279,11 @@ pub const KeyboardGrab = struct {
     context: *anyopaque,
     token: u64,
     surface: ?Surface.Id = null,
+    generated_client: ?ClientRegistry.Id = null,
     cancel: *const fn (*anyopaque) void,
     keymap: *const fn (*anyopaque, wl.Keyboard.KeymapFormat, std.posix.fd_t, u32) void,
     key: *const fn (*anyopaque, u32, u32, u32, wl.Keyboard.KeyState) void,
-    modifiers: *const fn (*anyopaque, u32, u32, u32, u32) void,
+    modifiers: *const fn (*anyopaque, u32, u32, u32, u32, u32) void,
     repeat_info: *const fn (*anyopaque, i32, i32) void,
 };
 
@@ -669,11 +670,11 @@ pub fn removeKeyboardFocusListener(self: *Self, context: *anyopaque) void {
     unreachable;
 }
 
-pub fn setKeyboardGrab(self: *Self, grab: KeyboardGrab) void {
+pub fn setKeyboardGrab(self: *Self, grab: KeyboardGrab) bool {
     if (self.keyboard_grab) |active| {
         active.cancel(active.context);
     }
-    std.debug.assert(self.installKeyboardGrab(grab));
+    return self.installKeyboardGrab(grab);
 }
 
 pub fn trySetKeyboardGrab(self: *Self, grab: KeyboardGrab) bool {
@@ -687,6 +688,10 @@ fn installKeyboardGrab(self: *Self, grab: KeyboardGrab) bool {
         if (Surface.resourceFor(self.surface_store, surface_id) == null) return false;
         if (self.parent_focused) self.sendLeave();
     }
+    const generated_serial = if (grab.generated_client) |client|
+        (self.delivery.issueSerial(client) orelse return false).value
+    else
+        null;
     self.keyboard_grab = grab;
     if (grab.surface != null) {
         if (self.parent_focused and self.keymap != null) self.sendEnter();
@@ -696,8 +701,10 @@ fn installKeyboardGrab(self: *Self, grab: KeyboardGrab) bool {
             grab.keymap(grab.context, keymap.format, keymap.file.handle, keymap.size);
         }
         grab.repeat_info(grab.context, self.repeat_info.rate, self.repeat_info.delay);
+        const serial = generated_serial orelse MatureSerials.issueWire(self.display);
         grab.modifiers(
             grab.context,
+            serial,
             self.modifier_state.current.depressed,
             self.modifier_state.current.latched,
             self.modifier_state.current.locked,
@@ -1546,9 +1553,13 @@ fn keyWithGrab(
             return;
         }
         if (state == .repeated) return;
+        const serial = if (grab.generated_client) |client|
+            (self.delivery.issueSerial(client) orelse return).value
+        else
+            MatureSerials.issueWire(self.display);
         grab.key(
             grab.context,
-            MatureSerials.issueWire(self.display),
+            serial,
             time,
             key_code,
             state,
@@ -1669,8 +1680,13 @@ fn sendCurrentModifiers(self: *Self, allow_grab: bool) void {
                 }
                 return;
             }
+            const serial = if (grab.generated_client) |client|
+                (self.delivery.issueSerial(client) orelse return).value
+            else
+                MatureSerials.issueWire(self.display);
             grab.modifiers(
                 grab.context,
+                serial,
                 modifiers.depressed,
                 modifiers.latched,
                 modifiers.locked,

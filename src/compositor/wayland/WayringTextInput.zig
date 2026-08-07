@@ -243,6 +243,17 @@ test "official text input descriptor and protocol values stay pinned" {
     try std.testing.expectEqual(@as(i64, 1), protocol.zwp_text_input_v3.action.submit);
 }
 
+test "official input method v2 descriptor family stays pinned" {
+    try std.testing.expectEqual(@as(u32, 1), protocol.zwp_input_method_manager_v2.interface.version);
+    try std.testing.expectEqual(@as(u32, 1), protocol.zwp_input_method_v2.interface.version);
+    try std.testing.expectEqual(@as(u32, 1), protocol.zwp_input_method_keyboard_grab_v2.interface.version);
+    try std.testing.expectEqual(@as(u32, 1), protocol.zwp_input_popup_surface_v2.interface.version);
+    try std.testing.expectEqual(@as(i64, 0), protocol.zwp_input_method_v2.@"error".role);
+    try std.testing.expectEqualStrings("get_input_method", protocol.zwp_input_method_manager_v2.request_messages[0].name);
+    try std.testing.expectEqualStrings("grab_keyboard", protocol.zwp_input_method_v2.request_messages[5].name);
+    try std.testing.expectEqualStrings("text_input_rectangle", protocol.zwp_input_popup_surface_v2.event_messages[0].name);
+}
+
 test "surrounding text validation rejects negative non-UTF-8 and split ranges" {
     try std.testing.expect(validSurroundingText("hé", 0, 3));
     try std.testing.expect(!validSurroundingText("hé", -1, 0));

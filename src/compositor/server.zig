@@ -104,6 +104,7 @@ const WayringOutput = @import("wayland/WayringOutput.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
+const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
 const Viewporter = @import("wayland/viewporter.zig");
 const InputManager = @import("input_manager.zig");
 const BuiltinKeybindings = @import("builtin_keybindings.zig");
@@ -174,6 +175,12 @@ pub const DataControlObserver = struct {
     transaction_abort: *const fn (*anyopaque) void,
     offer_rolled_back: *const fn (*anyopaque, NeutralDataDevice.ControlOfferId) void,
     offer_mime_offered: *const fn (*anyopaque, NeutralDataDevice.ControlOfferId, []const u8) void,
+};
+pub const GeneratedInputMethodObserver = struct {
+    context: *anyopaque,
+    set_inhibited: *const fn (*anyopaque, bool) void,
+    popup_iterator: *const fn (*anyopaque) WayringInputMethod.PopupIterator,
+    refresh_popups: *const fn (*anyopaque) void,
 };
 var expected_protocol_error: if (builtin.is_test) ?ExpectedProtocolError else void =
     if (builtin.is_test) null else {};
@@ -354,6 +361,7 @@ mature_data_device: WaylandDataDevice,
 data_device_observer: ?DataDeviceObserver = null,
 primary_selection_observer: ?PrimarySelectionObserver = null,
 data_control_observer: ?DataControlObserver = null,
+generated_input_method_observer: ?GeneratedInputMethodObserver = null,
 xdg_toplevel_drag: XdgToplevelDrag,
 xdg_toplevel_icon: XdgToplevelIcon,
 xdg_dialog: XdgDialog,
@@ -3950,6 +3958,45 @@ pub fn neutralTextInput(self: *Self) *NeutralTextInput {
     return &self.neutral_text_input;
 }
 
+/// Canonical seat authority used by protocol adapters that implement grabs.
+pub fn canonicalSeat(self: *Self) *Seat {
+    return &self.seat;
+}
+
+pub fn setGeneratedInputMethodObserver(self: *Self, observer: ?GeneratedInputMethodObserver) void {
+    self.generated_input_method_observer = observer;
+}
+
+pub fn generatedInputMethodLayout(self: *Self) WayringInputMethod.Layout {
+    return .{
+        .context = self,
+        .surface_position = generatedInputMethodSurfacePosition,
+        .output_size = generatedInputMethodOutputSize,
+        .popup_size = generatedInputMethodPopupSize,
+        .repaint = requestRepaint,
+    };
+}
+
+fn generatedInputMethodSurfacePosition(context: *anyopaque, surface_id: SurfaceRegistry.Id) ?WayringInputMethod.Position {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const root = self.headless_surface_forest.compoundRoot(surface_id) orelse surface_id;
+    const position = self.scene.surfacePosition(root) orelse return null;
+    return .{ .x = position.x, .y = position.y };
+}
+
+fn generatedInputMethodOutputSize(context: *anyopaque) render.Size {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.primaryRenderOutput().backend.size();
+}
+
+fn generatedInputMethodPopupSize(context: *anyopaque, surface_id: SurfaceRegistry.Id) ?render.Size {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return switch (self.headless_surface_forest.compoundBounds(surface_id)) {
+        .rect => |rect| .{ .width = rect.width, .height = rect.height },
+        .hidden, .full_damage => (self.surface_registry.renderState(surface_id) orelse return null).logical_size,
+    };
+}
+
 pub const DataDeviceResourceSnapshot = struct {
     neutral: NeutralDataDevice.ResourceCounts,
     mature: WaylandDataDevice.ResourceCounts,
@@ -4329,7 +4376,7 @@ fn reconcileGeneratedPointerTopology(self: *Self) void {
                     self.generatedManagedRootStructurallyLive(generated.root, generated.client)
                 else
                     self.generatedManagedRootEligible(generated.root, generated.client)),
-            .xdg_reserved, .cursor, .drag_icon => false,
+            .xdg_reserved, .cursor, .drag_icon, .input_popup => false,
         }
     else
         false;
@@ -6259,10 +6306,12 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
     if (locked) {
         self.virtual_keyboard.setInhibited(true);
         self.input_method.setInhibited(true);
+        if (self.generated_input_method_observer) |observer| observer.set_inhibited(observer.context, true);
         _ = self.seat.applyMatureKeyboardFocus(null);
     } else {
         _ = self.seat.applyMatureKeyboardFocus(null);
         self.input_method.setInhibited(false);
+        if (self.generated_input_method_observer) |observer| observer.set_inhibited(observer.context, false);
         self.virtual_keyboard.setInhibited(false);
         if (self.seat.pointerPosition()) |position| {
             const route = self.pointerRoute(position.x, position.y);
@@ -7675,7 +7724,7 @@ fn pointerButtonForSeat(
     const replace_generated = seat == &self.seat and state == .pressed and
         route.generated == null and root != null and self.seat.generatedKeyboardFocus() != null;
     const generated_popup = if (route.generated) |generated|
-        self.managedGeneratedPopup(generated.root) != null
+        self.managedGeneratedPopup(generated.root) != null or self.isGeneratedInputPopup(generated.root)
     else
         false;
     self.window_manager.pointerButton(if (generated_popup) null else root, state);
@@ -7689,10 +7738,8 @@ fn pointerButtonForSeat(
         if (seat == &self.seat and button == linux_button_left and
             !seat.hasPressedPointerButtons())
         {
-            if (route.generated) |generated| {
-                if (self.managedGeneratedPopup(generated.root) == null)
-                    _ = self.focusGeneratedSurface(generated.root);
-            }
+            if (route.generated != null and !generated_popup)
+                _ = self.focusGeneratedSurface(route.generated.?.root);
         }
         requestRepaint(self);
     }
@@ -8106,7 +8153,8 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     } else if (route.generated) |generated| {
         self.window_manager.pointerButton(null, .pressed);
         self.layer_shell.pointerPressed(null);
-        if (first_touch and self.managedGeneratedPopup(generated.root) == null)
+        if (first_touch and self.managedGeneratedPopup(generated.root) == null and
+            !self.isGeneratedInputPopup(generated.root))
             _ = self.focusGeneratedSurface(generated.root);
         requestRepaint(self);
     } else {
@@ -8315,6 +8363,7 @@ fn scenePointerRoute(
     y: f64,
     excluded_window: ?Scene.Id,
 ) ?PointerRoute {
+    if (self.generatedInputPopupFocus(x, y)) |focus| return generatedPointerRoute(focus);
     var input_popups = self.input_method.reversePopupIterator();
     while (input_popups.next()) |popup| {
         if (self.hitTestSurface(
@@ -8380,6 +8429,34 @@ fn generatedPointerRoute(focus: GeneratedPointerFocus) PointerRoute {
     };
 }
 
+fn generatedInputPopupFocus(self: *Self, x: f64, y: f64) ?GeneratedPointerFocus {
+    const observer = self.generated_input_method_observer orelse return null;
+    var popups = observer.popup_iterator(observer.context);
+    var result: ?GeneratedPointerFocus = null;
+    while (popups.next()) |popup| {
+        const root = self.headless_surface_forest.compoundRoot(popup.surface_id) orelse continue;
+        const client = self.seat.generatedSurfaceOwner(root) orelse continue;
+        var filter: GeneratedInputFilter = .{ .server = self, .root = root };
+        const hit = self.headless_surface_forest.subtreeInputHit(
+            root,
+            x - @as(f64, @floatFromInt(popup.position.x)),
+            y - @as(f64, @floatFromInt(popup.position.y)),
+            .{ .context = &filter, .accepts = generatedSurfaceAcceptsInput },
+        ) orelse continue;
+        result = .{ .surface_id = hit.id, .root = root, .client = client, .x = hit.x, .y = hit.y };
+    }
+    return result;
+}
+
+fn isGeneratedInputPopup(self: *Self, root: SurfaceRegistry.Id) bool {
+    const observer = self.generated_input_method_observer orelse return false;
+    var popups = observer.popup_iterator(observer.context);
+    while (popups.next()) |popup|
+        if (std.meta.eql(self.headless_surface_forest.compoundRoot(popup.surface_id) orelse continue, root))
+            return true;
+    return false;
+}
+
 const GeneratedInputFilter = struct {
     server: *Self,
     root: ?SurfaceRegistry.Id,
@@ -8422,7 +8499,7 @@ fn headlessPointerFocus(self: *Self, x: f64, y: f64) ?GeneratedPointerFocus {
     switch (self.headless_surface_forest.presentationClass(root) orelse return null) {
         .background => {},
         .managed => if (!self.generatedManagedRootEligible(root, client)) return null,
-        .xdg_reserved, .cursor, .drag_icon => return null,
+        .xdg_reserved, .cursor, .drag_icon, .input_popup => return null,
     }
     return .{
         .surface_id = hit.id,
@@ -10654,6 +10731,12 @@ fn renderDesktopContents(
             null,
             null,
         );
+    }
+    if (self.generated_input_method_observer) |observer| {
+        observer.refresh_popups(observer.context);
+        var generated_popups = observer.popup_iterator(observer.context);
+        while (generated_popups.next()) |popup|
+            try self.renderGeneratedCompound(frame, popup.surface_id, popup.position.x, popup.position.y);
     }
 
     const drag_icon = self.mature_data_device.iconInfo();
@@ -13941,6 +14024,9 @@ test "production mature text input v3 and input method v2 transact over canonica
     try waitForMatureTextStage(server, &method, .ready);
     var iterator = server.compositor.surfaceStore().iterator();
     const surface = (iterator.next() orelse return error.MatureSurfaceMissing).id;
+    // The shared input-method client also materializes its protocol-authentic
+    // popup surface; the application surface remains first in creation order.
+    try std.testing.expect(iterator.next() != null);
     try std.testing.expect(iterator.next() == null);
     _ = server.seat.applyMatureKeyboardFocus(surface);
     try server.seat.parentKeyboardEnter(&.{});
@@ -14079,11 +14165,11 @@ test "mature keyboard late bind reuses one logical enter serial and authority gr
         fn cancel(_: *anyopaque) void {}
         fn keymap(_: *anyopaque, _: wl.Keyboard.KeymapFormat, _: std.posix.fd_t, _: u32) void {}
         fn key(_: *anyopaque, _: u32, _: u32, _: u32, _: wl.Keyboard.KeyState) void {}
-        fn modifiers(_: *anyopaque, _: u32, _: u32, _: u32, _: u32) void {}
+        fn modifiers(_: *anyopaque, _: u32, _: u32, _: u32, _: u32, _: u32) void {}
         fn repeatInfo(_: *anyopaque, _: i32, _: i32) void {}
     };
     var grab_probe: GrabProbe = .{};
-    server.seat.setKeyboardGrab(.{
+    try std.testing.expect(server.seat.setKeyboardGrab(.{
         .context = &grab_probe,
         .token = 1,
         .surface = surface,
@@ -14092,7 +14178,7 @@ test "mature keyboard late bind reuses one logical enter serial and authority gr
         .key = GrabProbe.key,
         .modifiers = GrabProbe.modifiers,
         .repeat_info = GrabProbe.repeatInfo,
-    });
+    }));
     const grab_serial = server.seat.authority.latestKeyboardEnterSerial(client_id) orelse
         return error.MatureKeyboardGrabEnterGrantMissing;
     const grab_order = server.seat.authority.selectionOrder(client_id, grab_serial) orelse
@@ -14281,11 +14367,11 @@ test "canonical generated keyboard delivery preserves focus aggregation authorit
             const self: *@This() = @ptrCast(@alignCast(context));
             self.key_count += 1;
         }
-        fn modifiers(_: *anyopaque, _: u32, _: u32, _: u32, _: u32) void {}
+        fn modifiers(_: *anyopaque, _: u32, _: u32, _: u32, _: u32, _: u32) void {}
         fn repeatInfo(_: *anyopaque, _: i32, _: i32) void {}
     };
     var grab_probe: GrabProbe = .{};
-    server.seat.setKeyboardGrab(.{
+    try std.testing.expect(server.seat.setKeyboardGrab(.{
         .context = &grab_probe,
         .token = 42,
         .cancel = GrabProbe.cancel,
@@ -14293,7 +14379,7 @@ test "canonical generated keyboard delivery preserves focus aggregation authorit
         .key = GrabProbe.key,
         .modifiers = GrabProbe.modifiers,
         .repeat_info = GrabProbe.repeatInfo,
-    });
+    }));
     const before_grab_key = sink.keyboard_event_count;
     try server.seat.key(9, 33, .pressed);
     try std.testing.expectEqual(@as(usize, 1), grab_probe.key_count);
@@ -17125,10 +17211,12 @@ const WayringXdgClient = struct {
     registry_only: bool = false,
     registry_watch_data_device: bool = false,
     registry_watch_primary_selection: bool = false,
+    registry_watch_input_method: bool = false,
     expect_text_input: bool = false,
     expect_data_control: bool = false,
     guessed_data_control_name: ?u32 = null,
     guessed_data_control_bind_issued: bool = false,
+    expect_input_method: bool = false,
     offense: ?Offense = null,
     activation_role: ?ActivationRole = null,
     activation_exchange: ?*ActivationExchange = null,
@@ -17160,6 +17248,10 @@ const WayringXdgClient = struct {
     data_control_manager_name: u32 = 0,
     data_control_manager_removed: bool = false,
     generated_input_method_seen: bool = false,
+    input_method_manager_count: usize = 0,
+    input_method_manager_version: u32 = 0,
+    input_method_manager_name: u32 = 0,
+    input_method_manager_removed: bool = false,
     generated_virtual_keyboard_seen: bool = false,
     configure_serial: u32 = 0,
     configure_count: u8 = 0,
@@ -17205,11 +17297,12 @@ const WayringXdgClient = struct {
         .{ .name = "zwp_primary_selection_device_manager_v1", .version = 1 },
         .{ .name = "zwp_text_input_manager_v3", .version = 2 },
         .{ .name = "ext_data_control_manager_v1", .version = 1 },
+        .{ .name = "zwp_input_method_manager_v2", .version = 1 },
     };
 
     fn expectedGlobalCount(self: *const @This()) usize {
         return expected_globals.len - @intFromBool(!self.expect_text_input) -
-            @intFromBool(!self.expect_data_control);
+            @intFromBool(!self.expect_data_control) - @intFromBool(!self.expect_input_method);
     }
 
     fn run(self: *@This()) void {
@@ -17296,9 +17389,12 @@ const WayringXdgClient = struct {
                     self.data_control_manager = null;
                 }
                 try self.pause(.manager_removed);
-            } else if (self.registry_watch_primary_selection) {
+            } else if (self.registry_watch_primary_selection or self.registry_watch_input_method) {
                 try expectClientRoundtrip(display);
-                if (!self.primary_selection_manager_removed) return error.PrimarySelectionManagerRemovalMissing;
+                if (self.registry_watch_primary_selection and !self.primary_selection_manager_removed)
+                    return error.PrimarySelectionManagerRemovalMissing;
+                if (self.registry_watch_input_method and !self.input_method_manager_removed)
+                    return error.InputMethodManagerRemovalMissing;
                 try self.pause(.manager_removed);
             }
             activation.destroy();
@@ -17536,7 +17632,9 @@ const WayringXdgClient = struct {
                     self.data_control_manager_name = global.name;
                     self.data_control_manager = registry.bind(global.name, client_ext.DataControlManagerV1, 1) catch null;
                 } else if (std.mem.eql(u8, interface, "zwp_input_method_manager_v2")) {
-                    self.generated_input_method_seen = true;
+                    self.input_method_manager_count += 1;
+                    self.input_method_manager_version = global.version;
+                    self.input_method_manager_name = global.name;
                 } else if (std.mem.eql(u8, interface, "zwp_virtual_keyboard_manager_v1")) {
                     self.generated_virtual_keyboard_seen = true;
                 }
@@ -17553,6 +17651,8 @@ const WayringXdgClient = struct {
                     self.primary_selection_manager_removed = true;
                 if (removed.name == self.data_control_manager_name)
                     self.data_control_manager_removed = true;
+                if (removed.name == self.input_method_manager_name)
+                    self.input_method_manager_removed = true;
             },
         }
     }
@@ -20620,7 +20720,7 @@ const MatureTextClient = struct {
     const client_wl = wayland.client.wl;
     const client_zwp = wayland.client.zwp;
     const Role = enum { application, input_method };
-    const Stage = enum(u8) { starting, ready, state_received, edit_received, disconnected, failed };
+    const Stage = enum(u8) { starting, ready, state_received, edit_received, popup_clicked, popup_unmapped, disconnected, failed };
     const EditTag = enum { preedit, delete, commit, done };
     fd: std.posix.fd_t,
     role: Role,
@@ -20629,6 +20729,7 @@ const MatureTextClient = struct {
     shutdown_requested: std.atomic.Value(bool) = .init(false),
     failure: ?anyerror = null,
     compositor: ?*client_wl.Compositor = null,
+    shm: ?*client_wl.Shm = null,
     seat: ?*client_wl.Seat = null,
     text_manager: ?*client_zwp.TextInputManagerV3 = null,
     method_manager: ?*client_zwp.InputMethodManagerV2 = null,
@@ -20646,7 +20747,27 @@ const MatureTextClient = struct {
     method_cause: i32 = 0,
     method_content_hint: u32 = 0,
     method_content_purpose: i32 = 0,
+    popup_surface_object_id: u32 = 0,
+    popup_rectangle: NeutralTextInput.Rectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    popup_rectangle_count: usize = 0,
+    popup_rectangle_after_done: bool = false,
+    popup_pointer_surface: u32 = 0,
+    listen_pointer: bool = false,
     grab_delivery: bool = false,
+    grab_events: [5]u8 = undefined,
+    grab_event_count: usize = 0,
+    grab_keymap_size: u32 = 0,
+    grab_keymap_bytes: [16]u8 = undefined,
+    grab_keymap_len: usize = 0,
+    grab_keymap_fd_closed: bool = false,
+    grab_repeat_rate: i32 = 0,
+    grab_repeat_delay: i32 = 0,
+    grab_key_serial: u32 = 0,
+    grab_key_time: u32 = 0,
+    grab_key: u32 = 0,
+    grab_key_state: i32 = 0,
+    grab_modifier_serial: u32 = 0,
+    grab_modifiers: [4]u32 = @splat(0),
 
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
@@ -20702,6 +20823,10 @@ const MatureTextClient = struct {
                 }
             },
             .input_method => {
+                const compositor = self.compositor orelse return error.CompositorMissing;
+                defer compositor.destroy();
+                const shm = self.shm orelse return error.ShmMissing;
+                defer shm.release();
                 const manager = self.method_manager orelse return error.InputMethodManagerMissing;
                 defer manager.destroy();
                 const method = try manager.getInputMethod(seat);
@@ -20710,9 +20835,39 @@ const MatureTextClient = struct {
                 const grab = try method.grabKeyboard();
                 defer grab.release();
                 grab.setListener(*@This(), grabEvent, self);
+                const pointer = if (self.listen_pointer) try seat.getPointer() else null;
+                defer if (pointer) |value| value.release();
+                if (pointer) |value| value.setListener(*@This(), pointerEvent, self);
+                const popup_surface = try compositor.createSurface();
+                defer popup_surface.destroy();
+                self.popup_surface_object_id = popup_surface.getId();
+                const popup = try method.getInputPopupSurface(popup_surface);
+                defer popup.destroy();
+                popup.setListener(*@This(), popupEvent, self);
+                const shm_fd = try std.posix.memfd_create("keywork-generated-input-popup", std.os.linux.MFD.CLOEXEC);
+                defer _ = std.os.linux.close(shm_fd);
+                const popup_pixel: u32 = 0xffe1_37a5;
+                if (std.os.linux.errno(std.os.linux.ftruncate(shm_fd, @sizeOf(u32))) != .SUCCESS)
+                    return error.ShmResizeFailed;
+                if (std.c.pwrite(shm_fd, @ptrCast(&popup_pixel), @sizeOf(u32), 0) != @sizeOf(u32))
+                    return error.ShmWriteFailed;
+                const pool = try shm.createPool(shm_fd, @sizeOf(u32));
+                defer pool.destroy();
+                const buffer = try pool.createBuffer(0, 1, 1, @sizeOf(u32), .argb8888);
+                defer buffer.destroy();
                 self.stage.store(@intFromEnum(Stage.ready), .release);
                 while (self.method_event_count < 5) try expectClientRoundtrip(display);
+                popup_surface.attach(buffer, 0, 0);
+                popup_surface.damageBuffer(0, 0, 1, 1);
+                popup_surface.commit();
+                try expectClientRoundtrip(display);
                 self.stage.store(@intFromEnum(Stage.state_received), .release);
+                if (self.listen_pointer) {
+                    while (@as(Stage, @enumFromInt(self.stage.load(.acquire))) != .popup_clicked) {
+                        if (self.shutdown_requested.load(.acquire)) return;
+                        try expectClientRoundtrip(display);
+                    }
+                }
                 while (!self.proceed.load(.acquire)) {
                     if (self.shutdown_requested.load(.acquire)) return;
                     std.atomic.spinLoopHint();
@@ -20721,7 +20876,10 @@ const MatureTextClient = struct {
                 method.deleteSurroundingText(2, 1);
                 method.commitString("確定");
                 method.commit(self.method_done_count);
+                popup_surface.attach(null, 0, 0);
+                popup_surface.commit();
                 try expectClientRoundtrip(display);
+                self.stage.store(@intFromEnum(Stage.popup_unmapped), .release);
                 while (self.proceed.load(.acquire)) {
                     if (self.shutdown_requested.load(.acquire)) return;
                     std.atomic.spinLoopHint();
@@ -20733,12 +20891,29 @@ const MatureTextClient = struct {
         switch (event) {
             .global => |g| {
                 const name = std.mem.span(g.interface);
-                if (std.mem.eql(u8, name, "wl_compositor")) self.compositor = registry.bind(g.name, client_wl.Compositor, @min(g.version, 6)) catch null else if (std.mem.eql(u8, name, "wl_seat")) self.seat = registry.bind(g.name, client_wl.Seat, @min(g.version, 10)) catch null else if (std.mem.eql(u8, name, "zwp_text_input_manager_v3")) {
+                if (std.mem.eql(u8, name, "wl_compositor")) self.compositor = registry.bind(g.name, client_wl.Compositor, @min(g.version, 6)) catch null else if (std.mem.eql(u8, name, "wl_shm")) self.shm = registry.bind(g.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, name, "wl_seat")) self.seat = registry.bind(g.name, client_wl.Seat, @min(g.version, 10)) catch null else if (std.mem.eql(u8, name, "zwp_text_input_manager_v3")) {
                     self.text_manager_version = @min(g.version, 2);
                     self.text_manager = registry.bind(g.name, client_zwp.TextInputManagerV3, self.text_manager_version) catch null;
                 } else if (std.mem.eql(u8, name, "zwp_input_method_manager_v2")) self.method_manager = registry.bind(g.name, client_zwp.InputMethodManagerV2, 1) catch null;
             },
             .global_remove => {},
+        }
+    }
+    fn popupEvent(_: *client_zwp.InputPopupSurfaceV2, event: client_zwp.InputPopupSurfaceV2.Event, self: *@This()) void {
+        switch (event) {
+            .text_input_rectangle => |value| {
+                self.popup_rectangle = .{ .x = value.x, .y = value.y, .width = value.width, .height = value.height };
+                self.popup_rectangle_count += 1;
+                self.popup_rectangle_after_done = self.method_done_count > 0;
+            },
+        }
+    }
+    fn pointerEvent(_: *client_wl.Pointer, event: client_wl.Pointer.Event, self: *@This()) void {
+        switch (event) {
+            .enter => |enter| self.popup_pointer_surface = (enter.surface orelse return).getId(),
+            .button => |button| if (button.state == .pressed)
+                self.stage.store(@intFromEnum(Stage.popup_clicked), .release),
+            else => {},
         }
     }
     fn textEvent(_: *client_zwp.TextInputV3, event: client_zwp.TextInputV3.Event, self: *@This()) void {
@@ -20791,11 +20966,37 @@ const MatureTextClient = struct {
     fn grabEvent(_: *client_zwp.InputMethodKeyboardGrabV2, event: client_zwp.InputMethodKeyboardGrabV2.Event, self: *@This()) void {
         switch (event) {
             .keymap => |value| {
+                self.grab_keymap_size = value.size;
+                const wanted = @min(@as(usize, value.size), self.grab_keymap_bytes.len);
+                const read_count = std.c.pread(value.fd, &self.grab_keymap_bytes, wanted, 0);
+                if (read_count > 0) self.grab_keymap_len = @intCast(read_count);
                 _ = std.os.linux.close(value.fd);
+                self.grab_keymap_fd_closed = std.os.linux.errno(std.os.linux.fcntl(value.fd, std.os.linux.F.GETFD, 0)) == .BADF;
                 self.grab_delivery = true;
+                self.grab_events[self.grab_event_count] = 1;
+                self.grab_event_count += 1;
             },
-            .repeat_info => self.grab_delivery = true,
-            else => {},
+            .repeat_info => |value| {
+                self.grab_repeat_rate = value.rate;
+                self.grab_repeat_delay = value.delay;
+                self.grab_delivery = true;
+                self.grab_events[self.grab_event_count] = 2;
+                self.grab_event_count += 1;
+            },
+            .key => |value| {
+                self.grab_key_serial = value.serial;
+                self.grab_key_time = value.time;
+                self.grab_key = value.key;
+                self.grab_key_state = @intFromEnum(value.state);
+                self.grab_events[self.grab_event_count] = 3;
+                self.grab_event_count += 1;
+            },
+            .modifiers => |value| {
+                self.grab_modifier_serial = value.serial;
+                self.grab_modifiers = .{ value.mods_depressed, value.mods_latched, value.mods_locked, value.group };
+                self.grab_events[self.grab_event_count] = 4;
+                self.grab_event_count += 1;
+            },
         }
     }
     fn shutdown(self: *@This()) void {
@@ -20932,6 +21133,9 @@ const GeneratedTextInputClient = struct {
         }, .email);
         input.setCursorRectangle(2, 3, 4, 5);
         input.commit();
+        // Version 2 cursor rectangles settle with the associated surface
+        // transaction rather than the text-input commit alone.
+        surface.commit();
         try expectClientRoundtrip(display);
         try self.pause(display, .state_sent);
         while (self.edit_count < self.edits.len) try expectClientRoundtrip(display);
@@ -23292,6 +23496,30 @@ test "production generated data device completes the exact profile and supports 
     defer server.setDataControlObserver(null);
     // Privileged data-control is the final production global.
     try data_control.publish();
+    var input_method: WayringInputMethod = undefined;
+    input_method.init(
+        std.testing.allocator,
+        &protocol_server,
+        &clients,
+        &seat,
+        server.canonicalSeat(),
+        server.neutralTextInput(),
+        &compositor,
+        .{ .expected_uid = std.c.geteuid() },
+        server.generatedInputMethodLayout(),
+    );
+    defer {
+        server.setGeneratedInputMethodObserver(null);
+        if (input_method.global != null) input_method.unpublish();
+        input_method.deinit();
+    }
+    server.setGeneratedInputMethodObserver(.{
+        .context = &input_method,
+        .set_inhibited = WayringInputMethod.observerSetInhibited,
+        .popup_iterator = WayringInputMethod.observerPopupIterator,
+        .refresh_popups = WayringInputMethod.observerRefreshPopups,
+    });
+    try input_method.publish();
 
     const Lifecycle = struct {
         const FatalEvidence = struct {
@@ -23324,6 +23552,7 @@ test "production generated data device completes the exact profile and supports 
         primary_selection: *WayringPrimarySelection,
         text_input: *WayringTextInput,
         data_control: *WayringDataControl,
+        input_method: *WayringInputMethod,
         generated_client: ?ClientRegistry.Id = null,
         generated_raw: ?*wayring.server.Client = null,
         offender_fatal: ?FatalEvidence = null,
@@ -23370,6 +23599,7 @@ test "production generated data device completes the exact profile and supports 
                 };
             }
             self.data_control.destroyClientResources(client);
+            self.input_method.destroyClientResources(client);
             self.text_input.destroyClientResources(client);
             self.data_device.destroyClientResources(client);
             self.primary_selection.destroyClientResources(client);
@@ -23401,7 +23631,19 @@ test "production generated data device completes the exact profile and supports 
         .primary_selection = &primary_selection,
         .text_input = &text_input,
         .data_control = &data_control,
+        .input_method = &input_method,
     };
+    const GlobalFilter = struct {
+        expected_uid: std.os.linux.uid_t,
+        fn visible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
+            if (!std.mem.eql(u8, global.interface().name, "zwp_input_method_manager_v2")) return true;
+            const credentials = client.credentials() orelse return false;
+            return credentials.uid == self.expected_uid;
+        }
+    };
+    var global_filter: GlobalFilter = .{ .expected_uid = std.c.geteuid() };
+    protocol_server.setGlobalFilter(GlobalFilter, &global_filter, GlobalFilter.visible);
+    defer protocol_server.clearGlobalFilter();
     const host = try WayringHost.create(
         std.testing.allocator,
         server.eventLoop(),
@@ -23428,6 +23670,7 @@ test "production generated data device completes the exact profile and supports 
         .registry_watch_data_device = true,
         .expect_text_input = true,
         .expect_data_control = true,
+        .expect_input_method = true,
     };
     const thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&peer});
     var joined = false;
@@ -23437,7 +23680,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, host, &peer, .registry_ready);
     try std.testing.expect(peer.globals_exact);
-    try std.testing.expectEqual(WayringXdgClient.expected_globals.len, peer.global_count);
+    try std.testing.expectEqual(@as(usize, 15), peer.global_count);
     try std.testing.expectEqual(@as(usize, 1), peer.data_device_manager_count);
     try std.testing.expectEqual(@as(u32, 4), peer.data_device_manager_version);
     try std.testing.expectEqual(@as(usize, 1), peer.primary_selection_manager_count);
@@ -23524,6 +23767,13 @@ test "production generated data device completes the exact profile and supports 
     denied_host_live = false;
 
     data_control.unpublish();
+    try std.testing.expectEqual(@as(usize, 1), peer.input_method_manager_count);
+    try std.testing.expectEqual(@as(u32, 1), peer.input_method_manager_version);
+    try std.testing.expect(peer.input_method_manager_name != 0);
+    try std.testing.expect(!peer.generated_virtual_keyboard_seen);
+    try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
+
+    input_method.unpublish();
     text_input.unpublish();
     primary_selection.unpublish();
     data_device.unpublish();
@@ -23531,6 +23781,7 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringXdgStage(server, host, &peer, .manager_removed);
     try std.testing.expect(peer.data_device_manager_removed);
     try std.testing.expect(peer.data_control_manager_removed);
+    try std.testing.expect(peer.input_method_manager_removed);
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .disconnected);
     thread.join();
@@ -23603,6 +23854,7 @@ test "production generated data device completes the exact profile and supports 
     } else return error.GeneratedDataControlCleanupTimedOut;
     try std.testing.expectEqual(control_fd_baseline, try countMatureDataDeviceFds());
 
+    try input_method.publish();
     const primary_resource_baseline = server.neutralDataDevice().primaryResourceCounts();
     const raw_generated_primary_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     const raw_mature_primary_command = linux.eventfd(0, linux.EFD.CLOEXEC);
@@ -23795,8 +24047,10 @@ test "production generated data device completes the exact profile and supports 
         .command_fd = primary_watch_command,
         .registry_only = true,
         .registry_watch_primary_selection = true,
+        .registry_watch_input_method = true,
         .expect_text_input = true,
         .expect_data_control = true,
+        .expect_input_method = true,
     };
     const primary_watch_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_watch});
     var primary_watch_joined = false;
@@ -23808,11 +24062,13 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(primary_watch.globals_exact);
     try std.testing.expectEqual(@as(usize, 1), primary_watch.primary_selection_manager_count);
     data_control.unpublish();
+    input_method.unpublish();
     text_input.unpublish();
     primary_selection.unpublish();
     try signalWayringCommand(primary_watch_command);
     try waitForWayringXdgStage(server, host, &primary_watch, .manager_removed);
     try std.testing.expect(primary_watch.primary_selection_manager_removed);
+    try std.testing.expect(primary_watch.input_method_manager_removed);
     try signalWayringCommand(primary_watch_command);
     try waitForWayringXdgStage(server, host, &primary_watch, .disconnected);
     primary_watch_thread.join();
@@ -23822,6 +24078,7 @@ test "production generated data device completes the exact profile and supports 
     try primary_selection.publish();
     try text_input.publish();
     try data_control.publish();
+    try input_method.publish();
     const raw_primary_rebind_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_primary_rebind_command) != .SUCCESS) return error.EventFdFailed;
     const primary_rebind_command: std.posix.fd_t = @intCast(raw_primary_rebind_command);
@@ -23833,6 +24090,7 @@ test "production generated data device completes the exact profile and supports 
         .registry_only = true,
         .expect_text_input = true,
         .expect_data_control = true,
+        .expect_input_method = true,
     };
     const primary_rebind_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_rebind});
     var primary_rebind_joined = false;
@@ -23842,22 +24100,26 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, host, &primary_rebind, .registry_ready);
     try std.testing.expect(primary_rebind.globals_exact);
-    try std.testing.expectEqual(WayringXdgClient.expected_globals.len, primary_rebind.global_count);
+    try std.testing.expectEqual(@as(usize, 15), primary_rebind.global_count);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.primary_selection_manager_count);
     try std.testing.expectEqual(@as(u32, 1), primary_rebind.primary_selection_manager_version);
+    try std.testing.expectEqual(@as(usize, 1), primary_rebind.input_method_manager_count);
+    try std.testing.expectEqual(@as(u32, 1), primary_rebind.input_method_manager_version);
     try signalWayringCommand(primary_rebind_command);
     try waitForWayringXdgStage(server, host, &primary_rebind, .disconnected);
     primary_rebind_thread.join();
     primary_rebind_joined = true;
     try waitForWayringDisconnect(server, host, &compositor);
     const text_resource_baseline = server.neutral_text_input.resourceSnapshot();
-    var method_sockets: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(
-        @as(c_int, 0),
-        std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &method_sockets),
+    const generated_method_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/{s}",
+        .{ runtime_directory, host.displayName() },
+        0,
     );
-    _ = wl.Client.create(server.display, method_sockets[0]) orelse return error.OutOfMemory;
-    var method: MatureTextClient = .{ .fd = method_sockets[1], .role = .input_method };
+    defer std.testing.allocator.free(generated_method_path);
+    const generated_method_fd = try connectWayringTestSocket(generated_method_path);
+    var method: MatureTextClient = .{ .fd = generated_method_fd, .role = .input_method, .listen_pointer = true };
     const method_thread = try std.Thread.spawn(.{}, MatureTextClient.run, .{&method});
     var method_joined = false;
     defer if (!method_joined) {
@@ -23865,6 +24127,34 @@ test "production generated data device completes the exact profile and supports 
         method_thread.join();
     };
     try waitForMatureTextStage(server, &method, .ready);
+    for (0..2_000) |_| {
+        if (method.grab_event_count >= 2) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedInputMethodGrabSetupTimedOut;
+    keyboardKey(output, 77, 30, .pressed);
+    keyboardModifiers(output, 1, 2, 4, 3);
+    for (0..2_000) |_| {
+        if (method.grab_event_count >= 5) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedInputMethodGrabDeliveryTimedOut;
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 4, 3, 4 }, method.grab_events[0..method.grab_event_count]);
+    try std.testing.expectEqual(@as(u32, keymap.len), method.grab_keymap_size);
+    try std.testing.expectEqualStrings(keymap, method.grab_keymap_bytes[0..method.grab_keymap_len]);
+    try std.testing.expect(method.grab_keymap_fd_closed);
+    try std.testing.expectEqual(@as(i32, 0), method.grab_repeat_rate);
+    try std.testing.expectEqual(@as(i32, 500), method.grab_repeat_delay);
+    try std.testing.expect(method.grab_key_serial != 0);
+    try std.testing.expectEqual(@as(u32, 77), method.grab_key_time);
+    try std.testing.expectEqual(@as(u32, 30), method.grab_key);
+    try std.testing.expectEqual(@as(i32, @intFromEnum(wl.Keyboard.KeyState.pressed)), method.grab_key_state);
+    try std.testing.expect(method.grab_modifier_serial != 0);
+    try std.testing.expectEqual([4]u32{ 1, 2, 4, 3 }, method.grab_modifiers);
+    const generated_method_client = lifecycle.generated_raw orelse
+        return error.GeneratedMethodClientMissing;
 
     const raw_text_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_text_command) != .SUCCESS) return error.EventFdFailed;
@@ -23887,11 +24177,10 @@ test "production generated data device completes the exact profile and supports 
         generated_text.surface_object_id,
     ) orelse return error.GeneratedTextSurfaceMissing;
     server.seat.ensureParentKeyboardEnter();
-    try std.testing.expect(server.seat.applyGeneratedKeyboardFocus(.{
-        .surface = generated_text_surface,
-        .client = server.seat.generatedSurfaceOwner(generated_text_surface) orelse
-            return error.GeneratedTextSurfaceOwnerMissing,
-    }, null));
+    server.window_manager.pointerButton(generated_text_surface, .pressed);
+    try std.testing.expectEqual(generated_text_surface, server.window_manager.focusedSurface().?);
+    try std.testing.expect(server.focusGeneratedSurface(generated_text_surface));
+    try std.testing.expect(server.seat.generatedKeyboardFocus() != null);
     try signalWayringCommand(text_command);
     try waitForGeneratedTextInputStage(server, host, &generated_text, .state_sent);
     try waitForMatureTextStage(server, &method, .state_received);
@@ -23902,9 +24191,45 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(i32, 1), method.method_cause);
     try std.testing.expectEqual(@as(u32, (1 << 0) | (1 << 10) | (1 << 11) | (1 << 12)), method.method_content_hint);
     try std.testing.expectEqual(@as(i32, 6), method.method_content_purpose);
+    const popup_surface = compositor.surfaceId(
+        generated_method_client,
+        method.popup_surface_object_id,
+    ) orelse return error.GeneratedInputPopupSurfaceMissing;
+    try std.testing.expectEqual(@as(usize, 1), server.neutralTextInput().resourceSnapshot().popups);
+    try std.testing.expectEqual(HeadlessSurfaceForest.PresentationClass.input_popup, server.headless_surface_forest.presentationClass(popup_surface).?);
+    try std.testing.expect(generatedInputMethodPopupSize(server, popup_surface) != null);
+    var popup_iterator = input_method.popupIterator();
+    const popup_info = popup_iterator.next() orelse return error.GeneratedInputPopupNotMapped;
+    try std.testing.expectEqual(popup_surface, popup_info.surface_id);
+    try std.testing.expectEqual(WayringInputMethod.Position{ .x = 2, .y = 8 }, popup_info.position);
+    try std.testing.expect(popup_iterator.next() == null);
+    // Initial text state, settled surface state, and popup materialization each
+    // publish the current rectangle; the final event carries settled geometry.
+    try std.testing.expectEqual(@as(usize, 3), method.popup_rectangle_count);
+    try std.testing.expect(method.popup_rectangle_after_done);
+    try std.testing.expectEqual(NeutralTextInput.Rectangle{ .x = 0, .y = -5, .width = 4, .height = 5 }, method.popup_rectangle);
+    const popup_frame = output.frame_statistics.frames_presented;
+    try renderPendingWayringFrame(server, host, popup_frame);
+    const popup_target = switch (output.backend.acquire().?) {
+        .pixels => |pixels| pixels,
+        else => return error.ExpectedCpuHeadlessTarget,
+    };
+    try std.testing.expectEqual(@as(u32, 0xffe1_37a5), popup_target.pixels[8 * 640 + 2]);
+    pointerMotion(output, 78, 2.5, 8.5);
+    pointerButton(output, 79, linux_button_left, .pressed);
+    pointerFrame(output);
+    try waitForMatureTextStage(server, &method, .popup_clicked);
+    try std.testing.expectEqual(method.popup_surface_object_id, method.popup_pointer_surface);
+    pointerButton(output, 80, linux_button_left, .released);
+    pointerFrame(output);
     method.proceed.store(true, .release);
     try signalWayringCommand(text_command);
     try waitForGeneratedTextInputStage(server, host, &generated_text, .edit_received);
+    try waitForMatureTextStage(server, &method, .popup_unmapped);
+    input_method.refreshPopups();
+    var empty_popup_iterator = input_method.popupIterator();
+    try std.testing.expect(empty_popup_iterator.next() == null);
+    try std.testing.expect(output.repaint_needed);
     try std.testing.expectEqualSlices(
         GeneratedTextInputClient.EditTag,
         &.{ .preedit, .delete, .commit, .done },
@@ -23934,6 +24259,64 @@ test "production generated data device completes the exact profile and supports 
         server.display.flushClients();
         if (host.failure()) |err| return err;
     } else return error.GeneratedTextCleanupTimedOut;
+
+    // Reverse the production bridge: a mature application is edited by the
+    // scanner-backed generated input-method frontend.
+    const mature_app_path = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "{s}/{s}",
+        .{ runtime_directory, mature_socket_name },
+        0,
+    );
+    defer std.testing.allocator.free(mature_app_path);
+    const reverse_app_fd = try connectWayringTestSocket(mature_app_path);
+    const reverse_method_fd = try connectWayringTestSocket(generated_method_path);
+    var reverse_app: MatureTextClient = .{ .fd = reverse_app_fd, .role = .application };
+    var reverse_method: MatureTextClient = .{ .fd = reverse_method_fd, .role = .input_method };
+    const reverse_app_thread = try std.Thread.spawn(.{}, MatureTextClient.run, .{&reverse_app});
+    const reverse_method_thread = try std.Thread.spawn(.{}, MatureTextClient.run, .{&reverse_method});
+    var reverse_app_joined = false;
+    var reverse_method_joined = false;
+    defer if (!reverse_app_joined) {
+        reverse_app.shutdown();
+        reverse_app_thread.join();
+    };
+    defer if (!reverse_method_joined) {
+        reverse_method.shutdown();
+        reverse_method_thread.join();
+    };
+    try waitForMatureTextStage(server, &reverse_app, .ready);
+    try waitForMatureTextStage(server, &reverse_method, .ready);
+    var reverse_surfaces = server.compositor.surfaceStore().iterator();
+    const reverse_surface = (reverse_surfaces.next() orelse return error.ReverseMatureSurfaceMissing).id;
+    try std.testing.expect(reverse_surfaces.next() == null);
+    const reverse_scene = try server.scene.addShellSurface(reverse_surface);
+    server.scene.setShellSurfaceMapped(reverse_scene, true);
+    _ = server.seat.applyMatureKeyboardFocus(reverse_surface);
+    try server.seat.parentKeyboardEnter(&.{});
+    reverse_app.proceed.store(true, .release);
+    try waitForMatureTextStage(server, &reverse_method, .state_received);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, reverse_method.method_events[0..reverse_method.method_event_count]);
+    try std.testing.expectEqualStrings("héllo", reverse_method.method_surrounding[0..reverse_method.method_surrounding_len]);
+    reverse_method.proceed.store(true, .release);
+    try waitForMatureTextStage(server, &reverse_app, .edit_received);
+    try std.testing.expectEqualSlices(MatureTextClient.EditTag, &.{ .preedit, .delete, .commit, .done }, reverse_app.edits[0..reverse_app.edit_count]);
+    try std.testing.expectEqual(@as(u32, 1), reverse_app.done_serial);
+    server.scene.setShellSurfaceMapped(reverse_scene, false);
+    server.scene.removeShellSurface(reverse_scene);
+    reverse_app.shutdown();
+    reverse_method.shutdown();
+    reverse_app_thread.join();
+    reverse_app_joined = true;
+    reverse_method_thread.join();
+    reverse_method_joined = true;
+    for (0..2_000) |_| {
+        if (host.connectionCount() == 0 and server.compositor.surfaceStore().len() == mature_surface_baseline and
+            std.meta.eql(server.neutral_text_input.resourceSnapshot(), text_resource_baseline)) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.ReverseGeneratedTextCleanupTimedOut;
 
     const raw_generated_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     const raw_mature_command = linux.eventfd(0, linux.EFD.CLOEXEC);
@@ -24333,8 +24716,8 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringDndStage(server, host, &generated_target, .mapped);
 
     var mature_source_surface: ?Surface.Id = null;
-    var reverse_surfaces = server.compositor.surfaceStore().iterator();
-    while (reverse_surfaces.next()) |entry| {
+    var reverse_dnd_surfaces = server.compositor.surfaceStore().iterator();
+    while (reverse_dnd_surfaces.next()) |entry| {
         const state = server.surface_registry.renderState(entry.id) orelse continue;
         if (state.buffer.pixels.len == 1 and state.buffer.pixels[0] == 0xff22_4466)
             mature_source_surface = entry.id;

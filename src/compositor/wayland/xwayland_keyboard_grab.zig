@@ -209,7 +209,7 @@ const Grab = struct {
         unreachable;
     }
 
-    fn unusedSendModifiers(_: *anyopaque, _: u32, _: u32, _: u32, _: u32) void {
+    fn unusedSendModifiers(_: *anyopaque, _: u32, _: u32, _: u32, _: u32, _: u32) void {
         unreachable;
     }
 };

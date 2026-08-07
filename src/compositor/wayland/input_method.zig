@@ -9,7 +9,6 @@ const SecurityContext = @import("security_context.zig");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
 const NeutralTextInput = @import("../TextInput.zig");
-const MatureSerials = @import("mature_serials.zig");
 
 const wl = wayland.server.wl;
 const zwp = wayland.server.zwp;
@@ -253,6 +252,7 @@ const Method = struct {
     }
     fn unavailable(context: *anyopaque) void {
         const self: *Method = @ptrCast(@alignCast(context));
+        self.available = false;
         self.resource.sendUnavailable();
     }
 
@@ -424,7 +424,7 @@ const KeyboardGrab = struct {
 
     fn activate(self: *KeyboardGrab) void {
         self.method.active_grab = self;
-        self.method.manager.seat.setKeyboardGrab(.{
+        const installed = self.method.manager.seat.setKeyboardGrab(.{
             .context = self,
             .token = self.token,
             .cancel = cancel,
@@ -433,6 +433,7 @@ const KeyboardGrab = struct {
             .modifiers = sendModifiers,
             .repeat_info = sendRepeatInfo,
         });
+        std.debug.assert(installed);
     }
 
     fn cancel(context: *anyopaque) void {
@@ -467,6 +468,7 @@ const KeyboardGrab = struct {
 
     fn sendModifiers(
         context: *anyopaque,
+        serial: u32,
         depressed: u32,
         latched: u32,
         locked: u32,
@@ -474,7 +476,7 @@ const KeyboardGrab = struct {
     ) void {
         const self: *KeyboardGrab = @ptrCast(@alignCast(context));
         self.resource.sendModifiers(
-            MatureSerials.issueWire(self.method.manager.display),
+            serial,
             depressed,
             latched,
             locked,

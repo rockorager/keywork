@@ -66,6 +66,7 @@ pub const PresentationClass = enum {
     managed,
     cursor,
     drag_icon,
+    input_popup,
 };
 
 pub const NodeState = struct {
@@ -329,6 +330,7 @@ pub fn setRootPresentationClass(
         .managed => class == .managed,
         .cursor => class == .cursor,
         .drag_icon => class == .drag_icon,
+        .input_popup => class == .input_popup,
     };
     if (!allowed) return false;
     target.presentation_class = class;
@@ -351,6 +353,10 @@ pub fn isCursorRole(self: *const HeadlessSurfaceForest, id: SurfaceRegistry.Id) 
 
 pub fn isDragIconRole(self: *const HeadlessSurfaceForest, id: SurfaceRegistry.Id) bool {
     return self.presentationClass(id) == .drag_icon;
+}
+
+pub fn isInputPopupRole(self: *const HeadlessSurfaceForest, id: SurfaceRegistry.Id) bool {
+    return self.presentationClass(id) == .input_popup;
 }
 
 pub fn state(self: *const HeadlessSurfaceForest, id: SurfaceRegistry.Id) ?NodeState {
@@ -471,6 +477,7 @@ pub const RenderIterator = struct {
                 const root_node = self.forest.nodeConst(root) orelse return null;
                 self.next_root = root_node.root_next;
                 if (root_node.presentation_class == .xdg_reserved or
+                    root_node.presentation_class == .input_popup or
                     (root_node.presentation_class == .managed and !self.include_managed)) continue;
                 self.owner = root;
                 self.entry = root_node.stack_head;
@@ -580,14 +587,36 @@ pub fn inputHit(
     y: f64,
     filter: InputFilter,
 ) ?InputHit {
-    if (!std.math.isFinite(x) or !std.math.isFinite(y)) return null;
-    var hit: ?InputHit = null;
-    var iterator: RenderIterator = .{
+    return self.inputHitIterator(x, y, filter, .{
         .forest = self,
         .next_root = self.root_head,
         .include_managed = true,
         .steps_remaining = self.node_count *| 2 +| self.root_count,
-    };
+    });
+}
+
+/// Returns the topmost accepted node within one attached compound. Coordinates
+/// are relative to the compound root, matching `subtreeRenderIterator`.
+pub fn subtreeInputHit(
+    self: *const HeadlessSurfaceForest,
+    root: SurfaceRegistry.Id,
+    x: f64,
+    y: f64,
+    filter: InputFilter,
+) ?InputHit {
+    return self.inputHitIterator(x, y, filter, self.subtreeRenderIterator(root));
+}
+
+fn inputHitIterator(
+    self: *const HeadlessSurfaceForest,
+    x: f64,
+    y: f64,
+    filter: InputFilter,
+    initial_iterator: RenderIterator,
+) ?InputHit {
+    if (!std.math.isFinite(x) or !std.math.isFinite(y)) return null;
+    var hit: ?InputHit = null;
+    var iterator = initial_iterator;
     while (iterator.next()) |entry| {
         // Cursor and drag-icon compounds are compositor-owned pointer
         // adornments. Skipping every node in either compound here, rather
