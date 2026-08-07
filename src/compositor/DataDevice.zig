@@ -224,9 +224,25 @@ pub fn createSource(self: *DataDevice, owner: ?ClientRegistry.Id, endpoint: Sour
     return self.sources.insert(self.allocator, .{ .owner = owner, .endpoint = endpoint, .actions = options.actions, .actions_declared = options.actions_declared }) catch error.OutOfMemory;
 }
 
+/// Resource destruction is final. A false result means notification staging
+/// failed and was aborted, but all canonical references were still retired.
 pub fn destroySource(self: *DataDevice, id: SourceId) void {
-    if (self.selection) |selected| if (std.meta.eql(selected, id)) self.replaceSelection(null, self.authority.nextOrder(), false) catch unreachable;
-    if (self.drag) |drag| if (drag.source != null and std.meta.eql(drag.source.?, id)) self.cancelDragWithoutSource();
+    _ = self.destroySourceFinal(id);
+}
+
+pub fn destroySourceFinal(self: *DataDevice, id: SourceId) bool {
+    var notifications_prepared = true;
+    if (self.selection) |selected| if (std.meta.eql(selected, id)) {
+        const order = self.authority.nextOrder();
+        self.replaceSelection(null, order, false) catch {
+            notifications_prepared = false;
+            self.forceClearSelection(order);
+        };
+    };
+    if (self.drag) |drag| {
+        if (drag.source != null and std.meta.eql(drag.source.?, id))
+            notifications_prepared = self.cancelDragWithoutSource() and notifications_prepared;
+    }
     if (self.retained) |retained| if (std.meta.eql(retained.source, id)) {
         self.retained = null;
         self.listener.drag_changed(self.listener.context);
@@ -239,8 +255,11 @@ pub fn destroySource(self: *DataDevice, id: SourceId) void {
         }
     }
     if (self.sources.get(id)) |source| if (source.toplevel_drag_handler) |handler| handler.source_destroyed(handler.context);
-    var source = self.sources.remove(id) orelse return;
+    if (self.drag) |drag| std.debug.assert(drag.source == null or !std.meta.eql(drag.source.?, id));
+    if (self.retained) |retained| std.debug.assert(!std.meta.eql(retained.source, id));
+    var source = self.sources.remove(id) orelse return notifications_prepared;
     source.deinit(self.allocator);
+    return notifications_prepared;
 }
 
 pub fn offerMime(self: *DataDevice, id: SourceId, mime: []const u8) Error!void {
@@ -370,7 +389,8 @@ pub fn clientDisconnected(self: *DataDevice, client: ClientRegistry.Id) void {
             if (drag.target) |target| {
                 if (std.meta.eql(target.client, client)) self.leaveRetiredClient(client);
             }
-            self.cancelDragWithoutSource();
+            self.drag.?.source = null;
+            _ = self.cancelDragWithoutSource();
         } else if (drag.target) |target| {
             if (std.meta.eql(target.client, client)) self.leaveRetiredClient(client);
         }
@@ -426,7 +446,16 @@ pub fn setExternalSelection(self: *DataDevice, source: ?SourceId) Error!void {
 }
 
 pub fn clearSelection(self: *DataDevice, order: SeatAuthority.Order) void {
-    self.replaceSelection(null, order, true) catch unreachable;
+    self.replaceSelection(null, order, true) catch self.forceClearSelection(order);
+}
+
+fn forceClearSelection(self: *DataDevice, order: SeatAuthority.Order) void {
+    if (self.selection == null or order < self.selection_order) return;
+    self.selection = null;
+    self.selection_order = order;
+    self.selection_generation +%= 1;
+    self.invalidateSelectionOffers(null);
+    self.listener.selection_changed(self.listener.context);
 }
 
 fn replaceSelection(self: *DataDevice, source: ?SourceId, order: SeatAuthority.Order, cancel_old: bool) Error!void {
@@ -1200,10 +1229,14 @@ pub fn destroyOffer(self: *DataDevice, id: OfferId) void {
 /// `legacy_finish` preserves pre-v3 completion when the adapter retires the
 /// last dropped offer without an explicit finish request.
 pub fn retireOffer(self: *DataDevice, id: OfferId, legacy_finish: bool) void {
-    const offer = self.offers.get(id) orelse return;
+    _ = self.retireOfferFinal(id, legacy_finish);
+}
+
+pub fn retireOfferFinal(self: *DataDevice, id: OfferId, legacy_finish: bool) bool {
+    const offer = self.offers.get(id) orelse return true;
     if (offer.kind != .drag or !offer.dropped or offer.finished or offer.source == null) {
         _ = self.offers.remove(id);
-        return;
+        return true;
     }
     var offers = self.offers.iterator();
     while (offers.next()) |candidate| {
@@ -1213,24 +1246,27 @@ pub fn retireOffer(self: *DataDevice, id: OfferId, legacy_finish: bool) void {
             candidate.value.source != null and !std.meta.eql(candidate.id, id))
         {
             _ = self.offers.remove(id);
-            return;
+            return true;
         }
     }
     const source = self.sources.get(offer.source.?);
-    if (source) |value| {
+    var notifications_prepared = true;
+    if (source) |value| prepare: {
         if (legacy_finish) {
             if (value.endpoint.finished_preflight) |prepare| prepare(value.endpoint.context) catch {
                 self.abortTransaction();
-                return;
+                notifications_prepared = false;
+                break :prepare;
             };
         } else if (value.endpoint.cancelled_preflight) |prepare| prepare(value.endpoint.context) catch {
             self.abortTransaction();
-            return;
+            notifications_prepared = false;
+            break :prepare;
         };
     }
-    self.finalizeTransaction() catch {
+    if (notifications_prepared) self.finalizeTransaction() catch {
         self.abortTransaction();
-        return;
+        notifications_prepared = false;
     };
     const removed = self.offers.remove(id) orelse unreachable;
     if (source) |value| if (legacy_finish) {
@@ -1239,55 +1275,61 @@ pub fn retireOffer(self: *DataDevice, id: OfferId, legacy_finish: bool) void {
         value.endpoint.cancelled(value.endpoint.context);
     };
     invalidateGeneration(self, removed.drag_generation);
-    self.commitTransaction();
+    if (notifications_prepared) self.commitTransaction();
+    return notifications_prepared;
 }
 
 pub fn cancelDrag(self: *DataDevice) void {
-    self.cancelDragImpl(true);
+    _ = self.cancelDragImpl(true);
 }
 
 pub fn cancel(self: *DataDevice) void {
     self.cancelDrag();
 }
-fn cancelDragWithoutSource(self: *DataDevice) void {
-    self.cancelDragImpl(false);
+fn cancelDragWithoutSource(self: *DataDevice) bool {
+    return self.cancelDragImpl(false);
 }
-fn cancelDragImpl(self: *DataDevice, notify: bool) void {
-    const drag = self.drag orelse return;
+fn cancelDragImpl(self: *DataDevice, notify: bool) bool {
+    const drag = self.drag orelse return true;
+    var notifications_prepared = true;
     if (drag.target) |target| {
         if (drag.source) |id| if (self.sources.get(id)) |source| {
             if (source.endpoint.target_preflight) |prepare| prepare(source.endpoint.context, null) catch {
                 self.abortTransaction();
-                return;
+                notifications_prepared = false;
             };
-            if (source.endpoint.action_preflight) |prepare| prepare(source.endpoint.context, .{}) catch {
+            if (notifications_prepared) if (source.endpoint.action_preflight) |prepare| prepare(source.endpoint.context, .{}) catch {
                 self.abortTransaction();
-                return;
+                notifications_prepared = false;
             };
         };
-        var devices = self.devices.iterator();
-        while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, target.client))
-            if (entry.value.endpoint.drag_leave_preflight) |prepare| prepare(entry.value.endpoint.context) catch {
-                self.abortTransaction();
-                return;
-            };
+        if (notifications_prepared) {
+            var devices = self.devices.iterator();
+            while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, target.client))
+                if (entry.value.endpoint.drag_leave_preflight) |prepare| prepare(entry.value.endpoint.context) catch {
+                    self.abortTransaction();
+                    notifications_prepared = false;
+                    break;
+                };
+        }
     }
-    if (notify and drag.source != null) if (self.sources.get(drag.source.?)) |source|
+    if (notifications_prepared and notify and drag.source != null) if (self.sources.get(drag.source.?)) |source|
         if (source.endpoint.cancelled_preflight) |prepare| prepare(source.endpoint.context) catch {
             self.abortTransaction();
-            return;
+            notifications_prepared = false;
         };
-    self.finalizeTransaction() catch {
+    if (notifications_prepared) self.finalizeTransaction() catch {
         self.abortTransaction();
-        return;
+        notifications_prepared = false;
     };
     if (drag.source) |id| self.endToplevel(id);
     self.leaveCommitted();
     if (notify and drag.source != null) if (self.sources.get(drag.source.?)) |source| source.endpoint.cancelled(source.endpoint.context);
     invalidateGeneration(self, drag.generation);
     self.drag = null;
-    self.commitTransaction();
+    if (notifications_prepared) self.commitTransaction();
     self.listener.drag_changed(self.listener.context);
+    return notifications_prepared;
 }
 
 fn endToplevel(self: *DataDevice, source_id: SourceId) void {
@@ -1319,24 +1361,25 @@ pub fn retainForExternalTarget(self: *DataDevice, generation: u64) Error!void {
 pub fn finishRetained(self: *DataDevice, generation: u64, performed: bool) void {
     const retained = self.retained orelse return;
     if (retained.generation != generation) return;
+    var notifications_prepared = true;
     if (self.sources.get(retained.source)) |source| {
         if (performed) {
             if (source.endpoint.finished_preflight) |prepare| prepare(source.endpoint.context) catch {
                 self.abortTransaction();
-                return;
+                notifications_prepared = false;
             };
-        } else if (source.endpoint.cancelled_preflight) |prepare| prepare(source.endpoint.context) catch {
+        } else if (notifications_prepared) if (source.endpoint.cancelled_preflight) |prepare| prepare(source.endpoint.context) catch {
             self.abortTransaction();
-            return;
+            notifications_prepared = false;
         };
-        self.finalizeTransaction() catch {
+        if (notifications_prepared) self.finalizeTransaction() catch {
             self.abortTransaction();
-            return;
+            notifications_prepared = false;
         };
         if (performed) source.endpoint.finished(source.endpoint.context) else source.endpoint.cancelled(source.endpoint.context);
     }
     self.retained = null;
-    self.commitTransaction();
+    if (notifications_prepared) self.commitTransaction();
     self.listener.drag_changed(self.listener.context);
 }
 
@@ -1772,7 +1815,10 @@ const RegressionFixture = struct {
         copy_actions: usize = 0,
         fail_selection: bool = false,
         fail_enter: bool = false,
+        fail_cancel_preflight: bool = false,
+        fail_finalize: bool = false,
         legacy_copy: bool = false,
+        transaction_aborts: usize = 0,
 
         fn send(context: *anyopaque, _: []const u8, _: std.posix.fd_t) void {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -1787,6 +1833,10 @@ const RegressionFixture = struct {
         fn cancelled(context: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.cancellations += 1;
+        }
+        fn cancelPreflight(context: *anyopaque) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.fail_cancel_preflight) return error.OutOfMemory;
         }
         fn dropped(context: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -1824,10 +1874,19 @@ const RegressionFixture = struct {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.drag_changes += 1;
         }
+        fn transactionFinalize(context: *anyopaque) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.fail_finalize) return error.OutOfMemory;
+        }
+        fn transactionAbort(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.transaction_aborts += 1;
+        }
+        fn transactionCommit(_: *anyopaque) void {}
     };
 
     fn sourceEndpoint(events: *Events) SourceEndpoint {
-        return .{ .context = events, .send = Events.send, .target = Events.target, .action = Events.action, .cancelled = Events.cancelled, .drop_performed = Events.dropped, .finished = Events.finished };
+        return .{ .context = events, .send = Events.send, .target = Events.target, .action = Events.action, .cancelled_preflight = Events.cancelPreflight, .cancelled = Events.cancelled, .drop_performed = Events.dropped, .finished = Events.finished };
     }
     fn deviceEndpoint(events: *Events) DeviceEndpoint {
         return .{ .context = events, .selection = Events.selection, .drag_enter_prepare = Events.prepareEnter, .drag_enter = Events.enter, .drag_motion = Events.motion, .drag_leave = Events.ignored, .drag_drop = Events.deviceDrop };
@@ -1941,6 +2000,244 @@ test "drag enter rolls every prepared device back before retrying the batch" {
     _ = authority.clientDisconnected(source_client);
     clients.unregister(target_client);
     clients.unregister(source_client);
+}
+
+test "source destruction falls back to no-fail canonical drag retirement after every notification preparation phase" {
+    const Failure = enum { target, action, leave, finalize };
+    const Harness = struct {
+        failure: ?Failure,
+        offer: ?OfferId = null,
+        aborts: usize = 0,
+        commits: usize = 0,
+        targets: usize = 0,
+        actions: usize = 0,
+        leaves: usize = 0,
+
+        fn send(_: *anyopaque, _: []const u8, _: std.posix.fd_t) void {}
+        fn targetPreflight(context: *anyopaque, _: ?[]const u8) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.failure == .target) return error.OutOfMemory;
+        }
+        fn target(context: *anyopaque, _: ?[]const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.targets += 1;
+        }
+        fn actionPreflight(context: *anyopaque, _: Actions) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.failure == .action) return error.OutOfMemory;
+        }
+        fn action(context: *anyopaque, _: Actions) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.actions += 1;
+        }
+        fn ignored(_: *anyopaque) void {}
+        fn selection(_: *anyopaque, _: ?OfferId) error{OutOfMemory}!void {}
+        fn prepareEnter(_: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, _: ?OfferId) error{OutOfMemory}!DragPreparation {
+            return .{};
+        }
+        fn enter(context: *anyopaque, _: SurfaceRegistry.Id, _: f64, _: f64, offer: ?OfferId) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.offer = offer;
+        }
+        fn motion(_: *anyopaque, _: u32, _: f64, _: f64) void {}
+        fn leavePreflight(context: *anyopaque) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.failure == .leave) return error.OutOfMemory;
+        }
+        fn leave(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.leaves += 1;
+        }
+        fn finalize(context: *anyopaque) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (self.failure == .finalize) return error.OutOfMemory;
+        }
+        fn commit(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.commits += 1;
+        }
+        fn abort(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.aborts += 1;
+        }
+    };
+    const Provider = struct {
+        fn renderState(_: *anyopaque) ?SurfaceRegistry.RenderState {
+            return null;
+        }
+    };
+
+    inline for (std.meta.tags(Failure)) |failure| {
+        var clients = ClientRegistry.init(std.testing.allocator);
+        defer clients.deinit();
+        var surfaces = SurfaceRegistry.init(std.testing.allocator);
+        defer surfaces.deinit();
+        var authority = SeatAuthority.init(std.testing.allocator, &clients, &surfaces);
+        defer authority.deinit();
+        var harness: Harness = .{ .failure = null };
+        var data_device = DataDevice.init(std.testing.allocator, &clients, &surfaces, &authority, .{
+            .context = &harness,
+            .transaction_finalize = Harness.finalize,
+            .transaction_commit = Harness.commit,
+            .transaction_abort = Harness.abort,
+            .selection_changed = Harness.ignored,
+            .drag_changed = Harness.ignored,
+        });
+        defer data_device.deinit();
+        const source_client = try clients.register(.mature_display);
+        const target_client = try clients.register(.mature_display);
+        var provider: Provider = .{};
+        const origin = try surfaces.add(.{ .context = &provider, .render_state = Provider.renderState });
+        const target = try surfaces.add(.{ .context = &provider, .render_state = Provider.renderState });
+        const source_device = try data_device.createDevice(source_client, .{
+            .context = &harness,
+            .selection = Harness.selection,
+            .drag_enter_prepare = Harness.prepareEnter,
+            .drag_enter = Harness.enter,
+            .drag_motion = Harness.motion,
+            .drag_leave = Harness.leave,
+            .drag_drop = Harness.ignored,
+        });
+        _ = try data_device.createDevice(target_client, .{
+            .context = &harness,
+            .selection = Harness.selection,
+            .drag_enter_prepare = Harness.prepareEnter,
+            .drag_enter = Harness.enter,
+            .drag_motion = Harness.motion,
+            .drag_leave_preflight = Harness.leavePreflight,
+            .drag_leave = Harness.leave,
+            .drag_drop = Harness.ignored,
+        });
+        const endpoint: SourceEndpoint = .{
+            .context = &harness,
+            .send = Harness.send,
+            .target_preflight = Harness.targetPreflight,
+            .target = Harness.target,
+            .action_preflight = Harness.actionPreflight,
+            .action = Harness.action,
+            .cancelled = Harness.ignored,
+            .drop_performed = Harness.ignored,
+            .finished = Harness.ignored,
+        };
+        const source = try data_device.createSource(source_client, endpoint, .{ .actions = .{ .copy = true }, .actions_declared = true });
+        const serial: ClientRegistry.Serial = .{ .domain = .mature_display, .value = 500 + @as(u32, @intFromEnum(failure)) };
+        try std.testing.expect(try authority.addPointerPress(source_client, serial, 1, origin));
+        _ = try data_device.startDrag(source_device, source, origin, .{ .surface = origin }, serial, true);
+        try data_device.enter(.{ .surface = target, .client = target_client, .x = 2, .y = 3 });
+        const offer = harness.offer.?;
+        const baseline_commits = harness.commits;
+        harness.failure = failure;
+
+        try std.testing.expect(!data_device.destroySourceFinal(source));
+        try std.testing.expectEqual(baseline_commits, harness.commits);
+        try std.testing.expectEqual(@as(usize, 1), harness.aborts);
+        try std.testing.expect(!data_device.isDragging());
+        try std.testing.expect(data_device.currentTarget() == null);
+        try std.testing.expect(data_device.dragIcon() == null);
+        try std.testing.expectError(error.InvalidSource, data_device.sourceActions(source));
+        try std.testing.expect(data_device.offerInfo(offer).?.source == null);
+        try std.testing.expectEqual(@as(usize, 0), data_device.resourceCounts().sources);
+        try std.testing.expectEqual(@as(usize, 1), harness.targets);
+        try std.testing.expectEqual(@as(usize, 1), harness.actions);
+        try std.testing.expectEqual(@as(usize, 1), harness.leaves);
+
+        harness.failure = null;
+        authority.clearPointerPresses();
+        const replacement = try data_device.createSource(source_client, endpoint, .{ .actions = .{ .copy = true }, .actions_declared = true });
+        const retry_serial: ClientRegistry.Serial = .{ .domain = .mature_display, .value = 600 + @as(u32, @intFromEnum(failure)) };
+        try std.testing.expect(try authority.addPointerPress(source_client, retry_serial, 1, origin));
+        _ = try data_device.startDrag(source_device, replacement, origin, null, retry_serial, true);
+        try std.testing.expect(data_device.isDragging());
+        data_device.cancelDrag();
+        data_device.destroySource(replacement);
+        surfaces.remove(target);
+        surfaces.remove(origin);
+        data_device.clientDisconnected(target_client);
+        data_device.clientDisconnected(source_client);
+        _ = authority.clientDisconnected(target_client);
+        _ = authority.clientDisconnected(source_client);
+        clients.unregister(target_client);
+        clients.unregister(source_client);
+    }
+}
+
+test "last dropped offer destruction retires canonical generation when cancellation preparation fails" {
+    const Failure = enum { cancelled, finalize };
+    const Provider = struct {
+        fn renderState(_: *anyopaque) ?SurfaceRegistry.RenderState {
+            return null;
+        }
+    };
+
+    inline for (std.meta.tags(Failure)) |failure| {
+        var clients = ClientRegistry.init(std.testing.allocator);
+        defer clients.deinit();
+        var surfaces = SurfaceRegistry.init(std.testing.allocator);
+        defer surfaces.deinit();
+        var authority = SeatAuthority.init(std.testing.allocator, &clients, &surfaces);
+        defer authority.deinit();
+        var source_events: RegressionFixture.Events = .{};
+        var target_events: RegressionFixture.Events = .{};
+        var data_device = DataDevice.init(std.testing.allocator, &clients, &surfaces, &authority, .{
+            .context = &source_events,
+            .transaction_finalize = RegressionFixture.Events.transactionFinalize,
+            .transaction_commit = RegressionFixture.Events.transactionCommit,
+            .transaction_abort = RegressionFixture.Events.transactionAbort,
+            .selection_changed = RegressionFixture.Events.ignored,
+            .drag_changed = RegressionFixture.Events.dragChanged,
+        });
+        defer data_device.deinit();
+        const source_client = try clients.register(.mature_display);
+        const target_client = try clients.register(.mature_display);
+        var provider: Provider = .{};
+        const origin = try surfaces.add(.{ .context = &provider, .render_state = Provider.renderState });
+        const target = try surfaces.add(.{ .context = &provider, .render_state = Provider.renderState });
+        const source_device = try data_device.createDevice(source_client, RegressionFixture.deviceEndpoint(&source_events));
+        _ = try data_device.createDevice(target_client, RegressionFixture.deviceEndpoint(&target_events));
+        const source = try data_device.createSource(source_client, RegressionFixture.sourceEndpoint(&source_events), .{ .actions = .{ .copy = true }, .actions_declared = true });
+        try data_device.offerMime(source, "text/plain");
+        const serial: ClientRegistry.Serial = .{ .domain = .mature_display, .value = 700 + @as(u32, @intFromEnum(failure)) };
+        try std.testing.expect(try authority.addPointerPress(source_client, serial, 1, origin));
+        _ = try data_device.startDrag(source_device, source, origin, null, serial, true);
+        try data_device.enter(.{ .surface = target, .client = target_client, .x = 4, .y = 5 });
+        const offer = target_events.drag_offer.?;
+        try data_device.accept(offer, "text/plain");
+        try data_device.setOfferActions(offer, .{ .copy = true }, .{ .copy = true });
+        data_device.drop();
+        try std.testing.expect(data_device.offerInfo(offer).?.dropped);
+        switch (failure) {
+            .cancelled => source_events.fail_cancel_preflight = true,
+            .finalize => source_events.fail_finalize = true,
+        }
+
+        try std.testing.expect(!data_device.retireOfferFinal(offer, false));
+        try std.testing.expect(data_device.offerInfo(offer) == null);
+        try std.testing.expectEqual(@as(usize, 0), data_device.resourceCounts().offers);
+        try std.testing.expectEqual(@as(usize, 1), source_events.cancellations);
+        try std.testing.expectEqual(@as(usize, 1), source_events.transaction_aborts);
+        try std.testing.expect(!data_device.isDragging());
+        try std.testing.expectEqual(Actions{ .copy = true }, try data_device.sourceActions(source));
+
+        source_events.fail_cancel_preflight = false;
+        source_events.fail_finalize = false;
+        authority.clearPointerPresses();
+        const replacement = try data_device.createSource(source_client, RegressionFixture.sourceEndpoint(&source_events), .{ .actions = .{ .copy = true }, .actions_declared = true });
+        const retry_serial: ClientRegistry.Serial = .{ .domain = .mature_display, .value = 800 + @as(u32, @intFromEnum(failure)) };
+        try std.testing.expect(try authority.addPointerPress(source_client, retry_serial, 1, origin));
+        _ = try data_device.startDrag(source_device, replacement, origin, null, retry_serial, true);
+        try std.testing.expect(data_device.isDragging());
+        data_device.cancelDrag();
+        data_device.destroySource(replacement);
+        data_device.destroySource(source);
+        surfaces.remove(target);
+        surfaces.remove(origin);
+        data_device.clientDisconnected(target_client);
+        data_device.clientDisconnected(source_client);
+        _ = authority.clientDisconnected(target_client);
+        _ = authority.clientDisconnected(source_client);
+        clients.unregister(target_client);
+        clients.unregister(source_client);
+    }
 }
 
 test "offers outlive devices until explicit retirement" {
