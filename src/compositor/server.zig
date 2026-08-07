@@ -55,6 +55,7 @@ const XwaylandShell = @import("wayland/xwayland_shell.zig");
 const XwaylandServer = @import("xwayland/server.zig");
 const Xwm = @import("xwayland/xwm.zig");
 const Workspace = @import("wayland/workspace.zig");
+const NeutralTextInput = @import("TextInput.zig");
 const TextInput = @import("wayland/text_input.zig");
 const InputMethod = @import("wayland/input_method.zig");
 const VirtualKeyboard = @import("wayland/virtual_keyboard.zig");
@@ -358,6 +359,7 @@ xwayland_client_stack: std.ArrayList(Xwm.WindowId),
 xwayland_override_redirect_focus: ?Surface.Id,
 workspace: Workspace,
 workspace_initialized: bool,
+neutral_text_input: NeutralTextInput,
 text_input: TextInput,
 input_method: InputMethod,
 virtual_keyboard: VirtualKeyboard,
@@ -1188,6 +1190,7 @@ pub fn createWithVirtualOutput(
         .xwayland_override_redirect_focus = null,
         .workspace = undefined,
         .workspace_initialized = false,
+        .neutral_text_input = undefined,
         .text_input = undefined,
         .input_method = undefined,
         .virtual_keyboard = undefined,
@@ -1644,11 +1647,23 @@ pub fn createWithVirtualOutput(
         &self.primary_selection,
     );
     errdefer self.data_control.deinit();
+    self.neutral_text_input = NeutralTextInput.init(
+        allocator,
+        self.seat.clientRegistry(),
+        self.seat.surfaceRegistry(),
+    );
+    errdefer self.neutral_text_input.deinit();
+    try self.seat.mutableClientRegistry().addDisconnectListener(.{
+        .context = &self.neutral_text_input,
+        .notify = textInputClientDisconnected,
+    });
+    errdefer self.seat.mutableClientRegistry().removeDisconnectListener(&self.neutral_text_input);
     try self.text_input.init(
         allocator,
         display,
         &self.seat,
         self.compositor.surfaceStore(),
+        &self.neutral_text_input,
     );
     errdefer self.text_input.deinit();
     try self.input_method.init(
@@ -1657,7 +1672,7 @@ pub fn createWithVirtualOutput(
         &self.security_context,
         &self.seat,
         self.compositor.surfaceStore(),
-        &self.text_input,
+        &self.neutral_text_input,
         .{
             .context = self,
             .surface_position = inputMethodSurfacePosition,
@@ -2065,6 +2080,8 @@ pub fn destroy(self: *Self) void {
     self.transient_seat.deinit();
     self.input_method.deinit();
     self.text_input.deinit();
+    self.seat.mutableClientRegistry().removeDisconnectListener(&self.neutral_text_input);
+    self.neutral_text_input.deinit();
     self.data_control.deinit();
     self.primary_selection.deinit();
     self.mature_data_device.deinit();
@@ -7720,6 +7737,11 @@ fn dataDeviceExternalDragStart(context: *anyopaque) ?NeutralDataDevice.ExternalD
 fn dataDeviceClientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
     const data_device: *NeutralDataDevice = @ptrCast(@alignCast(context));
     data_device.clientDisconnected(client);
+}
+
+fn textInputClientDisconnected(context: *anyopaque, client: ClientRegistry.Id) void {
+    const text_input: *NeutralTextInput = @ptrCast(@alignCast(context));
+    text_input.clientDisconnected(client);
 }
 
 fn dataDeviceDragChanged(context: *anyopaque) void {
@@ -13757,6 +13779,70 @@ test "production mature data device v3 serves two canonical socket clients" {
     try std.testing.expectEqual(fd_baseline, try countMatureDataDeviceFds());
 }
 
+test "production mature text input v3 and input method v2 transact over canonical clients" {
+    const server = try Self.createWithVirtualOutput(std.testing.allocator, std.testing.io, .cpu, .headless, null, .{ .size = .{ .width = 4, .height = 4 } });
+    defer server.destroy();
+    const baseline = server.neutral_text_input.resourceSnapshot();
+    const surfaces = server.compositor.surfaceStore().len();
+    const registry = server.surface_registry.len();
+    var keymap_pipe: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&keymap_pipe) != 0) return error.Unexpected;
+    defer _ = std.c.close(keymap_pipe[1]);
+    server.seat.setKeymap(.xkb_v1, keymap_pipe[0], 8);
+    server.seat.setRepeatInfo(25, 500);
+    server.seat.setKeyboardAvailable(true);
+    defer server.seat.setKeyboardAvailable(false);
+    const fds = try countMatureDataDeviceFds();
+    var sockets_app: [2]std.posix.fd_t = undefined;
+    var sockets_method: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &sockets_app));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM | std.c.SOCK.CLOEXEC, 0, &sockets_method));
+    _ = wl.Client.create(server.display, sockets_app[0]) orelse return error.OutOfMemory;
+    _ = wl.Client.create(server.display, sockets_method[0]) orelse return error.OutOfMemory;
+    var app: MatureTextClient = .{ .fd = sockets_app[1], .role = .application };
+    var method: MatureTextClient = .{ .fd = sockets_method[1], .role = .input_method };
+    const app_thread = try std.Thread.spawn(.{}, MatureTextClient.run, .{&app});
+    const method_thread = try std.Thread.spawn(.{}, MatureTextClient.run, .{&method});
+    var app_joined = false;
+    var method_joined = false;
+    defer if (!app_joined) {
+        app.shutdown();
+        app_thread.join();
+    };
+    defer if (!method_joined) {
+        method.shutdown();
+        method_thread.join();
+    };
+    try waitForMatureTextStage(server, &app, .ready);
+    try waitForMatureTextStage(server, &method, .ready);
+    var iterator = server.compositor.surfaceStore().iterator();
+    const surface = (iterator.next() orelse return error.MatureSurfaceMissing).id;
+    try std.testing.expect(iterator.next() == null);
+    _ = server.seat.applyMatureKeyboardFocus(surface);
+    try server.seat.parentKeyboardEnter(&.{});
+    app.proceed.store(true, .release);
+    try waitForMatureTextStage(server, &method, .state_received);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, method.method_events[0..method.method_event_count]);
+    method.proceed.store(true, .release);
+    try waitForMatureTextStage(server, &app, .edit_received);
+    try std.testing.expectEqualSlices(MatureTextClient.EditTag, &.{ .preedit, .delete, .commit, .done }, app.edits[0..app.edit_count]);
+    try std.testing.expectEqual(@as(u32, 1), app.done_serial);
+    try std.testing.expect(method.grab_delivery);
+    app.shutdown();
+    method.shutdown();
+    app_thread.join();
+    app_joined = true;
+    method_thread.join();
+    method_joined = true;
+    for (0..2_000) |_| {
+        if (server.client_registry.len() == 0 and server.compositor.surfaceStore().len() == surfaces and
+            std.meta.eql(server.neutral_text_input.resourceSnapshot(), baseline)) break;
+        try server.eventLoop().dispatch(1);
+    } else return error.MatureTextCleanupTimedOut;
+    try std.testing.expectEqual(registry, server.surface_registry.len());
+    try std.testing.expectEqual(fds, try countMatureDataDeviceFds());
+}
+
 test "mature keyboard late bind reuses one logical enter serial and authority grant" {
     const KeyboardFocusProbe = struct {
         changes: usize = 0,
@@ -15942,6 +16028,8 @@ const WayringHeadlessClient = struct {
     compositor_version: std.atomic.Value(u32) = .init(0),
     global_count: usize = 0,
     globals_exact: bool = true,
+    text_input_global_seen: bool = false,
+    input_method_global_seen: bool = false,
     output_globals: u8 = 0,
     output_version: u32 = 0,
     output_name_valid: bool = false,
@@ -16012,7 +16100,8 @@ const WayringHeadlessClient = struct {
         defer registry.destroy();
         registry.setListener(*WayringHeadlessClient, registryEvent, self);
         try expectClientRoundtrip(display);
-        if (!self.globals_exact or self.global_count != expected_globals.len)
+        if (!self.globals_exact or self.global_count != expected_globals.len or
+            self.text_input_global_seen or self.input_method_global_seen)
             return error.UnexpectedRegistrySnapshot;
         const compositor = self.compositor orelse return error.CompositorMissing;
         const shm = self.shm orelse return error.ShmMissing;
@@ -16328,6 +16417,14 @@ const WayringHeadlessClient = struct {
         switch (event) {
             .global => |global| {
                 const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "zwp_text_input_manager_v3")) {
+                    self.text_input_global_seen = true;
+                    self.globals_exact = false;
+                }
+                if (std.mem.eql(u8, interface, "zwp_input_method_manager_v2")) {
+                    self.input_method_global_seen = true;
+                    self.globals_exact = false;
+                }
                 const index = self.global_count;
                 self.global_count += 1;
                 if (index >= expected_globals.len or
@@ -19753,6 +19850,164 @@ const MatureKeyboardClient = struct {
     }
 };
 
+const MatureTextClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_zwp = wayland.client.zwp;
+    const Role = enum { application, input_method };
+    const Stage = enum(u8) { starting, ready, state_received, edit_received, disconnected, failed };
+    const EditTag = enum { preedit, delete, commit, done };
+    fd: std.posix.fd_t,
+    role: Role,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    proceed: std.atomic.Value(bool) = .init(false),
+    shutdown_requested: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+    compositor: ?*client_wl.Compositor = null,
+    seat: ?*client_wl.Seat = null,
+    text_manager: ?*client_zwp.TextInputManagerV3 = null,
+    method_manager: ?*client_zwp.InputMethodManagerV2 = null,
+    edits: [4]EditTag = undefined,
+    edit_count: usize = 0,
+    done_serial: u32 = 0,
+    method_done_count: u32 = 0,
+    method_events: [5]u8 = undefined,
+    method_event_count: usize = 0,
+    grab_delivery: bool = false,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+    fn runFallible(self: *@This()) !void {
+        const display = try client_wl.Display.connectToFd(self.fd);
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        const seat = self.seat orelse return error.SeatMissing;
+        defer seat.release();
+        switch (self.role) {
+            .application => {
+                const compositor = self.compositor orelse return error.CompositorMissing;
+                defer compositor.destroy();
+                const manager = self.text_manager orelse return error.TextInputManagerMissing;
+                defer manager.destroy();
+                const surface = try compositor.createSurface();
+                defer surface.destroy();
+                const input = try manager.getTextInput(seat);
+                defer input.destroy();
+                input.setListener(*@This(), textEvent, self);
+                try expectClientRoundtrip(display);
+                self.stage.store(@intFromEnum(Stage.ready), .release);
+                while (!self.proceed.load(.acquire)) {
+                    if (self.shutdown_requested.load(.acquire)) return;
+                    std.atomic.spinLoopHint();
+                }
+                try expectClientRoundtrip(display);
+                input.enable();
+                input.setSurroundingText("héllo", 3, 1);
+                input.setTextChangeCause(.other);
+                input.setContentType(.{ .completion = true }, .email);
+                input.setCursorRectangle(2, 3, 4, 5);
+                input.commit();
+                while (self.edit_count < 4) try expectClientRoundtrip(display);
+                self.stage.store(@intFromEnum(Stage.edit_received), .release);
+                while (self.proceed.load(.acquire)) {
+                    if (self.shutdown_requested.load(.acquire)) return;
+                    std.atomic.spinLoopHint();
+                }
+            },
+            .input_method => {
+                const manager = self.method_manager orelse return error.InputMethodManagerMissing;
+                defer manager.destroy();
+                const method = try manager.getInputMethod(seat);
+                defer method.destroy();
+                method.setListener(*@This(), methodEvent, self);
+                const grab = try method.grabKeyboard();
+                defer grab.release();
+                grab.setListener(*@This(), grabEvent, self);
+                self.stage.store(@intFromEnum(Stage.ready), .release);
+                while (self.method_event_count < 5) try expectClientRoundtrip(display);
+                self.stage.store(@intFromEnum(Stage.state_received), .release);
+                while (!self.proceed.load(.acquire)) {
+                    if (self.shutdown_requested.load(.acquire)) return;
+                    std.atomic.spinLoopHint();
+                }
+                method.setPreeditString("候補", 0, 6);
+                method.deleteSurroundingText(2, 1);
+                method.commitString("確定");
+                method.commit(self.method_done_count);
+                try expectClientRoundtrip(display);
+                while (self.proceed.load(.acquire)) {
+                    if (self.shutdown_requested.load(.acquire)) return;
+                    std.atomic.spinLoopHint();
+                }
+            },
+        }
+    }
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |g| {
+                const name = std.mem.span(g.interface);
+                if (std.mem.eql(u8, name, "wl_compositor")) self.compositor = registry.bind(g.name, client_wl.Compositor, @min(g.version, 6)) catch null else if (std.mem.eql(u8, name, "wl_seat")) self.seat = registry.bind(g.name, client_wl.Seat, @min(g.version, 10)) catch null else if (std.mem.eql(u8, name, "zwp_text_input_manager_v3")) self.text_manager = registry.bind(g.name, client_zwp.TextInputManagerV3, 1) catch null else if (std.mem.eql(u8, name, "zwp_input_method_manager_v2")) self.method_manager = registry.bind(g.name, client_zwp.InputMethodManagerV2, 1) catch null;
+            },
+            .global_remove => {},
+        }
+    }
+    fn textEvent(_: *client_zwp.TextInputV3, event: client_zwp.TextInputV3.Event, self: *@This()) void {
+        const tag: ?EditTag = switch (event) {
+            .preedit_string => .preedit,
+            .delete_surrounding_text => .delete,
+            .commit_string => .commit,
+            .done => |done| value: {
+                self.done_serial = done.serial;
+                break :value .done;
+            },
+            else => null,
+        };
+        if (tag) |value| {
+            self.edits[self.edit_count] = value;
+            self.edit_count += 1;
+        }
+    }
+    fn methodEvent(_: *client_zwp.InputMethodV2, event: client_zwp.InputMethodV2.Event, self: *@This()) void {
+        const tag: u8 = switch (event) {
+            .activate => 1,
+            .surrounding_text => 2,
+            .text_change_cause => 3,
+            .content_type => 4,
+            .done => value: {
+                self.method_done_count += 1;
+                break :value 5;
+            },
+            else => 0,
+        };
+        if (tag != 0 and self.method_event_count < self.method_events.len) {
+            self.method_events[self.method_event_count] = tag;
+            self.method_event_count += 1;
+        }
+    }
+    fn grabEvent(_: *client_zwp.InputMethodKeyboardGrabV2, event: client_zwp.InputMethodKeyboardGrabV2.Event, self: *@This()) void {
+        switch (event) {
+            .keymap => |value| {
+                _ = std.os.linux.close(value.fd);
+                self.grab_delivery = true;
+            },
+            .repeat_info => self.grab_delivery = true,
+            else => {},
+        }
+    }
+    fn shutdown(self: *@This()) void {
+        self.shutdown_requested.store(true, .release);
+        _ = std.os.linux.shutdown(self.fd, std.os.linux.SHUT.RDWR);
+    }
+};
+
 fn connectWayringTestSocket(path: [:0]const u8) !std.posix.fd_t {
     const linux = std.os.linux;
     var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
@@ -19937,6 +20192,17 @@ fn waitForMatureKeyboardStage(
         server.display.flushClients();
     }
     return error.MatureKeyboardClientTimedOut;
+}
+
+fn waitForMatureTextStage(server: *Self, client: *MatureTextClient, expected: MatureTextClient.Stage) !void {
+    for (0..2_000) |_| {
+        const stage: MatureTextClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure.?;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+    }
+    return error.MatureTextClientTimedOut;
 }
 
 fn waitForMatureDataDeviceStage(

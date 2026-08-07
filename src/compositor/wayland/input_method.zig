@@ -8,7 +8,7 @@ const render = @import("../render/types.zig");
 const SecurityContext = @import("security_context.zig");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
-const TextInput = @import("text_input.zig");
+const NeutralTextInput = @import("../TextInput.zig");
 const MatureSerials = @import("mature_serials.zig");
 
 const wl = wayland.server.wl;
@@ -20,7 +20,7 @@ global: *wl.Global,
 security_context: *SecurityContext,
 seat: *Seat,
 surfaces: *Surface.Store,
-text_input: *TextInput,
+owner: *NeutralTextInput,
 layout: Layout,
 methods: std.ArrayList(*Method),
 active_method: ?*Method,
@@ -88,7 +88,7 @@ pub fn init(
     security_context: *SecurityContext,
     seat: *Seat,
     surfaces: *Surface.Store,
-    text_input: *TextInput,
+    owner: *NeutralTextInput,
     layout: Layout,
 ) !void {
     self.* = .{
@@ -98,7 +98,7 @@ pub fn init(
         .security_context = security_context,
         .seat = seat,
         .surfaces = surfaces,
-        .text_input = text_input,
+        .owner = owner,
         .layout = layout,
         .methods = .empty,
         .active_method = null,
@@ -112,14 +112,9 @@ pub fn init(
     errdefer self.global.destroy();
     try security_context.restrictGlobal(self.global);
     errdefer security_context.unrestrictGlobal(self.global);
-    text_input.setListener(.{
-        .context = self,
-        .changed = textInputChanged,
-    });
 }
 
 pub fn deinit(self: *Self) void {
-    self.text_input.clearListener();
     self.security_context.unrestrictGlobal(self.global);
     self.global.destroy();
     std.debug.assert(self.active_method == null);
@@ -145,6 +140,7 @@ pub fn refreshPopups(self: *Self) void {
 pub fn setInhibited(self: *Self, inhibited: bool) void {
     if (self.inhibited == inhibited) return;
     self.inhibited = inhibited;
+    self.owner.setInhibited(inhibited);
     if (inhibited) {
         if (self.active_method) |method| if (method.active_grab) |grab| {
             grab.active = false;
@@ -152,7 +148,6 @@ pub fn setInhibited(self: *Self, inhibited: bool) void {
             self.seat.clearKeyboardGrab(grab, false);
         };
     }
-    self.syncTextInput();
     if (!inhibited) {
         const method = self.active_method orelse return;
         if (!method.available or method.active_grab != null or method.grabs.items.len == 0) return;
@@ -189,32 +184,12 @@ fn handleManagerRequest(
     }
 }
 
-const OwnedPreedit = struct {
-    text: [:0]u8,
-    cursor_begin: i32,
-    cursor_end: i32,
-};
-
-const OwnedEdit = struct {
-    preedit: ?OwnedPreedit = null,
-    commit_string: ?[:0]u8 = null,
-    delete: ?TextInput.Edit.Delete = null,
-
-    fn reset(self: *OwnedEdit, allocator: std.mem.Allocator) void {
-        if (self.preedit) |preedit| allocator.free(preedit.text);
-        if (self.commit_string) |text| allocator.free(text);
-        self.* = .{};
-    }
-};
-
 const Method = struct {
     allocator: std.mem.Allocator,
     manager: *Self,
     resource: *zwp.InputMethodV2,
+    neutral_id: NeutralTextInput.MethodId,
     available: bool,
-    client_active: bool = false,
-    done_count: u32 = 0,
-    pending: OwnedEdit = .{},
     grabs: std.ArrayList(*KeyboardGrab) = .empty,
     active_grab: ?*KeyboardGrab = null,
     inert_popups: std.ArrayList(*InertPopup) = .empty,
@@ -232,20 +207,55 @@ const Method = struct {
         errdefer manager.allocator.destroy(self);
         manager.methods.append(manager.allocator, self) catch return error.OutOfMemory;
         errdefer _ = manager.methods.pop();
-
         self.* = .{
             .allocator = manager.allocator,
             .manager = manager,
             .resource = resource,
+            .neutral_id = undefined,
             .available = !force_inert and manager.active_method == null,
         };
+        const client_id = manager.seat.matureClientId(client) orelse return error.ResourceCreateFailed;
+        self.neutral_id = manager.owner.createMethodWithAvailability(client_id, .{
+            .context = self,
+            .activate = activate,
+            .deactivate = deactivate,
+            .state = state,
+            .done = done,
+            .unavailable = unavailable,
+        }, !force_inert) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ResourceCreateFailed,
+        };
+        errdefer manager.owner.destroyMethod(self.neutral_id);
         resource.setHandler(*Method, handleRequest, handleDestroy, self);
-        if (!self.available) {
-            resource.sendUnavailable();
-            return;
-        }
+        if (!self.available) return;
         manager.active_method = self;
-        manager.syncTextInput();
+    }
+
+    fn activate(context: *anyopaque) void {
+        const self: *Method = @ptrCast(@alignCast(context));
+        self.resource.sendActivate();
+        self.manager.updatePopups();
+    }
+    fn deactivate(context: *anyopaque) void {
+        const self: *Method = @ptrCast(@alignCast(context));
+        self.resource.sendDeactivate();
+        self.manager.updatePopups();
+    }
+    fn state(context: *anyopaque, snapshot: NeutralTextInput.Snapshot) void {
+        const self: *Method = @ptrCast(@alignCast(context));
+        if (snapshot.surrounding_text) |text| self.resource.sendSurroundingText(text.ptr, snapshot.cursor, snapshot.anchor);
+        self.resource.sendTextChangeCause(@enumFromInt(@intFromEnum(snapshot.change_cause)));
+        self.resource.sendContentType(@bitCast(snapshot.content_hint), @enumFromInt(@intFromEnum(snapshot.content_purpose)));
+        self.manager.updatePopups();
+    }
+    fn done(context: *anyopaque, _: u32) void {
+        const self: *Method = @ptrCast(@alignCast(context));
+        self.resource.sendDone();
+    }
+    fn unavailable(context: *anyopaque) void {
+        const self: *Method = @ptrCast(@alignCast(context));
+        self.resource.sendUnavailable();
     }
 
     fn handleRequest(
@@ -273,11 +283,11 @@ const Method = struct {
                 set.cursor_begin,
                 set.cursor_end,
             ),
-            .delete_surrounding_text => |set| self.pending.delete = .{
+            .delete_surrounding_text => |set| self.manager.owner.deleteSurrounding(self.neutral_id, .{
                 .before_length = set.before_length,
                 .after_length = set.after_length,
-            },
-            .commit => |request_commit| self.commit(request_commit.serial),
+            }) catch {},
+            .commit => |request_commit| self.manager.owner.commitEdit(self.neutral_id, request_commit.serial) catch {},
             .get_input_popup_surface => |get| Popup.create(
                 self,
                 Surface.fromResource(get.surface),
@@ -298,12 +308,7 @@ const Method = struct {
     ) void {
         const text = std.mem.span(text_ptr);
         if (!validText(text)) return;
-        const copy = self.allocator.dupeZ(u8, text) catch {
-            resource.postNoMemory();
-            return;
-        };
-        if (self.pending.commit_string) |old| self.allocator.free(old);
-        self.pending.commit_string = copy;
+        self.manager.owner.setCommitString(self.neutral_id, text) catch |err| if (err == error.OutOfMemory) resource.postNoMemory();
     }
 
     fn setPreedit(
@@ -315,37 +320,7 @@ const Method = struct {
     ) void {
         const text = std.mem.span(text_ptr);
         if (!validText(text) or !validPreeditCursor(text, cursor_begin, cursor_end)) return;
-        const copy = self.allocator.dupeZ(u8, text) catch {
-            resource.postNoMemory();
-            return;
-        };
-        if (self.pending.preedit) |old| self.allocator.free(old.text);
-        self.pending.preedit = .{
-            .text = copy,
-            .cursor_begin = cursor_begin,
-            .cursor_end = cursor_end,
-        };
-    }
-
-    fn commit(self: *Method, serial: u32) void {
-        defer self.pending.reset(self.allocator);
-        if (serial != self.done_count or !self.client_active or
-            self.manager.active_method != self) return;
-        const active = self.manager.text_input.activeState() orelse return;
-        const deletion = if (self.pending.delete) |delete|
-            if (validDeletion(active.surrounding_text, delete)) delete else null
-        else
-            null;
-        const preedit: ?TextInput.Edit.Preedit = if (self.pending.preedit) |preedit| .{
-            .text = preedit.text,
-            .cursor_begin = preedit.cursor_begin,
-            .cursor_end = preedit.cursor_end,
-        } else null;
-        _ = self.manager.text_input.sendEdit(.{
-            .preedit = preedit,
-            .commit_string = if (self.pending.commit_string) |text| text else null,
-            .delete = deletion,
-        });
+        self.manager.owner.setPreedit(self.neutral_id, text, cursor_begin, cursor_end) catch |err| if (err == error.OutOfMemory) resource.postNoMemory();
     }
 
     fn handleDestroy(_: *zwp.InputMethodV2, self: *Method) void {
@@ -368,7 +343,7 @@ const Method = struct {
             _ = self.manager.methods.orderedRemove(index);
             break;
         }
-        self.pending.reset(self.allocator);
+        self.manager.owner.destroyMethod(self.neutral_id);
         self.inert_popups.deinit(self.allocator);
         self.grabs.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -378,6 +353,7 @@ const Method = struct {
 const KeyboardGrab = struct {
     method: *Method,
     resource: *zwp.InputMethodKeyboardGrabV2,
+    neutral_id: NeutralTextInput.KeyboardGrabId,
     active: bool,
     token: u64,
 
@@ -396,9 +372,15 @@ const KeyboardGrab = struct {
         errdefer method.allocator.destroy(self);
         method.grabs.append(method.allocator, self) catch return error.OutOfMemory;
         errdefer _ = method.grabs.pop();
+        const neutral_id = method.manager.owner.createKeyboardGrab(method.neutral_id) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ResourceCreateFailed,
+        };
+        errdefer method.manager.owner.destroyKeyboardGrab(neutral_id);
         self.* = .{
             .method = method,
             .resource = resource,
+            .neutral_id = neutral_id,
             .active = usable and !method.manager.inhibited and method.active_grab == null,
             .token = method.manager.next_grab_token,
         };
@@ -434,6 +416,7 @@ const KeyboardGrab = struct {
         else
             null;
         if (self.active) method.manager.seat.clearKeyboardGrab(self, replacement == null);
+        method.manager.owner.destroyKeyboardGrab(self.neutral_id);
         method.allocator.destroy(self);
         if (replacement) |grab| {
             grab.active = true;
@@ -549,6 +532,7 @@ const InertPopup = struct {
 const Popup = struct {
     method: *Method,
     resource: *zwp.InputPopupSurfaceV2,
+    neutral_id: NeutralTextInput.PopupId,
     surface_id: Surface.Id,
     surface: ?*Surface,
     mapped: bool = false,
@@ -573,11 +557,17 @@ const Popup = struct {
             .surface_destroyed = surfaceDestroyed,
         }) catch return error.Role;
         errdefer surface.releaseRole(self);
+        const neutral_id = method.manager.owner.createPopup(method.neutral_id, surface.handle()) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ResourceCreateFailed,
+        };
+        errdefer method.manager.owner.destroyPopup(neutral_id);
         method.manager.popups.append(method.allocator, self) catch return error.OutOfMemory;
         errdefer _ = method.manager.popups.pop();
         self.* = .{
             .method = method,
             .resource = resource,
+            .neutral_id = neutral_id,
             .surface_id = surface.handle(),
             .surface = surface,
         };
@@ -600,6 +590,7 @@ const Popup = struct {
         const manager = self.method.manager;
         const was_mapped = self.mapped;
         if (self.surface) |surface| surface.releaseRole(self);
+        manager.owner.destroyPopup(self.neutral_id);
         for (manager.popups.items, 0..) |candidate, index| {
             if (candidate != self) continue;
             _ = manager.popups.orderedRemove(index);
@@ -623,6 +614,7 @@ const Popup = struct {
         const was_mapped = self.mapped;
         self.surface = null;
         self.mapped = false;
+        self.method.manager.owner.destroyPopup(self.neutral_id);
         if (was_mapped) {
             const manager = self.method.manager;
             manager.layout.repaint(manager.layout.context);
@@ -638,13 +630,13 @@ const Popup = struct {
             if (old_mapped) manager.layout.repaint(manager.layout.context);
             return;
         }
-        const active = manager.text_input.activeState();
-        self.mapped = self.method.client_active and active != null and
+        const active = manager.owner.activeMethodSnapshot(self.method.neutral_id);
+        self.mapped = active != null and
             Surface.currentBuffer(manager.surfaces, self.surface_id) != null;
         if (active) |state| {
             const focus_position = manager.layout.surface_position(
                 manager.layout.context,
-                state.surface_id,
+                state.surface,
             ) orelse Position{};
             const popup_size = Surface.currentLogicalSize(
                 manager.surfaces,
@@ -672,65 +664,22 @@ const Popup = struct {
     }
 };
 
-fn textInputChanged(context: *anyopaque) void {
-    const self: *Self = @ptrCast(@alignCast(context));
-    self.syncTextInput();
-}
-
-fn syncTextInput(self: *Self) void {
-    const method = self.active_method orelse return;
-    const active = if (self.inhibited) null else self.text_input.activeState();
-    if (active == null) {
-        if (method.client_active) {
-            method.resource.sendDeactivate();
-            method.client_active = false;
-            method.pending.reset(self.allocator);
-            self.sendDone(method);
-        }
-        self.updatePopups();
-        return;
-    }
-    if (!method.client_active) {
-        method.pending.reset(self.allocator);
-        method.resource.sendActivate();
-        method.client_active = true;
-    }
-    const state = active.?;
-    if (state.surrounding_text) |surrounding| {
-        method.resource.sendSurroundingText(
-            surrounding.text.ptr,
-            surrounding.cursor,
-            surrounding.anchor,
-        );
-    }
-    method.resource.sendTextChangeCause(state.change_cause);
-    method.resource.sendContentType(state.content_type.hint, state.content_type.purpose);
-    self.sendDone(method);
-    self.updatePopups();
-}
-
-fn sendDone(self: *Self, method: *Method) void {
-    _ = self;
-    method.resource.sendDone();
-    method.done_count +%= 1;
-}
-
 fn updatePopups(self: *Self) void {
     for (self.popups.items) |popup| popup.update(false);
 }
 
 const Placement = struct {
     position: Position,
-    rectangle: TextInput.CursorRectangle,
+    rectangle: NeutralTextInput.Rectangle,
 };
 
 fn placePopup(
     output: render.Size,
     focus: Position,
-    maybe_rectangle: ?TextInput.CursorRectangle,
+    maybe_rectangle: ?NeutralTextInput.Rectangle,
     popup: render.Size,
 ) Placement {
-    const rectangle = maybe_rectangle orelse TextInput.CursorRectangle{
+    const rectangle = maybe_rectangle orelse NeutralTextInput.Rectangle{
         .x = 0,
         .y = 0,
         .width = 0,
@@ -775,18 +724,6 @@ fn validPreeditCursor(text: []const u8, begin: i32, end: i32) bool {
     return validUtf8Index(text, @intCast(begin)) and validUtf8Index(text, @intCast(end));
 }
 
-fn validDeletion(
-    maybe_surrounding: ?TextInput.SurroundingText,
-    delete: TextInput.Edit.Delete,
-) bool {
-    if (delete.before_length == 0 and delete.after_length == 0) return true;
-    const surrounding = maybe_surrounding orelse return false;
-    if (delete.before_length > surrounding.cursor or
-        delete.after_length > surrounding.text.len - surrounding.cursor) return false;
-    return validUtf8Index(surrounding.text, surrounding.cursor - delete.before_length) and
-        validUtf8Index(surrounding.text, surrounding.cursor + delete.after_length);
-}
-
 fn validUtf8Index(text: []const u8, index: usize) bool {
     if (index > text.len) return false;
     return index == text.len or text[index] & 0xc0 != 0x80;
@@ -800,7 +737,7 @@ test "popup placement flips at output edges and reports popup-local cursor" {
         .{ .width = 200, .height = 100 },
     );
     try std.testing.expectEqual(Position{ .x = 530, .y = 410 }, placement.position);
-    try std.testing.expectEqual(TextInput.CursorRectangle{
+    try std.testing.expectEqual(NeutralTextInput.Rectangle{
         .x = 180,
         .y = 100,
         .width = 20,
@@ -814,14 +751,4 @@ test "input method validates UTF-8 edit boundaries" {
     try std.testing.expect(!validPreeditCursor(text, 2, 3));
     try std.testing.expect(validPreeditCursor(text, -1, -1));
     try std.testing.expect(!validPreeditCursor(text, -1, 0));
-    try std.testing.expect(validDeletion(.{
-        .text = text,
-        .cursor = 3,
-        .anchor = 3,
-    }, .{ .before_length = 2, .after_length = 1 }));
-    try std.testing.expect(!validDeletion(.{
-        .text = text,
-        .cursor = 3,
-        .anchor = 3,
-    }, .{ .before_length = 1, .after_length = 1 }));
 }
