@@ -1298,3 +1298,26 @@ test "Client object limit is out of memory and dense gap is protocol" {
     try Case.run(1, 2, .out_of_memory);
     try Case.run(4, 3, .protocol);
 }
+
+test "privileged UID authorization requires immutable direct provenance" {
+    const peer_credentials: Credentials = .{ .pid = 1, .uid = 42, .gid = 2 };
+    var direct: Client = .init(std.testing.allocator, .{
+        .credentials = peer_credentials,
+        .transport_provenance = .direct,
+    });
+    defer direct.deinit();
+    try std.testing.expect(direct.isAuthorizedDirectPeer(42));
+    try std.testing.expect(!direct.isAuthorizedDirectPeer(41));
+
+    inline for (.{ TransportProvenance.unknown, .security_context }) |provenance| {
+        var derived: Client = .init(std.testing.allocator, .{
+            .credentials = peer_credentials,
+            .transport_provenance = provenance,
+        });
+        defer derived.deinit();
+        try std.testing.expect(!derived.isAuthorizedDirectPeer(42));
+    }
+    var missing: Client = .init(std.testing.allocator, .{ .transport_provenance = .direct });
+    defer missing.deinit();
+    try std.testing.expect(!missing.isAuthorizedDirectPeer(42));
+}
