@@ -24,7 +24,10 @@ pub const ContentHint = packed struct(u32) {
     sensitive_data: bool = false,
     latin: bool = false,
     multiline: bool = false,
-    _reserved: u22 = 0,
+    on_screen_input_provided: bool = false,
+    no_emoji: bool = false,
+    preedit_shown: bool = false,
+    _reserved: u19 = 0,
 };
 pub const ContentPurpose = enum { normal, alpha, digits, number, phone, url, email, name, password, pin, date, time, datetime, terminal };
 pub const ChangeCause = enum { input_method, other };
@@ -98,7 +101,7 @@ const Transition = enum { enable, disable };
 const PendingState = struct {
     transition: ?Transition = null,
     surrounding: ?Surrounding = null,
-    cause: ?ChangeCause = null,
+    cause: ChangeCause = .input_method,
     hint: ?ContentHint = null,
     purpose: ?ContentPurpose = null,
     rectangle: ?Rectangle = null,
@@ -305,12 +308,10 @@ pub fn commitState(self: *TextInput, id: InputId) Error!void {
 pub fn surfaceCommitted(self: *TextInput, surface: SurfaceRegistry.Id) void {
     const focus = self.focus orelse return;
     if (!std.meta.eql(focus.surface, surface) or !self.surfaces.contains(surface)) return;
-    if (self.active_input) |id| if (self.inputs.get(id)) |input| {
-        if (input.current.staged_rectangle) |rectangle| {
-            input.current.rectangle = rectangle;
-            input.current.staged_rectangle = null;
-        }
-    };
+    const input = self.inputs.get(self.active_input orelse return) orelse return;
+    const rectangle = input.current.staged_rectangle orelse return;
+    input.current.rectangle = rectangle;
+    input.current.staged_rectangle = null;
     self.syncActive();
 }
 
@@ -327,8 +328,10 @@ pub fn createMethodWithAvailability(
     if (!self.clients.contains(owner)) return error.InvalidClient;
     const available = may_be_available and self.active_method == null;
     const id = self.methods.insert(self.allocator, .{ .owner = owner, .endpoint = endpoint, .available = available }) catch return error.OutOfMemory;
-    if (available) self.active_method = id else endpoint.unavailable(endpoint.context);
-    self.syncActive();
+    if (available) {
+        self.active_method = id;
+        self.syncActive();
+    } else endpoint.unavailable(endpoint.context);
     return id;
 }
 pub fn destroyMethod(self: *TextInput, id: MethodId) void {
@@ -532,6 +535,7 @@ fn availableMethod(self: *TextInput, id: MethodId) Error!*Method {
     return method;
 }
 fn sendFocusEvent(self: *TextInput, client: ClientRegistry.Id, surface: SurfaceRegistry.Id, enter: bool) void {
+    if (!self.clients.contains(client)) return;
     var iterator = self.inputs.iterator();
     while (iterator.next()) |entry| if (std.meta.eql(entry.value.owner, client)) {
         const endpoint = entry.value.endpoint;
@@ -540,11 +544,12 @@ fn sendFocusEvent(self: *TextInput, client: ClientRegistry.Id, surface: SurfaceR
 }
 fn deactivateInput(self: *TextInput) void {
     if (self.active_method) |id| if (self.methods.get(id)) |method| if (method.active) {
-        method.endpoint.deactivate(method.endpoint.context);
+        const endpoint_live = self.clients.contains(method.owner);
+        if (endpoint_live) method.endpoint.deactivate(method.endpoint.context);
         method.active = false;
         freeEdit(self.allocator, &method.edit);
         method.done_count +%= 1;
-        method.endpoint.done(method.endpoint.context, method.done_count);
+        if (endpoint_live) method.endpoint.done(method.endpoint.context, method.done_count);
     };
     self.active_input = null;
 }
@@ -600,7 +605,7 @@ fn applyPending(allocator: std.mem.Allocator, input: *Input) void {
         input.current.surrounding = surrounding;
         input.pending.surrounding = null;
     }
-    if (input.pending.cause) |cause| input.current.cause = cause;
+    input.current.cause = input.pending.cause;
     if (input.pending.hint) |hint| input.current.hint = hint;
     if (input.pending.purpose) |purpose| input.current.purpose = purpose;
     if (input.pending.rectangle) |rectangle| {
@@ -746,7 +751,12 @@ test "pending transactions preserve fields and disable clears active state" {
     try owner.enable(input);
     try owner.setSurroundingText(input, &text, 2, 1);
     try owner.setTextChangeCause(input, .other);
-    try owner.setContentType(input, .{ .multiline = true }, .terminal);
+    try owner.setContentType(input, .{
+        .multiline = true,
+        .on_screen_input_provided = true,
+        .no_emoji = true,
+        .preedit_shown = true,
+    }, .terminal);
     try owner.setCursorRectangle(input, .{ .x = 1, .y = 2, .width = 3, .height = 4 }, false);
     try owner.setSubmitAvailable(input, true);
     text = .{ 'n', 'o' };
@@ -754,17 +764,125 @@ test "pending transactions preserve fields and disable clears active state" {
     const first = owner.activeSnapshot().?;
     try std.testing.expectEqualStrings("hi", first.surrounding_text.?);
     try std.testing.expectEqual(ChangeCause.other, first.change_cause);
-    try std.testing.expect(first.content_hint.multiline and first.submit_available);
+    try std.testing.expect(first.content_hint.multiline and
+        first.content_hint.on_screen_input_provided and
+        first.content_hint.no_emoji and
+        first.content_hint.preedit_shown and
+        first.submit_available);
     try owner.setSubmitAvailable(input, false);
     try owner.commitState(input);
     const second = owner.activeSnapshot().?;
     try std.testing.expectEqualStrings("hi", second.surrounding_text.?);
+    try std.testing.expectEqual(ChangeCause.input_method, second.change_cause);
     try std.testing.expectEqual(ContentPurpose.terminal, second.content_purpose);
     try owner.disable(input);
     try owner.commitState(input);
     try std.testing.expectEqual(@as(?Snapshot, null), owner.activeSnapshot());
     owner.destroyInput(input);
     surfaces.remove(surface);
+    clients.unregister(client);
+}
+
+test "method publication ignores unrelated surfaces and unavailable methods" {
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    var owner = TextInput.init(std.testing.allocator, &clients, &surfaces);
+    defer owner.deinit();
+    var input_probe: TestProbe = .{};
+    defer input_probe.deinit();
+    var method_probe: TestProbe = .{};
+    defer method_probe.deinit();
+    var unavailable_probe: TestProbe = .{};
+    defer unavailable_probe.deinit();
+    const client = try clients.register(.mature_display);
+    const method_client = try clients.register(.wayring_server);
+    const surface = try surfaces.add(.{ .context = &input_probe, .render_state = testSurface });
+    const input = try owner.createInput(client, input_probe.inputEndpoint());
+    const method = try owner.createMethod(method_client, method_probe.methodEndpoint());
+    try owner.setKeyboardFocus(surface, client);
+    try owner.enable(input);
+    try owner.commitState(input);
+    method_probe.clear();
+
+    owner.surfaceCommitted(surface);
+    try std.testing.expectEqualStrings("", method_probe.events.items);
+    const unavailable = try owner.createMethod(method_client, unavailable_probe.methodEndpoint());
+    try std.testing.expectEqualStrings("unavailable ", unavailable_probe.events.items);
+    try std.testing.expectEqualStrings("", method_probe.events.items);
+
+    try owner.setCursorRectangle(input, .{ .x = 1, .y = 2, .width = 3, .height = 4 }, true);
+    try owner.commitState(input);
+    try std.testing.expectEqualStrings("state method-done ", method_probe.events.items);
+    try std.testing.expectEqual(@as(?Rectangle, null), owner.activeSnapshot().?.cursor_rectangle);
+    method_probe.clear();
+    owner.surfaceCommitted(surface);
+    try std.testing.expectEqualStrings("state method-done ", method_probe.events.items);
+    try std.testing.expectEqual(Rectangle{ .x = 1, .y = 2, .width = 3, .height = 4 }, owner.activeSnapshot().?.cursor_rectangle.?);
+
+    owner.destroyMethod(unavailable);
+    owner.destroyMethod(method);
+    owner.destroyInput(input);
+    surfaces.remove(surface);
+    clients.unregister(method_client);
+    clients.unregister(client);
+}
+
+test "method done observes settled popup visibility state" {
+    const DoneProbe = struct {
+        owner: *TextInput,
+        method: ?MethodId = null,
+        snapshots: [2]bool = undefined,
+        count: usize = 0,
+
+        fn noEvent(_: *anyopaque) void {}
+        fn noState(_: *anyopaque, _: Snapshot) void {}
+        fn done(context: *anyopaque, _: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.snapshots[self.count] = if (self.method) |method|
+                self.owner.activeMethodSnapshot(method) != null
+            else
+                false;
+            self.count += 1;
+        }
+        fn endpoint(self: *@This()) MethodEndpoint {
+            return .{
+                .context = self,
+                .activate = noEvent,
+                .deactivate = noEvent,
+                .state = noState,
+                .done = done,
+                .unavailable = noEvent,
+            };
+        }
+    };
+
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    var owner = TextInput.init(std.testing.allocator, &clients, &surfaces);
+    defer owner.deinit();
+    var input_probe: TestProbe = .{};
+    defer input_probe.deinit();
+    var done_probe: DoneProbe = .{ .owner = &owner };
+    const client = try clients.register(.mature_display);
+    const method_client = try clients.register(.wayring_server);
+    const surface = try surfaces.add(.{ .context = &input_probe, .render_state = testSurface });
+    const input = try owner.createInput(client, input_probe.inputEndpoint());
+    const method = try owner.createMethod(method_client, done_probe.endpoint());
+    done_probe.method = method;
+    try owner.setKeyboardFocus(surface, client);
+    try owner.enable(input);
+    try owner.commitState(input);
+    try owner.setKeyboardFocus(null, null);
+    try std.testing.expectEqualSlices(bool, &.{ true, false }, done_probe.snapshots[0..done_probe.count]);
+
+    owner.destroyMethod(method);
+    owner.destroyInput(input);
+    surfaces.remove(surface);
+    clients.unregister(method_client);
     clients.unregister(client);
 }
 
@@ -925,6 +1043,33 @@ test "focused client disconnect deactivates a live input method without stale en
     owner.destroyMethod(method);
     surfaces.remove(surface);
     clients.unregister(method_client);
+}
+
+test "dead endpoint owners receive no focus or method callbacks during listener-ordered cleanup" {
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    var owner = TextInput.init(std.testing.allocator, &clients, &surfaces);
+    defer owner.deinit();
+    var probe: TestProbe = .{};
+    defer probe.deinit();
+    const client = try clients.register(.mature_display);
+    const surface = try surfaces.add(.{ .context = &probe, .render_state = testSurface });
+    const input = try owner.createInput(client, probe.inputEndpoint());
+    _ = try owner.createMethod(client, probe.methodEndpoint());
+    try owner.setKeyboardFocus(surface, client);
+    try owner.enable(input);
+    try owner.commitState(input);
+    probe.clear();
+
+    clients.unregister(client);
+    try owner.setKeyboardFocus(null, null);
+    owner.clientDisconnected(client);
+    try std.testing.expectEqual(@as(usize, 0), probe.callbacks);
+    try std.testing.expectEqual(ResourceSnapshot{ .inputs = 0, .methods = 0, .keyboard_grabs = 0, .popups = 0 }, owner.resourceSnapshot());
+
+    surfaces.remove(surface);
 }
 
 test "allocation failures leave no resources and string replacement rolls back" {

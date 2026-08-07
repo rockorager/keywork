@@ -235,23 +235,21 @@ const Method = struct {
     fn activate(context: *anyopaque) void {
         const self: *Method = @ptrCast(@alignCast(context));
         self.resource.sendActivate();
-        self.manager.updatePopups();
     }
     fn deactivate(context: *anyopaque) void {
         const self: *Method = @ptrCast(@alignCast(context));
         self.resource.sendDeactivate();
-        self.manager.updatePopups();
     }
     fn state(context: *anyopaque, snapshot: NeutralTextInput.Snapshot) void {
         const self: *Method = @ptrCast(@alignCast(context));
         if (snapshot.surrounding_text) |text| self.resource.sendSurroundingText(text.ptr, snapshot.cursor, snapshot.anchor);
         self.resource.sendTextChangeCause(@enumFromInt(@intFromEnum(snapshot.change_cause)));
         self.resource.sendContentType(@bitCast(snapshot.content_hint), @enumFromInt(@intFromEnum(snapshot.content_purpose)));
-        self.manager.updatePopups();
     }
     fn done(context: *anyopaque, _: u32) void {
         const self: *Method = @ptrCast(@alignCast(context));
         self.resource.sendDone();
+        self.manager.updatePopups();
     }
     fn unavailable(context: *anyopaque) void {
         const self: *Method = @ptrCast(@alignCast(context));

@@ -13823,6 +13823,8 @@ test "production mature text input v3 and input method v2 transact over canonica
     app.proceed.store(true, .release);
     try waitForMatureTextStage(server, &method, .state_received);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5 }, method.method_events[0..method.method_event_count]);
+    try std.testing.expectEqual(@as(u32, 2), app.text_manager_version);
+    try std.testing.expectEqual(@as(u32, (1 << 0) | (1 << 10) | (1 << 11) | (1 << 12)), method.method_content_hint);
     method.proceed.store(true, .release);
     try waitForMatureTextStage(server, &app, .edit_received);
     try std.testing.expectEqualSlices(MatureTextClient.EditTag, &.{ .preedit, .delete, .commit, .done }, app.edits[0..app.edit_count]);
@@ -19866,12 +19868,14 @@ const MatureTextClient = struct {
     seat: ?*client_wl.Seat = null,
     text_manager: ?*client_zwp.TextInputManagerV3 = null,
     method_manager: ?*client_zwp.InputMethodManagerV2 = null,
+    text_manager_version: u32 = 0,
     edits: [4]EditTag = undefined,
     edit_count: usize = 0,
     done_serial: u32 = 0,
     method_done_count: u32 = 0,
     method_events: [5]u8 = undefined,
     method_event_count: usize = 0,
+    method_content_hint: u32 = 0,
     grab_delivery: bool = false,
 
     fn run(self: *@This()) void {
@@ -19912,7 +19916,12 @@ const MatureTextClient = struct {
                 input.enable();
                 input.setSurroundingText("héllo", 3, 1);
                 input.setTextChangeCause(.other);
-                input.setContentType(.{ .completion = true }, .email);
+                input.setContentType(.{
+                    .completion = true,
+                    .on_screen_input_provided = true,
+                    .no_emoji = true,
+                    .preedit_shown = true,
+                }, .email);
                 input.setCursorRectangle(2, 3, 4, 5);
                 input.commit();
                 while (self.edit_count < 4) try expectClientRoundtrip(display);
@@ -19954,7 +19963,10 @@ const MatureTextClient = struct {
         switch (event) {
             .global => |g| {
                 const name = std.mem.span(g.interface);
-                if (std.mem.eql(u8, name, "wl_compositor")) self.compositor = registry.bind(g.name, client_wl.Compositor, @min(g.version, 6)) catch null else if (std.mem.eql(u8, name, "wl_seat")) self.seat = registry.bind(g.name, client_wl.Seat, @min(g.version, 10)) catch null else if (std.mem.eql(u8, name, "zwp_text_input_manager_v3")) self.text_manager = registry.bind(g.name, client_zwp.TextInputManagerV3, 1) catch null else if (std.mem.eql(u8, name, "zwp_input_method_manager_v2")) self.method_manager = registry.bind(g.name, client_zwp.InputMethodManagerV2, 1) catch null;
+                if (std.mem.eql(u8, name, "wl_compositor")) self.compositor = registry.bind(g.name, client_wl.Compositor, @min(g.version, 6)) catch null else if (std.mem.eql(u8, name, "wl_seat")) self.seat = registry.bind(g.name, client_wl.Seat, @min(g.version, 10)) catch null else if (std.mem.eql(u8, name, "zwp_text_input_manager_v3")) {
+                    self.text_manager_version = @min(g.version, 2);
+                    self.text_manager = registry.bind(g.name, client_zwp.TextInputManagerV3, self.text_manager_version) catch null;
+                } else if (std.mem.eql(u8, name, "zwp_input_method_manager_v2")) self.method_manager = registry.bind(g.name, client_zwp.InputMethodManagerV2, 1) catch null;
             },
             .global_remove => {},
         }
@@ -19980,7 +19992,10 @@ const MatureTextClient = struct {
             .activate => 1,
             .surrounding_text => 2,
             .text_change_cause => 3,
-            .content_type => 4,
+            .content_type => |value| value: {
+                self.method_content_hint = @bitCast(value.hint);
+                break :value 4;
+            },
             .done => value: {
                 self.method_done_count += 1;
                 break :value 5;
