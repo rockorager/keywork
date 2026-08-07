@@ -1,4 +1,5 @@
-//! Protocol-free clipboard and drag-and-drop state for one compositor seat.
+//! Protocol-free clipboard, primary-selection, and drag-and-drop state for one
+//! compositor seat.
 //!
 //! Frontends own protocol objects and translate these synchronous callbacks.
 //! Callback arguments (including transfer file descriptors) are borrowed only
@@ -86,6 +87,10 @@ pub const Listener = struct {
     offer_action_changed: ?*const fn (*anyopaque, OfferId, Actions) void = null,
     external_drag_start: ?*const fn (*anyopaque) ?ExternalDragStart = null,
     retained_source_destroyed: ?*const fn (*anyopaque, u64) void = null,
+    primary_selection_changed: ?*const fn (*anyopaque) void = null,
+    primary_mime_offered: ?*const fn (*anyopaque, PrimarySourceId, []const u8) void = null,
+    primary_offer_rolled_back: ?*const fn (*anyopaque, PrimaryOfferId) void = null,
+    primary_offer_mime_offered: ?*const fn (*anyopaque, PrimaryOfferId, []const u8) void = null,
 };
 
 const SourceStore = slot_map.SlotMap(Source, enum { data_source });
@@ -94,6 +99,12 @@ const OfferStore = slot_map.SlotMap(Offer, enum { data_offer });
 pub const SourceId = SourceStore.Id;
 pub const DeviceId = DeviceStore.Id;
 pub const OfferId = OfferStore.Id;
+const PrimarySourceStore = slot_map.SlotMap(Source, enum { primary_source });
+const PrimaryDeviceStore = slot_map.SlotMap(PrimaryDevice, enum { primary_device });
+const PrimaryOfferStore = slot_map.SlotMap(PrimaryOffer, enum { primary_offer });
+pub const PrimarySourceId = PrimarySourceStore.Id;
+pub const PrimaryDeviceId = PrimaryDeviceStore.Id;
+pub const PrimaryOfferId = PrimaryOfferStore.Id;
 
 pub const SourceOptions = struct {
     actions: Actions = .{},
@@ -116,6 +127,13 @@ const Source = struct {
 };
 
 const Device = struct { owner: ClientRegistry.Id, endpoint: DeviceEndpoint };
+pub const PrimaryDeviceEndpoint = struct {
+    context: *anyopaque,
+    selection_prepare: ?*const fn (*anyopaque, ?PrimaryOfferId) error{OutOfMemory}!void = null,
+    selection: *const fn (*anyopaque, ?PrimaryOfferId) error{OutOfMemory}!void,
+};
+const PrimaryDevice = struct { owner: ClientRegistry.Id, endpoint: PrimaryDeviceEndpoint };
+const PrimaryOffer = struct { device: ?PrimaryDeviceId, source: ?PrimarySourceId, publication: u64 };
 pub const OfferKind = enum { selection, drag };
 const Offer = struct {
     device: ?DeviceId,
@@ -186,15 +204,23 @@ listener: Listener,
 sources: SourceStore = .{},
 devices: DeviceStore = .{},
 offers: OfferStore = .{},
+primary_sources: PrimarySourceStore = .{},
+primary_devices: PrimaryDeviceStore = .{},
+primary_offers: PrimaryOfferStore = .{},
 selection: ?SourceId = null,
 selection_order: SeatAuthority.Order = 0,
 selection_generation: u64 = 0,
 focused_client: ?ClientRegistry.Id = null,
+primary_selection: ?PrimarySourceId = null,
+primary_selection_order: SeatAuthority.Order = 0,
+primary_selection_generation: u64 = 0,
+primary_focused_client: ?ClientRegistry.Id = null,
 drag: ?Drag = null,
 retained: ?Retained = null,
 next_drag_generation: u64 = 0,
 next_publication: u64 = 0,
 enter_stage_failure: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+primary_stage_failure: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
 
 pub fn init(allocator: std.mem.Allocator, clients: *const ClientRegistry, surfaces: *const SurfaceRegistry, authority: *SeatAuthority, listener: Listener) DataDevice {
     return .{ .allocator = allocator, .clients = clients, .surfaces = surfaces, .authority = authority, .listener = listener };
@@ -204,6 +230,7 @@ pub fn deinit(self: *DataDevice) void {
     self.cancelDrag();
     self.cancelRetained();
     self.clearSelection(self.authority.nextOrder());
+    self.clearPrimarySelection(self.authority.nextOrder());
     var offers = self.offers.iterator();
     while (offers.next()) |entry| _ = self.offers.remove(entry.id);
     var devices = self.devices.iterator();
@@ -216,6 +243,18 @@ pub fn deinit(self: *DataDevice) void {
     self.offers.deinit(self.allocator);
     self.devices.deinit(self.allocator);
     self.sources.deinit(self.allocator);
+    var primary_offers = self.primary_offers.iterator();
+    while (primary_offers.next()) |entry| _ = self.primary_offers.remove(entry.id);
+    var primary_devices = self.primary_devices.iterator();
+    while (primary_devices.next()) |entry| _ = self.primary_devices.remove(entry.id);
+    var primary_sources = self.primary_sources.iterator();
+    while (primary_sources.next()) |entry| {
+        var source = self.primary_sources.remove(entry.id).?;
+        source.deinit(self.allocator);
+    }
+    self.primary_offers.deinit(self.allocator);
+    self.primary_devices.deinit(self.allocator);
+    self.primary_sources.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -275,6 +314,78 @@ pub fn offerMime(self: *DataDevice, id: SourceId, mime: []const u8) Error!void {
     var offers = self.offers.iterator();
     while (offers.next()) |entry| if (entry.value.source != null and std.meta.eql(entry.value.source.?, id)) {
         if (self.listener.offer_mime_offered) |offered| offered(self.listener.context, entry.id, copy);
+    };
+}
+
+pub fn createPrimarySource(self: *DataDevice, owner: ?ClientRegistry.Id, endpoint: SourceEndpoint) Error!PrimarySourceId {
+    if (owner) |id| if (!self.clients.contains(id)) return error.InvalidClient;
+    return self.primary_sources.insert(self.allocator, .{ .owner = owner, .endpoint = endpoint, .actions = .{}, .actions_declared = false }) catch error.OutOfMemory;
+}
+
+pub fn destroyPrimarySource(self: *DataDevice, id: PrimarySourceId) void {
+    if (self.primary_selection) |selected| if (std.meta.eql(selected, id)) {
+        const order = self.authority.nextOrder();
+        self.replacePrimarySelection(null, order, false) catch self.forceClearPrimarySelection(order);
+    };
+    var offers = self.primary_offers.iterator();
+    while (offers.next()) |entry| {
+        if (entry.value.source != null and std.meta.eql(entry.value.source.?, id)) entry.value.source = null;
+    }
+    var source = self.primary_sources.remove(id) orelse return;
+    source.deinit(self.allocator);
+}
+
+pub fn offerPrimaryMime(self: *DataDevice, id: PrimarySourceId, mime: []const u8) Error!void {
+    const source = self.primary_sources.get(id) orelse return error.InvalidSource;
+    if (source.used and !self.primarySelectionIs(id)) return;
+    for (source.mime_types.items) |existing| if (std.mem.eql(u8, existing, mime)) return;
+    const copy = self.allocator.dupeZ(u8, mime) catch return error.OutOfMemory;
+    errdefer self.allocator.free(copy);
+    try source.mime_types.append(self.allocator, copy);
+    if (self.listener.primary_mime_offered) |notify| notify(self.listener.context, id, copy);
+    var offers = self.primary_offers.iterator();
+    while (offers.next()) |entry| if (entry.value.source != null and std.meta.eql(entry.value.source.?, id))
+        if (self.listener.primary_offer_mime_offered) |notify| notify(self.listener.context, entry.id, copy);
+}
+
+pub fn createPrimaryDevice(self: *DataDevice, owner: ClientRegistry.Id, endpoint: PrimaryDeviceEndpoint) Error!PrimaryDeviceId {
+    if (!self.clients.contains(owner)) return error.InvalidClient;
+    const id = self.primary_devices.insert(self.allocator, .{ .owner = owner, .endpoint = endpoint }) catch return error.OutOfMemory;
+    errdefer {
+        self.removePrimaryOffersForDevice(id);
+        _ = self.primary_devices.remove(id);
+    }
+    var offer: ?PrimaryOfferId = null;
+    if (self.primary_focused_client != null and std.meta.eql(self.primary_focused_client.?, owner)) {
+        if (self.primary_selection) |source| offer = self.primary_offers.insert(self.allocator, .{ .device = id, .source = source, .publication = self.issuePublication() }) catch return error.OutOfMemory;
+        if (endpoint.selection_prepare) |prepare| try prepare(endpoint.context, offer);
+        self.finalizeTransaction() catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+        endpoint.selection(endpoint.context, offer) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+        self.commitTransaction();
+    }
+    return id;
+}
+
+pub fn destroyPrimaryDevice(self: *DataDevice, id: PrimaryDeviceId) void {
+    var offers = self.primary_offers.iterator();
+    while (offers.next()) |entry| {
+        if (entry.value.device != null and std.meta.eql(entry.value.device.?, id)) entry.value.device = null;
+    }
+    _ = self.primary_devices.remove(id);
+}
+
+fn removePrimaryOffersForDevice(self: *DataDevice, id: PrimaryDeviceId) void {
+    var offers = self.primary_offers.iterator();
+    while (offers.next()) |entry| if (entry.value.device != null and std.meta.eql(entry.value.device.?, id)) {
+        const offer_id = entry.id;
+        if (self.listener.primary_offer_rolled_back) |notify| notify(self.listener.context, offer_id);
+        _ = self.primary_offers.remove(offer_id);
     };
 }
 
@@ -421,6 +532,14 @@ pub fn clientDisconnected(self: *DataDevice, client: ClientRegistry.Id) void {
     while (devices.next()) |entry| if (std.meta.eql(entry.value.owner, client)) self.destroyDevice(entry.id);
     var sources = self.sources.iterator();
     while (sources.next()) |entry| if (entry.value.owner != null and std.meta.eql(entry.value.owner.?, client)) self.destroySource(entry.id);
+    if (self.primary_focused_client != null and std.meta.eql(self.primary_focused_client.?, client)) {
+        self.primary_focused_client = null;
+        self.invalidatePrimaryOffers(null);
+    }
+    var primary_devices = self.primary_devices.iterator();
+    while (primary_devices.next()) |entry| if (std.meta.eql(entry.value.owner, client)) self.destroyPrimaryDevice(entry.id);
+    var primary_sources = self.primary_sources.iterator();
+    while (primary_sources.next()) |entry| if (entry.value.owner != null and std.meta.eql(entry.value.owner.?, client)) self.destroyPrimarySource(entry.id);
 }
 
 fn leaveRetiredClient(self: *DataDevice, client: ClientRegistry.Id) void {
@@ -448,6 +567,187 @@ pub fn setFocus(self: *DataDevice, client: ?ClientRegistry.Id) Error!void {
     self.invalidateSelectionOffers(publication);
     self.focused_client = client;
     self.commitTransaction();
+}
+
+pub fn setPrimaryFocus(self: *DataDevice, client: ?ClientRegistry.Id) Error!void {
+    if (client) |id| if (!self.clients.contains(id)) return error.InvalidClient;
+    if (std.meta.eql(self.primary_focused_client, client)) return;
+    const publication = self.issuePublication();
+    errdefer self.removePrimaryPublication(publication);
+    if (client != null and self.primary_selection != null) try self.stagePrimaryOffers(client.?, self.primary_selection.?, publication);
+    try self.publishPrimaryFocusBatch(self.primary_focused_client, client, publication);
+    self.invalidatePrimaryOffers(publication);
+    self.primary_focused_client = client;
+}
+
+pub fn setPrimarySelection(self: *DataDevice, device_id: PrimaryDeviceId, source_id: ?PrimarySourceId, serial: ClientRegistry.Serial) Error!void {
+    const device = self.primary_devices.get(device_id) orelse return error.InvalidDevice;
+    const order = self.authority.selectionOrder(device.owner, serial) orelse return error.Unauthorized;
+    if (source_id) |id| {
+        const source = self.primary_sources.get(id) orelse return error.InvalidSource;
+        if (source.owner == null or !std.meta.eql(source.owner.?, device.owner)) return error.WrongClient;
+        if (source.used and !self.primarySelectionIs(id)) return error.SourceAlreadyUsed;
+    }
+    try self.replacePrimarySelection(source_id, order, true);
+    if (source_id) |id| {
+        if (self.primarySelectionIs(id)) self.primary_sources.get(id).?.used = true;
+    }
+}
+
+pub fn setExternalPrimarySelection(self: *DataDevice, source: ?PrimarySourceId) Error!void {
+    if (source) |id| if (self.primary_sources.get(id) == null) return error.InvalidSource;
+    try self.replacePrimarySelection(source, self.authority.nextOrder(), true);
+}
+
+pub fn clearExternalPrimarySelection(self: *DataDevice) void {
+    self.clearPrimarySelection(self.authority.nextOrder());
+}
+
+pub fn clearPrimarySelection(self: *DataDevice, order: SeatAuthority.Order) void {
+    self.replacePrimarySelection(null, order, true) catch self.forceClearPrimarySelection(order);
+}
+
+fn forceClearPrimarySelection(self: *DataDevice, order: SeatAuthority.Order) void {
+    if (self.primary_selection == null or order < self.primary_selection_order) return;
+    self.primary_selection = null;
+    self.primary_selection_order = order;
+    self.primary_selection_generation +%= 1;
+    self.invalidatePrimaryOffers(null);
+    if (self.listener.primary_selection_changed) |notify| notify(self.listener.context);
+}
+
+/// Fails closed after a focus-publication allocation failure. This retires
+/// existing offers without allocating or changing the selected source.
+pub fn clearPrimaryFocusNoFail(self: *DataDevice) void {
+    self.primary_focused_client = null;
+    self.invalidatePrimaryOffers(null);
+}
+
+fn replacePrimarySelection(self: *DataDevice, source: ?PrimarySourceId, order: SeatAuthority.Order, cancel_old: bool) Error!void {
+    if (self.primary_selection != null and order < self.primary_selection_order) return;
+    if (std.meta.eql(self.primary_selection, source)) {
+        self.primary_selection_order = order;
+        return;
+    }
+    const publication = self.issuePublication();
+    errdefer self.removePrimaryPublication(publication);
+    if (self.primary_focused_client != null and source != null) try self.stagePrimaryOffers(self.primary_focused_client.?, source.?, publication);
+    try self.publishPrimaryBatch(self.primary_focused_client, publication);
+    const old = self.primary_selection;
+    self.primary_selection = source;
+    self.primary_selection_order = order;
+    self.primary_selection_generation +%= 1;
+    self.invalidatePrimaryOffers(publication);
+    if (self.listener.primary_selection_changed) |notify| notify(self.listener.context);
+    if (cancel_old and old != null) if (self.primary_sources.get(old.?)) |state| {
+        const callback = state.endpoint.selection_cancelled orelse state.endpoint.cancelled;
+        callback(state.endpoint.context);
+    };
+}
+
+fn stagePrimaryOffers(self: *DataDevice, client: ClientRegistry.Id, source: PrimarySourceId, publication: u64) error{OutOfMemory}!void {
+    var devices = self.primary_devices.iterator();
+    while (devices.next()) |entry| {
+        if (std.meta.eql(entry.value.owner, client)) {
+            if (self.failPrimaryStageAllocationForTest()) return error.OutOfMemory;
+            _ = self.primary_offers.insert(self.allocator, .{ .device = entry.id, .source = source, .publication = publication }) catch return error.OutOfMemory;
+        }
+    }
+}
+
+pub fn failPrimaryStageAllocationAfterForTest(self: *DataDevice, successful_stages: usize) void {
+    if (comptime !builtin.is_test) unreachable;
+    self.primary_stage_failure = successful_stages;
+}
+
+fn failPrimaryStageAllocationForTest(self: *DataDevice) bool {
+    if (comptime !builtin.is_test) return false;
+    const remaining = self.primary_stage_failure orelse return false;
+    if (remaining != 0) {
+        self.primary_stage_failure = remaining - 1;
+        return false;
+    }
+    self.primary_stage_failure = null;
+    return true;
+}
+
+fn publishPrimaryBatch(self: *DataDevice, client: ?ClientRegistry.Id, publication: u64) error{OutOfMemory}!void {
+    var devices = self.primary_devices.iterator();
+    while (devices.next()) |entry| if (client != null and std.meta.eql(entry.value.owner, client.?)) {
+        var offer: ?PrimaryOfferId = null;
+        var offers = self.primary_offers.iterator();
+        while (offers.next()) |candidate| if (candidate.value.publication == publication and candidate.value.device != null and std.meta.eql(candidate.value.device.?, entry.id)) {
+            offer = candidate.id;
+            break;
+        };
+        if (entry.value.endpoint.selection_prepare) |prepare| prepare(entry.value.endpoint.context, offer) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+    };
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return error.OutOfMemory;
+    };
+    devices = self.primary_devices.iterator();
+    while (devices.next()) |entry| if (client != null and std.meta.eql(entry.value.owner, client.?)) {
+        var offer: ?PrimaryOfferId = null;
+        var offers = self.primary_offers.iterator();
+        while (offers.next()) |candidate| if (candidate.value.publication == publication and candidate.value.device != null and std.meta.eql(candidate.value.device.?, entry.id)) {
+            offer = candidate.id;
+            break;
+        };
+        entry.value.endpoint.selection(entry.value.endpoint.context, offer) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+    };
+    self.commitTransaction();
+}
+
+fn publishPrimaryFocusBatch(self: *DataDevice, old_client: ?ClientRegistry.Id, new_client: ?ClientRegistry.Id, publication: u64) error{OutOfMemory}!void {
+    var devices = self.primary_devices.iterator();
+    while (devices.next()) |entry| {
+        const old = old_client != null and std.meta.eql(entry.value.owner, old_client.?);
+        const new = new_client != null and std.meta.eql(entry.value.owner, new_client.?);
+        if (!old and !new) continue;
+        const offer = if (new) self.primaryOfferForDevice(entry.id, publication) else null;
+        if (entry.value.endpoint.selection_prepare) |prepare| prepare(entry.value.endpoint.context, offer) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+    }
+    self.finalizeTransaction() catch {
+        self.abortTransaction();
+        return error.OutOfMemory;
+    };
+    devices = self.primary_devices.iterator();
+    while (devices.next()) |entry| {
+        const old = old_client != null and std.meta.eql(entry.value.owner, old_client.?);
+        const new = new_client != null and std.meta.eql(entry.value.owner, new_client.?);
+        if (!old and !new) continue;
+        const offer = if (new) self.primaryOfferForDevice(entry.id, publication) else null;
+        entry.value.endpoint.selection(entry.value.endpoint.context, offer) catch {
+            self.abortTransaction();
+            return error.OutOfMemory;
+        };
+    }
+    self.commitTransaction();
+}
+
+fn primaryOfferForDevice(self: *DataDevice, device: PrimaryDeviceId, publication: u64) ?PrimaryOfferId {
+    var offers = self.primary_offers.iterator();
+    while (offers.next()) |candidate| if (candidate.value.publication == publication and candidate.value.device != null and std.meta.eql(candidate.value.device.?, device)) return candidate.id;
+    return null;
+}
+
+fn removePrimaryPublication(self: *DataDevice, publication: u64) void {
+    var offers = self.primary_offers.iterator();
+    while (offers.next()) |entry| if (entry.value.publication == publication) {
+        const id = entry.id;
+        if (self.listener.primary_offer_rolled_back) |notify| notify(self.listener.context, id);
+        _ = self.primary_offers.remove(id);
+    };
 }
 
 pub fn setSelection(self: *DataDevice, device_id: DeviceId, source_id: ?SourceId, serial: ClientRegistry.Serial) Error!void {
@@ -594,6 +894,13 @@ pub fn resourceCounts(self: *const DataDevice) ResourceCounts {
         .offers = self.offers.len(),
     };
 }
+pub fn primaryResourceCounts(self: *const DataDevice) ResourceCounts {
+    return .{
+        .sources = self.primary_sources.len(),
+        .devices = self.primary_devices.len(),
+        .offers = self.primary_offers.len(),
+    };
+}
 pub fn selectionMimeTypes(self: *const DataDevice) []const []u8 {
     const id = self.selection orelse return &.{};
     const source = self.sources.getConst(id) orelse return &.{};
@@ -605,6 +912,43 @@ pub fn selectionMimeTypes(self: *const DataDevice) []const []u8 {
 pub fn sendSelection(self: *DataDevice, mime: []const u8, fd: std.posix.fd_t) Error!void {
     const id = self.selection orelse return error.InvalidSource;
     try self.sendSource(id, mime, fd);
+}
+
+pub fn primarySelectionGeneration(self: *const DataDevice) u64 {
+    return self.primary_selection_generation;
+}
+pub fn hasPrimarySelection(self: *const DataDevice) bool {
+    return self.primary_selection != null;
+}
+pub fn primarySelectionIs(self: *const DataDevice, source: PrimarySourceId) bool {
+    return self.primary_selection != null and std.meta.eql(self.primary_selection.?, source);
+}
+pub fn primarySelectionMimeTypes(self: *const DataDevice) []const []u8 {
+    const id = self.primary_selection orelse return &.{};
+    const source = self.primary_sources.getConst(id) orelse return &.{};
+    return @ptrCast(source.mime_types.items);
+}
+pub fn primarySourceMimeTypes(self: *const DataDevice, id: PrimarySourceId) Error![]const []u8 {
+    const source = self.primary_sources.getConst(id) orelse return error.InvalidSource;
+    return @ptrCast(source.mime_types.items);
+}
+pub fn sendPrimarySelection(self: *DataDevice, mime: []const u8, fd: std.posix.fd_t) Error!void {
+    const id = self.primary_selection orelse return error.InvalidSource;
+    const source = self.primary_sources.get(id) orelse return error.InvalidSource;
+    if (!hasMime(source, mime)) return error.InvalidMime;
+    source.endpoint.send(source.endpoint.context, mime, fd);
+}
+pub fn primaryOfferSource(self: *const DataDevice, id: PrimaryOfferId) ?PrimarySourceId {
+    return (self.primary_offers.getConst(id) orelse return null).source;
+}
+pub fn receivePrimary(self: *DataDevice, id: PrimaryOfferId, mime: []const u8, fd: std.posix.fd_t) Error!void {
+    const offer = self.primary_offers.get(id) orelse return error.InvalidOffer;
+    const source = self.primary_sources.get(offer.source orelse return error.InvalidSource) orelse return error.InvalidSource;
+    if (!hasMime(source, mime)) return error.InvalidMime;
+    source.endpoint.send(source.endpoint.context, mime, fd);
+}
+pub fn destroyPrimaryOffer(self: *DataDevice, id: PrimaryOfferId) void {
+    _ = self.primary_offers.remove(id);
 }
 
 /// Requests a transfer from a specific live source. The descriptor remains
@@ -1441,6 +1785,12 @@ fn invalidateSelectionOffers(self: *DataDevice, preserve_publication: ?u64) void
             entry.value.source = null;
     }
 }
+fn invalidatePrimaryOffers(self: *DataDevice, preserve_publication: ?u64) void {
+    var it = self.primary_offers.iterator();
+    while (it.next()) |entry| {
+        if (preserve_publication == null or entry.value.publication != preserve_publication.?) entry.value.source = null;
+    }
+}
 fn invalidateGeneration(self: *DataDevice, generation: u64) void {
     var it = self.offers.iterator();
     while (it.next()) |entry| if (entry.value.kind == .drag and entry.value.drag_generation == generation) {
@@ -1471,6 +1821,7 @@ test "neutral action negotiation and nominal generations" {
     try std.testing.expectEqual(Actions{ .move = true }, selectAction(.{ .copy = true, .move = true }, .{ .copy = true, .move = true }, .{ .move = true }));
     try std.testing.expectEqual(Actions{ .copy = true }, selectAction(.{ .copy = true, .move = true }, .{ .copy = true }, .{}));
     try std.testing.expect(SourceId != DeviceId and DeviceId != OfferId);
+    try std.testing.expect(PrimarySourceId != SourceId and PrimaryDeviceId != DeviceId and PrimaryOfferId != OfferId);
 }
 
 test "selection authorization, publication, transfer, and replacement are canonical" {
@@ -1586,6 +1937,275 @@ test "selection authorization, publication, transfer, and replacement are canoni
     try data_device.setSelection(device, null, serial);
     try std.testing.expectEqual(@as(usize, 1), observer.cancellations);
     authority.discardGrants();
+}
+
+test "primary selection authorization publication transfer and lifetime are canonical" {
+    const Observer = struct {
+        offers: [12]?PrimaryOfferId = .{null} ** 12,
+        publications: usize = 0,
+        source_mimes: usize = 0,
+        offer_mimes: usize = 0,
+        cancellations: usize = 0,
+        changes: usize = 0,
+        sends: usize = 0,
+        expected_fd: std.posix.fd_t = -1,
+
+        fn primarySelection(context: *anyopaque, offer: ?PrimaryOfferId) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.offers[self.publications] = offer;
+            self.publications += 1;
+        }
+        fn send(context: *anyopaque, mime: []const u8, fd: std.posix.fd_t) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(std.mem.eql(u8, mime, "text/plain"));
+            std.debug.assert(fd == self.expected_fd);
+            self.sends += 1;
+        }
+        fn cancelled(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.cancellations += 1;
+        }
+        fn changed(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.changes += 1;
+        }
+        fn sourceMime(context: *anyopaque, _: PrimarySourceId, mime: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(std.mem.eql(u8, mime, "text/plain"));
+            self.source_mimes += 1;
+        }
+        fn offerMime(context: *anyopaque, _: PrimaryOfferId, mime: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            std.debug.assert(std.mem.eql(u8, mime, "text/plain"));
+            self.offer_mimes += 1;
+        }
+        fn ignored(_: *anyopaque) void {}
+        fn target(_: *anyopaque, _: ?[]const u8) void {}
+        fn action(_: *anyopaque, _: Actions) void {}
+    };
+
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    var authority = SeatAuthority.init(std.testing.allocator, &clients, &surfaces);
+    defer authority.deinit();
+    var observer: Observer = .{};
+    var data_device = DataDevice.init(std.testing.allocator, &clients, &surfaces, &authority, .{
+        .context = &observer,
+        .selection_changed = Observer.ignored,
+        .drag_changed = Observer.ignored,
+        .primary_selection_changed = Observer.changed,
+        .primary_mime_offered = Observer.sourceMime,
+        .primary_offer_mime_offered = Observer.offerMime,
+    });
+    defer data_device.deinit();
+    const client = try clients.register(.mature_display);
+    defer clients.unregister(client);
+    const endpoint: SourceEndpoint = .{
+        .context = &observer,
+        .send = Observer.send,
+        .target = Observer.target,
+        .action = Observer.action,
+        .cancelled = Observer.cancelled,
+        .drop_performed = Observer.ignored,
+        .finished = Observer.ignored,
+    };
+    const device_endpoint: PrimaryDeviceEndpoint = .{ .context = &observer, .selection = Observer.primarySelection };
+    const device_a = try data_device.createPrimaryDevice(client, device_endpoint);
+    const device_b = try data_device.createPrimaryDevice(client, device_endpoint);
+    try data_device.setPrimaryFocus(client);
+    const source = try data_device.createPrimarySource(client, endpoint);
+    const serial: ClientRegistry.Serial = .{ .domain = .mature_display, .value = 149 };
+    try std.testing.expect(authority.recordSelection(client, serial));
+    try data_device.setPrimarySelection(device_a, source, serial);
+    try std.testing.expectEqual(@as(u64, 1), data_device.primarySelectionGeneration());
+    try std.testing.expectEqual(@as(usize, 4), observer.publications);
+    const offer_a = observer.offers[2] orelse return error.TestExpectedEqual;
+    const offer_b = observer.offers[3] orelse return error.TestExpectedEqual;
+    try std.testing.expect(!std.meta.eql(offer_a, offer_b));
+    try std.testing.expect(std.meta.eql(data_device.primaryOfferSource(offer_a).?, source));
+    try std.testing.expect(std.meta.eql(data_device.primaryOfferSource(offer_b).?, source));
+
+    try data_device.offerPrimaryMime(source, "text/plain");
+    try std.testing.expectEqual(@as(usize, 1), observer.source_mimes);
+    try std.testing.expectEqual(@as(usize, 2), observer.offer_mimes);
+    var pipe: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe2(&pipe, .{ .CLOEXEC = true }));
+    defer _ = std.c.close(pipe[0]);
+    observer.expected_fd = pipe[1];
+    try data_device.receivePrimary(offer_a, "text/plain", pipe[1]);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.close(pipe[1]));
+    try std.testing.expectEqual(@as(usize, 1), observer.sends);
+
+    const clipboard = try data_device.createSource(client, endpoint, .{});
+    defer data_device.destroySource(clipboard);
+    try data_device.setExternalSelection(clipboard);
+    const clipboard_generation = data_device.selectionGeneration();
+    const replacement = try data_device.createPrimarySource(client, endpoint);
+    try data_device.setExternalPrimarySelection(replacement);
+    try std.testing.expectEqual(@as(usize, 1), observer.cancellations);
+    try std.testing.expectEqual(@as(u64, 2), data_device.primarySelectionGeneration());
+    try std.testing.expect(data_device.selectionIs(clipboard));
+    try std.testing.expectEqual(clipboard_generation, data_device.selectionGeneration());
+
+    const stale: ClientRegistry.Serial = .{ .domain = .mature_display, .value = 150 };
+    const generation = data_device.primarySelectionGeneration();
+    try std.testing.expectError(error.Unauthorized, data_device.setPrimarySelection(device_a, null, stale));
+    try std.testing.expect(data_device.primarySelectionIs(replacement));
+    try std.testing.expectEqual(generation, data_device.primarySelectionGeneration());
+    data_device.clearPrimarySelection(authority.nextOrder());
+    try std.testing.expectEqual(@as(usize, 2), observer.cancellations);
+    try std.testing.expectEqual(generation + 1, data_device.primarySelectionGeneration());
+
+    data_device.destroyPrimaryOffer(offer_a);
+    data_device.destroyPrimaryOffer(offer_a);
+    try std.testing.expectError(error.InvalidOffer, data_device.receivePrimary(offer_a, "text/plain", -1));
+    data_device.destroyPrimaryDevice(device_a);
+    data_device.destroyPrimaryDevice(device_a);
+    data_device.destroyPrimarySource(source);
+    data_device.destroyPrimarySource(source);
+    try std.testing.expectError(error.InvalidSource, data_device.offerPrimaryMime(source, "stale"));
+    data_device.destroyPrimaryDevice(device_b);
+    data_device.destroyPrimarySource(replacement);
+    authority.discardGrants();
+}
+
+test "primary publication allocation failure is atomic" {
+    const Endpoint = struct {
+        publications: usize = 0,
+        rollbacks: usize = 0,
+        fn selection(context: *anyopaque, _: ?PrimaryOfferId) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.publications += 1;
+        }
+        fn rollback(context: *anyopaque, _: PrimaryOfferId) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.rollbacks += 1;
+        }
+        fn ignored(_: *anyopaque) void {}
+        fn send(_: *anyopaque, _: []const u8, _: std.posix.fd_t) void {}
+        fn target(_: *anyopaque, _: ?[]const u8) void {}
+        fn action(_: *anyopaque, _: Actions) void {}
+    };
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    var authority = SeatAuthority.init(std.testing.allocator, &clients, &surfaces);
+    defer authority.deinit();
+    var endpoint: Endpoint = .{};
+    var data_device = DataDevice.init(std.testing.allocator, &clients, &surfaces, &authority, .{
+        .context = &endpoint,
+        .selection_changed = Endpoint.ignored,
+        .drag_changed = Endpoint.ignored,
+        .primary_offer_rolled_back = Endpoint.rollback,
+    });
+    defer data_device.deinit();
+    const client = try clients.register(.mature_display);
+    defer clients.unregister(client);
+    _ = try data_device.createPrimaryDevice(client, .{ .context = &endpoint, .selection = Endpoint.selection });
+    _ = try data_device.createPrimaryDevice(client, .{ .context = &endpoint, .selection = Endpoint.selection });
+    try data_device.setPrimaryFocus(client);
+    const source = try data_device.createPrimarySource(client, .{
+        .context = &endpoint,
+        .send = Endpoint.send,
+        .target = Endpoint.target,
+        .action = Endpoint.action,
+        .cancelled = Endpoint.ignored,
+        .drop_performed = Endpoint.ignored,
+        .finished = Endpoint.ignored,
+    });
+    data_device.failPrimaryStageAllocationAfterForTest(1);
+    try std.testing.expectError(error.OutOfMemory, data_device.setExternalPrimarySelection(source));
+    try std.testing.expectEqual(@as(usize, 2), endpoint.publications);
+    try std.testing.expectEqual(@as(usize, 1), endpoint.rollbacks);
+    try std.testing.expectEqual(@as(usize, 0), data_device.primary_offers.len());
+    try std.testing.expect(!data_device.hasPrimarySelection());
+    try std.testing.expectEqual(@as(u64, 0), data_device.primarySelectionGeneration());
+}
+
+test "primary focus handoff clears every losing device and stale order does not consume sources" {
+    const Endpoint = struct {
+        offers: usize = 0,
+        clears: usize = 0,
+
+        fn selection(context: *anyopaque, offer: ?PrimaryOfferId) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (offer == null) self.clears += 1 else self.offers += 1;
+        }
+        fn changed(_: *anyopaque) void {}
+        fn send(_: *anyopaque, _: []const u8, _: std.posix.fd_t) void {}
+        fn target(_: *anyopaque, _: ?[]const u8) void {}
+        fn action(_: *anyopaque, _: Actions) void {}
+        fn ignored(_: *anyopaque) void {}
+    };
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    var authority = SeatAuthority.init(std.testing.allocator, &clients, &surfaces);
+    defer authority.deinit();
+    var old_endpoint: Endpoint = .{};
+    var new_endpoint: Endpoint = .{};
+    var data_device = DataDevice.init(std.testing.allocator, &clients, &surfaces, &authority, .{
+        .context = &old_endpoint,
+        .selection_changed = Endpoint.changed,
+        .drag_changed = Endpoint.changed,
+    });
+    defer data_device.deinit();
+    const old_client = try clients.register(.wayring_server);
+    defer clients.unregister(old_client);
+    const new_client = try clients.register(.mature_display);
+    defer clients.unregister(new_client);
+    const old_device = try data_device.createPrimaryDevice(old_client, .{ .context = &old_endpoint, .selection = Endpoint.selection });
+    _ = try data_device.createPrimaryDevice(old_client, .{ .context = &old_endpoint, .selection = Endpoint.selection });
+    _ = try data_device.createPrimaryDevice(new_client, .{ .context = &new_endpoint, .selection = Endpoint.selection });
+    _ = try data_device.createPrimaryDevice(new_client, .{ .context = &new_endpoint, .selection = Endpoint.selection });
+    try data_device.setPrimaryFocus(old_client);
+    const source_a = try data_device.createPrimarySource(old_client, .{
+        .context = &old_endpoint,
+        .send = Endpoint.send,
+        .target = Endpoint.target,
+        .action = Endpoint.action,
+        .cancelled = Endpoint.ignored,
+        .drop_performed = Endpoint.ignored,
+        .finished = Endpoint.ignored,
+    });
+    const source_b = try data_device.createPrimarySource(old_client, .{
+        .context = &old_endpoint,
+        .send = Endpoint.send,
+        .target = Endpoint.target,
+        .action = Endpoint.action,
+        .cancelled = Endpoint.ignored,
+        .drop_performed = Endpoint.ignored,
+        .finished = Endpoint.ignored,
+    });
+    const first: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 301 };
+    try std.testing.expect(authority.recordSelection(old_client, first));
+    try data_device.setPrimarySelection(old_device, source_a, first);
+    const generation = data_device.primarySelectionGeneration();
+    const refresh: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 302 };
+    try std.testing.expect(authority.recordSelection(old_client, refresh));
+    try data_device.setPrimarySelection(old_device, source_a, refresh);
+    try std.testing.expectEqual(generation, data_device.primarySelectionGeneration());
+    try data_device.setPrimarySelection(old_device, source_b, first);
+    try std.testing.expect(data_device.primarySelectionIs(source_a));
+    try std.testing.expect(!data_device.primary_sources.get(source_b).?.used);
+    const fresh: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 303 };
+    try std.testing.expect(authority.recordSelection(old_client, fresh));
+    try data_device.setPrimarySelection(old_device, source_b, fresh);
+    try std.testing.expect(data_device.primarySelectionIs(source_b));
+    try data_device.offerPrimaryMime(source_a, "ignored-after-cancel");
+    try std.testing.expectEqual(@as(usize, 0), data_device.primary_sources.get(source_a).?.mime_types.items.len);
+
+    const old_clears_before_handoff = old_endpoint.clears;
+    const new_offers_before_handoff = new_endpoint.offers;
+    try data_device.setPrimaryFocus(new_client);
+    try std.testing.expectEqual(old_clears_before_handoff + 2, old_endpoint.clears);
+    try std.testing.expectEqual(new_offers_before_handoff + 2, new_endpoint.offers);
+    _ = authority.clientDisconnected(old_client);
+    _ = authority.clientDisconnected(new_client);
 }
 
 test "drag lifecycle rejects cross-client and stale IDs and finishes negotiated offers" {

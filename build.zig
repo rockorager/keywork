@@ -114,6 +114,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.dependency("wayland_source", .{}).path("protocol/wayland.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/xdg-shell/xdg-shell.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"));
+    generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("unstable/primary-selection/primary-selection-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/xdg-activation/xdg-activation-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/viewporter/viewporter.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/fractional-scale/fractional-scale-v1.xml"));

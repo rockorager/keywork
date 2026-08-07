@@ -95,6 +95,7 @@ const MatureClients = @import("wayland/MatureClients.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringDataDevice = @import("wayland/WayringDataDevice.zig");
+const WayringPrimarySelection = @import("wayland/WayringPrimarySelection.zig");
 const WayringCursorShape = @import("wayland/WayringCursorShape.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
@@ -151,6 +152,18 @@ pub const DataDeviceObserver = struct {
     offer_source_actions_changed: *const fn (*anyopaque, NeutralDataDevice.OfferId, NeutralDataDevice.Actions) void,
     offer_action_preflight: *const fn (*anyopaque, NeutralDataDevice.OfferId, NeutralDataDevice.Actions) error{OutOfMemory}!void,
     offer_action_changed: *const fn (*anyopaque, NeutralDataDevice.OfferId, NeutralDataDevice.Actions) void,
+};
+/// Canonical primary-selection notifications consumed by the generated
+/// frontend. The mature frontend remains attached directly as well.
+pub const PrimarySelectionObserver = struct {
+    context: *anyopaque,
+    transaction_finalize: *const fn (*anyopaque) error{OutOfMemory}!void,
+    transaction_commit: *const fn (*anyopaque) void,
+    transaction_abort: *const fn (*anyopaque) void,
+    selection_changed: *const fn (*anyopaque) void,
+    mime_offered: *const fn (*anyopaque, NeutralDataDevice.PrimarySourceId, []const u8) void,
+    offer_rolled_back: *const fn (*anyopaque, NeutralDataDevice.PrimaryOfferId) void,
+    offer_mime_offered: *const fn (*anyopaque, NeutralDataDevice.PrimaryOfferId, []const u8) void,
 };
 var expected_protocol_error: if (builtin.is_test) ?ExpectedProtocolError else void =
     if (builtin.is_test) null else {};
@@ -329,6 +342,7 @@ next_touch_id: u31,
 data_device: NeutralDataDevice,
 mature_data_device: WaylandDataDevice,
 data_device_observer: ?DataDeviceObserver = null,
+primary_selection_observer: ?PrimarySelectionObserver = null,
 xdg_toplevel_drag: XdgToplevelDrag,
 xdg_toplevel_icon: XdgToplevelIcon,
 xdg_dialog: XdgDialog,
@@ -1616,6 +1630,10 @@ pub fn createWithVirtualOutput(
             .offer_action_changed = dataDeviceOfferActionChanged,
             .external_drag_start = dataDeviceExternalDragStart,
             .retained_source_destroyed = dragExternalSourceDestroyed,
+            .primary_selection_changed = primarySelectionChanged,
+            .primary_mime_offered = primaryMimeOffered,
+            .primary_offer_rolled_back = primaryOfferRolledBack,
+            .primary_offer_mime_offered = primaryOfferMimeOffered,
         },
     );
     errdefer self.data_device.deinit();
@@ -1636,8 +1654,10 @@ pub fn createWithVirtualOutput(
         },
     );
     errdefer self.mature_data_device.deinit();
-    try self.primary_selection.init(allocator, display, &self.seat);
+    try self.primary_selection.init(allocator, display, &self.seat, &self.data_device);
     errdefer self.primary_selection.deinit();
+    try self.seat.addKeyboardFocusListener(.{ .context = self, .changed = primaryKeyboardFocusChanged });
+    errdefer self.seat.removeKeyboardFocusListener(self);
     try self.data_control.init(
         allocator,
         display,
@@ -2083,6 +2103,7 @@ pub fn destroy(self: *Self) void {
     self.seat.mutableClientRegistry().removeDisconnectListener(&self.neutral_text_input);
     self.neutral_text_input.deinit();
     self.data_control.deinit();
+    self.seat.removeKeyboardFocusListener(self);
     self.primary_selection.deinit();
     self.mature_data_device.deinit();
     self.seat.mutableClientRegistry().removeDisconnectListener(&self.data_device);
@@ -3935,6 +3956,10 @@ pub fn neutralDataDevice(self: *Self) *NeutralDataDevice {
 
 pub fn setDataDeviceObserver(self: *Self, observer: ?DataDeviceObserver) void {
     self.data_device_observer = observer;
+}
+
+pub fn setPrimarySelectionObserver(self: *Self, observer: ?PrimarySelectionObserver) void {
+    self.primary_selection_observer = observer;
 }
 
 /// Neutral XDG semantic owner used by unpublished generated adapters.
@@ -7665,6 +7690,41 @@ fn dataDeviceSelectionChanged(context: *anyopaque) void {
     if (self.xwm_initialized) self.xwm.selectionChanged();
 }
 
+fn primarySelectionChanged(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.primary_selection.neutralSelectionChanged();
+    if (self.primary_selection_observer) |observer|
+        observer.selection_changed(observer.context);
+}
+fn primaryKeyboardFocusChanged(context: *anyopaque, mature_client: ?*wl.Client) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const focused_client = if (self.seat.generatedKeyboardFocus()) |focus|
+        focus.client
+    else if (mature_client) |client|
+        self.seat.matureClientId(client)
+    else
+        null;
+    self.data_device.setPrimaryFocus(focused_client) catch self.data_device.clearPrimaryFocusNoFail();
+}
+fn primaryMimeOffered(context: *anyopaque, source: NeutralDataDevice.PrimarySourceId, mime: []const u8) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.primary_selection.neutralMimeOffered(source, mime);
+    if (self.primary_selection_observer) |observer|
+        observer.mime_offered(observer.context, source, mime);
+}
+fn primaryOfferRolledBack(context: *anyopaque, offer: NeutralDataDevice.PrimaryOfferId) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.primary_selection.neutralOfferRolledBack(offer);
+    if (self.primary_selection_observer) |observer|
+        observer.offer_rolled_back(observer.context, offer);
+}
+fn primaryOfferMimeOffered(context: *anyopaque, offer: NeutralDataDevice.PrimaryOfferId, mime: []const u8) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.primary_selection.neutralOfferMime(offer, mime);
+    if (self.primary_selection_observer) |observer|
+        observer.offer_mime_offered(observer.context, offer, mime);
+}
+
 fn dataDeviceMimeOffered(context: *anyopaque, source: NeutralDataDevice.SourceId, mime_type: []const u8) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.data_control.neutralMimeOffered(source, mime_type);
@@ -7680,16 +7740,23 @@ fn dataDeviceOfferRolledBack(context: *anyopaque, offer: NeutralDataDevice.Offer
 fn dataDeviceTransactionFinalize(context: *anyopaque) error{OutOfMemory}!void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.data_device_observer) |observer| try observer.transaction_finalize(observer.context);
+    if (self.primary_selection_observer) |observer| observer.transaction_finalize(observer.context) catch {
+        if (self.data_device_observer) |data_observer| data_observer.transaction_abort(data_observer.context);
+        return error.OutOfMemory;
+    };
 }
 
 fn dataDeviceTransactionCommit(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.data_device_observer) |observer| observer.transaction_commit(observer.context);
+    if (self.primary_selection_observer) |observer| observer.transaction_commit(observer.context);
 }
 
 fn dataDeviceTransactionAbort(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    self.primary_selection.transactionAbort();
     if (self.data_device_observer) |observer| observer.transaction_abort(observer.context);
+    if (self.primary_selection_observer) |observer| observer.transaction_abort(observer.context);
 }
 
 fn dataDeviceOfferSourceActionsPreflight(context: *anyopaque, offer: NeutralDataDevice.OfferId, actions: NeutralDataDevice.Actions) error{OutOfMemory}!void {
@@ -16999,6 +17066,7 @@ const WayringXdgClient = struct {
     command_fd: std.posix.fd_t,
     registry_only: bool = false,
     registry_watch_data_device: bool = false,
+    registry_watch_primary_selection: bool = false,
     offense: ?Offense = null,
     activation_role: ?ActivationRole = null,
     activation_exchange: ?*ActivationExchange = null,
@@ -17016,7 +17084,12 @@ const WayringXdgClient = struct {
     globals_exact: bool = true,
     data_device_manager_count: usize = 0,
     data_device_manager_version: u32 = 0,
+    data_device_manager_name: u32 = 0,
     data_device_manager_removed: bool = false,
+    primary_selection_manager_count: usize = 0,
+    primary_selection_manager_version: u32 = 0,
+    primary_selection_manager_name: u32 = 0,
+    primary_selection_manager_removed: bool = false,
     configure_serial: u32 = 0,
     configure_count: u8 = 0,
     toplevel_configure_count: u8 = 0,
@@ -17058,6 +17131,7 @@ const WayringXdgClient = struct {
         .{ .name = "zxdg_decoration_manager_v1", .version = 2 },
         .{ .name = "xdg_activation_v1", .version = 1 },
         .{ .name = "wl_data_device_manager", .version = 4 },
+        .{ .name = "zwp_primary_selection_device_manager_v1", .version = 1 },
     };
 
     fn run(self: *@This()) void {
@@ -17118,6 +17192,10 @@ const WayringXdgClient = struct {
             if (self.registry_watch_data_device) {
                 try expectClientRoundtrip(display);
                 if (!self.data_device_manager_removed) return error.DataDeviceManagerRemovalMissing;
+                try self.pause(.manager_removed);
+            } else if (self.registry_watch_primary_selection) {
+                try expectClientRoundtrip(display);
+                if (!self.primary_selection_manager_removed) return error.PrimarySelectionManagerRemovalMissing;
                 try self.pause(.manager_removed);
             }
             activation.destroy();
@@ -17338,6 +17416,11 @@ const WayringXdgClient = struct {
                 if (std.mem.eql(u8, interface, "wl_data_device_manager")) {
                     self.data_device_manager_count += 1;
                     self.data_device_manager_version = global.version;
+                    self.data_device_manager_name = global.name;
+                } else if (std.mem.eql(u8, interface, "zwp_primary_selection_device_manager_v1")) {
+                    self.primary_selection_manager_count += 1;
+                    self.primary_selection_manager_version = global.version;
+                    self.primary_selection_manager_name = global.name;
                 }
                 const index = self.global_count;
                 self.global_count += 1;
@@ -17345,7 +17428,12 @@ const WayringXdgClient = struct {
                     global.version != expected_globals[index].version) self.globals_exact = false;
                 if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, 6) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, 4) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, 11) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, 7) catch null else if (std.mem.eql(u8, interface, "zxdg_decoration_manager_v1")) self.decoration_manager = registry.bind(global.name, client_zxdg.DecorationManagerV1, 2) catch null else if (std.mem.eql(u8, interface, "xdg_activation_v1")) self.activation = registry.bind(global.name, client_xdg.ActivationV1, 1) catch null;
             },
-            .global_remove => self.data_device_manager_removed = self.data_device_manager_count != 0,
+            .global_remove => |removed| {
+                if (removed.name == self.data_device_manager_name)
+                    self.data_device_manager_removed = true;
+                if (removed.name == self.primary_selection_manager_name)
+                    self.primary_selection_manager_removed = true;
+            },
         }
     }
 
@@ -18908,6 +18996,296 @@ const MatureDataDeviceClient = struct {
     }
 };
 
+fn PrimarySelectionTestClient(comptime app_id: [:0]const u8, comptime pixel: u32) type {
+    const application_id = app_id;
+    const surface_pixel = pixel;
+    return struct {
+        const client_wl = wayland.client.wl;
+        const client_xdg = wayland.client.xdg;
+        const client_zwp = wayland.client.zwp;
+
+        const Stage = enum(u8) { starting, ready, focused, selected, stale_ignored, late_offered, receive_requested, sent, received, replaced, cleared, released, disconnected, failed };
+        const ClientCommand = enum(u8) { wait, focus, select, stale_clear, offer_late, serve, receive, replace, clear, release };
+        const mime_type: [:0]const u8 = "text/plain;charset=utf-8";
+        const late_mime_type: [:0]const u8 = "text/html";
+        const generated_bytes = "generated primary selection\n";
+        const mature_bytes = "mature primary selection\n";
+
+        runtime_directory: []const u8,
+        display_name: []const u8,
+        command_fd: std.posix.fd_t,
+        payload: []const u8,
+        stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+        command: std.atomic.Value(u8) = .init(@intFromEnum(ClientCommand.wait)),
+        wake_fd: std.atomic.Value(i32) = .init(-1),
+        failure: ?anyerror = null,
+        compositor: ?*client_wl.Compositor = null,
+        shm: ?*client_wl.Shm = null,
+        seat: ?*client_wl.Seat = null,
+        wm_base: ?*client_xdg.WmBase = null,
+        manager: ?*client_zwp.PrimarySelectionDeviceManagerV1 = null,
+        device: ?*client_zwp.PrimarySelectionDeviceV1 = null,
+        source: ?*client_zwp.PrimarySelectionSourceV1 = null,
+        offer: ?*client_zwp.PrimarySelectionOfferV1 = null,
+        keyboard_serial: u32 = 0,
+        configure_serial: u32 = 0,
+        surface_object_id: u32 = 0,
+        mime_count: usize = 0,
+        late_mime_count: usize = 0,
+        selection_count: usize = 0,
+        null_selection_count: usize = 0,
+        send_count: usize = 0,
+        cancelled_count: usize = 0,
+        received: [128]u8 = undefined,
+        received_len: usize = 0,
+
+        fn run(self: *@This()) void {
+            self.runFallible() catch |err| {
+                self.failure = err;
+                self.stage.store(@intFromEnum(Stage.failed), .release);
+                return;
+            };
+            self.stage.store(@intFromEnum(Stage.disconnected), .release);
+        }
+
+        fn runFallible(self: *@This()) !void {
+            const path = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}/{s}", .{ self.runtime_directory, self.display_name }, 0);
+            defer std.heap.page_allocator.free(path);
+            const fd = try connectWayringTestSocket(path);
+            var fd_owned = true;
+            defer if (fd_owned) {
+                _ = std.os.linux.close(fd);
+            };
+            const raw_wake_fd = std.os.linux.dup(fd);
+            if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+            const wake_fd: i32 = @intCast(raw_wake_fd);
+            if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+                _ = std.os.linux.close(wake_fd);
+                return error.ClientShutdown;
+            }
+            defer self.closeWake(false);
+
+            const display = try client_wl.Display.connectToFd(fd);
+            fd_owned = false;
+            defer display.disconnect();
+            const registry = try display.getRegistry();
+            defer registry.destroy();
+            registry.setListener(*@This(), registryEvent, self);
+            try expectClientRoundtrip(display);
+            const compositor = self.compositor orelse return error.CompositorMissing;
+            defer compositor.destroy();
+            const shm = self.shm orelse return error.ShmMissing;
+            defer shm.release();
+            const seat = self.seat orelse return error.SeatMissing;
+            defer seat.release();
+            const wm_base = self.wm_base orelse return error.XdgWmBaseMissing;
+            defer wm_base.destroy();
+            wm_base.setListener(*@This(), wmBaseEvent, self);
+            const manager = self.manager orelse return error.PrimarySelectionManagerMissing;
+            defer manager.destroy();
+            const keyboard = try seat.getKeyboard();
+            defer keyboard.release();
+            keyboard.setListener(*@This(), keyboardEvent, self);
+            const device = try manager.getDevice(seat);
+            self.device = device;
+            defer device.destroy();
+            device.setListener(*@This(), deviceEvent, self);
+            const surface = try compositor.createSurface();
+            self.surface_object_id = surface.getId();
+            defer surface.destroy();
+            const xdg_surface = try wm_base.getXdgSurface(surface);
+            defer xdg_surface.destroy();
+            xdg_surface.setListener(*@This(), xdgSurfaceEvent, self);
+            const toplevel = try xdg_surface.getToplevel();
+            defer toplevel.destroy();
+            toplevel.setListener(*@This(), toplevelEvent, self);
+            toplevel.setAppId(application_id);
+            surface.commit();
+            while (self.configure_serial == 0) try expectClientRoundtrip(display);
+            const buffer = try createClipboardBuffer(shm, surface_pixel);
+            defer buffer.buffer.destroy();
+            defer buffer.pool.destroy();
+            defer _ = std.os.linux.close(buffer.fd);
+            surface.attach(buffer.buffer, 0, 0);
+            surface.damageBuffer(0, 0, 1, 1);
+            surface.commit();
+            try expectClientRoundtrip(display);
+            try self.pause(.ready);
+
+            while (true) {
+                const command: ClientCommand = @enumFromInt(self.command.swap(@intFromEnum(ClientCommand.wait), .acq_rel));
+                switch (command) {
+                    .wait => return,
+                    .focus => {
+                        try expectClientRoundtrip(display);
+                        if (self.keyboard_serial == 0) return error.PrimaryFocusSerialMissing;
+                        try self.pause(.focused);
+                    },
+                    .select => {
+                        if (self.keyboard_serial == 0) return error.PrimaryFocusSerialMissing;
+                        if (self.source) |old| old.destroy();
+                        const source = try manager.createSource();
+                        self.source = source;
+                        source.setListener(*@This(), sourceEvent, self);
+                        source.offer(mime_type);
+                        device.setSelection(source, self.keyboard_serial);
+                        try expectClientRoundtrip(display);
+                        try self.pause(.selected);
+                    },
+                    .stale_clear => {
+                        if (self.keyboard_serial < 2) return error.PrimaryFocusSerialMissing;
+                        device.setSelection(null, self.keyboard_serial - 1);
+                        try expectClientRoundtrip(display);
+                        try self.pause(.stale_ignored);
+                    },
+                    .offer_late => {
+                        (self.source orelse return error.PrimarySourceMissing).offer(late_mime_type);
+                        try expectClientRoundtrip(display);
+                        try self.pause(.late_offered);
+                    },
+                    .serve => {
+                        try expectClientRoundtrip(display);
+                        if (self.send_count == 0) return error.PrimarySendMissing;
+                        try self.pause(.sent);
+                    },
+                    .receive => {
+                        try expectClientRoundtrip(display);
+                        const selected_offer = self.offer orelse return error.PrimaryOfferMissing;
+                        var pipe: [2]std.posix.fd_t = undefined;
+                        if (std.c.pipe(&pipe) != 0) return error.PipeFailed;
+                        var read_open = true;
+                        defer if (read_open) {
+                            _ = std.os.linux.close(pipe[0]);
+                        };
+                        selected_offer.receive(mime_type, pipe[1]);
+                        try closeMatureTransferFd(pipe[1]);
+                        try expectClientRoundtrip(display);
+                        try self.pause(.receive_requested);
+                        self.received_len = try readMatureTransfer(pipe[0], &self.received);
+                        try closeMatureTransferFd(pipe[0]);
+                        read_open = false;
+                        try self.pause(.received);
+                    },
+                    .replace => {
+                        const replacement = try manager.createSource();
+                        replacement.setListener(*@This(), sourceEvent, self);
+                        replacement.offer(mime_type);
+                        device.setSelection(replacement, self.keyboard_serial);
+                        try expectClientRoundtrip(display);
+                        if (self.source) |old| old.destroy();
+                        self.source = replacement;
+                        try self.pause(.replaced);
+                    },
+                    .clear => {
+                        device.setSelection(null, self.keyboard_serial);
+                        try expectClientRoundtrip(display);
+                        try self.pause(.cleared);
+                    },
+                    .release => {
+                        if (self.offer) |offer| {
+                            offer.destroy();
+                            self.offer = null;
+                        }
+                        if (self.source) |source| {
+                            source.destroy();
+                            self.source = null;
+                        }
+                        self.device = null;
+                        self.manager = null;
+                        try self.pause(.released);
+                        return;
+                    },
+                }
+            }
+        }
+
+        fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+            switch (event) {
+                .global => |global| {
+                    const interface = std.mem.span(global.interface);
+                    if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, @min(global.version, 7)) catch null else if (std.mem.eql(u8, interface, "zwp_primary_selection_device_manager_v1")) self.manager = registry.bind(global.name, client_zwp.PrimarySelectionDeviceManagerV1, 1) catch null;
+                },
+                .global_remove => {},
+            }
+        }
+        fn wmBaseEvent(wm_base: *client_xdg.WmBase, event: client_xdg.WmBase.Event, _: *@This()) void {
+            switch (event) {
+                .ping => |ping| wm_base.pong(ping.serial),
+            }
+        }
+        fn xdgSurfaceEvent(xdg_surface: *client_xdg.Surface, event: client_xdg.Surface.Event, self: *@This()) void {
+            switch (event) {
+                .configure => |configure| {
+                    self.configure_serial = configure.serial;
+                    xdg_surface.ackConfigure(configure.serial);
+                },
+            }
+        }
+        fn toplevelEvent(_: *client_xdg.Toplevel, _: client_xdg.Toplevel.Event, _: *@This()) void {}
+        fn keyboardEvent(_: *client_wl.Keyboard, event: client_wl.Keyboard.Event, self: *@This()) void {
+            switch (event) {
+                .keymap => |keymap| _ = std.os.linux.close(keymap.fd),
+                .enter => |enter| self.keyboard_serial = enter.serial,
+                else => {},
+            }
+        }
+        fn deviceEvent(_: *client_zwp.PrimarySelectionDeviceV1, event: client_zwp.PrimarySelectionDeviceV1.Event, self: *@This()) void {
+            switch (event) {
+                .data_offer => |data| data.offer.setListener(*@This(), offerEvent, self),
+                .selection => |selection| {
+                    self.selection_count += 1;
+                    if (selection.id == null) self.null_selection_count += 1;
+                    self.offer = selection.id;
+                },
+            }
+        }
+        fn offerEvent(_: *client_zwp.PrimarySelectionOfferV1, event: client_zwp.PrimarySelectionOfferV1.Event, self: *@This()) void {
+            switch (event) {
+                .offer => |offer| if (std.mem.eql(u8, std.mem.span(offer.mime_type), late_mime_type)) {
+                    self.late_mime_count += 1;
+                } else {
+                    self.mime_count += 1;
+                },
+            }
+        }
+        fn sourceEvent(_: *client_zwp.PrimarySelectionSourceV1, event: client_zwp.PrimarySelectionSourceV1.Event, self: *@This()) void {
+            switch (event) {
+                .send => |send| {
+                    if (std.c.write(send.fd, self.payload.ptr, self.payload.len) != self.payload.len) self.failure = error.PrimarySendFailed;
+                    closeMatureTransferFd(send.fd) catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                    self.send_count += 1;
+                },
+                .cancelled => self.cancelled_count += 1,
+            }
+        }
+        fn pause(self: *@This(), value: Stage) !void {
+            self.stage.store(@intFromEnum(value), .release);
+            try waitForWayringCommand(self.command_fd);
+        }
+        fn closeWake(self: *@This(), shutdown_requested: bool) void {
+            const fd = self.wake_fd.swap(-2, .acq_rel);
+            if (fd < 0) return;
+            if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+            _ = std.os.linux.close(fd);
+        }
+        fn shutdown(self: *@This()) void {
+            signalWayringCommand(self.command_fd) catch {};
+            self.closeWake(true);
+        }
+    };
+}
+
+const GeneratedPrimaryClient = PrimarySelectionTestClient("org.keywork.primary-generated", 0xff31_79d4);
+const MaturePrimaryClient = PrimarySelectionTestClient("org.keywork.primary-mature", 0xffd4_7931);
+
+comptime {
+    _ = GeneratedPrimaryClient.run;
+    _ = MaturePrimaryClient.run;
+}
+
 /// Socket client used by mixed-front-end clipboard tests.  This deliberately
 /// owns its connection and protocol objects instead of borrowing the much
 /// broader `MatureDataDeviceClient` (which also exercises data-control and
@@ -20270,6 +20648,25 @@ fn waitForClipboardStage(server: *Self, host: anytype, client: anytype, expected
     });
     std.debug.print("clipboard events: {d}, serial: {d}\n", .{ client.event_count, client.keyboard_serial });
     return error.ClipboardClientTimedOut;
+}
+
+fn waitForPrimaryStage(server: *Self, host: anytype, client: anytype, expected: GeneratedPrimaryClient.Stage) !void {
+    for (0..2_000) |_| {
+        const stage: GeneratedPrimaryClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) {
+            std.debug.print("primary-selection client failed while waiting for {t}: {t}\n", .{ expected, client.failure.? });
+            return client.failure.?;
+        }
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    }
+    std.debug.print("primary-selection timeout waiting for {t}, current {t}\n", .{
+        expected,
+        @as(GeneratedPrimaryClient.Stage, @enumFromInt(client.stage.load(.acquire))),
+    });
+    return error.PrimarySelectionClientTimedOut;
 }
 
 fn waitForGeneratedDragOffenderStage(
@@ -21641,6 +22038,22 @@ test "production Wayring XDG publication accepts a real registry client and surv
     defer server.setDataDeviceObserver(null);
     try data_device.publish();
     defer data_device.unpublish();
+    var primary_selection: WayringPrimarySelection = undefined;
+    primary_selection.init(std.testing.allocator, &protocol_server, &clients, &seat, server.neutralDataDevice());
+    defer primary_selection.deinit();
+    server.setPrimarySelectionObserver(.{
+        .context = &primary_selection,
+        .transaction_finalize = WayringPrimarySelection.transactionFinalize,
+        .transaction_commit = WayringPrimarySelection.transactionCommit,
+        .transaction_abort = WayringPrimarySelection.transactionAbort,
+        .selection_changed = WayringPrimarySelection.selectionChanged,
+        .mime_offered = WayringPrimarySelection.mimeOffered,
+        .offer_rolled_back = WayringPrimarySelection.offerRolledBack,
+        .offer_mime_offered = WayringPrimarySelection.offerMimeOffered,
+    });
+    defer server.setPrimarySelectionObserver(null);
+    try primary_selection.publish();
+    defer primary_selection.unpublish();
 
     const Lifecycle = struct {
         clients: *WayringClients,
@@ -21654,6 +22067,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
         decoration: *WayringXdgDecoration,
         activation: *WayringXdgActivation,
         data_device: *WayringDataDevice,
+        primary_selection: *WayringPrimarySelection,
         accepted_count: usize = 0,
 
         fn accepted(context: *anyopaque, client: *wayring.server.Client) !void {
@@ -21666,6 +22080,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.data_device.destroyClientResources(client);
+            self.primary_selection.destroyClientResources(client);
             self.activation.destroyClientResources(client);
             self.decoration.destroyClientResources(client);
             self.cursor_shape.destroyClientResources(client);
@@ -21678,7 +22093,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
             if (self.clients.id(client) != null) self.clients.unregister(client);
         }
     };
-    var lifecycle: Lifecycle = .{ .clients = &clients, .compositor = &compositor, .outputs = &outputs, .seat = &seat, .xdg = &xdg, .viewporter = &viewporter, .fractional_scale = &fractional_scale, .cursor_shape = &cursor_shape, .decoration = &decoration, .activation = &activation, .data_device = &data_device };
+    var lifecycle: Lifecycle = .{ .clients = &clients, .compositor = &compositor, .outputs = &outputs, .seat = &seat, .xdg = &xdg, .viewporter = &viewporter, .fractional_scale = &fractional_scale, .cursor_shape = &cursor_shape, .decoration = &decoration, .activation = &activation, .data_device = &data_device, .primary_selection = &primary_selection };
     const host = try WayringHost.create(std.testing.allocator, server.eventLoop(), &protocol_server, runtime_directory, .{
         .context = &lifecycle,
         .accepted = Lifecycle.accepted,
@@ -22145,6 +22560,30 @@ test "production generated data device completes the exact profile and supports 
 
     // Production publishes this global last, after every dependency is ready.
     try data_device.publish();
+    var primary_selection: WayringPrimarySelection = undefined;
+    primary_selection.init(
+        std.testing.allocator,
+        &protocol_server,
+        &clients,
+        &seat,
+        server.neutralDataDevice(),
+    );
+    defer {
+        if (primary_selection.global != null) primary_selection.unpublish();
+        primary_selection.deinit();
+    }
+    server.setPrimarySelectionObserver(.{
+        .context = &primary_selection,
+        .transaction_finalize = WayringPrimarySelection.transactionFinalize,
+        .transaction_commit = WayringPrimarySelection.transactionCommit,
+        .transaction_abort = WayringPrimarySelection.transactionAbort,
+        .selection_changed = WayringPrimarySelection.selectionChanged,
+        .mime_offered = WayringPrimarySelection.mimeOffered,
+        .offer_rolled_back = WayringPrimarySelection.offerRolledBack,
+        .offer_mime_offered = WayringPrimarySelection.offerMimeOffered,
+    });
+    defer server.setPrimarySelectionObserver(null);
+    try primary_selection.publish();
 
     const Lifecycle = struct {
         const FatalEvidence = struct {
@@ -22173,6 +22612,7 @@ test "production generated data device completes the exact profile and supports 
         decoration: *WayringXdgDecoration,
         activation: *WayringXdgActivation,
         data_device: *WayringDataDevice,
+        primary_selection: *WayringPrimarySelection,
         generated_client: ?ClientRegistry.Id = null,
         offender_fatal: ?FatalEvidence = null,
         fatal_count: usize = 0,
@@ -22203,6 +22643,7 @@ test "production generated data device completes the exact profile and supports 
                 }
             };
             self.data_device.destroyClientResources(client);
+            self.primary_selection.destroyClientResources(client);
             self.activation.destroyClientResources(client);
             self.decoration.destroyClientResources(client);
             self.cursor_shape.destroyClientResources(client);
@@ -22227,6 +22668,7 @@ test "production generated data device completes the exact profile and supports 
         .decoration = &decoration,
         .activation = &activation,
         .data_device = &data_device,
+        .primary_selection = &primary_selection,
     };
     const host = try WayringHost.create(
         std.testing.allocator,
@@ -22264,8 +22706,11 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(WayringXdgClient.expected_globals.len, peer.global_count);
     try std.testing.expectEqual(@as(usize, 1), peer.data_device_manager_count);
     try std.testing.expectEqual(@as(u32, 4), peer.data_device_manager_version);
+    try std.testing.expectEqual(@as(usize, 1), peer.primary_selection_manager_count);
+    try std.testing.expectEqual(@as(u32, 1), peer.primary_selection_manager_version);
     try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
 
+    primary_selection.unpublish();
     data_device.unpublish();
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .manager_removed);
@@ -22280,6 +22725,247 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(resource_baseline, server.dataDeviceResourceSnapshot());
 
     try data_device.publish();
+    try primary_selection.publish();
+    const primary_resource_baseline = server.neutralDataDevice().primaryResourceCounts();
+    const raw_generated_primary_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    const raw_mature_primary_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_generated_primary_command) != .SUCCESS or
+        linux.errno(raw_mature_primary_command) != .SUCCESS)
+        return error.EventFdFailed;
+    const generated_primary_command: std.posix.fd_t = @intCast(raw_generated_primary_command);
+    const mature_primary_command: std.posix.fd_t = @intCast(raw_mature_primary_command);
+    defer _ = linux.close(generated_primary_command);
+    defer _ = linux.close(mature_primary_command);
+    const primary_fd_baseline = try countMatureDataDeviceFds();
+    var generated_primary: GeneratedPrimaryClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = generated_primary_command,
+        .payload = GeneratedPrimaryClient.generated_bytes,
+    };
+    var mature_primary: MaturePrimaryClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = mature_socket_name,
+        .command_fd = mature_primary_command,
+        .payload = MaturePrimaryClient.mature_bytes,
+    };
+    const generated_primary_thread = try std.Thread.spawn(.{}, GeneratedPrimaryClient.run, .{&generated_primary});
+    const mature_primary_thread = try std.Thread.spawn(.{}, MaturePrimaryClient.run, .{&mature_primary});
+    var generated_primary_joined = false;
+    var mature_primary_joined = false;
+    defer if (!generated_primary_joined) {
+        generated_primary.shutdown();
+        generated_primary_thread.join();
+    };
+    defer if (!mature_primary_joined) {
+        mature_primary.shutdown();
+        mature_primary_thread.join();
+    };
+    try waitForPrimaryStage(server, host, &generated_primary, .ready);
+    try waitForPrimaryStage(server, host, &mature_primary, .ready);
+    const generated_primary_surface = wayringSurfaceWithPixel(server, 0xff31_79d4) orelse
+        return error.GeneratedPrimarySurfaceMissing;
+    var mature_primary_surface: ?Surface.Id = null;
+    var primary_surfaces = server.compositor.surfaceStore().iterator();
+    while (primary_surfaces.next()) |entry| {
+        const state = server.surface_registry.renderState(entry.id) orelse continue;
+        if (state.buffer.pixels.len == 1 and state.buffer.pixels[0] == 0xffd4_7931)
+            mature_primary_surface = entry.id;
+    }
+    const mature_primary_surface_id = mature_primary_surface orelse return error.MaturePrimarySurfaceMissing;
+
+    const primary_generation_a = server.neutralDataDevice().primarySelectionGeneration();
+    server.window_manager.settleConfigureTransactionForTest();
+    try std.testing.expect(server.window_manager.activationRequested(generated_primary_surface, true));
+    server.window_manager.settleConfigureTransactionForTest();
+    server.refreshKeyboardFocus();
+    try std.testing.expectEqual(
+        generated_primary_surface,
+        (server.seat.generatedKeyboardFocus() orelse return error.GeneratedPrimaryFocusMissing).surface,
+    );
+    try server.seat.parentKeyboardEnter(&.{});
+    generated_primary.command.store(@intFromEnum(GeneratedPrimaryClient.ClientCommand.focus), .release);
+    try signalWayringCommand(generated_primary_command);
+    try waitForPrimaryStage(server, host, &generated_primary, .focused);
+    generated_primary.command.store(@intFromEnum(GeneratedPrimaryClient.ClientCommand.select), .release);
+    try signalWayringCommand(generated_primary_command);
+    try waitForPrimaryStage(server, host, &generated_primary, .selected);
+    try std.testing.expectEqual(primary_generation_a + 1, server.neutralDataDevice().primarySelectionGeneration());
+    generated_primary.command.store(@intFromEnum(GeneratedPrimaryClient.ClientCommand.stale_clear), .release);
+    try signalWayringCommand(generated_primary_command);
+    try waitForPrimaryStage(server, host, &generated_primary, .stale_ignored);
+    try std.testing.expectEqual(primary_generation_a + 1, server.neutralDataDevice().primarySelectionGeneration());
+    try std.testing.expect(server.neutralDataDevice().hasPrimarySelection());
+    try std.testing.expectEqual(@as(usize, 1), host.connectionCount());
+    const generated_null_before_handoff = generated_primary.null_selection_count;
+
+    server.window_manager.settleConfigureTransactionForTest();
+    try std.testing.expect(server.window_manager.activationRequested(mature_primary_surface_id, true));
+    server.window_manager.settleConfigureTransactionForTest();
+    server.refreshKeyboardFocus();
+    try std.testing.expectEqual(
+        mature_primary_surface_id,
+        server.seat.matureKeyboardFocus() orelse return error.MaturePrimaryFocusMissing,
+    );
+    try server.seat.parentKeyboardEnter(&.{});
+    mature_primary.command.store(@intFromEnum(MaturePrimaryClient.ClientCommand.focus), .release);
+    try signalWayringCommand(mature_primary_command);
+    try waitForPrimaryStage(server, host, &mature_primary, .focused);
+    generated_primary.command.store(@intFromEnum(GeneratedPrimaryClient.ClientCommand.offer_late), .release);
+    try signalWayringCommand(generated_primary_command);
+    try waitForPrimaryStage(server, host, &generated_primary, .late_offered);
+    try std.testing.expectEqual(generated_null_before_handoff + 1, generated_primary.null_selection_count);
+    mature_primary.command.store(@intFromEnum(MaturePrimaryClient.ClientCommand.receive), .release);
+    try signalWayringCommand(mature_primary_command);
+    try waitForPrimaryStage(server, host, &mature_primary, .receive_requested);
+    generated_primary.command.store(@intFromEnum(GeneratedPrimaryClient.ClientCommand.serve), .release);
+    try signalWayringCommand(generated_primary_command);
+    try waitForPrimaryStage(server, host, &generated_primary, .sent);
+    try signalWayringCommand(mature_primary_command);
+    try waitForPrimaryStage(server, host, &mature_primary, .received);
+    try std.testing.expectEqualStrings(
+        GeneratedPrimaryClient.generated_bytes,
+        mature_primary.received[0..mature_primary.received_len],
+    );
+    try std.testing.expectEqual(@as(usize, 1), generated_primary.send_count);
+    try std.testing.expect(mature_primary.mime_count >= 1);
+    try std.testing.expectEqual(@as(usize, 1), mature_primary.late_mime_count);
+
+    const primary_generation_b = server.neutralDataDevice().primarySelectionGeneration();
+    mature_primary.command.store(@intFromEnum(MaturePrimaryClient.ClientCommand.select), .release);
+    try signalWayringCommand(mature_primary_command);
+    try waitForPrimaryStage(server, host, &mature_primary, .selected);
+    try std.testing.expectEqual(primary_generation_b + 1, server.neutralDataDevice().primarySelectionGeneration());
+    const mature_null_before_handoff = mature_primary.null_selection_count;
+    server.window_manager.settleConfigureTransactionForTest();
+    try std.testing.expect(server.window_manager.activationRequested(generated_primary_surface, true));
+    server.window_manager.settleConfigureTransactionForTest();
+    server.refreshKeyboardFocus();
+    try std.testing.expectEqual(
+        generated_primary_surface,
+        (server.seat.generatedKeyboardFocus() orelse return error.GeneratedPrimaryFocusMissing).surface,
+    );
+    try server.seat.parentKeyboardEnter(&.{});
+    generated_primary.command.store(@intFromEnum(GeneratedPrimaryClient.ClientCommand.focus), .release);
+    try signalWayringCommand(generated_primary_command);
+    try waitForPrimaryStage(server, host, &generated_primary, .focused);
+    mature_primary.command.store(@intFromEnum(MaturePrimaryClient.ClientCommand.offer_late), .release);
+    try signalWayringCommand(mature_primary_command);
+    try waitForPrimaryStage(server, host, &mature_primary, .late_offered);
+    try std.testing.expectEqual(mature_null_before_handoff + 1, mature_primary.null_selection_count);
+    generated_primary.command.store(@intFromEnum(GeneratedPrimaryClient.ClientCommand.receive), .release);
+    try signalWayringCommand(generated_primary_command);
+    try waitForPrimaryStage(server, host, &generated_primary, .receive_requested);
+    mature_primary.command.store(@intFromEnum(MaturePrimaryClient.ClientCommand.serve), .release);
+    try signalWayringCommand(mature_primary_command);
+    try waitForPrimaryStage(server, host, &mature_primary, .sent);
+    try signalWayringCommand(generated_primary_command);
+    try waitForPrimaryStage(server, host, &generated_primary, .received);
+    try std.testing.expectEqualStrings(
+        MaturePrimaryClient.mature_bytes,
+        generated_primary.received[0..generated_primary.received_len],
+    );
+    try std.testing.expectEqual(@as(usize, 1), mature_primary.send_count);
+    try std.testing.expectEqual(@as(usize, 1), generated_primary.late_mime_count);
+    try std.testing.expectEqual(@as(usize, 1), generated_primary.cancelled_count);
+
+    generated_primary.command.store(@intFromEnum(GeneratedPrimaryClient.ClientCommand.replace), .release);
+    try signalWayringCommand(generated_primary_command);
+    try waitForPrimaryStage(server, host, &generated_primary, .replaced);
+    mature_primary.command.store(@intFromEnum(MaturePrimaryClient.ClientCommand.focus), .release);
+    try signalWayringCommand(mature_primary_command);
+    try waitForPrimaryStage(server, host, &mature_primary, .focused);
+    try std.testing.expectEqual(@as(usize, 1), mature_primary.cancelled_count);
+    generated_primary.command.store(@intFromEnum(GeneratedPrimaryClient.ClientCommand.clear), .release);
+    try signalWayringCommand(generated_primary_command);
+    try waitForPrimaryStage(server, host, &generated_primary, .cleared);
+    try std.testing.expect(!server.neutralDataDevice().hasPrimarySelection());
+
+    generated_primary.command.store(@intFromEnum(GeneratedPrimaryClient.ClientCommand.release), .release);
+    mature_primary.command.store(@intFromEnum(MaturePrimaryClient.ClientCommand.release), .release);
+    try signalWayringCommand(generated_primary_command);
+    try signalWayringCommand(mature_primary_command);
+    try waitForPrimaryStage(server, host, &generated_primary, .released);
+    try waitForPrimaryStage(server, host, &mature_primary, .released);
+    try signalWayringCommand(generated_primary_command);
+    try signalWayringCommand(mature_primary_command);
+    try waitForPrimaryStage(server, host, &generated_primary, .disconnected);
+    try waitForPrimaryStage(server, host, &mature_primary, .disconnected);
+    generated_primary_thread.join();
+    generated_primary_joined = true;
+    mature_primary_thread.join();
+    mature_primary_joined = true;
+    for (0..2_000) |_| {
+        if (host.connectionCount() == 0 and server.client_registry.len() == client_baseline and
+            server.surface_registry.len() == surface_baseline and
+            server.compositor.surfaceStore().len() == mature_surface_baseline and
+            server.headless_surface_forest.len() == forest_baseline and
+            std.meta.eql(server.neutralDataDevice().primaryResourceCounts(), primary_resource_baseline) and
+            !server.neutralDataDevice().hasPrimarySelection()) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.MixedPrimarySelectionCleanupTimedOut;
+    try std.testing.expectEqual(primary_fd_baseline, try countMatureDataDeviceFds());
+
+    const raw_primary_watch_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_primary_watch_command) != .SUCCESS) return error.EventFdFailed;
+    const primary_watch_command: std.posix.fd_t = @intCast(raw_primary_watch_command);
+    defer _ = linux.close(primary_watch_command);
+    var primary_watch: WayringXdgClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = primary_watch_command,
+        .registry_only = true,
+        .registry_watch_primary_selection = true,
+    };
+    const primary_watch_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_watch});
+    var primary_watch_joined = false;
+    defer if (!primary_watch_joined) {
+        primary_watch.shutdown();
+        primary_watch_thread.join();
+    };
+    try waitForWayringXdgStage(server, host, &primary_watch, .registry_ready);
+    try std.testing.expect(primary_watch.globals_exact);
+    try std.testing.expectEqual(@as(usize, 1), primary_watch.primary_selection_manager_count);
+    primary_selection.unpublish();
+    try signalWayringCommand(primary_watch_command);
+    try waitForWayringXdgStage(server, host, &primary_watch, .manager_removed);
+    try std.testing.expect(primary_watch.primary_selection_manager_removed);
+    try signalWayringCommand(primary_watch_command);
+    try waitForWayringXdgStage(server, host, &primary_watch, .disconnected);
+    primary_watch_thread.join();
+    primary_watch_joined = true;
+    try waitForWayringDisconnect(server, host, &compositor);
+
+    try primary_selection.publish();
+    const raw_primary_rebind_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_primary_rebind_command) != .SUCCESS) return error.EventFdFailed;
+    const primary_rebind_command: std.posix.fd_t = @intCast(raw_primary_rebind_command);
+    defer _ = linux.close(primary_rebind_command);
+    var primary_rebind: WayringXdgClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = primary_rebind_command,
+        .registry_only = true,
+    };
+    const primary_rebind_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_rebind});
+    var primary_rebind_joined = false;
+    defer if (!primary_rebind_joined) {
+        primary_rebind.shutdown();
+        primary_rebind_thread.join();
+    };
+    try waitForWayringXdgStage(server, host, &primary_rebind, .registry_ready);
+    try std.testing.expect(primary_rebind.globals_exact);
+    try std.testing.expectEqual(WayringXdgClient.expected_globals.len, primary_rebind.global_count);
+    try std.testing.expectEqual(@as(usize, 1), primary_rebind.primary_selection_manager_count);
+    try std.testing.expectEqual(@as(u32, 1), primary_rebind.primary_selection_manager_version);
+    try signalWayringCommand(primary_rebind_command);
+    try waitForWayringXdgStage(server, host, &primary_rebind, .disconnected);
+    primary_rebind_thread.join();
+    primary_rebind_joined = true;
+    try waitForWayringDisconnect(server, host, &compositor);
+
     const raw_generated_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     const raw_mature_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     const raw_offender_command = linux.eventfd(0, linux.EFD.CLOEXEC);
