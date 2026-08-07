@@ -75,8 +75,7 @@ pub fn unpublish(self: *WayringDataControl) void {
 /// Suitable for Server.setGlobalFilter. The integration owns filter lifetime.
 pub fn globalFilter(self: *WayringDataControl, client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
     if (global.visibility() != .restricted) return true;
-    const credentials = client.credentials() orelse return false;
-    return credentials.uid == self.authorized_uid and client.transportProvenance() == .direct;
+    return client.isAuthorizedDirectPeer(self.authorized_uid);
 }
 
 fn bindManager(client: *wayring.server.Client, id: u32, version: u32, self: *WayringDataControl) !void {

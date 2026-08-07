@@ -14,16 +14,6 @@ const WayringCompositor = @import("WayringCompositor.zig");
 
 const wl = wayland.server.wl;
 
-pub const Authorization = union(enum) {
-    expected_uid: std.os.linux.uid_t,
-    callback: Callback,
-
-    pub const Callback = struct {
-        context: *anyopaque,
-        authorize: *const fn (*anyopaque, wayring.server.Client.Credentials) bool,
-    };
-};
-
 pub const Layout = struct {
     context: *anyopaque,
     popup_created: *const fn (*anyopaque, TextInput.PopupId, TextInput.MethodId, WayringCompositor.SurfaceId) error{OutOfMemory}!void,
@@ -65,7 +55,7 @@ clients: *WayringClients,
 seat_adapter: *WayringSeatAdapter,
 seat: *Seat,
 owner: *TextInput,
-authorization: Authorization,
+authorized_uid: std.os.linux.uid_t,
 compositor: *WayringCompositor,
 layout: Layout,
 global: ?*const wayring.server.Server.Global = null,
@@ -75,8 +65,8 @@ active_method: ?*Method = null,
 next_grab_token: ?u64 = 1,
 inhibited: bool = false,
 
-pub fn init(self: *WayringInputMethod, allocator: std.mem.Allocator, protocol_server: *wayring.server.Server, clients: *WayringClients, seat_adapter: *WayringSeatAdapter, seat: *Seat, owner: *TextInput, compositor: *WayringCompositor, authorization: Authorization, layout: Layout) void {
-    self.* = .{ .allocator = allocator, .protocol_server = protocol_server, .clients = clients, .seat_adapter = seat_adapter, .seat = seat, .owner = owner, .compositor = compositor, .authorization = authorization, .layout = layout };
+pub fn init(self: *WayringInputMethod, allocator: std.mem.Allocator, protocol_server: *wayring.server.Server, clients: *WayringClients, seat_adapter: *WayringSeatAdapter, seat: *Seat, owner: *TextInput, compositor: *WayringCompositor, authorized_uid: std.os.linux.uid_t, layout: Layout) void {
+    self.* = .{ .allocator = allocator, .protocol_server = protocol_server, .clients = clients, .seat_adapter = seat_adapter, .seat = seat, .owner = owner, .compositor = compositor, .authorized_uid = authorized_uid, .layout = layout };
     compositor.setInputPopupListener(.{ .context = self, .committed = popupCommitted, .removed = popupRemoved });
 }
 
@@ -102,17 +92,9 @@ pub fn unpublish(self: *WayringInputMethod) void {
     self.global = null;
 }
 
-fn authorized(policy: Authorization, credentials: ?wayring.server.Client.Credentials) bool {
-    const value = credentials orelse return false;
-    return switch (policy) {
-        .expected_uid => |uid| value.uid == uid,
-        .callback => |callback| callback.authorize(callback.context, value),
-    };
-}
-
 fn bind(client: *wayring.server.Client, id: u32, version: u32, self: *WayringInputMethod) !void {
     if (version != 1) return error.InvalidVersion;
-    if (!authorized(self.authorization, client.credentials())) {
+    if (!client.isAuthorizedDirectPeer(self.authorized_uid)) {
         // No manager resource exists yet. Returning from the global bind lets
         // the server terminalize this client without attributing the failure
         // to another object.
@@ -456,13 +438,6 @@ test "input method descriptors remain v1" {
     try std.testing.expectEqual(@as(u32, 1), protocol.zwp_input_method_manager_v2.interface.version);
     try std.testing.expectEqual(@as(usize, 2), protocol.zwp_input_method_manager_v2.request_messages.len);
 }
-test "authorization requires credentials and exact uid" {
-    const credentials: wayring.server.Client.Credentials = .{ .pid = 1, .uid = 42, .gid = 2 };
-    try std.testing.expect(!authorized(.{ .expected_uid = 42 }, null));
-    try std.testing.expect(authorized(.{ .expected_uid = 42 }, credentials));
-    try std.testing.expect(!authorized(.{ .expected_uid = 41 }, credentials));
-}
-
 pub const TestPublicGlobal = struct {
     pub const interface: wayring.wire.Interface = .{ .name = "kw_test_public", .version = 1 };
 };
@@ -513,9 +488,8 @@ test "generated input method registry authorization and forged bind isolate offe
         public_bind_count: usize = 0,
 
         fn visible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
-            if (!std.mem.eql(u8, global.interface().name, protocol.zwp_input_method_manager_v2.interface.name)) return true;
-            const credentials = client.credentials() orelse return false;
-            return credentials.uid == self.expected_uid;
+            if (global.visibility() != .restricted) return true;
+            return client.isAuthorizedDirectPeer(self.expected_uid);
         }
 
         fn bindPublic(_: *wayring.server.Client, _: u32, _: u32, self: *@This()) !void {
@@ -530,24 +504,27 @@ test "generated input method registry authorization and forged bind isolate offe
     var adapter: WayringInputMethod = undefined;
     adapter.allocator = std.testing.allocator;
     adapter.protocol_server = &host;
-    adapter.authorization = .{ .expected_uid = fixture.expected_uid };
+    adapter.authorized_uid = fixture.expected_uid;
     adapter.managers = .empty;
     adapter.methods = .empty;
-    const input_method_global = try host.addGlobal(protocol.zwp_input_method_manager_v2, 1, WayringInputMethod, &adapter, bind);
+    const input_method_global = try host.addGlobalWithOptions(protocol.zwp_input_method_manager_v2, 1, WayringInputMethod, &adapter, bind, .{ .visibility = .restricted });
     host.setGlobalFilter(Fixture, &fixture, Fixture.visible);
 
-    const expected = try wayring.server.CoreClient.create(std.testing.allocator, &host, .{ .credentials = .{ .pid = 1, .uid = 42, .gid = 1 } });
+    const expected = try wayring.server.CoreClient.create(std.testing.allocator, &host, .{ .credentials = .{ .pid = 1, .uid = 42, .gid = 1 }, .transport_provenance = .direct });
     defer expected.destroy();
-    const wrong = try wayring.server.CoreClient.create(std.testing.allocator, &host, .{ .credentials = .{ .pid = 2, .uid = 41, .gid = 1 } });
+    const wrong = try wayring.server.CoreClient.create(std.testing.allocator, &host, .{ .credentials = .{ .pid = 2, .uid = 41, .gid = 1 }, .transport_provenance = .direct });
     defer wrong.destroy();
     const missing = try wayring.server.CoreClient.create(std.testing.allocator, &host, .{});
     defer missing.destroy();
+    const derived = try wayring.server.CoreClient.create(std.testing.allocator, &host, .{ .credentials = .{ .pid = 3, .uid = 42, .gid = 1 }, .transport_provenance = .security_context });
+    defer derived.destroy();
 
-    for ([_]*wayring.server.CoreClient{ expected, wrong, missing }) |managed|
+    for ([_]*wayring.server.CoreClient{ expected, wrong, missing, derived }) |managed|
         try testSend(managed.client(), 1, 1, &test_display_get_registry, &.{.{ .new_id = .{ .typed = 2 } }});
     try expectRegistryGlobals(expected, &.{ public_global, input_method_global });
     try expectRegistryGlobals(wrong, &.{public_global});
     try expectRegistryGlobals(missing, &.{public_global});
+    try expectRegistryGlobals(derived, &.{public_global});
 
     try testSend(wrong.client(), 2, 0, &test_registry_bind, &.{
         .{ .uint = input_method_global.name() },
@@ -559,6 +536,12 @@ test "generated input method registry authorization and forged bind isolate offe
     try std.testing.expectEqual(@as(usize, 0), fixture.public_bind_count);
     try std.testing.expect(wrong.canDestroy());
 
+    // Exercise the typed binder's independent authorization recheck without
+    // weakening registry filtering for production clients.
+    try std.testing.expectError(error.Unauthorized, bind(derived.client(), 3, 1, &adapter));
+    try std.testing.expectEqual(@as(usize, 0), adapter.managers.items.len);
+    try std.testing.expect(derived.client().fatal() == null);
+
     try testSend(expected.client(), 2, 0, &test_registry_bind, &.{
         .{ .uint = input_method_global.name() },
         .{ .new_id = .{ .generic = .{ .interface = protocol.zwp_input_method_manager_v2.interface.name, .version = 1, .id = 3 } } },
@@ -566,6 +549,7 @@ test "generated input method registry authorization and forged bind isolate offe
     try std.testing.expect(expected.client().fatal() == null);
     try std.testing.expectEqual(@as(usize, 1), adapter.managers.items.len);
     try std.testing.expect(missing.client().fatal() == null);
+    try std.testing.expect(derived.client().fatal() == null);
 
     adapter.destroyClientResources(expected.client());
     try std.testing.expect(expected.canDestroy());
