@@ -6,6 +6,7 @@
 const WayringDataDevice = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const protocol = @import("wayring-protocol");
 const wayring = @import("wayring");
 const ClientRegistry = @import("../ClientRegistry.zig");
@@ -52,6 +53,8 @@ devices: std.ArrayList(*Device) = .empty,
 offers: std.ArrayList(*Offer) = .empty,
 staged_events: std.ArrayList(StagedEvents) = .empty,
 prepared_clients: std.ArrayList(PreparedClient) = .empty,
+stage_failure_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+finalize_failure: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
 
 pub fn init(
     self: *WayringDataDevice,
@@ -341,7 +344,9 @@ fn offerRequest(_: *protocol.wl_data_offer.Resource, request: protocol.wl_data_o
         .accept => |args| {
             if (info) |offer| if (offer.active and args.serial != value.enter_serial) return;
             value.owner.canonical.accept(value.id, args.mime_type) catch |err| switch (err) {
-                error.OutOfMemory => value.client.postOutOfMemory(&value.resource.runtime, "preparing generated offer acceptance"),
+                // The exact generated endpoint whose preparation failed has
+                // already terminalized its own client.
+                error.OutOfMemory => {},
                 else => {},
             };
         },
@@ -351,14 +356,14 @@ fn offerRequest(_: *protocol.wl_data_offer.Resource, request: protocol.wl_data_o
         },
         .destroy => value.owner.destroyOffer(value),
         .finish => value.owner.canonical.finish(value.id) catch |err| switch (err) {
-            error.OutOfMemory => value.client.postOutOfMemory(&value.resource.runtime, "preparing generated offer finish"),
+            error.OutOfMemory => {},
             else => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_finish), "drag-and-drop offer cannot be finished"),
         },
         .set_actions => |args| value.owner.canonical.setOfferActions(value.id, fromWireActions(args.dnd_actions), fromWireActions(args.preferred_action)) catch |err| switch (err) {
             error.InvalidActionMask => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_action_mask), "invalid drag-and-drop action mask"),
             error.InvalidPreferredAction => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_action), "invalid preferred drag-and-drop action"),
             error.InvalidOffer => value.client.postProtocolError(&value.resource.runtime, @intCast(protocol.wl_data_offer.@"error".invalid_offer), "actions are invalid for this offer"),
-            error.OutOfMemory => value.client.postOutOfMemory(&value.resource.runtime, "preparing generated offer actions"),
+            error.OutOfMemory => {},
             else => {},
         },
     }
@@ -597,6 +602,11 @@ fn deviceDragEnter(context: *anyopaque, surface_id: SurfaceRegistry.Id, x: f64, 
 pub fn transactionFinalize(context: *anyopaque) error{OutOfMemory}!void {
     const self: *WayringDataDevice = @ptrCast(@alignCast(context));
     std.debug.assert(self.prepared_clients.items.len == 0);
+    if (comptime builtin.is_test) if (self.finalize_failure) {
+        self.finalize_failure = false;
+        const staged = self.staged_events.items[0];
+        return transactionOutOfMemory(staged.client, staged.events[0].resource);
+    };
     var index: usize = 0;
     while (index < self.staged_events.items.len) {
         const client = self.staged_events.items[index].client;
@@ -615,7 +625,8 @@ pub fn transactionFinalize(context: *anyopaque) error{OutOfMemory}!void {
             event_count = std.math.add(usize, event_count, staged.events.len) catch return error.OutOfMemory;
             maximum_bytes = std.math.add(usize, maximum_bytes, staged.maximum_bytes) catch return error.OutOfMemory;
         };
-        const events = self.allocator.alloc(wayring.server.Client.PreparedEvent, event_count) catch return error.OutOfMemory;
+        const error_resource = self.staged_events.items[index].events[0].resource;
+        const events = self.allocator.alloc(wayring.server.Client.PreparedEvent, event_count) catch return transactionOutOfMemory(client, error_resource);
         var next: usize = 0;
         for (self.staged_events.items) |staged| if (staged.client == client) {
             @memcpy(events[next .. next + staged.events.len], staged.events);
@@ -623,12 +634,12 @@ pub fn transactionFinalize(context: *anyopaque) error{OutOfMemory}!void {
         };
         const batch = client.prepareEvents(maximum_bytes) catch {
             self.allocator.free(events);
-            return error.OutOfMemory;
+            return transactionOutOfMemory(client, error_resource);
         };
         self.prepared_clients.append(self.allocator, .{ .client = client, .batch = batch, .events = events }) catch {
             client.cancelPreparedEvents(batch);
             self.allocator.free(events);
-            return error.OutOfMemory;
+            return transactionOutOfMemory(client, error_resource);
         };
         index += 1;
     }
@@ -644,14 +655,36 @@ fn stageEvent(
     maximum_bytes: usize,
     offers: []const *Offer,
 ) error{OutOfMemory}!void {
-    const events = self.allocator.alloc(wayring.server.Client.PreparedEvent, 1) catch return error.OutOfMemory;
+    if (comptime builtin.is_test) if (self.stage_failure_after) |remaining| {
+        if (remaining == 0) {
+            self.stage_failure_after = null;
+            return transactionOutOfMemory(client, resource);
+        }
+        self.stage_failure_after = remaining - 1;
+    };
+    const events = self.allocator.alloc(wayring.server.Client.PreparedEvent, 1) catch return transactionOutOfMemory(client, resource);
     errdefer self.allocator.free(events);
-    const values = self.allocator.dupe(wire.Value, source_values) catch return error.OutOfMemory;
+    const values = self.allocator.dupe(wire.Value, source_values) catch return transactionOutOfMemory(client, resource);
     errdefer self.allocator.free(values);
-    const offer_copy = self.allocator.dupe(*Offer, offers) catch return error.OutOfMemory;
+    const offer_copy = self.allocator.dupe(*Offer, offers) catch return transactionOutOfMemory(client, resource);
     errdefer self.allocator.free(offer_copy);
     events[0] = .{ .resource = resource, .opcode = opcode, .descriptor = descriptor, .values = values };
-    self.staged_events.append(self.allocator, .{ .client = client, .events = events, .values = values, .offers = offer_copy, .maximum_bytes = maximum_bytes }) catch return error.OutOfMemory;
+    self.staged_events.append(self.allocator, .{ .client = client, .events = events, .values = values, .offers = offer_copy, .maximum_bytes = maximum_bytes }) catch return transactionOutOfMemory(client, resource);
+}
+
+fn failStageAfterForTest(self: *WayringDataDevice, successful_stages: usize) void {
+    if (comptime !builtin.is_test) unreachable;
+    self.stage_failure_after = successful_stages;
+}
+
+fn failFinalizeForTest(self: *WayringDataDevice) void {
+    if (comptime !builtin.is_test) unreachable;
+    self.finalize_failure = true;
+}
+
+fn transactionOutOfMemory(client: *wayring.server.Client, resource: *wayring.server.Resource) error{OutOfMemory} {
+    client.postOutOfMemory(resource, "preparing generated data-device transaction");
+    return error.OutOfMemory;
 }
 
 pub fn transactionCommit(context: *anyopaque) void {
@@ -744,11 +777,14 @@ fn destroyOffer(self: *WayringDataDevice, value: *Offer) void {
 }
 
 fn destroyOfferResource(self: *WayringDataDevice, value: *Offer, retire_canonical: bool) void {
+    if (retire_canonical) {
+        _ = self.canonical.retireOfferFinal(value.id, value.resource.version() < 3);
+        std.debug.assert(self.canonical.offerInfo(value.id) == null);
+    }
     for (self.offers.items, 0..) |item, i| if (item == value) {
         _ = self.offers.swapRemove(i);
         break;
     };
-    if (retire_canonical) self.canonical.retireOffer(value.id, value.resource.version() < 3);
     value.resource.destroy();
     value.resource.deinit();
     self.allocator.destroy(value);
@@ -767,11 +803,12 @@ fn destroyDevice(self: *WayringDataDevice, value: *Device) void {
     self.allocator.destroy(value);
 }
 fn destroySource(self: *WayringDataDevice, value: *Source) void {
+    _ = self.canonical.destroySourceFinal(value.id);
+    if (self.canonical.sourceActions(value.id)) |_| unreachable else |err| std.debug.assert(err == error.InvalidSource);
     for (self.sources.items, 0..) |item, i| if (item == value) {
         _ = self.sources.swapRemove(i);
         break;
     };
-    self.canonical.destroySource(value.id);
     value.resource.destroy();
     value.resource.deinit();
     self.allocator.destroy(value);
@@ -1128,6 +1165,137 @@ test "prepared generated action stays invisible until atomic commit and abort le
     try std.testing.expectEqual(@as(usize, 12), batch.bytes.len);
     try client.completeSend(batch.token, batch.bytes.len);
     try std.testing.expect((try client.beginSend()) == null);
+}
+
+test "generated source destruction aborts failed teardown bytes but always retires canonical drag" {
+    const Failure = enum { target, action, leave, finalize };
+    inline for (std.meta.tags(Failure)) |failure| {
+        var fixture: DataDeviceFixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const client = fixture.client();
+
+        try fixture.bind("wl_compositor", 5, 6);
+        try testSend(client, 5, 0, &protocol.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 6 } }});
+        try testSend(client, 4, 1, &protocol.wl_data_device_manager.request_messages[1], &.{ .{ .new_id = .{ .typed = 7 } }, .{ .object = 3 } });
+        try testSend(client, 5, 0, &protocol.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 8 } }});
+        try testSend(client, 4, 0, &protocol.wl_data_device_manager.request_messages[0], &.{.{ .new_id = .{ .typed = 9 } }});
+        try testSend(client, 9, 0, &protocol.wl_data_source.request_messages[0], &.{.{ .string = "text/plain" }});
+        try testSend(client, 9, 2, &protocol.wl_data_source.request_messages[2], &.{.{ .uint = 1 }});
+        const origin = fixture.compositor.surfaceId(client, 6).?;
+        const target = fixture.compositor.surfaceId(client, 8).?;
+        const serial: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 1 };
+        try std.testing.expect(try fixture.authority.addPointerPress(fixture.client_id, serial, 0x110, origin));
+        try testSend(client, 7, 0, &protocol.wl_data_device.request_messages[0], &.{
+            .{ .object = 9 },
+            .{ .object = 6 },
+            .{ .object = null },
+            .{ .uint = 1 },
+        });
+        try fixture.canonical.enter(.{ .surface = target, .client = fixture.client_id, .x = 2, .y = 3 });
+        const source_id = fixture.adapter.sources.items[0].id;
+        try discardEvents(client);
+        switch (failure) {
+            .target => fixture.adapter.failStageAfterForTest(0),
+            .action => fixture.adapter.failStageAfterForTest(1),
+            .leave => fixture.adapter.failStageAfterForTest(2),
+            .finalize => fixture.adapter.failFinalizeForTest(),
+        }
+
+        try testSend(client, 9, 1, &protocol.wl_data_source.request_messages[1], &.{});
+        try std.testing.expectEqual(@as(usize, 0), fixture.adapter.sources.items.len);
+        try std.testing.expectError(error.InvalidSource, fixture.canonical.sourceActions(source_id));
+        try std.testing.expect(!fixture.canonical.isDragging());
+        try std.testing.expect(fixture.canonical.currentTarget() == null);
+        try std.testing.expect(fixture.canonical.dragIcon() == null);
+        try std.testing.expectEqual(@as(usize, 0), fixture.adapter.staged_events.items.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.adapter.prepared_clients.items.len);
+        try std.testing.expectEqual(fixture.adapter.offers.items.len, fixture.canonical.resourceCounts().offers);
+        for (fixture.adapter.offers.items) |offer|
+            try std.testing.expect(fixture.canonical.offerInfo(offer.id).?.source == null);
+
+        var output_bytes: usize = 0;
+        while (try client.beginSend()) |batch| {
+            var offset: usize = 0;
+            while (offset < batch.bytes.len) {
+                const object_id = std.mem.readInt(u32, batch.bytes[offset..][0..4], .little);
+                const size_opcode = std.mem.readInt(u32, batch.bytes[offset + 4 ..][0..4], .little);
+                const message_size: usize = @intCast(size_opcode >> 16);
+                try std.testing.expect(object_id != 9);
+                try std.testing.expect(object_id != 7);
+                output_bytes += message_size;
+                offset += message_size;
+            }
+            try client.completeSend(batch.token, batch.bytes.len);
+        }
+        try std.testing.expect(output_bytes != 0);
+    }
+}
+
+test "generated dropped offer and whole-client destruction are final after cancellation preparation failure" {
+    const Failure = enum { cancelled, finalize };
+    const Teardown = enum { offer_request, whole_client };
+    inline for (std.meta.tags(Teardown)) |teardown| inline for (std.meta.tags(Failure)) |failure| {
+        var fixture: DataDeviceFixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const client = fixture.client();
+
+        try fixture.bind("wl_compositor", 5, 6);
+        try testSend(client, 5, 0, &protocol.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 6 } }});
+        try testSend(client, 4, 1, &protocol.wl_data_device_manager.request_messages[1], &.{ .{ .new_id = .{ .typed = 7 } }, .{ .object = 3 } });
+        try testSend(client, 5, 0, &protocol.wl_compositor.request_messages[0], &.{.{ .new_id = .{ .typed = 8 } }});
+        try testSend(client, 4, 0, &protocol.wl_data_device_manager.request_messages[0], &.{.{ .new_id = .{ .typed = 9 } }});
+        try testSend(client, 9, 0, &protocol.wl_data_source.request_messages[0], &.{.{ .string = "text/plain" }});
+        try testSend(client, 9, 2, &protocol.wl_data_source.request_messages[2], &.{.{ .uint = 1 }});
+        const origin = fixture.compositor.surfaceId(client, 6).?;
+        const target = fixture.compositor.surfaceId(client, 8).?;
+        const serial: ClientRegistry.Serial = .{ .domain = .wayring_server, .value = 1 };
+        try std.testing.expect(try fixture.authority.addPointerPress(fixture.client_id, serial, 0x110, origin));
+        try testSend(client, 7, 0, &protocol.wl_data_device.request_messages[0], &.{
+            .{ .object = 9 },
+            .{ .object = 6 },
+            .{ .object = null },
+            .{ .uint = 1 },
+        });
+        try fixture.canonical.enter(.{ .surface = target, .client = fixture.client_id, .x = 2, .y = 3 });
+        const offer = fixture.adapter.offers.items[0];
+        try testSend(client, offer.resource.id(), 0, &protocol.wl_data_offer.request_messages[0], &.{ .{ .uint = offer.enter_serial }, .{ .string = "text/plain" } });
+        try testSend(client, offer.resource.id(), 4, &protocol.wl_data_offer.request_messages[4], &.{ .{ .uint = 1 }, .{ .uint = 1 } });
+        fixture.canonical.drop();
+        try std.testing.expect(fixture.canonical.offerInfo(offer.id).?.dropped);
+        try discardEvents(client);
+        switch (failure) {
+            .cancelled => fixture.adapter.failStageAfterForTest(0),
+            .finalize => fixture.adapter.failFinalizeForTest(),
+        }
+
+        switch (teardown) {
+            .offer_request => try testSend(client, offer.resource.id(), 2, &protocol.wl_data_offer.request_messages[2], &.{}),
+            .whole_client => fixture.adapter.destroyClientResources(client),
+        }
+        try std.testing.expectEqual(@as(usize, 0), fixture.adapter.offers.items.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.canonical.resourceCounts().offers);
+        try std.testing.expectEqual(@as(usize, 0), fixture.adapter.staged_events.items.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.adapter.prepared_clients.items.len);
+        if (teardown == .whole_client) {
+            try std.testing.expectEqual(@as(usize, 0), fixture.adapter.sources.items.len);
+            try std.testing.expectEqual(@as(usize, 0), fixture.adapter.devices.items.len);
+            try std.testing.expectEqual(@as(usize, 0), fixture.canonical.resourceCounts().sources);
+            try std.testing.expectEqual(@as(usize, 0), fixture.canonical.resourceCounts().devices);
+        }
+
+        while (try client.beginSend()) |batch| {
+            var offset: usize = 0;
+            while (offset < batch.bytes.len) {
+                const object_id = std.mem.readInt(u32, batch.bytes[offset..][0..4], .little);
+                const size_opcode = std.mem.readInt(u32, batch.bytes[offset + 4 ..][0..4], .little);
+                try std.testing.expect(object_id != 9);
+                offset += @intCast(size_opcode >> 16);
+            }
+            try client.completeSend(batch.token, batch.bytes.len);
+        }
+    };
 }
 
 test "generated start_drag assigns a permanent icon role and follows surface lifecycle" {
