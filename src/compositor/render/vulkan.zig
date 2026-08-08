@@ -9460,17 +9460,19 @@ fn expectVideoImport(
     var gbm = Gbm.init(fd) catch return error.SkipZigTest;
     defer gbm.deinit();
     const size: render.Size = .{ .width = 64, .height = 64 };
+    // A DMA-BUF has no intrinsic pixel format. Allocate enough linear GBM
+    // storage for both planes, then describe the YUV layout explicitly to
+    // Vulkan using the allocator's hardware row-pitch alignment.
     var storage = gbm.createBuffer(
-        size,
+        .{ .width = size.width, .height = size.height + size.height / 2 },
         @intFromEnum(render.DmabufFormat.xrgb8888),
         &.{0},
     ) catch return error.SkipZigTest;
     defer storage.deinit();
     if (storage.modifier != 0) return error.SkipZigTest;
 
-    const bytes_per_sample: u32 = if (format == .p010) 2 else 1;
-    const luma_stride = size.width * bytes_per_sample;
-    const chroma_stride = size.width * bytes_per_sample;
+    const luma_stride = storage.stride;
+    const chroma_stride = storage.stride;
     const chroma_offset = luma_stride * size.height;
     const required_bytes: usize = chroma_offset + chroma_stride * (size.height / 2);
     var file_stat: sync.struct_stat = undefined;

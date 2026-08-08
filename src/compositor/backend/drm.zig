@@ -4025,15 +4025,38 @@ test "DRM mode refresh converts to presentation period" {
 }
 
 test "GBM Vulkan target accepts asynchronous render completion" {
-    const fd = std.c.open("/dev/dri/card0", std.c.O{
+    const render_fd = std.c.open("/dev/dri/renderD128", std.c.O{
+        .ACCMODE = .RDWR,
+        .CLOEXEC = true,
+    });
+    if (render_fd < 0) return error.SkipZigTest;
+    defer _ = std.c.close(render_fd);
+
+    var device: c.drmDevicePtr = null;
+    if (c.drmGetDevice2(render_fd, 0, &device) != 0 or device == null) {
+        return error.SkipZigTest;
+    }
+    defer c.drmFreeDevice(&device);
+    if (device.?.*.available_nodes & (1 << c.DRM_NODE_PRIMARY) == 0 or
+        device.?.*.nodes[c.DRM_NODE_PRIMARY] == null)
+    {
+        return error.SkipZigTest;
+    }
+    const fd = std.c.open(device.?.*.nodes[c.DRM_NODE_PRIMARY], std.c.O{
         .ACCMODE = .RDWR,
         .CLOEXEC = true,
     });
     if (fd < 0) return error.SkipZigTest;
     defer _ = std.c.close(fd);
 
+    var primary_stat: c.struct_stat = undefined;
+    if (c.fstat(fd, &primary_stat) != 0) return error.SkipZigTest;
+
     const VulkanRenderer = @import("../render/vulkan.zig");
-    var renderer = VulkanRenderer.init(std.testing.allocator, .{ .major = 226, .minor = 0 }) catch |err| switch (err) {
+    var renderer = VulkanRenderer.init(std.testing.allocator, .{
+        .major = @intCast(c.major(primary_stat.st_rdev)),
+        .minor = @intCast(c.minor(primary_stat.st_rdev)),
+    }) catch |err| switch (err) {
         error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
         else => return err,
     };
@@ -4099,11 +4122,10 @@ test "GBM Vulkan target accepts asynchronous render completion" {
         .size = size,
         .commands = &.{.{ .clear = render.Color.rgba(12, 34, 56, 255) }},
     }, .{ .dmabuf = .{ .id = selected.?.target_id, .size = size } }, null);
-    if (completion.sync_file_fd) |fence_fd| {
-        defer _ = std.c.close(fence_fd);
-        try std.testing.expect(importSyncFile(selected.?.buffer.fd, fence_fd));
-        try waitSyncFile(fence_fd);
-    }
+    const fence_fd = completion.sync_file_fd orelse return error.MissingSyncFile;
+    defer _ = std.c.close(fence_fd);
+    try std.testing.expect(importSyncFile(selected.?.buffer.fd, fence_fd));
+    try waitSyncFile(fence_fd);
 }
 
 test "DRM scale preserves mode pixels and derives logical size" {
