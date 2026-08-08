@@ -93,6 +93,7 @@ pub const Snapshot = struct {
 
 pub const Changes = packed struct {
     geometry: bool = false,
+    logical_size: bool = false,
     mode: bool = false,
     scale: bool = false,
     preferred_scale: bool = false,
@@ -269,6 +270,7 @@ pub fn configure(
     std.debug.assert(scale > 0 and scale <= std.math.maxInt(i32));
     std.debug.assert(preferred_scale.numerator > 0);
     const position_changed = !std.meta.eql(self.position, position);
+    const logical_size_changed = !std.meta.eql(self.size, size);
     const mode_changed = !std.meta.eql(self.mode_size, mode_size) or
         self.refresh_millihertz != refresh_millihertz or
         self.mode_preferred != preferred;
@@ -281,7 +283,7 @@ pub fn configure(
     self.mode_preferred = preferred;
     self.scale = @intCast(scale);
     self.preferred_scale = preferred_scale;
-    if (!position_changed and !mode_changed and !client_scale_changed and !preferred_scale_changed) return false;
+    if (!position_changed and !logical_size_changed and !mode_changed and !client_scale_changed and !preferred_scale_changed) return false;
     for (self.resources.items) |resource| {
         if (position_changed) self.sendGeometry(resource);
         if (mode_changed) self.sendMode(resource);
@@ -291,6 +293,7 @@ pub fn configure(
     }
     self.notifyConfigured(.{
         .geometry = position_changed,
+        .logical_size = logical_size_changed,
         .mode = mode_changed,
         .scale = client_scale_changed,
         .preferred_scale = preferred_scale_changed,
@@ -854,7 +857,7 @@ test "canonical membership and delivery are independent of mature resources" {
         .refresh_nanoseconds = 20_000_000,
     });
     try std.testing.expectEqual(@as(usize, 2), probe.change_count);
-    try std.testing.expectEqual(Changes{ .geometry = true, .mode = true, .scale = true, .preferred_scale = true }, probe.changes[0]);
+    try std.testing.expectEqual(Changes{ .geometry = true, .logical_size = true, .mode = true, .scale = true, .preferred_scale = true }, probe.changes[0]);
     try std.testing.expectEqual(Changes{ .mode = true }, probe.changes[1]);
 
     output.beginFrame();

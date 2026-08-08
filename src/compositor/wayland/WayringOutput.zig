@@ -26,12 +26,19 @@ layout: *OutputLayout,
 compositor: *WayringCompositor,
 adapters: std.ArrayList(*Adapter) = .empty,
 scale_listener: ?ScaleListener = null,
+metadata_listener: ?MetadataListener = null,
 bind_listener: ?BindListener = null,
 
 pub const ScaleListener = struct {
     context: *anyopaque,
     configured: *const fn (*anyopaque, OutputLayout.Id, Output.Changes) void,
     membership_changed: *const fn (*anyopaque, WayringCompositor.SurfaceId, ?OutputLayout.Id) void,
+};
+
+pub const MetadataListener = struct {
+    context: *anyopaque,
+    configured: *const fn (*anyopaque, OutputLayout.Id, Output.Changes) void,
+    removing: *const fn (*anyopaque, OutputLayout.Id) void,
 };
 
 /// Narrow notification used by protocols whose initial snapshot may predate a
@@ -92,7 +99,7 @@ fn rollbackInit(self: *WayringOutput) void {
 }
 
 pub fn deinit(self: *WayringOutput) void {
-    std.debug.assert(self.bind_listener == null);
+    std.debug.assert(self.bind_listener == null and self.metadata_listener == null);
     self.layout.clearListener();
     for (self.adapters.items) |adapter| {
         std.debug.assert(adapter.bindings.items.len == 0);
@@ -129,6 +136,16 @@ pub fn setScaleListener(self: *WayringOutput, listener: ScaleListener) void {
 pub fn clearScaleListener(self: *WayringOutput, context: *anyopaque) void {
     std.debug.assert(self.scale_listener != null and self.scale_listener.?.context == context);
     self.scale_listener = null;
+}
+
+pub fn setMetadataListener(self: *WayringOutput, listener: MetadataListener) void {
+    std.debug.assert(self.metadata_listener == null);
+    self.metadata_listener = listener;
+}
+
+pub fn clearMetadataListener(self: *WayringOutput, context: *anyopaque) void {
+    std.debug.assert(self.metadata_listener != null and self.metadata_listener.?.context == context);
+    self.metadata_listener = null;
 }
 
 pub fn setBindListener(self: *WayringOutput, listener: BindListener) void {
@@ -266,6 +283,7 @@ fn layoutAdded(context: *anyopaque, id: OutputLayout.Id) error{OutOfMemory}!void
 fn layoutRemoving(context: *anyopaque, id: OutputLayout.Id) void {
     const self: *WayringOutput = @ptrCast(@alignCast(context));
     const adapter = self.findAdapter(id) orelse unreachable;
+    if (self.metadata_listener) |listener| listener.removing(listener.context, id);
     self.protocol_server.removeGlobal(adapter.global) catch unreachable;
     var memberships = adapter.output.membershipIterator();
     while (memberships.next()) |surface_id| {
@@ -321,6 +339,10 @@ fn sendInitial(binding: *Binding) void {
 
 fn configured(context: *anyopaque, snapshot: Output.Snapshot, changes: Output.Changes) void {
     const adapter: *Adapter = @ptrCast(@alignCast(context));
+    // XDG output version 3 batches its metadata with wl_output.done, so
+    // metadata listeners must publish before the core output update closes.
+    if (adapter.manager.metadata_listener) |listener|
+        listener.configured(listener.context, adapter.id, changes);
     for (adapter.bindings.items) |binding| {
         if (changes.geometry) sendGeometry(binding, snapshot) catch |err| {
             eventFailure(binding, err, "queueing wl_output geometry");
@@ -335,7 +357,7 @@ fn configured(context: *anyopaque, snapshot: Output.Snapshot, changes: Output.Ch
                 eventFailure(binding, err, "queueing wl_output scale");
                 continue;
             };
-        if ((changes.geometry or changes.mode or changes.scale) and binding.resource.version() >= 2)
+        if ((changes.geometry or changes.logical_size or changes.mode or changes.scale) and binding.resource.version() >= 2)
             core.wl_output.@"send:done"(&binding.resource) catch |err| eventFailure(binding, err, "queueing wl_output done");
     }
     if (changes.preferred_scale) if (adapter.manager.scale_listener) |listener|
