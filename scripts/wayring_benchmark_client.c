@@ -63,9 +63,10 @@ static uint64_t parse_count(const char *text) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 6 || (strcmp(argv[2], "serial") != 0 && strcmp(argv[2], "pipeline") != 0 &&
+    const bool cleanup_gate = argc == 7 && strcmp(argv[6], "cleanup-gate") == 0;
+    if ((argc != 6 && !cleanup_gate) || (strcmp(argv[2], "serial") != 0 && strcmp(argv[2], "pipeline") != 0 &&
         strcmp(argv[2], "churn") != 0 && strcmp(argv[2], "registry") != 0)) {
-        fprintf(stderr, "usage: %s SOCKET serial|pipeline|churn|registry OPERATIONS WARMUP HOLD_MS\n", argv[0]);
+        fprintf(stderr, "usage: %s SOCKET serial|pipeline|churn|registry OPERATIONS WARMUP HOLD_MS [cleanup-gate]\n", argv[0]);
         return 2;
     }
     const uint64_t operations = parse_count(argv[3]);
@@ -126,8 +127,12 @@ int main(int argc, char **argv) {
     printf("{\"workload\":\"%s\",\"operations\":%" PRIu64 ",\"completed\":%" PRIu64 ",\"wall_ns\":%" PRIu64 "}\n",
            argv[2], operations, counter.done, elapsed);
     fflush(stdout);
-    struct timespec hold = { .tv_sec = hold_ms / 1000, .tv_nsec = (hold_ms % 1000) * 1000000L };
-    while (nanosleep(&hold, &hold) != 0 && errno == EINTR) {}
+    if (cleanup_gate) {
+        if (read(STDIN_FILENO, &start, 1) != 1) fail("cleanup gate");
+    } else {
+        struct timespec hold = { .tv_sec = hold_ms / 1000, .tv_nsec = (hold_ms % 1000) * 1000000L };
+        while (nanosleep(&hold, &hold) != 0 && errno == EINTR) {}
+    }
     if (display != NULL) wl_display_disconnect(display);
     return 0;
 }

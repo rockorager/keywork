@@ -292,6 +292,10 @@ pub fn build(b: *std.Build) void {
         const require_release_safe = b.addSystemCommand(&.{ "sh", "-c", "echo 'benchmark-wayland-parity requires -Doptimize=ReleaseSafe' >&2; exit 2" });
         parity_step.dependOn(&require_release_safe.step);
     }
+    const parity_harness_tests = b.addSystemCommand(&.{ "python3", "scripts/keywork_wayland_benchmark_test.py" });
+    const parity_harness_test_step = b.step("test-wayland-parity-harness", "Test parity harness deadlines, reaping, settle, and schema");
+    parity_harness_test_step.dependOn(&parity_harness_tests.step);
+    test_step.dependOn(&parity_harness_tests.step);
     release.add(
         b,
         target,

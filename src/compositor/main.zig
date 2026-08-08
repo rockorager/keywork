@@ -717,10 +717,11 @@ pub fn main(init: std.process.Init) !void {
         wayring_idle_alarm_attached = true;
         if (wayring_host.?.failure()) |err| return err;
     }
-    const canonical_display_name = switch (wayland_server_mode) {
-        .libwayland, .dual => mature_socket_name.?,
-        .wayring => wayring_host.?.displayName(),
-    };
+    const canonical_display_name = canonicalDisplayName(
+        wayland_server_mode,
+        mature_socket_name,
+        if (wayring_host) |host| host.displayName() else null,
+    );
     try server.configureXdgSessionStorage(
         init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
         if (native_session) "session" else canonical_display_name,
@@ -745,16 +746,22 @@ pub fn main(init: std.process.Init) !void {
     if (xwayland_display) |display_name|
         try writer.interface.print("DISPLAY={s}\n", .{display_name});
     try writer.interface.flush();
-    systemd.ready(canonical_display_name, init.environ_map.get("XCURSOR_SIZE").?) catch |err| {
-        systemd.shutdown() catch |shutdown_err| {
-            log.warn("failed to roll back graphical session startup: {t}", .{shutdown_err});
-        };
-        return err;
-    };
+    try systemd.readyWithRollback(canonical_display_name, init.environ_map.get("XCURSOR_SIZE").?);
 
     server.run();
     systemd.shutdown() catch |err| {
         log.warn("failed to shut down the graphical session targets: {t}", .{err});
+    };
+}
+
+fn canonicalDisplayName(
+    mode: WaylandServerMode,
+    mature_display_name: ?[]const u8,
+    wayring_display_name: ?[]const u8,
+) []const u8 {
+    return switch (mode) {
+        .libwayland, .dual => mature_display_name.?,
+        .wayring => wayring_display_name.?,
     };
 }
 
@@ -976,6 +983,21 @@ test "startup options replace environment backend controls" {
 
     var version: TestArguments = .{ .values = &.{"--version"} };
     try std.testing.expect((try parseArguments(&version)).version);
+}
+
+test "Wayland server modes select exactly one canonical display" {
+    try std.testing.expectEqualStrings(
+        "wayland-mature",
+        canonicalDisplayName(.libwayland, "wayland-mature", null),
+    );
+    try std.testing.expectEqualStrings(
+        "wayland-mature",
+        canonicalDisplayName(.dual, "wayland-mature", "wayland-sidecar"),
+    );
+    try std.testing.expectEqualStrings(
+        "wayland-generated",
+        canonicalDisplayName(.wayring, null, "wayland-generated"),
+    );
 }
 
 test "startup options reject duplicates and backend-specific misuse" {
