@@ -26,6 +26,11 @@ const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
 const WayringProfile = @import("wayland/WayringProfile.zig");
 const WayringSessionLock = @import("wayland/WayringSessionLock.zig");
 const WayringWorkspace = @import("wayland/WayringWorkspace.zig");
+const WayringSecurityContext = @import("wayland/WayringSecurityContext.zig");
+const WayringLinuxDmabuf = @import("wayland/WayringLinuxDmabuf.zig");
+const WayringOutputManagement = @import("wayland/WayringOutputManagement.zig");
+const WayringScreencopy = @import("wayland/WayringScreencopy.zig");
+const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
@@ -35,6 +40,44 @@ const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const wayring = @import("wayring");
+
+const WayringProductionAdapters = struct {
+    server: *Server,
+    output_management: *WayringOutputManagement,
+    screencopy: *WayringScreencopy,
+    security_context: *WayringSecurityContext,
+    direct_host: ?*WayringHost = null,
+
+    fn flush(self: *@This()) void {
+        if (self.direct_host) |host| host.flush() catch {
+            self.server.terminate();
+            return;
+        };
+        self.security_context.flushIngress() catch self.server.terminate();
+    }
+
+    fn outputChanged(context: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const size = self.server.primaryOutputModeSize();
+        const modes = [_]WayringOutputManagement.ModeSnapshot{.{
+            .width = size.width,
+            .height = size.height,
+            .refresh_millihertz = self.server.primaryOutputRefresh(),
+            .preferred = true,
+        }};
+        const output_id = self.server.wayringDefaultOutputId().?;
+        self.screencopy.invalidateOutput(output_id);
+        self.output_management.syncOutput(self.server.generatedOutputSnapshot(&modes)) catch
+            self.server.terminate();
+        self.flush();
+    }
+
+    fn capture(context: *anyopaque, output: @import("wayland/output_layout.zig").Id) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.screencopy.captureOutput(output);
+        self.flush();
+    }
+};
 
 comptime {
     _ = @import("DataDevice.zig");
@@ -62,7 +105,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 21/16 profile is not default eligible
+    \\                            its limited 26/17 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -272,6 +315,22 @@ pub fn main(init: std.process.Init) !void {
     var wayring_workspace: WayringWorkspace = undefined;
     var wayring_workspace_initialized = false;
     var wayring_workspace_published = false;
+    var wayring_security_context: WayringSecurityContext = undefined;
+    var wayring_security_context_initialized = false;
+    var wayring_security_context_published = false;
+    var wayring_linux_dmabuf: WayringLinuxDmabuf = undefined;
+    var wayring_linux_dmabuf_initialized = false;
+    var wayring_linux_dmabuf_published = false;
+    var wayring_output_management: WayringOutputManagement = undefined;
+    var wayring_output_management_initialized = false;
+    var wayring_output_management_published = false;
+    var wayring_screencopy: WayringScreencopy = undefined;
+    var wayring_screencopy_initialized = false;
+    var wayring_screencopy_published = false;
+    var wayring_virtual_pointer: WayringVirtualPointer = undefined;
+    var wayring_virtual_pointer_initialized = false;
+    var wayring_virtual_pointer_published = false;
+    var wayring_production_adapters: WayringProductionAdapters = undefined;
     const WayringLifecycle = struct {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
@@ -293,6 +352,11 @@ pub fn main(init: std.process.Init) !void {
         layer_shell: ?*WayringLayerShell,
         session_lock: ?*WayringSessionLock,
         workspace: ?*WayringWorkspace,
+        linux_dmabuf: ?*WayringLinuxDmabuf,
+        output_management: ?*WayringOutputManagement,
+        screencopy: ?*WayringScreencopy,
+        virtual_pointer: ?*WayringVirtualPointer,
+        security_context: ?*WayringSecurityContext,
         authorized_uid: std.os.linux.uid_t,
 
         fn globalVisible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
@@ -308,6 +372,11 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            if (self.virtual_pointer) |adapter| adapter.destroyClientResources(client);
+            if (self.screencopy) |adapter| adapter.destroyClientResources(client);
+            if (self.output_management) |adapter| adapter.destroyClientResources(client);
+            if (self.linux_dmabuf) |adapter| adapter.destroyClientResources(client);
+            if (self.security_context) |adapter| adapter.destroyClientResources(client);
             if (self.workspace) |workspace| workspace.destroyClientResources(client);
             if (self.idle_notification) |idle_notification| idle_notification.destroyClientResources(client);
             if (self.session_lock) |generated_session_lock| generated_session_lock.destroyClientResources(client);
@@ -338,10 +407,36 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_idle_alarm_attached) if (wayring_host) |host| {
             server.shutdownIdleAlarmHost(host);
         };
+        // Derived transports borrow every adapter and the direct client that
+        // created them. Drain those children before destroying the direct
+        // host, then tear the shared adapters down in reverse order.
+        if (wayring_security_context_initialized) wayring_security_context.shutdownIngress();
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down Wayring socket: {t}", .{err});
         };
         if (wayring_protocol_server) |*protocol_server| protocol_server.clearGlobalFilter();
+        if (wayring_virtual_pointer_initialized) {
+            if (wayring_virtual_pointer_published) wayring_virtual_pointer.unpublish();
+            wayring_virtual_pointer.deinit();
+        }
+        if (wayring_screencopy_initialized) {
+            server.setGeneratedCaptureObserver(null);
+            if (wayring_screencopy_published) wayring_screencopy.unpublish();
+            wayring_screencopy.deinit();
+        }
+        if (wayring_output_management_initialized) {
+            server.setGeneratedOutputObserver(null);
+            if (wayring_output_management_published) wayring_output_management.unpublish();
+            wayring_output_management.deinit();
+        }
+        if (wayring_linux_dmabuf_initialized) {
+            if (wayring_linux_dmabuf_published) wayring_linux_dmabuf.unpublish();
+            wayring_linux_dmabuf.deinit();
+        }
+        if (wayring_security_context_initialized) {
+            if (wayring_security_context_published) wayring_security_context.unpublish();
+            wayring_security_context.deinit();
+        }
         if (wayring_workspace_initialized) {
             if (wayring_workspace_published) wayring_workspace.unpublish();
             wayring_workspace.deinit();
@@ -685,8 +780,55 @@ pub fn main(init: std.process.Init) !void {
             .layer_shell = if (wayring_layer_shell_initialized) &wayring_layer_shell else null,
             .session_lock = if (wayring_session_lock_initialized) &wayring_session_lock else null,
             .workspace = if (wayring_workspace_initialized) &wayring_workspace else null,
+            .linux_dmabuf = null,
+            .output_management = null,
+            .screencopy = null,
+            .virtual_pointer = null,
+            .security_context = null,
             .authorized_uid = std.os.linux.getuid(),
         };
+        if (wayring_outputs_initialized) {
+            wayring_security_context.init(init.gpa, server.eventLoop(), &wayring_protocol_server.?, std.os.linux.getuid(), .{
+                .context = &wayring_lifecycle,
+                .accepted = WayringLifecycle.accepted,
+                .destroy_resources = WayringLifecycle.destroy,
+            });
+            wayring_security_context_initialized = true;
+            try wayring_security_context.publish();
+            wayring_security_context_published = true;
+            try wayring_linux_dmabuf.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor, server.generatedDmabufCapabilities());
+            wayring_linux_dmabuf_initialized = true;
+            try wayring_linux_dmabuf.publish();
+            wayring_linux_dmabuf_published = true;
+            wayring_output_management.init(init.gpa, &wayring_protocol_server.?, server.generatedOutputManagement(), std.os.linux.getuid(), server.generatedOutputManagementListener());
+            wayring_output_management_initialized = true;
+            const size = server.primaryOutputModeSize();
+            const modes = [_]WayringOutputManagement.ModeSnapshot{.{ .width = size.width, .height = size.height, .refresh_millihertz = server.primaryOutputRefresh(), .preferred = true }};
+            try wayring_output_management.addOutput(server.generatedOutputSnapshot(&modes));
+            try wayring_output_management.publish();
+            wayring_output_management_published = true;
+            wayring_screencopy.init(init.gpa, &wayring_protocol_server.?, .{ .context = &wayring_outputs, .resolve = Server.resolveGeneratedOutput, .logical_size = Server.generatedOutputLogicalSize }, &wayring_compositor, &wayring_linux_dmabuf, std.os.linux.getuid(), .{ .context = server, .constraints = Server.generatedScreencopyConstraints, .schedule = Server.scheduleGeneratedScreencopy, .capture_shm = Server.captureGeneratedScreencopy });
+            wayring_screencopy_initialized = true;
+            try wayring_screencopy.publish();
+            wayring_screencopy_published = true;
+            wayring_production_adapters = .{
+                .server = server,
+                .output_management = &wayring_output_management,
+                .screencopy = &wayring_screencopy,
+                .security_context = &wayring_security_context,
+            };
+            server.setGeneratedOutputObserver(.{ .context = &wayring_production_adapters, .changed = WayringProductionAdapters.outputChanged });
+            server.setGeneratedCaptureObserver(.{ .context = &wayring_production_adapters, .capture_output = WayringProductionAdapters.capture });
+            try wayring_virtual_pointer.init(init.gpa, &wayring_protocol_server.?, &wayring_seat_adapter, &wayring_outputs, server.virtualPointerAuthority(), server.canonicalSeat(), std.os.linux.getuid());
+            wayring_virtual_pointer_initialized = true;
+            try wayring_virtual_pointer.publish();
+            wayring_virtual_pointer_published = true;
+            wayring_lifecycle.linux_dmabuf = &wayring_linux_dmabuf;
+            wayring_lifecycle.output_management = &wayring_output_management;
+            wayring_lifecycle.screencopy = &wayring_screencopy;
+            wayring_lifecycle.virtual_pointer = &wayring_virtual_pointer;
+            wayring_lifecycle.security_context = &wayring_security_context;
+        }
         if (WayringProfile.validate(
             &wayring_protocol_server.?,
             if (wayring_outputs_initialized) .presenting_headless else .sidecar,
@@ -715,6 +857,7 @@ pub fn main(init: std.process.Init) !void {
         );
         try server.attachIdleAlarmHost(wayring_host.?);
         wayring_idle_alarm_attached = true;
+        if (wayring_outputs_initialized) wayring_production_adapters.direct_host = wayring_host.?;
         if (wayring_host.?.failure()) |err| return err;
     }
     const canonical_display_name = canonicalDisplayName(

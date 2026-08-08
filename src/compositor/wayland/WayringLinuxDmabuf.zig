@@ -1,6 +1,6 @@
-//! Fixture-only scanner-backed linux-dmabuf adapter.
+//! Scanner-backed linux-dmabuf adapter.
 //!
-//! Publication is explicit and no production profile constructs this type.
+//! Publication remains explicit so profile construction controls ordering.
 
 const WayringLinuxDmabuf = @This();
 

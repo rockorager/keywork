@@ -1,8 +1,7 @@
-//! Unpublished scanner-resource security-context ingress adapter.
+//! Scanner-resource security-context ingress adapter.
 //!
-//! The production compositor does not initialize or publish this adapter yet.
-//! It is a fixture-backed boundary for deriving Wayring transports whose
-//! immutable provenance and peer credentials are assigned before dispatch.
+//! Derives Wayring transports whose immutable provenance and peer credentials
+//! are assigned before dispatch.
 
 const WayringSecurityContext = @This();
 
@@ -107,7 +106,6 @@ pub fn init(
     };
 }
 
-/// Fixture-only publication. Production profile composition must not call it.
 pub fn publish(self: *WayringSecurityContext) !void {
     std.debug.assert(self.global == null);
     self.global = try self.protocol_server.addGlobalWithOptions(
@@ -129,15 +127,30 @@ pub fn unpublish(self: *WayringSecurityContext) void {
     self.global = null;
 }
 
+/// Stops every derived listener and drains its clients while the shared
+/// protocol adapters referenced by the lifecycle callbacks are still live.
+pub fn shutdownIngress(self: *WayringSecurityContext) void {
+    var index = self.contexts.items.len;
+    while (index != 0) {
+        index -= 1;
+        self.deactivate(self.contexts.items[index]);
+    }
+    std.debug.assert(self.derived_clients.items.len == 0);
+}
+
+/// Submits externally queued events for every live derived transport.
+pub fn flushIngress(self: *WayringSecurityContext) !void {
+    for (self.contexts.items) |value| if (value.host) |host| try host.flush();
+}
+
 /// Deactivates ingress before releasing manager/filter dependencies.
 pub fn deinit(self: *WayringSecurityContext) void {
+    self.shutdownIngress();
     while (self.contexts.items.len != 0) {
         const value = self.contexts.items[self.contexts.items.len - 1];
         const resource_live = value.resource != null;
-        self.deactivate(value);
         if (resource_live) self.destroyContextResource(value);
     }
-    std.debug.assert(self.derived_clients.items.len == 0);
     while (self.managers.items.len != 0) self.destroyManager(self.managers.items[self.managers.items.len - 1]);
     self.unpublish();
     self.derived_clients.deinit(self.allocator);
@@ -601,6 +614,42 @@ test "fixture filter exposes manager only to the exact direct compositor UID" {
     try std.testing.expect(adapter.globalFilter(&direct, global));
     inline for (.{ &derived, &foreign, &unknown, &missing }) |client|
         try std.testing.expect(!adapter.globalFilter(client, global));
+}
+
+test "shutdown ingress drains multiple resource-less contexts in reverse" {
+    const event_loop = try wl.EventLoop.create();
+    defer event_loop.destroy();
+    var protocol_server: server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    const Lifecycle = struct {
+        fn accepted(_: *anyopaque, _: *server.Client) !void {}
+        fn destroy(_: *anyopaque, _: *server.Client) void {}
+    };
+    var marker: u8 = 0;
+    var adapter: WayringSecurityContext = undefined;
+    adapter.init(std.testing.allocator, event_loop, &protocol_server, linux.getuid(), .{
+        .context = &marker,
+        .accepted = Lifecycle.accepted,
+        .destroy_resources = Lifecycle.destroy,
+    });
+    defer adapter.deinit();
+    var client: server.Client = .init(std.testing.allocator, .{});
+    defer client.deinit();
+
+    for (0..3) |_| {
+        const value = try std.testing.allocator.create(Context);
+        value.* = .{
+            .owner = &adapter,
+            .client = &client,
+            .resource = null,
+            .listen_fd = null,
+            .close_fd = null,
+            .committed = true,
+        };
+        try adapter.contexts.append(std.testing.allocator, value);
+    }
+    adapter.shutdownIngress();
+    try std.testing.expectEqual(@as(usize, 0), adapter.contexts.items.len);
 }
 
 const FixtureClient = struct {

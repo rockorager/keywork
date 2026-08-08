@@ -323,7 +323,6 @@ pub const Output = struct {
         values: []const Value,
     ) !void {
         if (self.sealed) return error.OutputSealed;
-        if (self.prepared_batch != null) return error.PreparedBatchActive;
         if (values.len != descriptor.arguments.len) return error.ArgumentCountMismatch;
 
         var writer: std.Io.Writer.Allocating = .init(self.allocator);
@@ -361,16 +360,22 @@ pub const Output = struct {
 
         var bytes = writer.toArrayList();
         errdefer bytes.deinit(self.allocator);
+        // A prepared transaction reserves the final slot. Events emitted by
+        // canonical mutation are ordered before that transaction's atomic
+        // publication and must not consume its reserved capacity.
+        if (self.prepared_batch != null) try self.batches.ensureUnusedCapacity(self.allocator, 2);
         try self.batches.append(self.allocator, .{
             .bytes = bytes,
             .fds = owned_fds,
             .kind = if (owned_fds.len == 0) .coalesced else .file_descriptors,
         });
+        if (self.prepared_batch) |*prepared| prepared.batch_count += 1;
     }
 
     /// Reserves both payload and queue storage for one later descriptor-free
-    /// event sequence. Publication is allocation-free and requires no other
-    /// batch to be appended between prepare and publish.
+    /// event sequence. Publication is allocation-free. Ordinary events may be
+    /// appended while canonical mutation runs; they remain ordered before the
+    /// prepared transaction and preserve its reserved queue slot.
     pub fn prepareBatch(self: *Output, maximum_bytes: usize) !PreparedBatch {
         if (self.sealed) return error.OutputSealed;
         if (self.prepared_batch != null) return error.PreparedBatchActive;
@@ -1207,7 +1212,7 @@ test "prepared output publishes one complete batch or cancels without output" {
     try std.testing.expect((try output.beginSend()) == null);
 }
 
-test "prepared output encoding failure and interleaving rejection remain atomic" {
+test "prepared output orders canonical mutation events before atomic publication" {
     const argument = [_]ArgumentDescriptor{.{ .name = "value", .kind = .uint }};
     const descriptor: MessageDescriptor = .{ .name = "value", .arguments = &argument };
     var output = Output.init(std.testing.allocator);
@@ -1229,16 +1234,14 @@ test "prepared output encoding failure and interleaving rejection remain atomic"
     const interleaved = try output.prepareBatch(12);
     var writer = std.Io.Writer.fixed(try output.preparedBatchStorage(interleaved));
     try encodePreparedMessage(&writer, 7, 1, &descriptor, &.{.{ .uint = 11 }});
-    try std.testing.expectError(
-        error.PreparedBatchActive,
-        output.enqueue(8, 2, &descriptor, &.{.{ .uint = 12 }}),
-    );
+    try output.enqueue(8, 2, &descriptor, &.{.{ .uint = 12 }});
     try output.publishPreparedBatch(interleaved, writer.buffered().len);
 
     const prior = (try output.beginSend()).?;
-    try std.testing.expectEqual(@as(usize, 12), prior.bytes.len);
+    try std.testing.expectEqual(@as(usize, 24), prior.bytes.len);
     try std.testing.expectEqual(@as(u32, 9), readU32(prior.bytes[0..4]));
     try std.testing.expectEqual(@as(u16, 3), @as(u16, @truncate(readU32(prior.bytes[4..8]))));
+    try std.testing.expectEqual(@as(u32, 8), readU32(prior.bytes[12..16]));
     try output.completeSend(prior.token, prior.bytes.len);
     const prepared = (try output.beginSend()).?;
     try std.testing.expectEqual(@as(u32, 7), readU32(prepared.bytes[0..4]));

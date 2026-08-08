@@ -275,6 +275,18 @@ pub fn failure(self: *const WayringHost) ?anyerror {
     return self.failure_value;
 }
 
+/// Submits protocol output queued by compositor callbacks that run outside a
+/// transport completion. Normal request dispatch flushes as part of its
+/// completion cycle; render and output callbacks must explicitly wake writes.
+pub fn flush(self: *WayringHost) !void {
+    if (self.failure_value) |err| return err;
+    if (self.shutting_down) return error.HostShuttingDown;
+    self.prepareAndSubmit() catch |err| {
+        self.fail(err);
+        return err;
+    };
+}
+
 /// Installs the host-level one-shot notification endpoint. The callback may
 /// rearm the alarm. It is never called for canceled or superseded operations.
 pub fn setAlarmCallback(self: *WayringHost, callback: ?Alarm) void {

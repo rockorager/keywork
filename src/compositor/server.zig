@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const libc = @cImport(@cInclude("stdlib.h"));
 const wayland = @import("wayland");
+const sysmacros = @cImport(@cInclude("sys/sysmacros.h"));
 const slot_map = @import("slot_map.zig");
 const presentation = @import("presentation.zig");
 const Compositor = @import("wayland/compositor.zig");
@@ -84,6 +85,8 @@ const OutputLayout = @import("wayland/output_layout.zig");
 const OutputManagement = @import("wayland/output_management.zig");
 const NeutralOutputManagement = @import("OutputManagement.zig");
 const WayringOutputManagement = @import("wayland/WayringOutputManagement.zig");
+const WayringScreencopy = @import("wayland/WayringScreencopy.zig");
+const WayringLinuxDmabuf = @import("wayland/WayringLinuxDmabuf.zig");
 const OutputPower = @import("wayland/output_power.zig");
 const GammaControl = @import("wayland/gamma_control.zig");
 const DrmLease = @import("wayland/drm_lease.zig");
@@ -197,6 +200,14 @@ pub const GeneratedInputMethodObserver = struct {
     set_inhibited: *const fn (*anyopaque, bool) void,
     send_popup_rectangle: *const fn (*anyopaque, NeutralTextInput.PopupId, NeutralTextInput.Rectangle) void,
     refresh_popups: *const fn (*anyopaque) void,
+};
+pub const GeneratedOutputObserver = struct {
+    context: *anyopaque,
+    changed: *const fn (*anyopaque) void,
+};
+pub const GeneratedCaptureObserver = struct {
+    context: *anyopaque,
+    capture_output: *const fn (*anyopaque, OutputLayout.Id) void,
 };
 const GeneratedInputPopup = struct {
     id: NeutralTextInput.PopupId,
@@ -392,6 +403,8 @@ data_device_observer: ?DataDeviceObserver = null,
 primary_selection_observer: ?PrimarySelectionObserver = null,
 data_control_observer: ?DataControlObserver = null,
 generated_input_method_observer: ?GeneratedInputMethodObserver = null,
+generated_output_observer: ?GeneratedOutputObserver = null,
+generated_capture_observer: ?GeneratedCaptureObserver = null,
 generated_input_popups: std.ArrayList(GeneratedInputPopup) = .empty,
 xdg_toplevel_drag: XdgToplevelDrag,
 xdg_toplevel_icon: XdgToplevelIcon,
@@ -2917,6 +2930,7 @@ fn setHeadlessOutputMode(
             render_output.backend.renderScale(),
         );
     }
+    if (self.generated_output_observer) |observer| observer.changed(observer.context);
     self.damageFullOutput(render_output);
     log.info(
         "configured headless output: mode {d}x{d}, logical {d}x{d}, scale {d}/{d}",
@@ -4085,6 +4099,10 @@ pub fn canonicalSeat(self: *Self) *Seat {
     return &self.seat;
 }
 
+pub fn virtualPointerAuthority(self: *Self) *@import("VirtualPointer.zig") {
+    return self.virtual_pointer.authority();
+}
+
 pub fn setGeneratedInputMethodObserver(self: *Self, observer: ?GeneratedInputMethodObserver) void {
     self.generated_input_method_observer = observer;
 }
@@ -4420,6 +4438,114 @@ pub fn neutralWorkspace(self: *Self) *NeutralWorkspace {
 pub fn wayringDefaultOutputId(self: *Self) ?OutputLayout.Id {
     if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return null;
     return self.primaryRenderOutput().protocol_id;
+}
+
+pub fn generatedOutputManagement(self: *Self) *NeutralOutputManagement {
+    return &self.output_management_authority;
+}
+
+pub fn generatedOutputManagementListener(self: *Self) NeutralOutputManagement.Listener {
+    return .{ .context = self, .test_configuration = testOutputConfiguration, .apply = applyOutputConfiguration };
+}
+
+pub fn primaryOutputModeSize(self: *Self) render.Size {
+    return self.primaryRenderOutput().backend.modeSize();
+}
+
+pub fn primaryOutputRefresh(self: *Self) i32 {
+    return self.primaryRenderOutput().backend.refreshMillihertz();
+}
+
+pub fn setGeneratedOutputObserver(self: *Self, observer: ?GeneratedOutputObserver) void {
+    self.generated_output_observer = observer;
+}
+
+pub fn setGeneratedCaptureObserver(self: *Self, observer: ?GeneratedCaptureObserver) void {
+    self.generated_capture_observer = observer;
+}
+
+pub fn generatedOutputTarget(self: *Self) ?NeutralOutputManagement.Target {
+    const id = self.wayringDefaultOutputId() orelse return null;
+    return .{ .virtual = self.outputs.get(id) orelse return null };
+}
+
+pub fn generatedOutputSnapshot(
+    self: *Self,
+    modes: []const WayringOutputManagement.ModeSnapshot,
+) WayringOutputManagement.HeadSnapshot {
+    const render_output = self.primaryRenderOutput();
+    const output = self.outputs.get(render_output.protocol_id).?;
+    const snapshot = output.snapshot();
+    const scale_fixed: i32 = @intCast(
+        @as(u64, snapshot.preferred_scale.numerator) * 256 /
+            render.Scale.denominator,
+    );
+    return .{
+        .id = @intFromPtr(output),
+        .target = .{ .virtual = output },
+        .name = snapshot.name,
+        .description = snapshot.description,
+        .make = snapshot.make,
+        .model = snapshot.model,
+        .physical_width = @intCast(snapshot.physical_size.width),
+        .physical_height = @intCast(snapshot.physical_size.height),
+        .x = snapshot.position.x,
+        .y = snapshot.position.y,
+        .scale_fixed = scale_fixed,
+        .modes = modes,
+    };
+}
+
+pub fn resolveGeneratedOutput(context: *anyopaque, client: *@import("wayring").server.Client, object_id: u32) ?OutputLayout.Id {
+    const outputs: *WayringOutput = @ptrCast(@alignCast(context));
+    return switch (outputs.identifyResource(client, object_id)) {
+        .live => |identity| identity.output,
+        .retired, .invalid => null,
+    };
+}
+
+pub fn generatedOutputLogicalSize(context: *anyopaque, id: OutputLayout.Id) ?render.Size {
+    const outputs: *WayringOutput = @ptrCast(@alignCast(context));
+    const size = outputs.logicalSize(id) orelse return null;
+    return .{ .width = size.width, .height = size.height };
+}
+
+pub fn generatedScreencopyConstraints(context: *anyopaque, target: WayringScreencopy.Target) ?render.Size {
+    return screencopyConstraints(@ptrCast(@alignCast(context)), .{ .output = target.output, .region = target.region });
+}
+
+pub fn scheduleGeneratedScreencopy(context: *anyopaque, target: WayringScreencopy.Target, wait_for_damage: bool) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.scheduleCaptureFrame(target.output, wait_for_damage);
+}
+
+pub fn captureGeneratedScreencopy(context: *anyopaque, target: WayringScreencopy.Target, cursors: bool, pixels: render.PixelBuffer) WayringScreencopy.CaptureError!presentation.Timestamp {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const completion_fd = self.captureOutputRegion(target.output, target.region, cursors, pixels) catch return error.Failed;
+    if (completion_fd) |fd| {
+        defer _ = std.c.close(fd);
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        if ((std.posix.poll(&poll_fds, -1) catch return error.Failed) != 1 or
+            poll_fds[0].revents & std.posix.POLL.IN == 0 or
+            poll_fds[0].revents &
+                (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0)
+        {
+            return error.Failed;
+        }
+    }
+    return presentation.Info.now(self.io).timestamp;
+}
+
+pub fn generatedDmabufCapabilities(self: *Self) WayringLinuxDmabuf.Capabilities {
+    const device = if (self.renderer.dmabufDeviceId()) |id|
+        sysmacros.makedev(id.major, id.minor)
+    else
+        0;
+    return .{ .device = device, .supported_pairs = self.renderer.dmabufSourceFormats(), .source_validator = self.renderer.dmabufSourceValidator() };
 }
 
 pub fn setWayringDefaultOutputListener(self: *Self, listener: WayringDefaultOutputListener) void {
@@ -11140,6 +11266,7 @@ fn captureOutputFrame(
     defer self.composed_capture_source = null;
     if (self.image_copy_capture_initialized) self.image_copy_capture.captureOutput(output_id);
     if (self.screencopy_initialized) self.screencopy.captureOutput(output_id);
+    if (self.generated_capture_observer) |observer| observer.capture_output(observer.context, output_id);
 }
 
 fn selectFrameOutputColorDescription(
@@ -26179,6 +26306,7 @@ test "production generated data device completes the exact profile and supports 
     const WayringTextInput = @import("wayland/WayringTextInput.zig");
     const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
     const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
+    const WayringSecurityContext = @import("wayland/WayringSecurityContext.zig");
     const wayring = @import("wayring");
     const linux = std.os.linux;
     var marker: u8 = 0;
@@ -26512,6 +26640,10 @@ test "production generated data device completes the exact profile and supports 
         if (generated_workspace.global != null) generated_workspace.unpublish();
         generated_workspace.deinit();
     }
+    var generated_security_context: WayringSecurityContext = undefined;
+    var generated_linux_dmabuf: WayringLinuxDmabuf = undefined;
+    var generated_output_management: WayringOutputManagement = undefined;
+    var generated_screencopy: WayringScreencopy = undefined;
 
     const Lifecycle = struct {
         const FatalEvidence = struct {
@@ -26551,6 +26683,10 @@ test "production generated data device completes the exact profile and supports 
         idle_notify: *WayringIdleNotification,
         session_lock: *WayringSessionLock,
         workspace: *WayringWorkspace,
+        security_context: *WayringSecurityContext,
+        linux_dmabuf: *WayringLinuxDmabuf,
+        output_management: *WayringOutputManagement,
+        screencopy: *WayringScreencopy,
         generated_client: ?ClientRegistry.Id = null,
         generated_raw: ?*wayring.server.Client = null,
         offender_fatal: ?FatalEvidence = null,
@@ -26571,6 +26707,11 @@ test "production generated data device completes the exact profile and supports 
         }
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            self.virtual_pointer.destroyClientResources(client);
+            self.screencopy.destroyClientResources(client);
+            self.output_management.destroyClientResources(client);
+            self.linux_dmabuf.destroyClientResources(client);
+            self.security_context.destroyClientResources(client);
             self.workspace.destroyClientResources(client);
             self.idle_notify.destroyClientResources(client);
             self.session_lock.destroyClientResources(client);
@@ -26602,7 +26743,6 @@ test "production generated data device completes the exact profile and supports 
             }
             // Synthetic devices must release canonical input state before
             // their seat/output resources lose identity.
-            self.virtual_pointer.destroyClientResources(client);
             self.virtual_keyboard.destroyClientResources(client);
             self.input_method.destroyClientResources(client);
             self.data_control.destroyClientResources(client);
@@ -26644,15 +26784,102 @@ test "production generated data device completes the exact profile and supports 
         .idle_notify = &idle_notify,
         .session_lock = &session_lock,
         .workspace = &generated_workspace,
+        .security_context = &generated_security_context,
+        .linux_dmabuf = &generated_linux_dmabuf,
+        .output_management = &generated_output_management,
+        .screencopy = &generated_screencopy,
     };
+    generated_security_context.init(
+        std.testing.allocator,
+        server.eventLoop(),
+        &protocol_server,
+        linux.getuid(),
+        .{
+            .context = &lifecycle,
+            .accepted = Lifecycle.accepted,
+            .destroy_resources = Lifecycle.destroy,
+        },
+    );
+    defer {
+        generated_security_context.shutdownIngress();
+        if (generated_security_context.global != null) generated_security_context.unpublish();
+        generated_security_context.deinit();
+    }
+    try generated_linux_dmabuf.init(
+        std.testing.allocator,
+        &protocol_server,
+        &compositor,
+        server.generatedDmabufCapabilities(),
+    );
+    defer {
+        if (generated_linux_dmabuf.global != null) generated_linux_dmabuf.unpublish();
+        generated_linux_dmabuf.deinit();
+    }
+    generated_output_management.init(
+        std.testing.allocator,
+        &protocol_server,
+        server.generatedOutputManagement(),
+        linux.getuid(),
+        server.generatedOutputManagementListener(),
+    );
+    defer {
+        if (generated_output_management.global != null) generated_output_management.unpublish();
+        generated_output_management.deinit();
+    }
+    const generated_mode_size = server.primaryOutputModeSize();
+    const generated_modes = [_]WayringOutputManagement.ModeSnapshot{.{
+        .width = generated_mode_size.width,
+        .height = generated_mode_size.height,
+        .refresh_millihertz = server.primaryOutputRefresh(),
+        .preferred = true,
+    }};
+    try generated_output_management.addOutput(server.generatedOutputSnapshot(&generated_modes));
+    generated_screencopy.init(
+        std.testing.allocator,
+        &protocol_server,
+        .{
+            .context = &outputs,
+            .resolve = Self.resolveGeneratedOutput,
+            .logical_size = Self.generatedOutputLogicalSize,
+        },
+        &compositor,
+        &generated_linux_dmabuf,
+        linux.getuid(),
+        .{
+            .context = server,
+            .constraints = Self.generatedScreencopyConstraints,
+            .schedule = Self.scheduleGeneratedScreencopy,
+            .capture_shm = Self.captureGeneratedScreencopy,
+        },
+    );
+    defer {
+        if (generated_screencopy.global != null) generated_screencopy.unpublish();
+        generated_screencopy.deinit();
+    }
     const GlobalFilter = struct {
         data_control: *WayringDataControl,
         workspace: *WayringWorkspace,
+        security_context: *WayringSecurityContext,
+        output_management: *WayringOutputManagement,
+        screencopy: *WayringScreencopy,
+        virtual_pointer: *WayringVirtualPointer,
         fn visible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
-            return self.data_control.globalFilter(client, global) and self.workspace.globalFilter(client, global);
+            return self.data_control.globalFilter(client, global) and
+                self.workspace.globalFilter(client, global) and
+                self.security_context.globalFilter(client, global) and
+                self.output_management.globalFilter(client, global) and
+                self.screencopy.globalFilter(client, global) and
+                self.virtual_pointer.globalFilter(client, global);
         }
     };
-    var global_filter: GlobalFilter = .{ .data_control = &data_control, .workspace = &generated_workspace };
+    var global_filter: GlobalFilter = .{
+        .data_control = &data_control,
+        .workspace = &generated_workspace,
+        .security_context = &generated_security_context,
+        .output_management = &generated_output_management,
+        .screencopy = &generated_screencopy,
+        .virtual_pointer = &generated_virtual_pointer,
+    };
     protocol_server.setGlobalFilter(GlobalFilter, &global_filter, GlobalFilter.visible);
     defer protocol_server.clearGlobalFilter();
     const host = try WayringHost.create(
@@ -26718,6 +26945,11 @@ test "production generated data device completes the exact profile and supports 
     try session_lock.publish();
     try idle_notify.publish();
     try generated_workspace.publish();
+    try generated_security_context.publish();
+    try generated_linux_dmabuf.publish();
+    try generated_output_management.publish();
+    try generated_screencopy.publish();
+    try generated_virtual_pointer.publish();
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .manager_added);
     try std.testing.expect(peer.globals_exact);
@@ -27130,7 +27362,10 @@ test "production generated data device completes the exact profile and supports 
         denied_workspace_thread.join();
     };
     try waitForWayringXdgStage(server, denied_host, &denied_workspace, .registry_ready);
-    try std.testing.expectEqual(@as(usize, 16), denied_workspace.global_count);
+    try std.testing.expectEqual(
+        WayringProfile.expectedCount(.presenting_headless, .security_context),
+        denied_workspace.global_count,
+    );
     try std.testing.expectEqual(@as(usize, 0), denied_workspace.workspace_manager_count);
     try signalWayringCommand(denied_workspace_command);
     try waitForWayringXdgStage(server, denied_host, &denied_workspace, .manager_added);
@@ -27149,6 +27384,11 @@ test "production generated data device completes the exact profile and supports 
     try denied_host.destroy();
     denied_host_live = false;
 
+    generated_virtual_pointer.unpublish();
+    generated_screencopy.unpublish();
+    generated_output_management.unpublish();
+    generated_linux_dmabuf.unpublish();
+    generated_security_context.unpublish();
     generated_workspace.unpublish();
     idle_notify.unpublish();
     session_lock.unpublish();
@@ -27192,6 +27432,11 @@ test "production generated data device completes the exact profile and supports 
     try session_lock.publish();
     try idle_notify.publish();
     try generated_workspace.publish();
+    try generated_security_context.publish();
+    try generated_linux_dmabuf.publish();
+    try generated_output_management.publish();
+    try generated_screencopy.publish();
+    try generated_virtual_pointer.publish();
     try std.testing.expect(WayringProfile.validate(&protocol_server, .presenting_headless) == null);
 
     const raw_layer_command = linux.eventfd(0, linux.EFD.CLOEXEC);
@@ -27638,6 +27883,11 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringXdgStage(server, host, &primary_watch, .registry_ready);
     try std.testing.expect(primary_watch.globals_exact);
     try std.testing.expectEqual(@as(usize, 1), primary_watch.primary_selection_manager_count);
+    generated_virtual_pointer.unpublish();
+    generated_screencopy.unpublish();
+    generated_output_management.unpublish();
+    generated_linux_dmabuf.unpublish();
+    generated_security_context.unpublish();
     generated_workspace.unpublish();
     idle_notify.unpublish();
     session_lock.unpublish();
@@ -27669,6 +27919,11 @@ test "production generated data device completes the exact profile and supports 
     try session_lock.publish();
     try idle_notify.publish();
     try generated_workspace.publish();
+    try generated_security_context.publish();
+    try generated_linux_dmabuf.publish();
+    try generated_output_management.publish();
+    try generated_screencopy.publish();
+    try generated_virtual_pointer.publish();
     try std.testing.expect(WayringProfile.validate(&protocol_server, .presenting_headless) == null);
     const raw_primary_rebind_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_primary_rebind_command) != .SUCCESS) return error.EventFdFailed;
@@ -27783,9 +28038,6 @@ test "production generated data device completes the exact profile and supports 
         return error.GeneratedTextWindowPositionMissing;
     const pointer_bounds = server.virtualPointerBounds(null) orelse return error.VirtualPointerBoundsMissing;
 
-    // Virtual pointer is intentionally absent from the production profile;
-    // expose it only for this authentic generated-client integration phase.
-    try generated_virtual_pointer.publish();
     const raw_virtual_pointer_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_virtual_pointer_command) != .SUCCESS) return error.EventFdFailed;
     const virtual_pointer_command: std.posix.fd_t = @intCast(raw_virtual_pointer_command);
@@ -27851,8 +28103,6 @@ test "production generated data device completes the exact profile and supports 
     } else return error.GeneratedVirtualPointerCleanupTimedOut;
     try std.testing.expectEqual(@as(u32, 0), generated_text.pointer_button_times[3]);
     try std.testing.expectEqual(wayland.client.wl.Pointer.ButtonState.released, generated_text.pointer_button_states[3]);
-    generated_virtual_pointer.unpublish();
-
     const raw_virtual_keyboard_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_virtual_keyboard_command) != .SUCCESS) return error.EventFdFailed;
     const virtual_keyboard_command: std.posix.fd_t = @intCast(raw_virtual_keyboard_command);

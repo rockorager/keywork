@@ -44,6 +44,11 @@ pub const entries = [_]Entry{
     .{ .interface = "ext_session_lock_manager_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "ext_idle_notifier_v1", .version = 2, .gate = .presenting_headless },
     .{ .interface = "ext_workspace_manager_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
+    .{ .interface = "wp_security_context_manager_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
+    .{ .interface = "zwp_linux_dmabuf_v1", .version = 6, .gate = .presenting_headless },
+    .{ .interface = "zwlr_output_manager_v1", .version = 4, .visibility = .restricted, .gate = .presenting_headless },
+    .{ .interface = "zwlr_screencopy_manager_v1", .version = 3, .visibility = .restricted, .gate = .presenting_headless },
+    .{ .interface = "zwlr_virtual_pointer_manager_v1", .version = 2, .visibility = .restricted, .gate = .presenting_headless },
 };
 
 pub const PeerClass = enum { direct, security_context, unknown };
@@ -142,11 +147,12 @@ fn enabled(entry: Entry, gate: Gate) bool {
 test "manifest pins exact direct and security-context profiles" {
     try std.testing.expectEqual(@as(usize, 4), expectedCount(.sidecar, .direct));
     try std.testing.expectEqual(@as(usize, 4), expectedCount(.sidecar, .security_context));
-    try std.testing.expectEqual(@as(usize, 21), expectedCount(.presenting_headless, .direct));
-    try std.testing.expectEqual(@as(usize, 16), expectedCount(.presenting_headless, .security_context));
-    try std.testing.expectEqual(@as(usize, 16), expectedCount(.presenting_headless, .unknown));
-    try std.testing.expectEqualStrings("ext_workspace_manager_v1", expectedAt(.presenting_headless, .direct, 20).?.interface);
-    try std.testing.expect(expectedAt(.presenting_headless, .security_context, 16) == null);
+    try std.testing.expectEqual(@as(usize, 26), expectedCount(.presenting_headless, .direct));
+    try std.testing.expectEqual(@as(usize, 17), expectedCount(.presenting_headless, .security_context));
+    try std.testing.expectEqual(@as(usize, 17), expectedCount(.presenting_headless, .unknown));
+    try std.testing.expectEqualStrings("wp_security_context_manager_v1", expectedAt(.presenting_headless, .direct, 21).?.interface);
+    try std.testing.expectEqualStrings("zwp_linux_dmabuf_v1", expectedAt(.presenting_headless, .security_context, 16).?.interface);
+    try std.testing.expect(expectedAt(.presenting_headless, .security_context, 17) == null);
 }
 
 test "security visibility requires trusted direct UID and keeps public open" {

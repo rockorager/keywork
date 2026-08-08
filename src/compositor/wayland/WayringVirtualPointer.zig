@@ -1,4 +1,4 @@
-//! Unpublished generated privileged virtual-pointer protocol adapter.
+//! Generated privileged virtual-pointer protocol adapter.
 //!
 //! This type owns only authenticated wire resources and exact object
 //! identities. `VirtualPointer` owns all input state and canonical routing.

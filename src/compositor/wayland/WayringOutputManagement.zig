@@ -1,4 +1,4 @@
-//! Unpublished scanner adapter for complete output-management transactions.
+//! Scanner adapter for complete output-management transactions.
 
 const Self = @This();
 const std = @import("std");
@@ -64,6 +64,7 @@ head_resources: std.ArrayList(*HeadResource) = .empty,
 mode_resources: std.ArrayList(*ModeResource) = .empty,
 configurations: std.ArrayList(*Configuration) = .empty,
 next_generation: u64 = 1,
+applying_configuration: bool = false,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, protocol_server: *server.Server, authority: *Neutral, authorized_uid: std.os.linux.uid_t, listener: Listener) void {
     self.* = .{ .allocator = allocator, .protocol_server = protocol_server, .authority = authority, .authorized_uid = authorized_uid, .listener = listener };
@@ -130,6 +131,10 @@ pub fn addOutput(self: *Self, snapshot: HeadSnapshot) !void {
     self.sendDone();
 }
 pub fn syncOutput(self: *Self, snapshot: HeadSnapshot) !void {
+    // A generated apply already has one prepared atomic publication against
+    // the current head resources. Canonical output observers may run during
+    // that mutation; commitSnapshots updates those same resources afterward.
+    if (self.applying_configuration) return;
     const old = self.findHead(snapshot.id) orelse return error.UnknownHead;
     // Replacing storage also deliberately creates a fresh generation.
     self.removeOutput(snapshot.id);
@@ -458,7 +463,13 @@ fn execute(self: *Self, config: *Configuration, apply: bool) !void {
         publication.reserved = true;
     }
 
-    if (!self.listener.apply(self.listener.context, prepared.changes)) {
+    const applied = blk: {
+        std.debug.assert(!self.applying_configuration);
+        self.applying_configuration = true;
+        defer self.applying_configuration = false;
+        break :blk self.listener.apply(self.listener.context, prepared.changes);
+    };
+    if (!applied) {
         for (publications.items) |*publication| {
             publication.client.cancelEventBatch(publication.reservation);
             publication.reserved = false;
@@ -872,20 +883,32 @@ fn drainClient(client: *server.Client) !void {
 
 test "renderer conformance: canonical apply encodes high server ids as exact wire objects" {
     const Context = struct {
+        adapter: ?*Self = null,
+        self_sync_observed: bool = false,
+
         fn accept(_: *anyopaque, _: []const Neutral.Change) bool {
+            return true;
+        }
+
+        fn apply(erased: *anyopaque, _: []const Neutral.Change) bool {
+            const self: *@This() = @ptrCast(@alignCast(erased));
+            const adapter = self.adapter.?;
+            self.self_sync_observed = adapter.applying_configuration;
+            adapter.syncOutput(adapter.heads.items[0].snapshot) catch return false;
             return true;
         }
     };
     var host: server.Server = .init(std.testing.allocator);
     defer host.deinit();
     var authority: Neutral = .{};
-    var context: u8 = 0;
+    var context: Context = .{};
     var adapter: Self = undefined;
     adapter.init(std.testing.allocator, &host, &authority, 42, .{
         .context = &context,
         .test_configuration = Context.accept,
-        .apply = Context.accept,
+        .apply = Context.apply,
     });
+    context.adapter = &adapter;
     defer adapter.deinit();
     try adapter.addOutput(.{
         .id = 1,
@@ -911,6 +934,7 @@ test "renderer conformance: canonical apply encodes high server ids as exact wir
     try drainClient(client.client());
 
     const head = adapter.head_resources.items[0];
+    const canonical_head = adapter.heads.items[0];
     const mode = head.modes.items[0];
     try std.testing.expect(head.resource.id() >= server.ObjectMap.first_server_id);
     try std.testing.expect(mode.resource.id() >= server.ObjectMap.first_server_id);
@@ -949,6 +973,10 @@ test "renderer conformance: canonical apply encodes high server ids as exact wir
     }
     try std.testing.expect(current_mode_seen and scale_seen);
     try client.client().completeSend(batch.token, batch.bytes.len);
+    try std.testing.expect(context.self_sync_observed);
+    try std.testing.expect(adapter.heads.items[0] == canonical_head);
+    try std.testing.expect(adapter.head_resources.items[0] == head);
+    try std.testing.expect(!head.finished and !mode.finished);
     try std.testing.expectEqual(@as(u32, 1920), adapter.heads.items[0].modes[0].width);
     try std.testing.expectEqual(@as(i32, 384), adapter.heads.items[0].snapshot.scale_fixed);
 

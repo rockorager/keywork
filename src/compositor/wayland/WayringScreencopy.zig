@@ -1,4 +1,4 @@
-//! Unpublished generated wlr-screencopy v3 adapter.
+//! Generated wlr-screencopy v3 adapter.
 //!
 //! This type owns only generated manager/frame resources, destination
 //! retention, wire validation, and events. `screencopy_session` owns shared
