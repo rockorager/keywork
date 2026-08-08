@@ -443,7 +443,8 @@ workspace_transitions: std.ArrayList(WorkspaceTransition),
 animation_now: i96,
 renderer: Renderer,
 socket_buffer: [11]u8,
-listening: bool,
+mature_listening: bool,
+started: bool,
 xwayland_display_listener: ?XwaylandDisplayListener,
 wayring_default_output_listener: ?WayringDefaultOutputListener,
 
@@ -1281,7 +1282,8 @@ pub fn createWithVirtualOutput(
         .animation_now = 0,
         .renderer = undefined,
         .socket_buffer = undefined,
-        .listening = false,
+        .mature_listening = false,
+        .started = false,
         .xwayland_display_listener = null,
         .wayring_default_output_listener = null,
     };
@@ -3519,14 +3521,21 @@ fn stopRenderOutput(render_output: *RenderOutput) void {
 }
 
 pub fn listen(self: *Self) ![:0]const u8 {
-    std.debug.assert(!self.listening);
+    std.debug.assert(!self.mature_listening and !self.started);
     const socket_name = try self.display.addSocketAuto(&self.socket_buffer);
-    self.listening = true;
+    self.mature_listening = true;
     return socket_name;
 }
 
+/// Allows control and event-loop dispatch after the selected public listener
+/// and all of its policy gates are ready. This does not open mature ingress.
+pub fn markStarted(self: *Self) void {
+    std.debug.assert(!self.started);
+    self.started = true;
+}
+
 pub fn listenControl(self: *Self, runtime_directory: []const u8) !void {
-    std.debug.assert(self.listening and !self.control_initialized);
+    std.debug.assert(self.started and !self.control_initialized);
     try self.control.init(
         self.allocator,
         self.io,
@@ -4424,7 +4433,7 @@ fn wayringPresentationEnabled(output_kind: OutputBackend.Kind) bool {
 }
 
 pub fn run(self: *Self) void {
-    std.debug.assert(self.listening);
+    std.debug.assert(self.started);
     std.debug.assert(self.configuration != null);
     self.display.run();
 }

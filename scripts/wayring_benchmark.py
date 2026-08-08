@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproducible core-Wayland server benchmark. Run via `zig build benchmark-wayring`."""
+"""Non-parity Sway/example microdiagnostic. Run via `zig build microdiagnostic-wayring`."""
 import argparse, csv, json, os, platform, signal, stat, statistics, subprocess, tempfile, time
 from pathlib import Path
 
@@ -140,7 +140,7 @@ def main():
     if not args.skip_perf:
         for name in ("wayring","sway"): metadata.setdefault("perf_commands",[]).append(profile_perf(name,out,"pipeline",args.pipeline,args.warmup))
     (out/"raw.json").write_text(json.dumps(dict(metadata=metadata,samples=rows),indent=2)+"\n")
-    report=["# Wayring vs headless Sway core-Wayland benchmark","",f"Kernel `{metadata['kernel']}`; `{metadata['sway']}`; Zig `{metadata['zig']}`. {args.repetitions} samples per cell after {args.warmup} warm-up roundtrips.","",
+    report=["# Non-parity Wayring example vs headless Sway microdiagnostic","","**This is a microdiagnostic, not a same-compositor parity comparison. Do not use it for comparative claims.**","",f"Kernel `{metadata['kernel']}`; `{metadata['sway']}`; Zig `{metadata['zig']}`. {args.repetitions} samples per cell after {args.warmup} warm-up roundtrips.","",
             "| server | workload | operations | wall ns/op median (min–max) | server CPU ns/op median (min–max) | RSS/HWM KiB median |","|---|---:|---:|---:|---:|---:|"]
     for name in ("wayring","sway"):
       for workload in ("serial","pipeline"):

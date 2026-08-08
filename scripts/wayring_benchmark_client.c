@@ -63,8 +63,9 @@ static uint64_t parse_count(const char *text) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 6 || (strcmp(argv[2], "serial") != 0 && strcmp(argv[2], "pipeline") != 0)) {
-        fprintf(stderr, "usage: %s SOCKET serial|pipeline OPERATIONS WARMUP HOLD_MS\n", argv[0]);
+    if (argc != 6 || (strcmp(argv[2], "serial") != 0 && strcmp(argv[2], "pipeline") != 0 &&
+        strcmp(argv[2], "churn") != 0 && strcmp(argv[2], "registry") != 0)) {
+        fprintf(stderr, "usage: %s SOCKET serial|pipeline|churn|registry OPERATIONS WARMUP HOLD_MS\n", argv[0]);
         return 2;
     }
     const uint64_t operations = parse_count(argv[3]);
@@ -85,7 +86,7 @@ int main(int argc, char **argv) {
         for (uint64_t i = 0; i < operations; i++)
             if (wl_display_roundtrip(display) < 0) fail("measured roundtrip");
         counter.done = operations;
-    } else {
+    } else if (strcmp(argv[2], "pipeline") == 0) {
         const uint64_t pipeline_batch = 5000;
         for (uint64_t issued = 0; issued < operations;) {
             const uint64_t target = issued + (operations - issued < pipeline_batch ? operations - issued : pipeline_batch);
@@ -98,17 +99,35 @@ int main(int argc, char **argv) {
             while (counter.done < target)
                 if (wl_display_dispatch(display) < 0) fail("dispatch");
         }
+    } else if (strcmp(argv[2], "registry") == 0) {
+        for (uint64_t i = 0; i < operations; i++) {
+            struct wl_registry *registry = wl_display_get_registry(display);
+            if (registry == NULL || wl_display_roundtrip(display) < 0) fail("registry roundtrip");
+            wl_registry_destroy(registry);
+        }
+        counter.done = operations;
+    } else {
+        wl_display_disconnect(display);
+        display = NULL;
+        for (uint64_t i = 0; i < operations; i++) {
+            struct wl_display *connection = connect_path(argv[1]);
+            struct wl_registry *registry = wl_display_get_registry(connection);
+            if (registry == NULL || wl_display_roundtrip(connection) < 0) fail("churn registry roundtrip");
+            wl_registry_destroy(registry);
+            wl_display_disconnect(connection);
+        }
+        counter.done = operations;
     }
     uint64_t elapsed = monotonic_ns() - begin;
     if (counter.done != operations) {
-        fprintf(stderr, "callback count mismatch: %" PRIu64 " != %" PRIu64 "\n", counter.done, operations);
+        fprintf(stderr, "completed operation count mismatch: %" PRIu64 " != %" PRIu64 "\n", counter.done, operations);
         return 1;
     }
-    printf("{\"workload\":\"%s\",\"operations\":%" PRIu64 ",\"callbacks\":%" PRIu64 ",\"wall_ns\":%" PRIu64 "}\n",
+    printf("{\"workload\":\"%s\",\"operations\":%" PRIu64 ",\"completed\":%" PRIu64 ",\"wall_ns\":%" PRIu64 "}\n",
            argv[2], operations, counter.done, elapsed);
     fflush(stdout);
     struct timespec hold = { .tv_sec = hold_ms / 1000, .tv_nsec = (hold_ms % 1000) * 1000000L };
     while (nanosleep(&hold, &hold) != 0 && errno == EINTR) {}
-    wl_display_disconnect(display);
+    if (display != NULL) wl_display_disconnect(display);
     return 0;
 }
