@@ -119,6 +119,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/xdg-activation/xdg-activation-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/viewporter/viewporter.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/fractional-scale/fractional-scale-v1.xml"));
+    generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));
     // Cursor shape refers to the tablet-tool interface in its manager request;
     // tablet is scanner input only and is not published by the generated host.
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/tablet/tablet-v2.xml"));
@@ -128,6 +129,8 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/upstream/input-method-unstable-v2.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/virtual-keyboard-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/upstream/wlr-layer-shell-unstable-v1.xml"));
+    generate_xdg_protocol.addFileArg(b.path("protocols/wayland/wlr-output-management-unstable-v1.xml"));
+    generate_xdg_protocol.addFileArg(b.path("protocols/wayland/wlr-screencopy-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-session-lock/ext-session-lock-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-workspace/ext-workspace-v1.xml"));
     // Security-context is generated for the unpublished ingress fixture only;
@@ -149,6 +152,20 @@ pub fn build(b: *std.Build) void {
     const run_xdg_protocol_check = b.addRunArtifact(b.addTest(.{ .root_module = xdg_protocol_check }));
     test_wayring_step.dependOn(&run_xdg_protocol_check.step);
     test_step.dependOn(&run_xdg_protocol_check.step);
+    const wayring_dmabuf_fixture = b.createModule(.{
+        .root_source_file = b.path("src/compositor/wayring_dmabuf_fixture_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "wayring", .module = wayring },
+            .{ .name = "wayring-protocol", .module = xdg_protocol },
+        },
+    });
+    wayring_dmabuf_fixture.linkSystemLibrary("pixman-1", .{ .use_pkg_config = .force });
+    const run_wayring_dmabuf_fixture = b.addRunArtifact(b.addTest(.{ .root_module = wayring_dmabuf_fixture }));
+    test_wayring_step.dependOn(&run_wayring_dmabuf_fixture.step);
+    test_step.dependOn(&run_wayring_dmabuf_fixture.step);
     const wayring_example = b.addExecutable(.{
         .name = "wayring-example",
         .root_module = b.createModule(.{

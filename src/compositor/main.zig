@@ -1104,6 +1104,7 @@ test "cursor size defaults when missing or empty" {
 }
 
 test {
+    _ = @import("OutputManagement.zig");
     _ = @import("render/types.zig");
     _ = @import("render/backdrop_cache_key.zig");
     _ = @import("render/blur_geometry.zig");
@@ -1140,6 +1141,8 @@ test {
     _ = @import("SurfaceRegistry.zig");
     _ = @import("Workspace.zig");
     _ = @import("wayland/WayringWorkspace.zig");
+    _ = @import("wayland/WayringOutputManagement.zig");
+    _ = @import("wayland/WayringScreencopy.zig");
     _ = @import("input_configuration.zig");
     _ = @import("output_configuration.zig");
     _ = @import("region.zig");
@@ -1203,6 +1206,7 @@ test {
     _ = @import("wayland/image_capture_source.zig");
     _ = @import("wayland/image_copy_capture.zig");
     _ = @import("wayland/screencopy.zig");
+    _ = @import("wayland/screencopy_session.zig");
     _ = @import("wayland/xwayland_shell.zig");
     _ = @import("xwayland/selection.zig");
     _ = @import("xwayland/server.zig");

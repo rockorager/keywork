@@ -8,6 +8,7 @@ const presentation = @import("../presentation.zig");
 const render = @import("../render/types.zig");
 const LinuxDmabuf = @import("linux_dmabuf.zig");
 const OutputLayout = @import("output_layout.zig");
+const Sessions = @import("screencopy_session.zig");
 const SecurityContext = @import("security_context.zig");
 
 const wl = wayland.server.wl;
@@ -22,13 +23,9 @@ linux_dmabuf: *LinuxDmabuf,
 listener: Listener,
 managers: std.ArrayList(*Manager),
 frames: std.ArrayList(*Frame),
-output_generations: std.ArrayList(OutputGeneration),
+sessions: Sessions,
 
-pub const Target = struct {
-    output: OutputLayout.Id,
-    /// Output-local logical coordinates. Null selects the complete output.
-    region: ?render.Rect = null,
-};
+pub const Target = Sessions.Target;
 
 pub const CaptureError = error{ Stopped, Failed };
 
@@ -76,21 +73,11 @@ const Destination = union(enum) {
     }
 };
 
-const OutputGeneration = struct {
-    output: OutputLayout.Id,
-    generation: u64 = 0,
-};
-
 const Manager = struct {
     owner: *Self,
     resource: ?*zwlr.ScreencopyManagerV1,
     reference_count: usize = 1,
-    baselines: std.ArrayList(Baseline) = .empty,
-
-    const Baseline = struct {
-        output: OutputLayout.Id,
-        generation: ?u64 = null,
-    };
+    session: Sessions.Manager = .{},
 
     fn create(owner: *Self, client: *wl.Client, version: u32, id: u32) !void {
         const resource = try zwlr.ScreencopyManagerV1.create(client, version, id);
@@ -151,34 +138,9 @@ const Manager = struct {
         std.debug.assert(self.reference_count > 0);
         self.reference_count -= 1;
         if (self.reference_count == 0) {
-            self.baselines.deinit(self.owner.allocator);
+            self.session.deinit(self.owner.allocator);
             self.owner.allocator.destroy(self);
         }
-    }
-
-    fn ensureBaseline(self: *Manager, output: OutputLayout.Id) !void {
-        if (self.baseline(output) != null) return;
-        try self.baselines.append(self.owner.allocator, .{ .output = output });
-    }
-
-    fn baseline(self: *Manager, output: OutputLayout.Id) ?*Baseline {
-        for (self.baselines.items) |*candidate| {
-            if (std.meta.eql(candidate.output, output)) return candidate;
-        }
-        return null;
-    }
-
-    fn removeOutput(self: *Manager, output: OutputLayout.Id) void {
-        for (self.baselines.items, 0..) |candidate, index| {
-            if (!std.meta.eql(candidate.output, output)) continue;
-            _ = self.baselines.swapRemove(index);
-            return;
-        }
-    }
-
-    fn invalidateOutput(self: *Manager, output: OutputLayout.Id) void {
-        const current = self.baseline(output) orelse return;
-        current.generation = null;
     }
 };
 
@@ -186,14 +148,8 @@ const Frame = struct {
     owner: *Self,
     manager: *Manager,
     resource: *zwlr.ScreencopyFrameV1,
-    target: ?Target,
-    size: ?render.Size,
-    overlay_cursor: bool,
-    used: bool = false,
-    finished: bool = false,
+    transaction: Sessions.Frame,
     destination: ?Destination = null,
-    with_damage: bool = false,
-    capture_generation: ?u64 = null,
     pending: ?PendingCapture = null,
 
     const PendingCapture = struct {
@@ -224,19 +180,19 @@ const Frame = struct {
             owner.listener.context,
             value,
         ) else null;
-        if (target) |value| {
-            try owner.ensureOutputGeneration(value.output);
-            try manager.ensureBaseline(value.output);
-        }
+        const transaction = try owner.sessions.createFrame(
+            &manager.session,
+            target,
+            size,
+            overlay_cursor,
+        );
         manager.reference();
         errdefer manager.unreference();
         self.* = .{
             .owner = owner,
             .manager = manager,
             .resource = resource,
-            .target = target,
-            .size = size,
-            .overlay_cursor = overlay_cursor,
+            .transaction = transaction,
         };
         try owner.frames.append(owner.allocator, self);
         resource.setHandler(*Frame, handleRequest, handleDestroy, self);
@@ -282,36 +238,33 @@ const Frame = struct {
     }
 
     fn copy(self: *Frame, buffer_resource: *wl.Buffer, with_damage: bool) void {
-        if (self.finished) return;
-        if (self.used) {
+        if (self.transaction.finished) return;
+        if (self.transaction.used) {
             self.resource.postError(.already_used, "screencopy frame was already used");
             return;
         }
-        const size = self.size orelse return self.fail();
+        const size = self.transaction.size orelse return self.fail();
         const destination = self.destinationForBuffer(buffer_resource, size) orelse {
             self.resource.postError(.invalid_buffer, "buffer does not match screencopy constraints");
             return;
         };
         destination.retain();
         self.destination = destination;
-        self.with_damage = with_damage;
-        self.used = true;
-        const target = self.target orelse return self.fail();
-        const generation = self.owner.outputGeneration(target.output) orelse return self.fail();
-        const baseline = self.manager.baseline(target.output) orelse return self.fail();
+        const wait_for_damage = self.transaction.start(&self.owner.sessions, with_damage) orelse
+            return self.fail();
+        const target = self.transaction.target orelse return self.fail();
         if (!self.owner.listener.schedule(
             self.owner.listener.context,
             target,
-            shouldWaitForDamage(with_damage, generation, baseline.generation),
+            wait_for_damage,
         )) self.fail();
     }
 
     fn capture(self: *Frame, generation: u64) void {
-        if (self.finished or !self.used or self.pending != null) return;
-        const size = self.size orelse return self.fail();
-        const target = self.target orelse return self.fail();
+        if (self.pending != null or !self.transaction.beginCapture(generation)) return;
+        const size = self.transaction.size orelse return self.fail();
+        const target = self.transaction.target orelse return self.fail();
         const destination = self.destination orelse return self.fail();
-        self.capture_generation = generation;
         const result: ?CaptureResult = switch (destination) {
             .shm => |shm| capture: {
                 shm.beginAccess();
@@ -322,7 +275,7 @@ const Frame = struct {
                 const captured = self.owner.listener.capture(
                     self.owner.listener.context,
                     target,
-                    self.overlay_cursor,
+                    self.transaction.overlay_cursor,
                     pixels,
                 ) catch |err| {
                     shm.endAccess();
@@ -354,7 +307,7 @@ const Frame = struct {
                 const timestamp = self.owner.listener.capture_dmabuf(
                     self.owner.listener.context,
                     target,
-                    self.overlay_cursor,
+                    self.transaction.overlay_cursor,
                     dmabuf,
                 ) catch |err| switch (err) {
                     error.Failed => null,
@@ -377,7 +330,7 @@ const Frame = struct {
                 const captured = self.owner.listener.capture(
                     self.owner.listener.context,
                     target,
-                    self.overlay_cursor,
+                    self.transaction.overlay_cursor,
                     pixel_buffer,
                 ) catch |err| break :capture err;
                 if (captured.completion_fd) |fd| {
@@ -454,13 +407,9 @@ const Frame = struct {
     }
 
     fn ready(self: *Frame, timestamp: presentation.Timestamp) void {
-        if (self.finished) return;
-        const size = self.size orelse return self.fail();
+        if (!self.transaction.ready()) return self.fail();
+        const size = self.transaction.size orelse return self.fail();
         const destination = self.destination orelse return self.fail();
-        const target = self.target orelse return self.fail();
-        const generation = self.capture_generation orelse return self.fail();
-        const baseline = self.manager.baseline(target.output) orelse return self.fail();
-        baseline.generation = generation;
 
         self.resource.sendFlags(.{
             .y_invert = switch (destination) {
@@ -468,7 +417,7 @@ const Frame = struct {
                 .dmabuf => |dmabuf| dmabuf.yInverted(),
             },
         });
-        if (self.with_damage and self.resource.getVersion() >= 2) {
+        if (self.transaction.with_damage and self.resource.getVersion() >= 2) {
             self.resource.sendDamage(0, 0, size.width, size.height);
         }
         self.resource.sendReady(
@@ -476,7 +425,6 @@ const Frame = struct {
             timestamp.lowSeconds(),
             timestamp.nanoseconds,
         );
-        self.finished = true;
         self.releaseDestination();
     }
 
@@ -497,10 +445,8 @@ const Frame = struct {
 
     fn fail(self: *Frame) void {
         self.cancelPendingCapture();
-        if (self.finished) return;
+        if (!self.transaction.fail()) return;
         self.resource.sendFailed();
-        self.finished = true;
-        self.target = null;
         self.releaseDestination();
     }
 
@@ -529,11 +475,11 @@ pub fn init(
         .listener = listener,
         .managers = .empty,
         .frames = .empty,
-        .output_generations = .empty,
+        .sessions = .init(allocator),
     };
     errdefer self.managers.deinit(allocator);
     errdefer self.frames.deinit(allocator);
-    errdefer self.output_generations.deinit(allocator);
+    errdefer self.sessions.deinit();
     self.global = try wl.Global.create(
         display,
         zwlr.ScreencopyManagerV1,
@@ -553,7 +499,7 @@ pub fn deinit(self: *Self) void {
     std.debug.assert(self.frames.items.len == 0);
     self.frames.deinit(self.allocator);
     self.managers.deinit(self.allocator);
-    self.output_generations.deinit(self.allocator);
+    self.sessions.deinit();
     self.* = undefined;
 }
 
@@ -571,51 +517,27 @@ pub fn destinationBufferCount(self: *const Self) usize {
 
 pub fn removeOutput(self: *Self, output: OutputLayout.Id) void {
     for (self.frames.items) |frame| {
-        const target = frame.target orelse continue;
+        const target = frame.transaction.target orelse continue;
         if (std.meta.eql(target.output, output)) frame.fail();
     }
-    for (self.managers.items) |manager| manager.removeOutput(output);
-    for (self.output_generations.items, 0..) |state, index| {
-        if (!std.meta.eql(state.output, output)) continue;
-        _ = self.output_generations.swapRemove(index);
-        break;
-    }
+    for (self.managers.items) |manager|
+        self.sessions.removeManagerOutput(&manager.session, output);
+    self.sessions.removeOutput(output);
 }
 
 pub fn captureOutput(self: *Self, output: OutputLayout.Id) void {
-    const state = self.outputGenerationState(output) orelse return;
-    if (state.generation == std.math.maxInt(u64)) {
-        state.generation = 1;
-        for (self.frames.items) |frame| frame.manager.invalidateOutput(output);
-        for (self.managers.items) |manager| manager.invalidateOutput(output);
-    } else {
-        state.generation += 1;
+    if (self.sessions.generationWillWrap(output)) {
+        for (self.managers.items) |manager|
+            self.sessions.invalidateManager(&manager.session, output);
+        for (self.frames.items) |frame|
+            self.sessions.invalidateManager(&frame.manager.session, output);
     }
+    const generation = self.sessions.captureOutput(output) orelse return;
     for (self.frames.items) |frame| {
-        const target = frame.target orelse continue;
+        const target = frame.transaction.target orelse continue;
         if (!std.meta.eql(target.output, output)) continue;
-        frame.capture(state.generation);
+        frame.capture(generation);
     }
-}
-
-fn ensureOutputGeneration(self: *Self, output: OutputLayout.Id) !void {
-    if (self.outputGenerationState(output) != null) return;
-    try self.output_generations.append(self.allocator, .{ .output = output });
-}
-
-fn outputGeneration(self: *Self, output: OutputLayout.Id) ?u64 {
-    return (self.outputGenerationState(output) orelse return null).generation;
-}
-
-fn outputGenerationState(self: *Self, output: OutputLayout.Id) ?*OutputGeneration {
-    for (self.output_generations.items) |*state| {
-        if (std.meta.eql(state.output, output)) return state;
-    }
-    return null;
-}
-
-fn shouldWaitForDamage(with_damage: bool, current: u64, baseline: ?u64) bool {
-    return with_damage and baseline != null and baseline.? == current;
 }
 
 pub fn needsComposedCursorFrame(
@@ -624,10 +546,12 @@ pub fn needsComposedCursorFrame(
     cursor_bounds: ?render.Rect,
 ) bool {
     for (self.frames.items) |frame| {
-        if (frame.finished or !frame.used or frame.pending != null or !frame.overlay_cursor) {
+        if (frame.transaction.finished or !frame.transaction.used or frame.pending != null or
+            !frame.transaction.overlay_cursor)
+        {
             continue;
         }
-        const target = frame.target orelse continue;
+        const target = frame.transaction.target orelse continue;
         if (!std.meta.eql(target.output, output)) continue;
         if (!captureRegionIntersectsCursor(target.region, cursor_bounds)) continue;
         return true;
@@ -735,11 +659,4 @@ test "screencopy region only forces cursor composition when cursor intersects" {
         .height = 32,
     }));
     try std.testing.expect(captureRegionIntersectsCursor(region, null));
-}
-
-test "damage capture does not wait when output changed while client rearmed" {
-    try std.testing.expect(!shouldWaitForDamage(false, 4, 4));
-    try std.testing.expect(!shouldWaitForDamage(true, 4, null));
-    try std.testing.expect(shouldWaitForDamage(true, 4, 4));
-    try std.testing.expect(!shouldWaitForDamage(true, 5, 4));
 }

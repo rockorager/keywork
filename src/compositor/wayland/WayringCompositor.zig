@@ -14,6 +14,7 @@ const wayring = @import("wayring");
 const ClientRegistry = @import("../ClientRegistry.zig");
 const CopiedBufferSnapshot = @import("../CopiedBufferSnapshot.zig");
 const HeadlessSurfaceForest = @import("../HeadlessSurfaceForest.zig");
+const linux_dmabuf = @import("linux_dmabuf_buffer.zig");
 const Region = @import("../region.zig");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const SurfaceFrameCompletion = @import("../SurfaceFrameCompletion.zig");
@@ -38,6 +39,12 @@ pub const ViewportHandler = struct {
     post_error: *const fn (*anyopaque, ViewportError) void,
     surface_destroyed: *const fn (*anyopaque) void,
 };
+
+/// Borrowed generated SHM adapter for protocol frontends which retain an
+/// exact wl_buffer destination independently of surface attachment.
+pub fn shmAdapter(self: *WayringCompositor) *Shm {
+    return &self.shm;
+}
 pub const ViewportAttachResult = union(enum) {
     attached: SurfaceId,
     viewport_exists,
@@ -226,6 +233,13 @@ pub const InputPopupReservation = struct {
 
 pub const InputPopupError = error{ NotLive, WrongClient, RoleConflict, GenerationExhausted, StaleReservation };
 
+/// Fixture adapters may install one protocol-free resolver. A successful
+/// resolve returns one retained reference owned by the compositor attachment.
+pub const DmabufResolver = struct {
+    context: *anyopaque,
+    resolve: *const fn (*anyopaque, *server.Resource) ?*linux_dmabuf.Buffer,
+};
+
 pub const CursorRoleResult = enum { assigned, already_cursor, role_conflict, not_live, wrong_client };
 pub const DragIconRoleResult = enum { assigned, already_drag_icon, role_conflict, not_live, wrong_client };
 
@@ -269,7 +283,7 @@ const Surface = struct {
     current_scale: i32 = 1,
     pending_transform: render.BufferTransform = .normal,
     current_transform: render.BufferTransform = .normal,
-    current: ?CopiedBufferSnapshot = null,
+    current: ?BufferSnapshot = null,
     current_logical_size: ?render.Size = null,
     has_committed_buffer: bool = false,
     pending_viewport: ViewportState = .{},
@@ -432,7 +446,7 @@ const PreparedCommit = struct {
     damage: Region,
     opaque_region: ?Region = null,
     input: ?InputRegion = null,
-    buffer: ?CopiedBufferSnapshot = null,
+    buffer: ?BufferSnapshot = null,
     pending_frame_callback_count: usize,
     callback_only: bool = false,
     attachment_changed: bool,
@@ -470,7 +484,12 @@ const PreparedCommit = struct {
 };
 
 const PendingAttachment = struct {
-    pin: server.shm.Buffer.Pin,
+    const Pin = union(enum) {
+        shm: server.shm.Buffer.Pin,
+        dmabuf: *linux_dmabuf.Buffer,
+    };
+
+    pin: Pin,
     resource: ?*server.Resource,
     observer: ?*server.Resource.Observer = null,
 
@@ -481,8 +500,71 @@ const PendingAttachment = struct {
 
     fn deinit(self: *PendingAttachment) void {
         if (self.observer) |observer| server.Resource.removeDestroyObserver(observer);
-        self.pin.deinit();
+        switch (self.pin) {
+            .shm => |*pin| pin.deinit(),
+            .dmabuf => |buffer| buffer.unreference(),
+        }
         self.* = undefined;
+    }
+};
+
+const DmabufSnapshot = struct {
+    buffer: *linux_dmabuf.Buffer,
+    source_cache: render.SourceCache,
+
+    fn init(buffer: *linux_dmabuf.Buffer) DmabufSnapshot {
+        buffer.retainSnapshot();
+        return .{ .buffer = buffer, .source_cache = buffer.acquireSourceCache() };
+    }
+
+    fn deinit(self: *DmabufSnapshot) void {
+        self.buffer.releaseSnapshot();
+        self.* = undefined;
+    }
+
+    fn pixelBuffer(self: *DmabufSnapshot) render.PixelBuffer {
+        const descriptor = self.buffer.descriptor;
+        const format = render.DmabufFormat.fromFourcc(descriptor.format).?;
+        return .{
+            .size = descriptor.size,
+            .stride_pixels = if (format.isPackedRgb()) descriptor.planes[0].plane.stride / @sizeOf(u32) else 0,
+            .dmabuf = self.buffer.renderSource(),
+            .source_cache = self.source_cache,
+        };
+    }
+};
+
+const BufferSnapshot = union(enum) {
+    copied: CopiedBufferSnapshot,
+    dmabuf: DmabufSnapshot,
+
+    fn deinit(self: *BufferSnapshot) void {
+        switch (self.*) {
+            .copied => |*snapshot| snapshot.deinit(),
+            .dmabuf => |*snapshot| snapshot.deinit(),
+        }
+        self.* = undefined;
+    }
+
+    fn size(self: *const BufferSnapshot) render.Size {
+        return switch (self.*) {
+            .copied => |snapshot| snapshot.size,
+            .dmabuf => |snapshot| snapshot.buffer.descriptor.size,
+        };
+    }
+
+    fn pixelBuffer(self: *BufferSnapshot) render.PixelBuffer {
+        return switch (self.*) {
+            .copied => |*snapshot| snapshot.pixelBuffer(.{}, .{}),
+            .dmabuf => |*snapshot| snapshot.pixelBuffer(),
+        };
+    }
+
+    fn forceOpaque(self: *const BufferSnapshot) bool {
+        return switch (self.*) {
+            .copied => |snapshot| snapshot.forceOpaque(),
+            .dmabuf => |snapshot| !render.DmabufFormat.fromFourcc(snapshot.buffer.descriptor.format).?.hasAlpha(),
+        };
     }
 };
 
@@ -529,6 +611,7 @@ allocator: std.mem.Allocator,
 protocol_server: *server.Server,
 surface_registry: *SurfaceRegistry,
 presentation_listener: ?PresentationListener,
+dmabuf_resolver: ?DmabufResolver = null,
 cursor_listener: ?CursorListener = null,
 drag_icon_listener: ?DragIconListener = null,
 input_popup_listener: ?InputPopupListener = null,
@@ -559,6 +642,7 @@ pub fn init(
         .protocol_server = protocol_server,
         .surface_registry = surface_registry,
         .presentation_listener = presentation_listener,
+        .dmabuf_resolver = null,
         .global = undefined,
         .subcompositor_global = undefined,
         .shm = .init(allocator),
@@ -587,6 +671,7 @@ pub fn init(
 pub fn deinit(self: *WayringCompositor) void {
     std.debug.assert(self.clients.items.len == 0);
     std.debug.assert(self.owned_provider_count == 0);
+    std.debug.assert(self.dmabuf_resolver == null);
     self.protocol_server.removeGlobal(self.subcompositor_global) catch |err| switch (err) {
         error.AlreadyRemoved => {},
         error.ForeignGlobal => unreachable,
@@ -632,6 +717,16 @@ pub fn surfaceCount(self: *const WayringCompositor) usize {
     var count: usize = 0;
     for (self.clients.items) |objects| count += objects.surfaces.items.len;
     return count;
+}
+
+pub fn setDmabufResolver(self: *WayringCompositor, resolver: DmabufResolver) void {
+    std.debug.assert(self.dmabuf_resolver == null);
+    self.dmabuf_resolver = resolver;
+}
+
+pub fn clearDmabufResolver(self: *WayringCompositor, context: *anyopaque) void {
+    std.debug.assert(self.dmabuf_resolver != null and self.dmabuf_resolver.?.context == context);
+    self.dmabuf_resolver = null;
 }
 
 pub fn regionCount(self: *const WayringCompositor) usize {
@@ -1168,7 +1263,10 @@ pub fn currentOffset(self: *const WayringCompositor, id: SurfaceId) ?Position {
 
 pub fn currentBuffer(self: *WayringCompositor, id: SurfaceId) ?*CopiedBufferSnapshot {
     const surface = self.surfaceForId(id) orelse return null;
-    return if (surface.current) |*current| current else null;
+    return if (surface.current) |*current| switch (current.*) {
+        .copied => |*snapshot| snapshot,
+        .dmabuf => null,
+    } else null;
 }
 
 // Private resource-free controls exercise CU relationships without protocol
@@ -1746,7 +1844,7 @@ fn surfaceRenderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
     const surface: *Surface = @ptrCast(@alignCast(context));
     const current = if (surface.current) |*snapshot| snapshot else return null;
     return .{
-        .buffer = current.pixelBuffer(.{}, .{}),
+        .buffer = current.pixelBuffer(),
         .logical_size = surface.current_logical_size.?,
         .source = surface.current_source,
         .transform = surface.current_transform,
@@ -1980,7 +2078,16 @@ fn attachSurface(
         client.postImplementationError(&resource.runtime, "wl_surface.attach references an unknown buffer");
         return;
     };
-    const pin = self.shm.pin(buffer_resource) orelse {
+    const pin: PendingAttachment.Pin = if (self.shm.pin(buffer_resource)) |shm_pin|
+        .{ .shm = shm_pin }
+    else if (self.dmabuf_resolver) |resolver|
+        if (resolver.resolve(resolver.context, buffer_resource)) |buffer|
+            .{ .dmabuf = buffer }
+        else {
+            client.postImplementationError(&resource.runtime, "wl_surface.attach references an unsupported buffer");
+            return;
+        }
+    else {
         client.postImplementationError(&resource.runtime, "wl_surface.attach supports only Wayring wl_shm buffers");
         return;
     };
@@ -2123,9 +2230,12 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     // Release enqueue is the final fallible operation. Adapter preparation is
     // explicitly abortable; callbacks, pending state, claims, and applied
     // state are untouched before it.
-    const buffer_resource = if (surface.pending_attachment) |*pending| pending.resource else null;
-    if (buffer_resource != null and self.failCommitAt(.release_enqueue)) return error.OutOfMemory;
-    if (buffer_resource) |resource| try self.shm.sendRelease(resource);
+    const shm_buffer_resource = if (surface.pending_attachment) |*pending| switch (pending.pin) {
+        .shm => pending.resource,
+        .dmabuf => null,
+    } else null;
+    if (shm_buffer_resource != null and self.failCommitAt(.release_enqueue)) return error.OutOfMemory;
+    if (shm_buffer_resource) |resource| try self.shm.sendRelease(resource);
 
     const unmaps_direct_root = direct_handler != null and surface.current_logical_size != null and
         candidate.prepared.logical_size == null;
@@ -2177,7 +2287,7 @@ fn projectedPhysicalSize(self: *WayringCompositor, surface: *const Surface) ?ren
         if (!prepared.attachment_changed) continue;
         return prepared.physical_size;
     }
-    return if (surface.current) |*current| current.size else null;
+    return if (surface.current) |*current| current.size() else null;
 }
 
 fn updateForToken(self: *WayringCompositor, token: UpdateToken) ?*ContentUpdate {
@@ -2479,52 +2589,64 @@ fn preparePendingBuffer(
     pending: *PendingAttachment,
     prepared: *PreparedCommit,
 ) !void {
-    if (self.failCommitAt(.access)) return error.InvalidBacking;
-    var access = pending.pin.access() catch |err| {
-        return err;
-    };
-    var access_live = true;
-    defer if (access_live) access.end() catch {};
-    const geometry = access.geometry;
-    const physical_size: render.Size = .{
-        .width = @intCast(geometry.width),
-        .height = @intCast(geometry.height),
-    };
-    prepared.physical_size = physical_size;
-    const surface_geometry_value = try surface_geometry.calculate(physical_size, prepared.scale, prepared.transform, prepared.viewport, surface.role == .cursor);
-    prepared.logical_size = surface_geometry_value.logical_size;
-    prepared.source = surface_geometry_value.source;
-    const source_cache: render.SourceCache = .{
-        .id = surface.source_cache_id,
-        .version = surface.next_source_version,
-    };
-    if (self.failCommitAt(.copy)) return error.OutOfMemory;
-    prepared.buffer = try CopiedBufferSnapshot.copy(
-        self.allocator,
-        .{
-            .bytes = access.bytes,
-            .size = physical_size,
-            .stride_bytes = geometry.stride,
-            .format = switch (geometry.format) {
-                .argb8888 => .argb8888,
-                .xrgb8888 => .xrgb8888,
-            },
+    switch (pending.pin) {
+        .shm => |*pin| {
+            if (self.failCommitAt(.access)) return error.InvalidBacking;
+            var access = pin.access() catch |err| return err;
+            var access_live = true;
+            defer if (access_live) access.end() catch {};
+            const geometry = access.geometry;
+            const physical_size: render.Size = .{
+                .width = @intCast(geometry.width),
+                .height = @intCast(geometry.height),
+            };
+            prepared.physical_size = physical_size;
+            const surface_geometry_value = try surface_geometry.calculate(physical_size, prepared.scale, prepared.transform, prepared.viewport, surface.role == .cursor);
+            prepared.logical_size = surface_geometry_value.logical_size;
+            prepared.source = surface_geometry_value.source;
+            const source_cache: render.SourceCache = .{
+                .id = surface.source_cache_id,
+                .version = surface.next_source_version,
+            };
+            if (self.failCommitAt(.copy)) return error.OutOfMemory;
+            const snapshot = try CopiedBufferSnapshot.copy(
+                self.allocator,
+                .{
+                    .bytes = access.bytes,
+                    .size = physical_size,
+                    .stride_bytes = geometry.stride,
+                    .format = switch (geometry.format) {
+                        .argb8888 => .argb8888,
+                        .xrgb8888 => .xrgb8888,
+                    },
+                },
+                null,
+                null,
+                source_cache,
+            );
+            prepared.buffer = .{ .copied = snapshot };
+            prepared.publishes_snapshot = true;
+            if (self.failCommitAt(.access_end)) {
+                access.end() catch {};
+                access_live = false;
+                return error.InvalidBacking;
+            }
+            access.end() catch |err| {
+                access_live = false;
+                return err;
+            };
+            access_live = false;
         },
-        null,
-        null,
-        source_cache,
-    );
-    prepared.publishes_snapshot = true;
-    if (self.failCommitAt(.access_end)) {
-        access.end() catch {};
-        access_live = false;
-        return error.InvalidBacking;
+        .dmabuf => |buffer| {
+            const physical_size = buffer.descriptor.size;
+            prepared.physical_size = physical_size;
+            const geometry = try surface_geometry.calculate(physical_size, prepared.scale, prepared.transform, prepared.viewport, surface.role == .cursor);
+            prepared.logical_size = geometry.logical_size;
+            prepared.source = geometry.source;
+            prepared.buffer = .{ .dmabuf = .init(buffer) };
+            prepared.publishes_snapshot = true;
+        },
     }
-    access.end() catch |err| {
-        access_live = false;
-        return err;
-    };
-    access_live = false;
 }
 
 fn logicalSize(
@@ -2552,7 +2674,7 @@ fn publishPreparedCommit(
 ) void {
     // Wayland 1.26 applies the buffer before every other CU field so all
     // coordinates and regions are interpreted against the new content.
-    if (prepared.attachment_changed) std.mem.swap(?CopiedBufferSnapshot, &surface.current, &prepared.buffer);
+    if (prepared.attachment_changed) std.mem.swap(?BufferSnapshot, &surface.current, &prepared.buffer);
     if (prepared.opaque_region) |*opaque_region| std.mem.swap(Region, &surface.current_opaque, opaque_region);
     if (prepared.input) |*input| std.mem.swap(InputRegion, &surface.current_input, input);
     surface.current_logical_size = prepared.logical_size;
@@ -5156,7 +5278,7 @@ test "scanner pending replacements never release and clean live and destroyed bu
     try std.testing.expect(surface.pending_attachment != null);
     try std.testing.expect(surface.pending_attachment.?.resource == null);
     try std.testing.expect(surface.pending_attachment.?.observer == null);
-    try std.testing.expect(surface.pending_attachment.?.pin.buffer != null);
+    try std.testing.expect(surface.pending_attachment.?.pin.shm.buffer != null);
     const destroyed_pending_delete_id = try drain(client);
     defer std.testing.allocator.free(destroyed_pending_delete_id);
     try std.testing.expectEqual(@as(usize, 12), destroyed_pending_delete_id.len);
@@ -5458,7 +5580,7 @@ test "scanner wl_surface version 5 and newer reject attach offsets before mutati
             const old_event_count = listener_state.event_count;
             const old_pending_resource = surface.pending_attachment.?.resource;
             const old_pending_observer = surface.pending_attachment.?.observer;
-            const old_pending_pin = surface.pending_attachment.?.pin.buffer;
+            const old_pending_pin = surface.pending_attachment.?.pin.shm.buffer;
             const old_callback = surface.frame_callbacks.items[0];
 
             try attachBufferAt(client, 5, 9, 1, -2);
@@ -5470,7 +5592,7 @@ test "scanner wl_surface version 5 and newer reject attach offsets before mutati
             try std.testing.expect(surface.has_pending_attachment);
             try std.testing.expectEqual(old_pending_resource, surface.pending_attachment.?.resource);
             try std.testing.expectEqual(old_pending_observer, surface.pending_attachment.?.observer);
-            try std.testing.expectEqual(old_pending_pin, surface.pending_attachment.?.pin.buffer);
+            try std.testing.expectEqual(old_pending_pin, surface.pending_attachment.?.pin.shm.buffer);
             try std.testing.expectEqual(@as(i32, -23), surface.pending_offset_x);
             try std.testing.expectEqual(@as(i32, 29), surface.pending_offset_y);
             try std.testing.expectEqual(@as(i32, 0), surface.current_offset_x);
@@ -5851,7 +5973,7 @@ test "new attachment invalid size preserves current state and consumes only term
     try attachBuffer(client, 5, 8);
     try std.testing.expect(surface.has_pending_attachment);
     try std.testing.expect(surface.pending_attachment.?.observer != null);
-    try std.testing.expect(surface.pending_attachment.?.pin.buffer != null);
+    try std.testing.expect(surface.pending_attachment.?.pin.shm.buffer != null);
     try commitSurfaceResource(client, 5);
 
     const fatal = client.fatal().?;
@@ -7532,7 +7654,7 @@ test "queued CU projection and callbacks follow exact update application" {
     try std.testing.expectEqual(render.Size{ .width = 4, .height = 2 }, child.content_updates.items[0].prepared.logical_size.?);
     try std.testing.expectEqual(render.Size{ .width = 2, .height = 1 }, child.content_updates.items[1].prepared.logical_size.?);
     try std.testing.expectEqual(render.Size{ .width = 1, .height = 2 }, child.content_updates.items[2].prepared.logical_size.?);
-    try std.testing.expectEqual(@as(u64, 1), child.content_updates.items[0].prepared.buffer.?.source_cache.version);
+    try std.testing.expectEqual(@as(u64, 1), child.content_updates.items[0].prepared.buffer.?.copied.source_cache.version);
     try std.testing.expectEqual(@as(u64, 2), child.next_source_version);
     try std.testing.expect(child.content_updates.items[1].prepared.buffer == null);
     try std.testing.expect(child.content_updates.items[2].prepared.buffer == null);

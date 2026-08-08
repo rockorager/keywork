@@ -82,6 +82,8 @@ const XdgActivation = @import("wayland/xdg_activation.zig");
 const Output = @import("wayland/output.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const OutputManagement = @import("wayland/output_management.zig");
+const NeutralOutputManagement = @import("OutputManagement.zig");
+const WayringOutputManagement = @import("wayland/WayringOutputManagement.zig");
 const OutputPower = @import("wayland/output_power.zig");
 const GammaControl = @import("wayland/gamma_control.zig");
 const DrmLease = @import("wayland/drm_lease.zig");
@@ -334,6 +336,7 @@ outputs: OutputLayout,
 xdg_output: XdgOutput,
 xdg_output_initialized: bool,
 output_management: OutputManagement,
+output_management_authority: NeutralOutputManagement,
 output_management_initialized: bool,
 output_power: OutputPower,
 output_power_initialized: bool,
@@ -1174,6 +1177,7 @@ pub fn createWithVirtualOutput(
         .xdg_output = undefined,
         .xdg_output_initialized = false,
         .output_management = undefined,
+        .output_management_authority = .{},
         .output_management_initialized = false,
         .output_power = undefined,
         .output_power_initialized = false,
@@ -1421,6 +1425,7 @@ pub fn createWithVirtualOutput(
             display,
             if (output_kind == .drm) self.drm_device.outputs() else &.{},
             &self.security_context,
+            &self.output_management_authority,
             .{
                 .context = self,
                 .test_configuration = testOutputConfiguration,
@@ -23658,6 +23663,213 @@ const GeneratedVirtualKeyboardClient = struct {
     }
 };
 
+const GeneratedOutputManagementClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_zwlr = wayland.client.zwlr;
+    const Stage = enum(u8) { starting, initial, stale, failed, tested, applied, stopped, disconnected, client_failed };
+    const Result = enum(u8) { none, succeeded, failed, cancelled };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    manager: ?*client_zwlr.OutputManagerV1 = null,
+    head: ?*client_zwlr.OutputHeadV1 = null,
+    mode: ?*client_zwlr.OutputModeV1 = null,
+    serial: u32 = 0,
+    done_count: usize = 0,
+    result: Result = .none,
+    result_count: usize = 0,
+    finished: bool = false,
+    name_seen: bool = false,
+    description_seen: bool = false,
+    make_seen: bool = false,
+    model_seen: bool = false,
+    physical_seen: bool = false,
+    enabled: bool = false,
+    current_mode_seen: bool = false,
+    position_seen: bool = false,
+    transform_seen: bool = false,
+    adaptive_sync_seen: bool = false,
+    scale_fixed: i32 = 0,
+    mode_width: i32 = 0,
+    mode_height: i32 = 0,
+    mode_refresh: i32 = 0,
+    mode_preferred: bool = false,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.client_failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(
+            std.heap.page_allocator,
+            "{s}/{s}",
+            .{ self.runtime_directory, self.display_name },
+            0,
+        );
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        const manager = self.manager orelse return error.OutputManagerMissing;
+        defer manager.destroy();
+        manager.setListener(*@This(), managerEvent, self);
+        while (self.done_count == 0) try expectClientRoundtrip(display);
+        if (self.head == null or self.mode == null) return error.OutputSnapshotMissing;
+        try self.pause(display, .initial);
+
+        try self.configure(display, self.serial -% 1, 1920, 1080, 384, true);
+        if (self.result != .cancelled) return error.StaleConfigurationAccepted;
+        try self.pause(display, .stale);
+
+        try self.configure(display, self.serial, 65_535, 65_535, 384, true);
+        if (self.result != .failed) return error.InvalidConfigurationAccepted;
+        try self.pause(display, .failed);
+
+        try self.configure(display, self.serial, 1920, 1080, 384, false);
+        if (self.result != .succeeded) return error.OutputConfigurationTestFailed;
+        try self.pause(display, .tested);
+
+        const previous_done = self.done_count;
+        try self.configure(display, self.serial, 1920, 1080, 384, true);
+        while (self.done_count == previous_done) try expectClientRoundtrip(display);
+        if (self.result != .succeeded) return error.OutputConfigurationApplyFailed;
+        try self.pause(display, .applied);
+
+        manager.stop();
+        while (!self.finished) try expectClientRoundtrip(display);
+        try self.pause(display, .stopped);
+        if (self.mode) |mode| mode.release();
+        if (self.head) |head| head.release();
+        try expectClientRoundtrip(display);
+    }
+
+    fn configure(self: *@This(), display: *client_wl.Display, serial: u32, width: i32, height: i32, scale_fixed: i32, apply: bool) !void {
+        const manager = self.manager orelse return error.OutputManagerMissing;
+        const head = self.head orelse return error.OutputHeadMissing;
+        const configuration = try manager.createConfiguration(serial);
+        defer configuration.destroy();
+        configuration.setListener(*@This(), configurationEvent, self);
+        const configured = try configuration.enableHead(head);
+        defer configured.destroy();
+        configured.setCustomMode(width, height, 60_000);
+        configured.setScale(@enumFromInt(scale_fixed));
+        self.result = .none;
+        if (apply) configuration.apply() else configuration.@"test"();
+        const previous_count = self.result_count;
+        while (self.result_count == previous_count) try expectClientRoundtrip(display);
+    }
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                if (std.mem.eql(u8, std.mem.span(global.interface), "zwlr_output_manager_v1"))
+                    self.manager = registry.bind(global.name, client_zwlr.OutputManagerV1, @min(global.version, 4)) catch null;
+            },
+            .global_remove => {},
+        }
+    }
+
+    fn managerEvent(_: *client_zwlr.OutputManagerV1, event: client_zwlr.OutputManagerV1.Event, self: *@This()) void {
+        switch (event) {
+            .head => |value| {
+                self.head = value.head;
+                value.head.setListener(*@This(), headEvent, self);
+            },
+            .done => |value| {
+                self.serial = value.serial;
+                self.done_count += 1;
+            },
+            .finished => self.finished = true,
+        }
+    }
+
+    fn headEvent(_: *client_zwlr.OutputHeadV1, event: client_zwlr.OutputHeadV1.Event, self: *@This()) void {
+        switch (event) {
+            .name => |value| self.name_seen = std.mem.eql(u8, std.mem.span(value.name), "HEADLESS-1"),
+            .description => self.description_seen = true,
+            .physical_size => self.physical_seen = true,
+            .mode => |value| {
+                self.mode = value.mode;
+                value.mode.setListener(*@This(), modeEvent, self);
+            },
+            .enabled => |value| self.enabled = value.enabled != 0,
+            .current_mode => self.current_mode_seen = true,
+            .position => self.position_seen = true,
+            .transform => self.transform_seen = true,
+            .scale => |value| self.scale_fixed = @intFromEnum(value.scale),
+            .make => self.make_seen = true,
+            .model => self.model_seen = true,
+            .adaptive_sync => self.adaptive_sync_seen = true,
+            .serial_number, .finished => {},
+        }
+    }
+
+    fn modeEvent(_: *client_zwlr.OutputModeV1, event: client_zwlr.OutputModeV1.Event, self: *@This()) void {
+        switch (event) {
+            .size => |value| {
+                self.mode_width = value.width;
+                self.mode_height = value.height;
+            },
+            .refresh => |value| self.mode_refresh = value.refresh,
+            .preferred => self.mode_preferred = true,
+            .finished => {},
+        }
+    }
+
+    fn configurationEvent(_: *client_zwlr.OutputConfigurationV1, event: client_zwlr.OutputConfigurationV1.Event, self: *@This()) void {
+        self.result = switch (event) {
+            .succeeded => .succeeded,
+            .failed => .failed,
+            .cancelled => .cancelled,
+        };
+        self.result_count += 1;
+    }
+
+    fn pause(self: *@This(), display: *client_wl.Display, stage_value: Stage) !void {
+        self.stage.store(@intFromEnum(stage_value), .release);
+        try waitForWayringCommandDraining(display, self.command_fd);
+    }
+
+    fn closeWake(self: *@This(), shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(-2, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
+
+    fn shutdown(self: *@This()) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
 fn connectWayringTestSocket(path: [:0]const u8) !std.posix.fd_t {
     const linux = std.os.linux;
     var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
@@ -23861,6 +24073,23 @@ fn waitForGeneratedVirtualKeyboardStage(
         if (host.failure()) |err| return err;
     }
     return error.GeneratedVirtualKeyboardClientTimedOut;
+}
+
+fn waitForGeneratedOutputManagementStage(
+    server: *Self,
+    host: anytype,
+    client: *GeneratedOutputManagementClient,
+    expected: GeneratedOutputManagementClient.Stage,
+) !void {
+    for (0..4_000) |_| {
+        const stage: GeneratedOutputManagementClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .client_failed) return client.failure orelse error.GeneratedOutputManagementClientFailed;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    }
+    return error.GeneratedOutputManagementClientTimedOut;
 }
 
 fn waitForMatureKeyboardStage(
@@ -28805,4 +29034,191 @@ test "production Wayring seat global accepts canonical input through the real ho
     try std.testing.expectEqual(registry_baseline, server.surface_registry.len());
     server.destroy();
     server_live = false;
+}
+
+test "generated output management libwayland client uses canonical headless transaction" {
+    const WayringHost = @import("wayland/WayringHost.zig");
+    const wayring = @import("wayring");
+    const linux = std.os.linux;
+    var marker: u8 = 0;
+    const runtime_directory = try std.fmt.allocPrintSentinel(
+        std.testing.allocator,
+        "/tmp/keywork-output-management-{d}-{x}",
+        .{ linux.getpid(), @intFromPtr(&marker) },
+        0,
+    );
+    defer std.testing.allocator.free(runtime_directory);
+    if (linux.errno(linux.mkdir(runtime_directory.ptr, 0o700)) != .SUCCESS)
+        return error.TestDirectoryCreationFailed;
+    defer _ = linux.rmdir(runtime_directory.ptr);
+
+    const server = try Self.createWithVirtualOutput(
+        std.testing.allocator,
+        std.testing.io,
+        .cpu,
+        .headless,
+        null,
+        .{ .size = .{ .width = 1280, .height = 720 }, .refresh_millihertz = 60_000 },
+    );
+    defer server.destroy();
+    const render_output = server.primaryRenderOutput();
+    const protocol_output = server.outputs.get(render_output.protocol_id).?;
+    const protocol_identity = @intFromPtr(protocol_output);
+    const initial_snapshot = protocol_output.snapshot();
+    const initial_logical_size = protocol_output.logicalSize();
+    const initial_authority_serial = server.output_management_authority.serial;
+    try std.testing.expectEqual(server.output_management.serial, initial_authority_serial);
+
+    var protocol_server: wayring.server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    var adapter: WayringOutputManagement = undefined;
+    adapter.init(
+        std.testing.allocator,
+        &protocol_server,
+        &server.output_management_authority,
+        linux.getuid(),
+        .{
+            .context = server,
+            .test_configuration = testOutputConfiguration,
+            .apply = applyOutputConfiguration,
+        },
+    );
+    defer adapter.deinit();
+    try adapter.addOutput(.{
+        .id = 1,
+        .target = .{ .virtual = protocol_output },
+        .name = initial_snapshot.name,
+        .description = initial_snapshot.description,
+        .make = initial_snapshot.make,
+        .model = initial_snapshot.model,
+        .physical_width = @intCast(initial_snapshot.physical_size.width),
+        .physical_height = @intCast(initial_snapshot.physical_size.height),
+        .scale_fixed = 256,
+        .modes = &.{.{
+            .width = initial_snapshot.mode_size.width,
+            .height = initial_snapshot.mode_size.height,
+            .refresh_millihertz = initial_snapshot.refresh_millihertz,
+            .preferred = initial_snapshot.mode_preferred,
+        }},
+    });
+    try std.testing.expectEqual(initial_authority_serial, server.output_management_authority.serial);
+    try adapter.publish();
+    defer adapter.unpublish();
+    protocol_server.setGlobalFilter(WayringOutputManagement, &adapter, WayringOutputManagement.globalFilter);
+    defer protocol_server.clearGlobalFilter();
+
+    const Lifecycle = struct {
+        adapter: *WayringOutputManagement,
+        accepted_count: usize = 0,
+
+        fn accepted(context: *anyopaque, _: *wayring.server.Client) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.accepted_count += 1;
+        }
+
+        fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.adapter.destroyClientResources(client);
+        }
+    };
+    var lifecycle: Lifecycle = .{ .adapter = &adapter };
+    const host = try WayringHost.create(
+        std.testing.allocator,
+        server.eventLoop(),
+        &protocol_server,
+        runtime_directory,
+        .{
+            .context = &lifecycle,
+            .accepted = Lifecycle.accepted,
+            .destroy_resources = Lifecycle.destroy,
+        },
+    );
+    var host_live = true;
+    defer if (host_live) host.destroy() catch {};
+
+    const raw_command_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_command_fd) != .SUCCESS) return error.EventFdFailed;
+    const command_fd: std.posix.fd_t = @intCast(raw_command_fd);
+    defer _ = linux.close(command_fd);
+    var client: GeneratedOutputManagementClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = command_fd,
+    };
+    const thread = try std.Thread.spawn(.{}, GeneratedOutputManagementClient.run, .{&client});
+    var joined = false;
+    defer if (!joined) {
+        client.shutdown();
+        thread.join();
+    };
+
+    try waitForGeneratedOutputManagementStage(server, host, &client, .initial);
+    try std.testing.expectEqual(@as(usize, 1), lifecycle.accepted_count);
+    try std.testing.expect(client.name_seen and client.description_seen and client.make_seen and client.model_seen);
+    try std.testing.expect(client.physical_seen and client.enabled and client.current_mode_seen);
+    try std.testing.expect(client.position_seen and client.transform_seen and client.adaptive_sync_seen);
+    try std.testing.expectEqual(@as(i32, 256), client.scale_fixed);
+    try std.testing.expectEqual(@as(i32, 1280), client.mode_width);
+    try std.testing.expectEqual(@as(i32, 720), client.mode_height);
+    try std.testing.expectEqual(@as(i32, 60_000), client.mode_refresh);
+    try std.testing.expect(client.mode_preferred);
+    const initial_done_count = client.done_count;
+    render_output.repaint_needed = false;
+
+    try signalWayringCommand(command_fd);
+    try waitForGeneratedOutputManagementStage(server, host, &client, .stale);
+    try std.testing.expectEqual(render.Size{ .width = 1280, .height = 720 }, render_output.backend.modeSize());
+    try std.testing.expectEqual(initial_logical_size, protocol_output.logicalSize());
+    try std.testing.expectEqual(initial_authority_serial, server.output_management_authority.serial);
+    try std.testing.expectEqual(initial_done_count, client.done_count);
+    try std.testing.expect(!render_output.repaint_needed);
+
+    try signalWayringCommand(command_fd);
+    try waitForGeneratedOutputManagementStage(server, host, &client, .failed);
+    try std.testing.expectEqual(render.Size{ .width = 1280, .height = 720 }, render_output.backend.modeSize());
+    try std.testing.expectEqual(initial_logical_size, protocol_output.logicalSize());
+    try std.testing.expectEqual(initial_authority_serial, server.output_management_authority.serial);
+    try std.testing.expectEqual(initial_done_count, client.done_count);
+    try std.testing.expect(!render_output.repaint_needed);
+
+    try signalWayringCommand(command_fd);
+    try waitForGeneratedOutputManagementStage(server, host, &client, .tested);
+    try std.testing.expectEqual(render.Size{ .width = 1280, .height = 720 }, render_output.backend.modeSize());
+    try std.testing.expectEqual(initial_logical_size, protocol_output.logicalSize());
+    try std.testing.expectEqual(initial_authority_serial, server.output_management_authority.serial);
+    try std.testing.expectEqual(initial_done_count, client.done_count);
+    try std.testing.expect(!render_output.repaint_needed);
+
+    try signalWayringCommand(command_fd);
+    try waitForGeneratedOutputManagementStage(server, host, &client, .applied);
+    try std.testing.expectEqual(protocol_identity, @intFromPtr(server.outputs.get(render_output.protocol_id).?));
+    try std.testing.expectEqual(render.Size{ .width = 1920, .height = 1080 }, render_output.backend.modeSize());
+    try std.testing.expectEqual(@as(u32, 180), render_output.backend.renderScale().numerator);
+    try std.testing.expectEqual(@as(u32, 120), render.Scale.denominator);
+    try std.testing.expectEqual(render.Size{ .width = 1280, .height = 720 }, protocol_output.logicalSize());
+    try std.testing.expectEqual(@as(i32, 1920), client.mode_width);
+    try std.testing.expectEqual(@as(i32, 1080), client.mode_height);
+    try std.testing.expectEqual(@as(i32, 384), client.scale_fixed);
+    try std.testing.expectEqual(initial_authority_serial +% 1, server.output_management_authority.serial);
+    try std.testing.expectEqual(server.output_management_authority.serial, server.output_management.serial);
+    try std.testing.expectEqual(initial_done_count + 1, client.done_count);
+    try std.testing.expect(render_output.repaint_needed);
+
+    try signalWayringCommand(command_fd);
+    try waitForGeneratedOutputManagementStage(server, host, &client, .stopped);
+    try std.testing.expect(client.finished);
+    // Manager stop does not destroy independently surviving head/mode objects.
+    try signalWayringCommand(command_fd);
+    try waitForGeneratedOutputManagementStage(server, host, &client, .disconnected);
+    thread.join();
+    joined = true;
+    for (0..1_000) |_| {
+        if (adapter.managers.items.len == 0) break;
+        try server.eventLoop().dispatch(1);
+    } else return error.GeneratedOutputManagementCleanupTimedOut;
+    try std.testing.expectEqual(@as(usize, 0), adapter.head_resources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), adapter.mode_resources.items.len);
+    try std.testing.expectEqual(@as(usize, 0), adapter.configurations.items.len);
+    try host.destroy();
+    host_live = false;
 }

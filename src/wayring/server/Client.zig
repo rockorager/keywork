@@ -450,6 +450,24 @@ pub fn lookup(self: *Client, id: u32) ?*Resource {
     return @ptrCast(@alignCast(live.resource));
 }
 
+/// Reserves allocation-free publication storage for a frontend transaction.
+/// The caller must cancel the reservation unless canonical mutation commits.
+pub fn prepareEventBatch(self: *Client, maximum_bytes: usize) !wire.PreparedBatch {
+    return self.output.prepareBatch(maximum_bytes);
+}
+
+pub fn preparedEventStorage(self: *Client, prepared: wire.PreparedBatch) ![]u8 {
+    return self.output.preparedBatchStorage(prepared);
+}
+
+pub fn cancelEventBatch(self: *Client, prepared: wire.PreparedBatch) void {
+    self.output.cancelPreparedBatch(prepared);
+}
+
+pub fn publishEventBatch(self: *Client, prepared: wire.PreparedBatch, encoded_length: usize) !void {
+    try self.output.publishPreparedBatch(prepared, encoded_length);
+}
+
 pub fn dispatch(self: *Client) !void {
     if (self.dispatching) return error.DispatchInProgress;
     if (self.fatal_state.recorded) return;

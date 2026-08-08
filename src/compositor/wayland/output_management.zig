@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const Neutral = @import("../OutputManagement.zig");
 const DrmOutput = @import("../backend/drm.zig");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const render = @import("../render/types.zig");
@@ -17,6 +18,7 @@ allocator: std.mem.Allocator,
 global: *wl.Global,
 security_context: *SecurityContext,
 serial: u32,
+authority: *Neutral,
 heads: std.ArrayList(*Head),
 managers: std.ArrayList(*ManagerResource),
 head_resources: std.ArrayList(*HeadResource),
@@ -24,31 +26,9 @@ mode_resources: std.ArrayList(*ModeResource),
 configurations: std.ArrayList(*Configuration),
 listener: Listener,
 
-pub const Change = struct {
-    target: Target,
-    was_enabled: bool,
-    enabled: bool,
-    old_x: i32,
-    old_y: i32,
-    old_scale: render.Scale,
-    old_mode_index: usize,
-    x: i32,
-    y: i32,
-    scale: render.Scale,
-    mode_index: usize,
-    custom_mode: ?CustomMode,
-};
-
-pub const Target = union(enum) {
-    drm: *DrmOutput,
-    virtual: *Output,
-};
-
-pub const CustomMode = struct {
-    width: u32,
-    height: u32,
-    refresh_millihertz: i32,
-};
+pub const Change = Neutral.Change;
+pub const Target = Neutral.Target;
+pub const CustomMode = Neutral.CustomMode;
 
 pub const VirtualHeadConfig = struct {
     output: *Output,
@@ -60,13 +40,10 @@ pub const VirtualHeadConfig = struct {
     serial: []const u8 = "",
 };
 
-pub const Listener = struct {
-    context: *anyopaque,
-    test_configuration: *const fn (*anyopaque, []const Change) bool,
-    apply: *const fn (*anyopaque, []const Change) bool,
-};
+pub const Listener = Neutral.Listener;
 
 const Head = struct {
+    reference: Neutral.HeadRef,
     target: ?Target,
     connected: bool,
     name: [:0]u8,
@@ -111,6 +88,7 @@ const ModeResource = struct {
 
 const Configuration = struct {
     manager: *Self,
+    owner: *ManagerResource,
     resource: *zwlr.OutputConfigurationV1,
     serial: u32,
     used: bool,
@@ -125,7 +103,7 @@ const ConfiguredHead = struct {
     mode_set: bool = false,
     mode_index: ?usize = null,
     custom_mode: ?CustomMode = null,
-    position: ?struct { x: i32, y: i32 } = null,
+    position: ?Neutral.Position = null,
     transform: ?wl.Output.Transform = null,
     scale: ?wl.Fixed = null,
     adaptive_sync: ?zwlr.OutputHeadV1.AdaptiveSyncState = null,
@@ -137,6 +115,7 @@ pub fn init(
     display: *wl.Server,
     outputs: []const *DrmOutput,
     security_context: *SecurityContext,
+    authority: *Neutral,
     listener: Listener,
 ) !void {
     self.* = .{
@@ -144,6 +123,7 @@ pub fn init(
         .global = undefined,
         .security_context = security_context,
         .serial = 1,
+        .authority = authority,
         .heads = .empty,
         .managers = .empty,
         .head_resources = .empty,
@@ -298,6 +278,10 @@ fn addHeadStorage(self: *Self, config: HeadStorageConfig) !*Head {
     const head = try self.allocator.create(Head);
     errdefer self.allocator.destroy(head);
     head.* = .{
+        .reference = try self.authority.generation(switch (config.target) {
+            .drm => |output| @intFromPtr(output),
+            .virtual => |output| @intFromPtr(output),
+        }),
         .target = config.target,
         .connected = true,
         .name = name,
@@ -430,8 +414,7 @@ fn targetsEqual(a: Target, b: Target) bool {
 }
 
 fn changed(self: *Self) void {
-    self.serial +%= 1;
-    if (self.serial == 0) self.serial = 1;
+    self.serial = self.authority.changed();
     for (self.managers.items) |manager| {
         if (manager.resource) |resource| if (!manager.stopped) resource.sendDone(self.serial);
     }
@@ -693,6 +676,7 @@ fn createConfiguration(
     };
     configuration.* = .{
         .manager = self,
+        .owner = owner,
         .resource = resource,
         .serial = serial,
         .used = false,
@@ -901,107 +885,86 @@ fn finish(configuration: *Configuration, apply: bool) void {
         if (configured.resource) |resource| resource.destroy();
     }
     const manager = configuration.manager;
-    if (configuration.serial != manager.serial) {
-        configuration.resource.sendCancelled();
-        return;
-    }
-    var connected_count: usize = 0;
-    for (manager.heads.items) |head| {
-        if (!head.connected) continue;
-        connected_count += 1;
-        var found = false;
-        for (configuration.heads.items) |configured| {
-            if (configured.head == head) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            configuration.resource.postError(.unconfigured_head, "output head was omitted");
-            return;
-        }
-    }
-    if (configuration.heads.items.len != connected_count) {
-        configuration.resource.sendCancelled();
-        return;
-    }
-
-    var enabled_count: usize = 0;
+    var transaction = manager.authority.transaction(
+        manager.allocator,
+        @intFromPtr(configuration.resource.getClient()),
+        @intFromPtr(configuration.owner),
+    );
+    defer transaction.deinit();
+    transaction.serial = configuration.serial;
     for (configuration.heads.items) |configured| {
-        if (!configured.head.connected) {
-            configuration.resource.sendCancelled();
-            return;
-        }
-        if (!configured.enabled) continue;
-        enabled_count += 1;
-        if ((configured.transform != null and configured.transform.? != .normal) or
-            (configured.adaptive_sync != null and configured.adaptive_sync.? != .disabled))
-        {
-            configuration.resource.sendFailed();
-            return;
-        }
-        const mode_index = configured.mode_index orelse configured.head.current_mode_index;
-        const scale = if (configured.scale) |value|
-            scaleFromFixed(value) catch unreachable
-        else
-            configured.head.scale;
-        const x = if (configured.position) |position| position.x else configured.head.x;
-        const y = if (configured.position) |position| position.y else configured.head.y;
-        const mode_size = if (configured.custom_mode) |custom|
-            render.Size{ .width = custom.width, .height = custom.height }
-        else
-            configured.head.modes[mode_index].size;
-        if (!modeGeometryValid(mode_size, scale, x, y)) {
-            configuration.resource.sendFailed();
-            return;
-        }
-    }
-    if (enabled_count == 0) {
-        configuration.resource.sendFailed();
-        return;
-    }
-
-    var changes: std.ArrayList(Change) = .empty;
-    defer changes.deinit(manager.allocator);
-    for (configuration.heads.items) |configured| {
-        const head = configured.head;
-        const x = if (configured.position) |position| position.x else head.x;
-        const y = if (configured.position) |position| position.y else head.y;
-        const scale = if (configured.scale) |value| scaleFromFixed(value) catch unreachable else head.scale;
-        const mode_index = configured.mode_index orelse head.current_mode_index;
-        changes.append(manager.allocator, .{
-            .target = head.target.?,
-            .was_enabled = head.enabled,
+        transaction.configure(.{
+            .reference = configured.head.reference,
             .enabled = configured.enabled,
-            .old_x = head.x,
-            .old_y = head.y,
-            .old_scale = head.scale,
-            .old_mode_index = head.current_mode_index,
-            .x = x,
-            .y = y,
-            .scale = scale,
-            .mode_index = mode_index,
+            .position = configured.position,
+            .scale = if (configured.scale) |value| scaleFromFixed(value) catch unreachable else null,
+            .mode_index = configured.mode_index,
             .custom_mode = configured.custom_mode,
+            .transform_supported = configured.transform == null or configured.transform.? == .normal,
+            .adaptive_sync_supported = configured.adaptive_sync == null or configured.adaptive_sync.? == .disabled,
         }) catch {
             configuration.resource.postNoMemory();
             return;
         };
     }
+    var states: std.ArrayList(Neutral.HeadState) = .empty;
+    defer states.deinit(manager.allocator);
+    for (manager.heads.items) |head| {
+        states.append(manager.allocator, .{
+            .reference = head.reference,
+            .connected = head.connected,
+            .target = head.target,
+            .enabled = head.enabled,
+            .x = head.x,
+            .y = head.y,
+            .scale = head.scale,
+            .mode_count = head.modes.len,
+            .current_mode_index = head.current_mode_index,
+        }) catch {
+            configuration.resource.postNoMemory();
+            return;
+        };
+    }
+    var prepared = transaction.prepare(
+        manager.authority,
+        @intFromPtr(configuration.resource.getClient()),
+        @intFromPtr(configuration.owner),
+        states.items,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => {
+            configuration.resource.postNoMemory();
+            return;
+        },
+        error.MissingHead => {
+            configuration.resource.postError(.unconfigured_head, "output head was omitted");
+            return;
+        },
+        error.InvalidConfiguration => {
+            configuration.resource.sendFailed();
+            return;
+        },
+        else => {
+            configuration.resource.sendCancelled();
+            return;
+        },
+    };
+    defer prepared.deinit();
+    const changes = prepared.changes;
     if (!apply) {
-        if (manager.listener.test_configuration(manager.listener.context, changes.items)) {
+        if (manager.listener.test_configuration(manager.listener.context, changes)) {
             configuration.resource.sendSucceeded();
         } else {
             configuration.resource.sendFailed();
         }
         return;
     }
-    if (!manager.listener.apply(manager.listener.context, changes.items)) {
+    if (!manager.listener.apply(manager.listener.context, changes)) {
         configuration.resource.sendFailed();
         return;
     }
 
     var state_changed = false;
-    for (changes.items) |change| {
+    for (changes) |change| {
         const head = manager.findHead(change.target) orelse continue;
         const enabled_changed = head.enabled != change.enabled;
         const position_changed = head.x != change.x or head.y != change.y;
@@ -1084,7 +1047,7 @@ fn testApply(_: *anyopaque, _: []const Change) bool {
     return true;
 }
 
-test "output scales round-trip between fixed and v120 units" {
+test "renderer conformance: output scales round-trip between fixed and v120 units" {
     const scale = try scaleFromFixed(wl.Fixed.fromDouble(1.25));
     try std.testing.expectEqual(@as(u32, 150), scale.numerator);
     try std.testing.expectApproxEqAbs(
@@ -1095,7 +1058,7 @@ test "output scales round-trip between fixed and v120 units" {
     try std.testing.expectError(error.InvalidScale, scaleFromFixed(wl.Fixed.fromInt(0)));
 }
 
-test "output geometry validation uses the selected mode and scale" {
+test "renderer conformance: output geometry validation uses the selected mode and scale" {
     var current = std.mem.zeroes(DrmOutput.Mode);
     current.value.hdisplay = 3840;
     current.value.vdisplay = 2160;
@@ -1114,7 +1077,7 @@ test "output geometry validation uses the selected mode and scale" {
     ));
 }
 
-test "virtual head mode and scale stay synchronized" {
+test "renderer conformance: virtual head mode and scale stay synchronized" {
     const display = try wl.Server.create();
     defer display.destroy();
 
@@ -1144,12 +1107,14 @@ test "virtual head mode and scale stay synchronized" {
     defer security_context.deinit();
 
     var context: u8 = 0;
+    var authority: Neutral = .{};
     var manager: Self = undefined;
     try manager.init(
         std.testing.allocator,
         display,
         &.{},
         &security_context,
+        &authority,
         .{ .context = &context, .test_configuration = testApply, .apply = testApply },
     );
     defer manager.deinit();
@@ -1175,7 +1140,7 @@ test "virtual head mode and scale stay synchronized" {
     try std.testing.expectEqual(@as(u32, 180), manager.heads.items[0].scale.numerator);
 }
 
-test "disconnected head storage is reclaimed across reconnects" {
+test "renderer conformance: disconnected head storage is reclaimed across reconnects" {
     const display = try wl.Server.create();
     defer display.destroy();
 
@@ -1206,11 +1171,13 @@ test "disconnected head storage is reclaimed across reconnects" {
     defer security_context.deinit();
 
     var manager: Self = undefined;
+    var authority: Neutral = .{};
     try manager.init(
         std.testing.allocator,
         display,
         &.{&output},
         &security_context,
+        &authority,
         .{ .context = &context, .test_configuration = testApply, .apply = testApply },
     );
     defer manager.deinit();
@@ -1228,7 +1195,7 @@ test "disconnected head storage is reclaimed across reconnects" {
     }
 }
 
-test "configuration retains disconnected head storage" {
+test "renderer conformance: configuration retains disconnected head storage" {
     const display = try wl.Server.create();
     defer display.destroy();
 
@@ -1256,11 +1223,13 @@ test "configuration retains disconnected head storage" {
     defer security_context.deinit();
 
     var manager: Self = undefined;
+    var authority: Neutral = .{};
     try manager.init(
         std.testing.allocator,
         display,
         &.{&output},
         &security_context,
+        &authority,
         .{ .context = &context, .test_configuration = testApply, .apply = testApply },
     );
     defer manager.deinit();
@@ -1268,6 +1237,7 @@ test "configuration retains disconnected head storage" {
     const configuration = try std.testing.allocator.create(Configuration);
     configuration.* = .{
         .manager = &manager,
+        .owner = undefined,
         .resource = undefined,
         .serial = manager.serial,
         .used = false,

@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const neutral = @import("linux_dmabuf_buffer.zig");
 const render = @import("../render/types.zig");
 
 const wl = wayland.server.wl;
@@ -19,9 +20,9 @@ const linux = @cImport({
     @cInclude("sys/sysmacros.h");
 });
 
-const max_planes = render.max_dmabuf_planes;
-const invalid_modifier: u64 = 0x00ff_ffff_ffff_ffff;
-const linear_modifier: u64 = 0;
+const max_planes = neutral.max_planes;
+const invalid_modifier = neutral.invalid_modifier;
+const linear_modifier = neutral.linear_modifier;
 const argb8888: u32 = linux.DRM_FORMAT_ARGB8888;
 const xrgb8888: u32 = linux.DRM_FORMAT_XRGB8888;
 const abgr8888: u32 = linux.DRM_FORMAT_ABGR8888;
@@ -120,7 +121,7 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn allocationDevice(self: *const Self) ?Device {
-    return if (self.feedback_state) |state| state.device else null;
+    return if (self.feedback_state) |state| state.owner.device else null;
 }
 
 pub fn bufferCount(self: *const Self) usize {
@@ -167,19 +168,9 @@ fn handleRequest(
     }
 }
 
-const FormatTableEntry = extern struct {
-    format: u32,
-    padding: u32,
-    modifier: u64,
-};
-
 const FeedbackState = struct {
-    device: linux.dev_t,
     scanout_device: ?linux.dev_t,
-    file: std.Io.File,
-    pairs: []render.DmabufFormatModifier,
-    sampling_indices: []align(4) u16,
-    scanout_indices: []align(4) u16,
+    owner: neutral.Feedback,
 
     fn init(
         io: std.Io,
@@ -189,9 +180,7 @@ const FeedbackState = struct {
         sampled_pairs: []const render.DmabufFormatModifier,
         scanout_pairs: []const render.DmabufFormatModifier,
     ) !FeedbackState {
-        if (sampled_pairs.len == 0 or sampled_pairs.len > std.math.maxInt(u16) + 1 or
-            sampled_pairs.len > std.math.maxInt(u32) / @sizeOf(FormatTableEntry))
-            return error.InvalidFormatTable;
+        _ = io;
         const device = if (renderer_device_id) |id|
             linux.makedev(id.major, id.minor)
         else
@@ -200,66 +189,20 @@ const FeedbackState = struct {
             linux.makedev(id.major, id.minor)
         else
             null;
-        comptime std.debug.assert(@sizeOf(FormatTableEntry) == 16);
-        const pairs = try allocator.dupe(render.DmabufFormatModifier, sampled_pairs);
-        errdefer allocator.free(pairs);
-        const sampling_indices = try allocator.alignedAlloc(u16, .fromByteUnits(4), pairs.len);
-        errdefer allocator.free(sampling_indices);
-        var scanout_count: usize = 0;
-        for (pairs, 0..) |pair, index| {
-            sampling_indices[index] = @intCast(index);
-            if (render.DmabufFormatModifier.contains(scanout_pairs, pair.format, pair.modifier)) scanout_count += 1;
-        }
-        const scanout_indices = try allocator.alignedAlloc(u16, .fromByteUnits(4), scanout_count);
-        errdefer allocator.free(scanout_indices);
-        var scanout_index: usize = 0;
-        for (pairs, 0..) |pair, index| if (render.DmabufFormatModifier.contains(
-            scanout_pairs,
-            pair.format,
-            pair.modifier,
-        )) {
-            scanout_indices[scanout_index] = @intCast(index);
-            scanout_index += 1;
-        };
-        const entries = try allocator.alloc(FormatTableEntry, pairs.len);
-        defer allocator.free(entries);
-        for (pairs, entries) |pair, *entry| entry.* = .{
-            .format = pair.format,
-            .padding = 0,
-            .modifier = pair.modifier,
-        };
-
-        const fd = try std.posix.memfd_create(
-            "keywork-dmabuf-formats",
-            linux.MFD_CLOEXEC | linux.MFD_ALLOW_SEALING,
-        );
-        const file: std.Io.File = .{
-            .handle = fd,
-            .flags = .{ .nonblocking = false },
-        };
-        errdefer file.close(io);
-        const bytes = std.mem.sliceAsBytes(entries);
-        try file.setLength(io, bytes.len);
-        try file.writePositionalAll(io, bytes, 0);
-        const seals = std.os.linux.F.SEAL_SHRINK | std.os.linux.F.SEAL_GROW |
-            std.os.linux.F.SEAL_WRITE | std.os.linux.F.SEAL_SEAL;
-        const seal_result = std.os.linux.fcntl(fd, std.os.linux.F.ADD_SEALS, seals);
-        if (std.posix.errno(seal_result) != .SUCCESS) return error.SealFailed;
         return .{
-            .device = device,
             .scanout_device = scanout_device,
-            .file = file,
-            .pairs = pairs,
-            .sampling_indices = sampling_indices,
-            .scanout_indices = scanout_indices,
+            .owner = try neutral.Feedback.initWithScanout(
+                allocator,
+                device,
+                sampled_pairs,
+                scanout_pairs,
+            ),
         };
     }
 
     fn deinit(self: *FeedbackState, allocator: std.mem.Allocator, io: std.Io) void {
-        self.file.close(io);
-        allocator.free(self.pairs);
-        allocator.free(self.sampling_indices);
-        allocator.free(self.scanout_indices);
+        _ = io;
+        self.owner.deinit(allocator);
     }
 };
 
@@ -302,28 +245,28 @@ const Feedback = struct {
         manager.feedback_count += 1;
         resource.setHandler(*Feedback, Feedback.handleRequest, Feedback.handleDestroy, self);
 
-        var device = state.device;
+        var device = state.owner.device;
         var device_array: wl.Array = .{
             .size = @sizeOf(linux.dev_t),
             .alloc = @sizeOf(linux.dev_t),
             .data = @ptrCast(&device),
         };
         var scanout_indices_array: wl.Array = .{
-            .size = state.scanout_indices.len * @sizeOf(u16),
-            .alloc = state.scanout_indices.len * @sizeOf(u16),
-            .data = state.scanout_indices.ptr,
+            .size = state.owner.scanout_indices.len * @sizeOf(u16),
+            .alloc = state.owner.scanout_indices.len * @sizeOf(u16),
+            .data = state.owner.scanout_indices.ptr,
         };
         var indices_array: wl.Array = .{
-            .size = state.sampling_indices.len * @sizeOf(u16),
-            .alloc = state.sampling_indices.len * @sizeOf(u16),
-            .data = state.sampling_indices.ptr,
+            .size = state.owner.indices.len * @sizeOf(u16),
+            .alloc = state.owner.indices.len * @sizeOf(u16),
+            .data = state.owner.indices.ptr,
         };
         resource.sendFormatTable(
-            state.file.handle,
-            @intCast(state.pairs.len * @sizeOf(FormatTableEntry)),
+            state.owner.fd,
+            @intCast(state.owner.pairs.len * @sizeOf(neutral.FormatTableEntry)),
         );
         if (resource.getVersion() < 6) resource.sendMainDevice(&device_array);
-        if (state.scanout_device) |scanout_device| if (state.scanout_indices.len != 0) {
+        if (state.scanout_device) |scanout_device| if (state.owner.scanout_indices.len != 0) {
             var scanout_device_value = scanout_device;
             var scanout_device_array: wl.Array = .{
                 .size = @sizeOf(linux.dev_t),
@@ -361,23 +304,13 @@ const Feedback = struct {
     }
 };
 
-const Plane = struct {
-    fd: std.posix.fd_t,
-    offset: u32,
-    stride: u32,
-    modifier: u64,
-
-    fn close(self: Plane) void {
-        _ = std.c.close(self.fd);
-    }
-};
+const Plane = neutral.Plane;
 
 const Params = struct {
     manager: *Self,
     resource: *zwp.LinuxBufferParamsV1,
-    planes: [max_planes]?Plane,
+    parameters: neutral.Parameters,
     sampling_device: ?linux.dev_t,
-    used: bool,
 
     fn create(
         manager: *Self,
@@ -391,9 +324,8 @@ const Params = struct {
         self.* = .{
             .manager = manager,
             .resource = resource,
-            .planes = @splat(null),
+            .parameters = .{},
             .sampling_device = null,
-            .used = false,
         };
         manager.params_count += 1;
         resource.setHandler(*Params, Params.handleRequest, Params.handleDestroy, self);
@@ -435,7 +367,7 @@ const Params = struct {
         resource: *zwp.LinuxBufferParamsV1,
         array: *wl.Array,
     ) void {
-        if (self.used) {
+        if (self.parameters.used) {
             resource.postError(.already_used, "buffer parameters were already used");
             return;
         }
@@ -451,22 +383,11 @@ const Params = struct {
         plane: Plane,
         index: u32,
     ) void {
-        if (self.used) {
-            plane.close();
-            resource.postError(.already_used, "buffer parameters were already used");
-            return;
-        }
-        if (index >= max_planes) {
-            plane.close();
-            resource.postError(.plane_idx, "DMA-BUF plane index is out of bounds");
-            return;
-        }
-        if (self.planes[index] != null) {
-            plane.close();
-            resource.postError(.plane_set, "DMA-BUF plane was already set");
-            return;
-        }
-        self.planes[index] = plane;
+        self.parameters.add(plane, index) catch |err| switch (err) {
+            error.AlreadyUsed => resource.postError(.already_used, "buffer parameters were already used"),
+            error.PlaneIndex => resource.postError(.plane_idx, "DMA-BUF plane index is out of bounds"),
+            error.PlaneSet => resource.postError(.plane_set, "DMA-BUF plane was already set"),
+        };
     }
 
     fn createBuffer(
@@ -477,18 +398,15 @@ const Params = struct {
         flags: zwp.LinuxBufferParamsV1.Flags,
         immediate_id: ?u32,
     ) void {
-        if (self.used) {
+        if (self.parameters.used) {
             self.resource.postError(.already_used, "buffer parameters were already used");
             return;
         }
-        self.used = true;
-
-        const descriptor = validateDescriptor(
-            self.planes,
+        const descriptor = self.parameters.validate(
             width,
             height,
             format,
-            flags,
+            @bitCast(flags),
             self.resource.getVersion() < 3,
             self.manager.supported_pairs,
         ) catch |err| {
@@ -510,12 +428,13 @@ const Params = struct {
                     "DMA-BUF plane does not contain the requested image",
                 ),
                 error.ImportFailed => self.importFailed(immediate_id),
+                error.AlreadyUsed => unreachable,
             }
             return;
         };
         if (self.sampling_device) |device| {
             const feedback = self.manager.feedback_state.?;
-            if (device != feedback.device and
+            if (device != feedback.owner.device and
                 (feedback.scanout_device == null or device != feedback.scanout_device.?))
             {
                 self.importFailed(immediate_id);
@@ -553,7 +472,7 @@ const Params = struct {
             self.resource.postNoMemory();
             return;
         };
-        for (self.planes[0..descriptor.plane_count]) |*plane| plane.* = null;
+        self.parameters.transfer(descriptor.plane_count);
         if (immediate_id == null) self.resource.sendCreated(buffer.resource.?);
     }
 
@@ -566,7 +485,7 @@ const Params = struct {
     }
 
     fn handleDestroy(_: *zwp.LinuxBufferParamsV1, self: *Params) void {
-        for (self.planes) |plane| if (plane) |value| value.close();
+        self.parameters.deinit();
         self.manager.params_count -= 1;
         self.manager.allocator.destroy(self);
     }
@@ -581,46 +500,8 @@ fn deviceFromArray(array: *const wl.Array) error{InvalidSize}!linux.dev_t {
     return device;
 }
 
-const DescriptorPlane = struct {
-    plane: Plane,
-    required_bytes: usize,
-};
-
-const Descriptor = struct {
-    planes: [max_planes]DescriptorPlane,
-    plane_count: u8,
-    size: render.Size,
-    format: u32,
-    modifier: u64,
-    implicit_modifier: bool,
-    y_inverted: bool,
-
-    fn renderPlanes(self: Descriptor) [max_planes]render.DmabufPlane {
-        var planes: [max_planes]render.DmabufPlane = @splat(.{
-            .fd = -1,
-            .stride = 0,
-            .offset = 0,
-            .required_bytes = 0,
-        });
-        for (self.planes[0..self.plane_count], planes[0..self.plane_count]) |source, *destination| {
-            destination.* = .{
-                .fd = source.plane.fd,
-                .stride = source.plane.stride,
-                .offset = source.plane.offset,
-                .required_bytes = source.required_bytes,
-            };
-        }
-        return planes;
-    }
-};
-
-const DescriptorError = error{
-    Incomplete,
-    InvalidFormat,
-    InvalidDimensions,
-    OutOfBounds,
-    ImportFailed,
-};
+const Descriptor = neutral.Descriptor;
+const DescriptorError = neutral.DescriptorError;
 
 fn validateDescriptor(
     planes: [max_planes]?Plane,
@@ -631,113 +512,21 @@ fn validateDescriptor(
     allow_implicit_modifier: bool,
     supported_pairs: []const render.DmabufFormatModifier,
 ) DescriptorError!Descriptor {
-    if (width <= 0 or height <= 0) return error.InvalidDimensions;
-    const format_info = render.DmabufFormat.fromFourcc(format) orelse return error.InvalidFormat;
-    if (!format_info.isPackedRgb() and (@rem(width, 2) != 0 or @rem(height, 2) != 0)) {
-        return error.InvalidDimensions;
-    }
-    const plane_count = format_info.planeCount();
-    for (planes[0..plane_count]) |plane| if (plane == null) return error.Incomplete;
-    for (planes[plane_count..]) |plane| if (plane != null) return error.Incomplete;
-
-    const first_plane = planes[0].?;
-    for (planes[1..plane_count]) |plane| {
-        if (plane.?.modifier != first_plane.modifier) return error.InvalidFormat;
-    }
-    const implicit_modifier = allow_implicit_modifier and first_plane.modifier == invalid_modifier;
-    const effective_modifier = if (implicit_modifier)
-        linear_modifier
-    else
-        first_plane.modifier;
-    if (!render.DmabufFormatModifier.contains(supported_pairs, format, effective_modifier)) return error.InvalidFormat;
-    const flag_bits: u32 = @bitCast(flags);
-    if (flag_bits & ~@as(u32, 7) != 0 or flags.interlaced or flags.bottom_first) {
-        return error.ImportFailed;
-    }
-
-    const size: render.Size = .{
-        .width = @intCast(width),
-        .height = @intCast(height),
-    };
-    var validated_planes: [max_planes]DescriptorPlane = @splat(.{
-        .plane = .{ .fd = -1, .offset = 0, .stride = 0, .modifier = 0 },
-        .required_bytes = 0,
-    });
-    for (planes[0..plane_count], 0..) |optional_plane, index| {
-        const plane = optional_plane.?;
-        const required_bytes = if (effective_modifier == linear_modifier) required: {
-            const plane_index: u8 = @intCast(index);
-            const row_bytes = format_info.planeRowBytes(plane_index, size.width).?;
-            const plane_height = format_info.planeHeight(plane_index, size.height).?;
-            const alignment = format_info.planeAlignment();
-            if (plane.stride < row_bytes or plane.stride % alignment != 0 or
-                plane.offset % alignment != 0) return error.OutOfBounds;
-            const row_offset = std.math.mul(u64, plane_height - 1, plane.stride) catch
-                return error.OutOfBounds;
-            const required_offset = std.math.add(u64, plane.offset, row_offset) catch
-                return error.OutOfBounds;
-            const required_end = std.math.add(u64, required_offset, row_bytes) catch
-                return error.OutOfBounds;
-            if (required_end == 0 or required_end > std.math.maxInt(usize)) {
-                return error.OutOfBounds;
-            }
-            const fd_size = std.c.lseek(plane.fd, 0, std.c.SEEK.END);
-            if (fd_size < 0) return error.ImportFailed;
-            if (required_end > @as(u64, @intCast(fd_size))) return error.OutOfBounds;
-
-            if (!syncDmaBuf(plane.fd, linux.DMA_BUF_SYNC_READ)) return error.ImportFailed;
-            const mapping = std.posix.mmap(
-                null,
-                @intCast(required_end),
-                .{ .READ = true },
-                .{ .TYPE = .SHARED },
-                plane.fd,
-                0,
-            ) catch {
-                _ = syncDmaBuf(plane.fd, linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END);
-                return error.ImportFailed;
-            };
-            std.posix.munmap(mapping);
-            if (!syncDmaBuf(plane.fd, linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END)) {
-                return error.ImportFailed;
-            }
-            break :required @as(usize, @intCast(required_end));
-        } else non_linear: {
-            const fd_size = std.c.lseek(plane.fd, 0, std.c.SEEK.END);
-            if (fd_size <= 0) return error.ImportFailed;
-            if (@as(u64, @intCast(fd_size)) > std.math.maxInt(usize)) {
-                return error.OutOfBounds;
-            }
-            break :non_linear @as(usize, @intCast(fd_size));
-        };
-        validated_planes[index] = .{ .plane = plane, .required_bytes = required_bytes };
-    }
-
-    return .{
-        .planes = validated_planes,
-        .plane_count = plane_count,
-        .size = size,
-        .format = format,
-        .modifier = effective_modifier,
-        .implicit_modifier = implicit_modifier,
-        .y_inverted = flags.y_invert,
-    };
+    return neutral.validateDescriptor(
+        planes,
+        width,
+        height,
+        format,
+        @bitCast(flags),
+        allow_implicit_modifier,
+        supported_pairs,
+    );
 }
 
 pub const Buffer = struct {
     manager: *Self,
     resource: ?*wl.Buffer,
-    descriptor: Descriptor,
-    reference_count: usize,
-    snapshot_count: usize,
-    source_cache_id: u64,
-    next_source_version: u64,
-    render_target: ?ImportedRenderTarget,
-
-    const ImportedRenderTarget = struct {
-        renderer: render.DmabufRenderer,
-        target: render.DmabufTarget,
-    };
+    neutral_buffer: neutral.Buffer,
 
     // Optimized builds may merge identical wl_buffer request handlers, so the
     // implementation address cannot also serve as the resource type identity.
@@ -760,13 +549,9 @@ pub const Buffer = struct {
         self.* = .{
             .manager = manager,
             .resource = resource,
-            .descriptor = descriptor,
-            .reference_count = 1,
-            .snapshot_count = 0,
-            .source_cache_id = render.allocateSourceCacheId(),
-            .next_source_version = 1,
-            .render_target = null,
+            .neutral_buffer = undefined,
         };
+        self.neutral_buffer = .init(descriptor, self, sendReleaseCallback, finalizeCallback);
         manager.buffer_count += 1;
         const raw_resource: *wl.Resource = @ptrCast(resource);
         raw_resource.setDispatcher(
@@ -789,43 +574,31 @@ pub const Buffer = struct {
     }
 
     pub fn size(self: *const Buffer) render.Size {
-        return self.descriptor.size;
+        return self.neutral_buffer.descriptor.size;
     }
 
     pub fn format(self: *const Buffer) u32 {
-        return self.descriptor.format;
+        return self.neutral_buffer.descriptor.format;
     }
 
     pub fn isCaptureCompatible(self: *const Buffer) bool {
         for (capture_formats) |candidate| {
-            if (candidate.format == self.descriptor.format and
-                candidate.modifier == self.descriptor.modifier) return true;
+            if (candidate.format == self.neutral_buffer.descriptor.format and
+                candidate.modifier == self.neutral_buffer.descriptor.modifier) return true;
         }
         return false;
     }
 
     pub fn yInverted(self: *const Buffer) bool {
-        return self.descriptor.y_inverted;
+        return self.neutral_buffer.descriptor.y_inverted;
     }
 
     pub fn reference(self: *Buffer) void {
-        std.debug.assert(self.reference_count > 0);
-        self.reference_count += 1;
+        self.neutral_buffer.reference();
     }
 
     pub fn unreference(self: *Buffer) void {
-        std.debug.assert(self.reference_count > 0);
-        self.reference_count -= 1;
-        if (self.reference_count != 0) return;
-        if (self.render_target) |imported| {
-            imported.renderer.release_target(
-                imported.renderer.context,
-                imported.target.id,
-            );
-        }
-        for (self.descriptor.planes[0..self.descriptor.plane_count]) |plane| plane.plane.close();
-        self.manager.buffer_count -= 1;
-        self.manager.allocator.destroy(self);
+        self.neutral_buffer.unreference();
     }
 
     pub fn sendRelease(self: *Buffer) void {
@@ -833,106 +606,37 @@ pub const Buffer = struct {
     }
 
     pub fn retainSnapshot(self: *Buffer) void {
-        self.reference();
-        self.snapshot_count += 1;
+        self.neutral_buffer.retainSnapshot();
     }
 
     pub fn releaseSnapshot(self: *Buffer) void {
-        std.debug.assert(self.snapshot_count > 0);
-        self.snapshot_count -= 1;
-        if (self.snapshot_count == 0) self.sendRelease();
-        self.unreference();
+        self.neutral_buffer.releaseSnapshot();
     }
 
     pub fn acquireSourceCache(self: *Buffer) render.SourceCache {
-        const source_cache: render.SourceCache = .{
-            .id = self.source_cache_id,
-            .version = self.next_source_version,
-        };
-        self.next_source_version +%= 1;
-        return source_cache;
+        return self.neutral_buffer.acquireSourceCache();
     }
 
     pub fn renderSource(self: *Buffer) render.DmabufSource {
-        const descriptor = self.descriptor;
-        const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
-        return .{
-            .context = self,
-            .format = descriptor.format,
-            .modifier = descriptor.modifier,
-            .planes = descriptor.renderPlanes(),
-            .plane_count = descriptor.plane_count,
-            .y_inverted = descriptor.y_inverted,
-            .force_opaque = !format_info.hasAlpha(),
-            .retain = retainSourceCallback,
-            .release = releaseSourceCallback,
-            .begin_cpu_read = beginCpuReadCallback,
-            .end_cpu_read = endCpuReadCallback,
-            .export_read_fence = exportReadFenceCallback,
-        };
+        return self.neutral_buffer.renderSource();
     }
 
     pub fn captureTarget(
         self: *Buffer,
         renderer: render.DmabufRenderer,
     ) CopyError!render.DmabufTarget {
-        if (self.render_target) |imported| {
-            if (imported.renderer.context != renderer.context) return error.ImportFailed;
-            return imported.target;
-        }
-        const descriptor = self.descriptor;
-        if (descriptor.y_inverted or descriptor.plane_count != 1 or
-            !renderer.supports_target(
-                renderer.context,
-                descriptor.size,
-                descriptor.format,
-                descriptor.modifier,
-            )) return error.ImportFailed;
-        const plane = descriptor.planes[0].plane;
-        const target: render.DmabufTarget = .{
-            .id = render.allocateRenderTargetId(),
-            .size = descriptor.size,
-        };
-        renderer.import_target(renderer.context, .{
-            .id = target.id,
-            .size = target.size,
-            .fd = plane.fd,
-            .format = descriptor.format,
-            .modifier = descriptor.modifier,
-            .stride = plane.stride,
-            .offset = plane.offset,
-        }) catch return error.ImportFailed;
-        self.render_target = .{ .renderer = renderer, .target = target };
-        return target;
+        return self.neutral_buffer.captureTarget(renderer);
     }
 
     pub fn importWriteFence(self: *const Buffer, sync_file_fd: std.posix.fd_t) bool {
-        for (self.descriptor.planes[0..self.descriptor.plane_count]) |plane| {
-            var import_sync_file: linux.dma_buf_import_sync_file = .{
-                .flags = linux.DMA_BUF_SYNC_WRITE,
-                .fd = sync_file_fd,
-            };
-            while (true) {
-                const result = linux.ioctl(
-                    plane.plane.fd,
-                    linux.DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
-                    &import_sync_file,
-                );
-                if (result >= 0) break;
-                switch (std.posix.errno(result)) {
-                    .INTR, .AGAIN => continue,
-                    else => return false,
-                }
-            }
-        }
-        return true;
+        return self.neutral_buffer.importWriteFence(sync_file_fd);
     }
 
     pub fn copyPixels(
         self: *const Buffer,
         allocator: std.mem.Allocator,
     ) CopyError![]u32 {
-        const descriptor = self.descriptor;
+        const descriptor = self.neutral_buffer.descriptor;
         const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
         if (descriptor.modifier != linear_modifier or !format_info.isPackedRgb() or
             descriptor.plane_count != 1) return error.ImportFailed;
@@ -988,7 +692,7 @@ pub const Buffer = struct {
         self: *const Buffer,
         source: render.PixelBuffer,
     ) CopyError!void {
-        const descriptor = self.descriptor;
+        const descriptor = self.neutral_buffer.descriptor;
         const format_info = render.DmabufFormat.fromFourcc(descriptor.format).?;
         if (descriptor.modifier != linear_modifier or !format_info.isPackedRgb() or
             descriptor.plane_count != 1) return error.ImportFailed;
@@ -1076,73 +780,19 @@ pub const Buffer = struct {
         self.unreference();
     }
 
-    fn beginCpuReadCallback(context: *anyopaque) bool {
+    fn sendReleaseCallback(context: *anyopaque) void {
         const self: *Buffer = @ptrCast(@alignCast(context));
-        for (self.descriptor.planes[0..self.descriptor.plane_count], 0..) |plane, index| {
-            if (syncDmaBuf(plane.plane.fd, linux.DMA_BUF_SYNC_READ)) continue;
-            for (self.descriptor.planes[0..index]) |started| {
-                _ = syncDmaBuf(started.plane.fd, linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END);
-            }
-            return false;
-        }
-        return true;
+        self.sendRelease();
     }
 
-    fn retainSourceCallback(context: *anyopaque) void {
+    fn finalizeCallback(context: *anyopaque) void {
         const self: *Buffer = @ptrCast(@alignCast(context));
-        self.reference();
-    }
-
-    fn releaseSourceCallback(context: *anyopaque) void {
-        const self: *Buffer = @ptrCast(@alignCast(context));
-        self.unreference();
-    }
-
-    fn endCpuReadCallback(context: *anyopaque) bool {
-        const self: *Buffer = @ptrCast(@alignCast(context));
-        var succeeded = true;
-        for (self.descriptor.planes[0..self.descriptor.plane_count]) |plane| {
-            succeeded = syncDmaBuf(
-                plane.plane.fd,
-                linux.DMA_BUF_SYNC_READ | linux.DMA_BUF_SYNC_END,
-            ) and succeeded;
-        }
-        return succeeded;
-    }
-
-    fn exportReadFenceCallback(context: *anyopaque, plane_index: u8) ?std.posix.fd_t {
-        const self: *Buffer = @ptrCast(@alignCast(context));
-        if (plane_index >= self.descriptor.plane_count) return null;
-        var export_sync_file: linux.dma_buf_export_sync_file = .{
-            .flags = linux.DMA_BUF_SYNC_READ,
-            .fd = -1,
-        };
-        while (true) {
-            const result = linux.ioctl(
-                self.descriptor.planes[plane_index].plane.fd,
-                linux.DMA_BUF_IOCTL_EXPORT_SYNC_FILE,
-                &export_sync_file,
-            );
-            if (result >= 0) return export_sync_file.fd;
-            switch (std.posix.errno(result)) {
-                .INTR, .AGAIN => continue,
-                else => return null,
-            }
-        }
+        self.manager.buffer_count -= 1;
+        self.manager.allocator.destroy(self);
     }
 };
 
-fn syncDmaBuf(fd: std.posix.fd_t, flags: u64) bool {
-    while (true) {
-        var sync: linux.dma_buf_sync = .{ .flags = flags };
-        const result = linux.ioctl(fd, linux.DMA_BUF_IOCTL_SYNC, &sync);
-        if (result >= 0) return true;
-        switch (std.posix.errno(result)) {
-            .INTR, .AGAIN => continue,
-            else => return false,
-        }
-    }
-}
+const syncDmaBuf = neutral.syncDmaBuf;
 
 extern fn wl_resource_instance_of(
     resource: *wl.Resource,
