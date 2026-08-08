@@ -481,9 +481,21 @@ fn execute(self: *Self, config: *Configuration, apply: bool) !void {
     std.debug.assert(self.authority.serial == expected_serial);
     self.commitSnapshots(config, prepared.changes);
     for (publications.items) |*publication| {
+        if (publication.client.fatal() != null) {
+            publication.client.cancelEventBatch(publication.reservation);
+            publication.reserved = false;
+            continue;
+        }
         const storage = try publication.client.preparedEventStorage(publication.reservation);
         @memcpy(storage[0..publication.encoded.items.len], publication.encoded.items);
-        try publication.client.publishEventBatch(publication.reservation, publication.encoded.items.len);
+        publication.client.publishEventBatch(publication.reservation, publication.encoded.items.len) catch |err| switch (err) {
+            error.OutputSealed => {
+                publication.client.cancelEventBatch(publication.reservation);
+                publication.reserved = false;
+                continue;
+            },
+            else => return err,
+        };
         publication.reserved = false;
     }
 }
@@ -879,6 +891,238 @@ fn testSend(client: *server.Client, object_id: u32, opcode: u16, descriptor: *co
 
 fn drainClient(client: *server.Client) !void {
     while (try client.beginSend()) |batch| try client.completeSend(batch.token, batch.bytes.len);
+}
+
+fn exercisePostCommitOffenderIsolation(offender_first: bool) !void {
+    const wayland = @import("wayland");
+    const SurfaceRegistry = @import("../SurfaceRegistry.zig");
+    const Surface = @import("surface.zig");
+    const OutputLayout = @import("output_layout.zig");
+    const WayringCompositor = @import("WayringCompositor.zig");
+    const WayringOutput = @import("WayringOutput.zig");
+
+    const wl = wayland.server.wl;
+    const display = try wl.Server.create();
+    defer display.destroy();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var surfaces: Surface.Store = .{};
+    defer surfaces.deinit(std.testing.allocator);
+    var layout: OutputLayout = undefined;
+    layout.init(std.testing.allocator, display, &surface_registry, &surfaces);
+    const output_id = try layout.add(.{
+        .size = .{ .width = 1280, .height = 720 },
+        .mode_size = .{ .width = 1280, .height = 720 },
+        .physical_size = .{ .width = 600, .height = 340 },
+        .scale = 1,
+        .name = "HEADLESS-1",
+        .description = "post-commit offender isolation",
+        .model = "headless",
+    });
+    defer {
+        std.debug.assert(layout.remove(output_id));
+        layout.deinit();
+    }
+    const canonical_output = layout.get(output_id).?;
+
+    var protocol_server: server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &protocol_server, &surface_registry, null);
+    defer compositor.deinit();
+    var outputs: WayringOutput = undefined;
+    try outputs.init(std.testing.allocator, &protocol_server, &layout, &compositor);
+    defer outputs.deinit();
+
+    var offender_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var requester_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const offender = try server.CoreClient.create(offender_allocator.allocator(), &protocol_server, .{
+        .credentials = .{ .pid = 1, .uid = 42, .gid = 1 },
+        .transport_provenance = .direct,
+    });
+    const requester = try server.CoreClient.create(requester_allocator.allocator(), &protocol_server, .{
+        .credentials = .{ .pid = 2, .uid = 42, .gid = 1 },
+        .transport_provenance = .direct,
+    });
+
+    const Context = struct {
+        output: *@import("output.zig"),
+        offender_allocator: *std.testing.FailingAllocator,
+        applied: bool = false,
+
+        fn accept(_: *anyopaque, _: []const Neutral.Change) bool {
+            return true;
+        }
+
+        fn apply(erased: *anyopaque, changes: []const Neutral.Change) bool {
+            const self: *@This() = @ptrCast(@alignCast(erased));
+            std.debug.assert(changes.len == 1);
+            const custom = changes[0].custom_mode orelse unreachable;
+            const snapshot = self.output.snapshot();
+            self.offender_allocator.fail_index = self.offender_allocator.alloc_index;
+            _ = self.output.configure(
+                snapshot.position,
+                .{ .width = custom.width, .height = custom.height },
+                .{ .width = custom.width, .height = custom.height },
+                custom.refresh_millihertz,
+                true,
+                @intCast(snapshot.scale),
+                snapshot.preferred_scale,
+            );
+            self.applied = true;
+            return true;
+        }
+    };
+    var context: Context = .{
+        .output = canonical_output,
+        .offender_allocator = &offender_allocator,
+    };
+    var authority: Neutral = .{};
+    var adapter: Self = undefined;
+    adapter.init(std.testing.allocator, &protocol_server, &authority, 42, .{
+        .context = &context,
+        .test_configuration = Context.accept,
+        .apply = Context.apply,
+    });
+    try adapter.addOutput(.{
+        .id = 1,
+        .target = .{ .virtual = canonical_output },
+        .name = "HEADLESS-1",
+        .modes = &.{.{
+            .width = 1280,
+            .height = 720,
+            .refresh_millihertz = 60_000,
+            .preferred = true,
+        }},
+    });
+    defer adapter.deinit();
+    try adapter.publish();
+    protocol_server.setGlobalFilter(Self, &adapter, globalFilter);
+    defer {
+        protocol_server.clearGlobalFilter();
+        adapter.unpublish();
+    }
+
+    var cleaned = false;
+    defer if (!cleaned) {
+        adapter.destroyClientResources(offender.client());
+        adapter.destroyClientResources(requester.client());
+        outputs.destroyClientResources(offender.client());
+        outputs.destroyClientResources(requester.client());
+        compositor.destroyClientResources(offender.client());
+        compositor.destroyClientResources(requester.client());
+        offender.destroy();
+        requester.destroy();
+    };
+
+    var output_global: ?*const server.Server.Global = null;
+    var globals = protocol_server.iterator();
+    while (globals.next()) |global| {
+        if (std.mem.eql(u8, global.interface().name, protocol.wl_output.interface.name)) {
+            output_global = global;
+            break;
+        }
+    }
+    const participants = if (offender_first)
+        [_]*server.CoreClient{ offender, requester }
+    else
+        [_]*server.CoreClient{ requester, offender };
+    for (participants) |participant| {
+        try testSend(participant.client(), 1, 1, &test_display_get_registry, &.{.{ .new_id = .{ .typed = 2 } }});
+        try drainClient(participant.client());
+        try testSend(participant.client(), 2, 0, &test_registry_bind, &.{
+            .{ .uint = output_global.?.name() },
+            .{ .new_id = .{ .generic = .{
+                .interface = protocol.wl_output.interface.name,
+                .version = 4,
+                .id = 3,
+            } } },
+        });
+        try testSend(participant.client(), 2, 0, &test_registry_bind, &.{
+            .{ .uint = adapter.global.?.name() },
+            .{ .new_id = .{ .generic = .{
+                .interface = protocol.zwlr_output_manager_v1.interface.name,
+                .version = 4,
+                .id = 4,
+            } } },
+        });
+        try drainClient(participant.client());
+    }
+
+    var requester_manager: ?*Manager = null;
+    for (adapter.managers.items) |manager| {
+        if (manager.client == requester.client()) requester_manager = manager;
+    }
+    const manager = requester_manager.?;
+    var requester_head: ?*HeadResource = null;
+    for (adapter.head_resources.items) |head| {
+        if (head.manager == manager) requester_head = head;
+    }
+    try testSend(requester.client(), manager.resource.id(), 0, &protocol.zwlr_output_manager_v1.request_messages[0], &.{
+        .{ .new_id = .{ .typed = 5 } },
+        .{ .uint = authority.serial },
+    });
+    const configuration = adapter.configurations.items[0];
+    try testSend(requester.client(), configuration.resource.id(), 0, &protocol.zwlr_output_configuration_v1.request_messages[0], &.{
+        .{ .new_id = .{ .typed = 6 } },
+        .{ .object = requester_head.?.resource.id() },
+    });
+    const configured = configuration.heads.items[0];
+    try testSend(requester.client(), configured.resource.?.id(), 1, &protocol.zwlr_output_configuration_head_v1.request_messages[1], &.{
+        .{ .int = 1920 },
+        .{ .int = 1080 },
+        .{ .int = 75_000 },
+    });
+    try testSend(requester.client(), configuration.resource.id(), 2, &protocol.zwlr_output_configuration_v1.request_messages[2], &.{});
+    try std.testing.expect(context.applied);
+    try std.testing.expect(offender_allocator.has_induced_failure);
+    try std.testing.expectEqual(server.Fatal.Kind.out_of_memory, offender.client().fatal().?.kind);
+    try std.testing.expect(requester.client().fatal() == null);
+    try std.testing.expectEqual(@as(u32, 1920), canonical_output.snapshot().mode_size.width);
+    try std.testing.expectEqual(@as(u32, 1080), canonical_output.snapshot().mode_size.height);
+    try std.testing.expectEqual(@as(u32, 1920), adapter.heads.items[0].modes[0].width);
+    try std.testing.expectEqual(@as(u32, 2), authority.serial);
+
+    var committed_epoch_count: usize = 0;
+    var succeeded_count: usize = 0;
+    while (try requester.client().beginSend()) |batch| {
+        var cursor: usize = 0;
+        while (cursor < batch.bytes.len) {
+            const object_id = std.mem.readInt(u32, batch.bytes[cursor..][0..4], .native);
+            const size_opcode = std.mem.readInt(u32, batch.bytes[cursor + 4 ..][0..4], .native);
+            const size: usize = @intCast(size_opcode >> 16);
+            const opcode: u16 = @truncate(size_opcode);
+            if (object_id == manager.resource.id() and opcode == 1) {
+                try std.testing.expectEqual(authority.serial, std.mem.readInt(u32, batch.bytes[cursor + 8 ..][0..4], .native));
+                committed_epoch_count += 1;
+            }
+            if (object_id == configuration.resource.id() and opcode == 0) succeeded_count += 1;
+            cursor += size;
+        }
+        try requester.client().completeSend(batch.token, batch.bytes.len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), committed_epoch_count);
+    try std.testing.expectEqual(@as(usize, 1), succeeded_count);
+    const fresh_reservation = try requester.client().prepareEventBatch(1);
+    requester.client().cancelEventBatch(fresh_reservation);
+    try std.testing.expectError(error.OutputSealed, offender.client().prepareEventBatch(1));
+
+    adapter.destroyClientResources(offender.client());
+    adapter.destroyClientResources(requester.client());
+    outputs.destroyClientResources(offender.client());
+    outputs.destroyClientResources(requester.client());
+    compositor.destroyClientResources(offender.client());
+    compositor.destroyClientResources(requester.client());
+    offender.destroy();
+    requester.destroy();
+    cleaned = true;
+    try std.testing.expectEqual(offender_allocator.allocated_bytes, offender_allocator.freed_bytes);
+    try std.testing.expectEqual(requester_allocator.allocated_bytes, requester_allocator.freed_bytes);
+}
+
+test "renderer conformance: committed output epoch isolates canonical wl_output offender in either order" {
+    try exercisePostCommitOffenderIsolation(true);
+    try exercisePostCommitOffenderIsolation(false);
 }
 
 test "renderer conformance: canonical apply encodes high server ids as exact wire objects" {
