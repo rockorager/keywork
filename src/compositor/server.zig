@@ -23332,6 +23332,17 @@ const GeneratedTextInputClient = struct {
     keyboard_states: [2]client_wl.Keyboard.KeyState = undefined,
     keyboard_event_count: usize = 0,
     keyboard_modifiers_seen: bool = false,
+    pointer_enter_serial: u32 = 0,
+    pointer_motion_times: [2]u32 = @splat(0),
+    pointer_motion_count: usize = 0,
+    pointer_button_times: [4]u32 = @splat(0),
+    pointer_button_states: [4]client_wl.Pointer.ButtonState = undefined,
+    pointer_button_count: usize = 0,
+    pointer_axis_time: u32 = 0,
+    pointer_axis_source_seen: bool = false,
+    pointer_axis_stop_seen: bool = false,
+    pointer_axis_discrete: i32 = 0,
+    pointer_frame_count: usize = 0,
 
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
@@ -23385,6 +23396,9 @@ const GeneratedTextInputClient = struct {
         const keyboard = try seat.getKeyboard();
         defer keyboard.release();
         keyboard.setListener(*@This(), keyboardEvent, self);
+        const pointer = try seat.getPointer();
+        defer pointer.release();
+        pointer.setListener(*@This(), pointerEvent, self);
 
         const surface = try compositor.createSurface();
         defer surface.destroy();
@@ -23536,6 +23550,28 @@ const GeneratedTextInputClient = struct {
         }
     }
 
+    fn pointerEvent(_: *client_wl.Pointer, event: client_wl.Pointer.Event, self: *@This()) void {
+        switch (event) {
+            .enter => |value| self.pointer_enter_serial = value.serial,
+            .motion => |value| if (self.pointer_motion_count < self.pointer_motion_times.len) {
+                self.pointer_motion_times[self.pointer_motion_count] = value.time;
+                self.pointer_motion_count += 1;
+            },
+            .button => |value| if (self.pointer_button_count < self.pointer_button_times.len) {
+                const index = self.pointer_button_count;
+                self.pointer_button_times[index] = value.time;
+                self.pointer_button_states[index] = value.state;
+                self.pointer_button_count += 1;
+            },
+            .axis => |value| self.pointer_axis_time = value.time,
+            .axis_source => |value| self.pointer_axis_source_seen = value.axis_source == .finger,
+            .axis_stop => self.pointer_axis_stop_seen = true,
+            .axis_discrete => |value| self.pointer_axis_discrete = value.discrete,
+            .frame => self.pointer_frame_count += 1,
+            else => {},
+        }
+    }
+
     fn pause(self: *@This(), display: *client_wl.Display, stage_value: Stage) !void {
         self.stage.store(@intFromEnum(stage_value), .release);
         try waitForWayringCommandDraining(display, self.command_fd);
@@ -23548,6 +23584,108 @@ const GeneratedTextInputClient = struct {
         _ = std.os.linux.close(fd);
     }
 
+    fn shutdown(self: *@This()) void {
+        signalWayringCommand(self.command_fd) catch {};
+        self.closeWake(true);
+    }
+};
+
+const GeneratedVirtualPointerClient = struct {
+    const client_wl = wayland.client.wl;
+    const client_zwlr = wayland.client.zwlr;
+    const Stage = enum(u8) { starting, ready, sent, disconnected, failed };
+
+    runtime_directory: []const u8,
+    display_name: []const u8,
+    command_fd: std.posix.fd_t,
+    stage: std.atomic.Value(u8) = .init(@intFromEnum(Stage.starting)),
+    wake_fd: std.atomic.Value(i32) = .init(-1),
+    failure: ?anyerror = null,
+    seat: ?*client_wl.Seat = null,
+    output: ?*client_wl.Output = null,
+    manager: ?*client_zwlr.VirtualPointerManagerV1 = null,
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            self.failure = err;
+            self.stage.store(@intFromEnum(Stage.failed), .release);
+            return;
+        };
+        self.stage.store(@intFromEnum(Stage.disconnected), .release);
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const path = try std.fmt.allocPrintSentinel(std.heap.page_allocator, "{s}/{s}", .{ self.runtime_directory, self.display_name }, 0);
+        defer std.heap.page_allocator.free(path);
+        const fd = try connectWayringTestSocket(path);
+        var fd_owned = true;
+        defer if (fd_owned) _ = std.os.linux.close(fd);
+        const raw_wake_fd = std.os.linux.dup(fd);
+        if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
+        const wake_fd: i32 = @intCast(raw_wake_fd);
+        if (self.wake_fd.cmpxchgStrong(-1, wake_fd, .acq_rel, .acquire)) |_| {
+            _ = std.os.linux.close(wake_fd);
+            return error.ClientShutdown;
+        }
+        defer self.closeWake(false);
+        const display = try client_wl.Display.connectToFd(fd);
+        fd_owned = false;
+        defer display.disconnect();
+        const registry = try display.getRegistry();
+        defer registry.destroy();
+        registry.setListener(*@This(), registryEvent, self);
+        try expectClientRoundtrip(display);
+        const seat = self.seat orelse return error.SeatMissing;
+        defer seat.release();
+        const output = self.output orelse return error.OutputMissing;
+        defer output.release();
+        const manager = self.manager orelse return error.VirtualPointerManagerMissing;
+        defer manager.destroy();
+        const pointer = try manager.createVirtualPointerWithOutput(seat, output);
+        defer pointer.destroy();
+        try expectClientRoundtrip(display);
+        try self.pause(display, .ready);
+        pointer.motionAbsolute(101, 128, 128, 256, 256);
+        pointer.motion(102, client_wl.Fixed.fromDouble(1.5), client_wl.Fixed.fromDouble(-2.0));
+        pointer.button(103, linux_button_left, .pressed);
+        pointer.axisSource(.finger);
+        pointer.axis(104, .vertical_scroll, client_wl.Fixed.fromDouble(3.0));
+        pointer.axisDiscrete(105, .vertical_scroll, client_wl.Fixed.fromDouble(4.0), -2);
+        pointer.axisStop(106, .vertical_scroll);
+        pointer.frame();
+        pointer.button(107, linux_button_left, .released);
+        pointer.button(108, linux_button_left, .pressed);
+        pointer.frame();
+        try expectClientRoundtrip(display);
+        try self.pause(display, .sent);
+        // Disconnect while pressed: protocol-neutral teardown owes one release.
+    }
+
+    fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
+        switch (event) {
+            .global => |global| {
+                const interface = std.mem.span(global.interface);
+                if (std.mem.eql(u8, interface, "wl_seat"))
+                    self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null
+                else if (std.mem.eql(u8, interface, "wl_output"))
+                    self.output = registry.bind(global.name, client_wl.Output, @min(global.version, 4)) catch null
+                else if (std.mem.eql(u8, interface, "zwlr_virtual_pointer_manager_v1"))
+                    self.manager = registry.bind(global.name, client_zwlr.VirtualPointerManagerV1, 2) catch null;
+            },
+            .global_remove => {},
+        }
+    }
+
+    fn pause(self: *@This(), display: *client_wl.Display, value: Stage) !void {
+        self.stage.store(@intFromEnum(value), .release);
+        try waitForWayringCommandDraining(display, self.command_fd);
+    }
+    fn closeWake(self: *@This(), shutdown_requested: bool) void {
+        const fd = self.wake_fd.swap(-2, .acq_rel);
+        if (fd < 0) return;
+        if (shutdown_requested) _ = std.os.linux.shutdown(fd, std.os.linux.SHUT.RDWR);
+        _ = std.os.linux.close(fd);
+    }
     fn shutdown(self: *@This()) void {
         signalWayringCommand(self.command_fd) catch {};
         self.closeWake(true);
@@ -24073,6 +24211,23 @@ fn waitForGeneratedVirtualKeyboardStage(
         if (host.failure()) |err| return err;
     }
     return error.GeneratedVirtualKeyboardClientTimedOut;
+}
+
+fn waitForGeneratedVirtualPointerStage(
+    server: *Self,
+    host: anytype,
+    client: *GeneratedVirtualPointerClient,
+    expected: GeneratedVirtualPointerClient.Stage,
+) !void {
+    for (0..4_000) |_| {
+        const stage: GeneratedVirtualPointerClient.Stage = @enumFromInt(client.stage.load(.acquire));
+        if (stage == expected) return;
+        if (stage == .failed) return client.failure orelse error.GeneratedVirtualPointerClientFailed;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    }
+    return error.GeneratedVirtualPointerClientTimedOut;
 }
 
 fn waitForGeneratedOutputManagementStage(
@@ -26005,6 +26160,7 @@ test "production generated data device completes the exact profile and supports 
     const WayringDataControl = @import("wayland/WayringDataControl.zig");
     const WayringTextInput = @import("wayland/WayringTextInput.zig");
     const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
+    const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
     const wayring = @import("wayring");
     const linux = std.os.linux;
     var marker: u8 = 0;
@@ -26276,6 +26432,20 @@ test "production generated data device completes the exact profile and supports 
         if (virtual_keyboard.global != null) virtual_keyboard.unpublish();
         virtual_keyboard.deinit();
     }
+    var generated_virtual_pointer: WayringVirtualPointer = undefined;
+    try generated_virtual_pointer.init(
+        std.testing.allocator,
+        &protocol_server,
+        &seat,
+        &outputs,
+        server.virtual_pointer.authority(),
+        server.canonicalSeat(),
+        linux.getuid(),
+    );
+    defer {
+        if (generated_virtual_pointer.global != null) generated_virtual_pointer.unpublish();
+        generated_virtual_pointer.deinit();
+    }
     var layer_shell: WayringLayerShell = undefined;
     layer_shell.init(
         std.testing.allocator,
@@ -26358,6 +26528,7 @@ test "production generated data device completes the exact profile and supports 
         data_control: *WayringDataControl,
         input_method: *WayringInputMethod,
         virtual_keyboard: *WayringVirtualKeyboard,
+        virtual_pointer: *WayringVirtualPointer,
         layer_shell: *WayringLayerShell,
         idle_notify: *WayringIdleNotification,
         session_lock: *WayringSessionLock,
@@ -26411,6 +26582,9 @@ test "production generated data device completes the exact profile and supports 
                     evidence_slot.* = evidence;
                 };
             }
+            // Synthetic devices must release canonical input state before
+            // their seat/output resources lose identity.
+            self.virtual_pointer.destroyClientResources(client);
             self.virtual_keyboard.destroyClientResources(client);
             self.input_method.destroyClientResources(client);
             self.data_control.destroyClientResources(client);
@@ -26447,6 +26621,7 @@ test "production generated data device completes the exact profile and supports 
         .data_control = &data_control,
         .input_method = &input_method,
         .virtual_keyboard = &virtual_keyboard,
+        .virtual_pointer = &generated_virtual_pointer,
         .layer_shell = &layer_shell,
         .idle_notify = &idle_notify,
         .session_lock = &session_lock,
@@ -27584,6 +27759,59 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(generated_text_surface, server.window_manager.focusedSurface().?);
     try std.testing.expect(server.focusGeneratedSurface(generated_text_surface));
     try std.testing.expect(server.seat.generatedKeyboardFocus() != null);
+
+    // Virtual pointer is intentionally absent from the production profile;
+    // expose it only for this authentic generated-client integration phase.
+    try generated_virtual_pointer.publish();
+    const raw_virtual_pointer_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_virtual_pointer_command) != .SUCCESS) return error.EventFdFailed;
+    const virtual_pointer_command: std.posix.fd_t = @intCast(raw_virtual_pointer_command);
+    defer _ = linux.close(virtual_pointer_command);
+    const virtual_pointer_connection_baseline = host.connectionCount();
+    var generated_pointer_client: GeneratedVirtualPointerClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = virtual_pointer_command,
+    };
+    const generated_pointer_thread = try std.Thread.spawn(.{}, GeneratedVirtualPointerClient.run, .{&generated_pointer_client});
+    var generated_pointer_joined = false;
+    defer if (!generated_pointer_joined) {
+        generated_pointer_client.shutdown();
+        generated_pointer_thread.join();
+    };
+    try waitForGeneratedVirtualPointerStage(server, host, &generated_pointer_client, .ready);
+    try std.testing.expectEqual(@as(usize, 1), generated_virtual_pointer.managers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_virtual_pointer.devices.items.len);
+    try signalWayringCommand(virtual_pointer_command);
+    try waitForGeneratedVirtualPointerStage(server, host, &generated_pointer_client, .sent);
+    for (0..2_000) |_| {
+        if (generated_text.pointer_button_count == 3 and generated_text.pointer_axis_stop_seen) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedVirtualPointerDeliveryTimedOut;
+    try std.testing.expect(generated_text.pointer_enter_serial != 0);
+    try std.testing.expectEqualSlices(u32, &.{ 101, 102 }, &generated_text.pointer_motion_times);
+    try std.testing.expectEqualSlices(u32, &.{ 103, 107, 108 }, generated_text.pointer_button_times[0..3]);
+    try std.testing.expectEqualSlices(wayland.client.wl.Pointer.ButtonState, &.{ .pressed, .released, .pressed }, generated_text.pointer_button_states[0..3]);
+    try std.testing.expectEqual(@as(u32, 105), generated_text.pointer_axis_time);
+    try std.testing.expect(generated_text.pointer_axis_source_seen);
+    try std.testing.expectEqual(@as(i32, -2), generated_text.pointer_axis_discrete);
+    try std.testing.expect(generated_text.pointer_frame_count >= 2);
+    try signalWayringCommand(virtual_pointer_command);
+    try waitForGeneratedVirtualPointerStage(server, host, &generated_pointer_client, .disconnected);
+    generated_pointer_thread.join();
+    generated_pointer_joined = true;
+    for (0..2_000) |_| {
+        if (generated_virtual_pointer.managers.items.len == 0 and generated_virtual_pointer.devices.items.len == 0 and
+            generated_text.pointer_button_count == 4 and host.connectionCount() == virtual_pointer_connection_baseline) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedVirtualPointerCleanupTimedOut;
+    try std.testing.expectEqual(@as(u32, 0), generated_text.pointer_button_times[3]);
+    try std.testing.expectEqual(wayland.client.wl.Pointer.ButtonState.released, generated_text.pointer_button_states[3]);
+    generated_virtual_pointer.unpublish();
 
     const raw_virtual_keyboard_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_virtual_keyboard_command) != .SUCCESS) return error.EventFdFailed;
