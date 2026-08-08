@@ -284,8 +284,8 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
-            if (self.session_lock) |generated_session_lock| generated_session_lock.destroyClientResources(client);
             if (self.idle_notification) |idle_notification| idle_notification.destroyClientResources(client);
+            if (self.session_lock) |generated_session_lock| generated_session_lock.destroyClientResources(client);
             if (self.layer_shell) |layer_shell| layer_shell.destroyClientResources(client);
             if (self.virtual_keyboard) |keyboard| keyboard.destroyClientResources(client);
             if (self.input_method) |input_method| input_method.destroyClientResources(client);
@@ -311,20 +311,19 @@ pub fn main(init: std.process.Init) !void {
     var wayring_idle_alarm_attached = false;
     defer {
         if (wayring_idle_alarm_attached) if (wayring_host) |host| {
-            server.detachIdleAlarmHost(host) catch |err|
-                log.err("failed to restore the canonical idle timer: {t}", .{err});
+            server.shutdownIdleAlarmHost(host);
         };
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
         if (wayring_protocol_server) |*protocol_server| protocol_server.clearGlobalFilter();
-        if (wayring_session_lock_initialized) {
-            if (wayring_session_lock_published) wayring_session_lock.unpublish();
-            wayring_session_lock.deinit();
-        }
         if (wayring_idle_notification_initialized) {
             if (wayring_idle_notification_published) wayring_idle_notification.unpublish();
             wayring_idle_notification.deinit();
+        }
+        if (wayring_session_lock_initialized) {
+            if (wayring_session_lock_published) wayring_session_lock.unpublish();
+            wayring_session_lock.deinit();
         }
         if (wayring_layer_shell_initialized) {
             if (wayring_layer_shell_published) wayring_layer_shell.unpublish();

@@ -362,6 +362,7 @@ idle_notification: NeutralIdleNotification,
 idle_notify: IdleNotify,
 idle_notify_initialized: bool,
 idle_alarm_host: ?*IdleAlarmHost,
+termination_requests: if (builtin.is_test) usize else void,
 compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
@@ -1200,6 +1201,7 @@ pub fn createWithVirtualOutput(
         .idle_notify = undefined,
         .idle_notify_initialized = false,
         .idle_alarm_host = null,
+        .termination_requests = if (builtin.is_test) 0 else {},
         .compositor = undefined,
         .subcompositor = undefined,
         .scene = undefined,
@@ -4422,6 +4424,7 @@ pub fn run(self: *Self) void {
 }
 
 pub fn terminate(self: *Self) void {
+    if (builtin.is_test) self.termination_requests += 1;
     self.display.terminate();
 }
 
@@ -6578,7 +6581,11 @@ pub fn idleNotificationFrontendFailed(context: *anyopaque) void {
 
 pub fn attachIdleAlarmHost(self: *Self, host: *IdleAlarmHost) error{ ScheduleFailed, TimerGenerationExhausted }!void {
     std.debug.assert(self.idle_alarm_host == null);
-    host.setAlarmCallback(.{ .context = self, .fired = idleHostAlarmFired });
+    host.setAlarmCallback(.{
+        .context = self,
+        .fired = idleHostAlarmFired,
+        .failed = idleNotificationFrontendFailed,
+    });
     self.idle_alarm_host = host;
     self.idle_notification.rearm() catch |err| {
         self.idle_alarm_host = null;
@@ -6590,9 +6597,22 @@ pub fn attachIdleAlarmHost(self: *Self, host: *IdleAlarmHost) error{ ScheduleFai
 pub fn detachIdleAlarmHost(self: *Self, host: *IdleAlarmHost) error{ ScheduleFailed, TimerGenerationExhausted }!void {
     std.debug.assert(self.idle_alarm_host == host);
     self.idle_alarm_host = null;
-    try self.idle_notification.rearm();
-    host.armAlarm(null, 0) catch return error.ScheduleFailed;
+    self.idle_notification.rearm() catch |err| {
+        self.idle_alarm_host = host;
+        return err;
+    };
     host.setAlarmCallback(null);
+    host.armAlarm(null, 0) catch return error.ScheduleFailed;
+}
+
+/// Severs scheduler transport ownership during compositor teardown without
+/// installing a fallback alarm. Later client destruction may still update
+/// neutral state, so the Server borrow must be cleared before the host dies.
+pub fn shutdownIdleAlarmHost(self: *Self, host: *IdleAlarmHost) void {
+    std.debug.assert(self.idle_alarm_host == host);
+    self.idle_alarm_host = null;
+    host.setAlarmCallback(null);
+    host.armAlarm(null, 0) catch {};
 }
 
 fn scheduleIdleAlarm(context: *anyopaque, delay: NeutralIdleNotification.TimerDelay, generation: NeutralIdleNotification.TimerGeneration) error{ScheduleFailed}!void {
@@ -20173,7 +20193,7 @@ const MatureLayerClient = struct {
 const MatureIdleNotifyClient = struct {
     const client_wl = wayland.client.wl;
     const client_ext = wayland.client.ext;
-    const Stage = enum(u8) { starting, idled, resumed, reidled, destroyed, disconnected, failed };
+    const Stage = enum(u8) { starting, created, idled, resumed, reidled, destroyed, disconnected, failed };
 
     runtime_directory: []const u8,
     display_name: []const u8,
@@ -20188,6 +20208,7 @@ const MatureIdleNotifyClient = struct {
     idled_count: u8 = 0,
     resumed_count: u8 = 0,
     timeout_ms: u32 = 20,
+    pause_after_create: bool = false,
 
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
@@ -20230,6 +20251,10 @@ const MatureIdleNotifyClient = struct {
         if (notifier.getVersion() != 2) return error.IdleNotifierVersionMismatch;
         const notification = try notifier.getIdleNotification(self.timeout_ms, seat);
         notification.setListener(*@This(), notificationEvent, self);
+        if (self.pause_after_create) {
+            try expectClientRoundtrip(display);
+            try self.pause(.created);
+        }
         while (self.idled_count == 0)
             if (display.dispatch() != .SUCCESS) return error.WaylandDispatchFailed;
         try self.pause(.idled);
@@ -26090,8 +26115,8 @@ test "production generated data device completes the exact profile and supports 
         }
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
-            self.session_lock.destroyClientResources(client);
             self.idle_notify.destroyClientResources(client);
+            self.session_lock.destroyClientResources(client);
             self.layer_shell.destroyClientResources(client);
             if (client.fatal()) |fatal| {
                 const provenance = client.transportProvenance();
@@ -26492,8 +26517,8 @@ test "production generated data device completes the exact profile and supports 
     try denied_host.destroy();
     denied_host_live = false;
 
-    session_lock.unpublish();
     idle_notify.unpublish();
+    session_lock.unpublish();
     layer_shell.unpublish();
     virtual_keyboard.unpublish();
     try std.testing.expectEqual(@as(usize, 1), peer.input_method_manager_count);
@@ -26977,8 +27002,8 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringXdgStage(server, host, &primary_watch, .registry_ready);
     try std.testing.expect(primary_watch.globals_exact);
     try std.testing.expectEqual(@as(usize, 1), primary_watch.primary_selection_manager_count);
-    session_lock.unpublish();
     idle_notify.unpublish();
+    session_lock.unpublish();
     layer_shell.unpublish();
     virtual_keyboard.unpublish();
     input_method.unpublish();
@@ -28189,10 +28214,53 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(server.seat.matureKeyboardFocus() == null);
     try std.testing.expectEqual(fd_baseline, try countMatureDataDeviceFds());
     data_device.unpublish();
-    try server.detachIdleAlarmHost(host);
+
+    // A host transport failure is compositor-fatal even when the alarm it
+    // cancels belongs only to a mature client. Otherwise the shared neutral
+    // scheduler would remain attached to a permanently shutting-down host.
+    const raw_fault_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_fault_command) != .SUCCESS) return error.EventFdFailed;
+    const fault_command: std.posix.fd_t = @intCast(raw_fault_command);
+    defer _ = linux.close(fault_command);
+    const notification_baseline = server.idle_notification.len();
+    var fault_client: MatureIdleNotifyClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = mature_socket_name,
+        .command_fd = fault_command,
+        .timeout_ms = std.math.maxInt(u32),
+        .pause_after_create = true,
+    };
+    const fault_thread = try std.Thread.spawn(.{}, MatureIdleNotifyClient.run, .{&fault_client});
+    var fault_joined = false;
+    defer if (!fault_joined) {
+        fault_client.shutdown();
+        fault_thread.join();
+    };
+    try waitForMatureIdleNotifyStage(server, &fault_client, .created);
+    try std.testing.expectEqual(notification_baseline + 1, server.idle_notification.len());
+    try std.testing.expectEqual(@as(usize, 0), server.termination_requests);
+    host.failForTesting(error.InjectedIdleAlarmTransportFailure);
+    host.failForTesting(error.RepeatedIdleAlarmTransportFailure);
+    try std.testing.expectEqual(@as(usize, 1), server.termination_requests);
+    try std.testing.expectEqual(error.InjectedIdleAlarmTransportFailure, host.failure().?);
+    fault_client.shutdown();
+    fault_thread.join();
+    fault_joined = true;
+    for (0..2_000) |_| {
+        if (server.idle_notification.len() == notification_baseline) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+    } else return error.MatureIdleNotifyFaultCleanupTimedOut;
+
+    server.shutdownIdleAlarmHost(host);
     idle_alarm_attached = false;
-    try host.destroy();
+    try std.testing.expectError(error.InjectedIdleAlarmTransportFailure, host.destroy());
     host_live = false;
+    // Client/session teardown can still update canonical inhibition after the
+    // native transport is gone; it must use the mature fallback, never host.
+    server.setIdleInhibited(true);
+    server.setIdleInhibited(false);
+    try std.testing.expectEqual(@as(usize, 1), server.termination_requests);
 }
 
 test "production Wayring seat global accepts canonical input through the real host" {
