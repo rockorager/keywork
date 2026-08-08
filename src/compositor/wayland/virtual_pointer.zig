@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const VirtualPointerOwner = @import("../VirtualPointer.zig");
 const OutputLayout = @import("output_layout.zig");
 const SecurityContext = @import("security_context.zig");
 const Seat = @import("seat.zig");
@@ -20,44 +21,10 @@ transient_seat: *TransientSeat,
 outputs: *OutputLayout,
 listener: Listener,
 devices: std.ArrayList(*Device),
-next_source: u64,
+owner: VirtualPointerOwner,
+provider: *VirtualPointerOwner.Provider,
 
-pub const Event = union(enum) {
-    motion: struct {
-        time: u32,
-        dx: f64,
-        dy: f64,
-    },
-    motion_absolute: struct {
-        time: u32,
-        x: u32,
-        y: u32,
-        x_extent: u32,
-        y_extent: u32,
-    },
-    button: struct {
-        time: u32,
-        button: u32,
-        state: wl.Pointer.ButtonState,
-    },
-    axis: struct {
-        time: u32,
-        axis: wl.Pointer.Axis,
-        value: wl.Fixed,
-    },
-    frame,
-    axis_source: wl.Pointer.AxisSource,
-    axis_stop: struct {
-        time: u32,
-        axis: wl.Pointer.Axis,
-    },
-    axis_discrete: struct {
-        time: u32,
-        axis: wl.Pointer.Axis,
-        value: wl.Fixed,
-        discrete: i32,
-    },
-};
+pub const Event = VirtualPointerOwner.Event;
 
 pub const Listener = struct {
     context: *anyopaque,
@@ -96,9 +63,15 @@ pub fn init(
         .outputs = outputs,
         .listener = listener,
         .devices = .empty,
-        .next_source = 0,
+        .owner = VirtualPointerOwner.init(allocator, outputs, listener),
+        .provider = undefined,
     };
     errdefer self.global.destroy();
+    self.provider = try self.owner.createProvider();
+    errdefer {
+        self.owner.destroyProvider(self.provider);
+        self.owner.deinit();
+    }
     try security_context.restrictGlobal(self.global);
     errdefer security_context.unrestrictGlobal(self.global);
     try transient_seat.addSeatListener(.{
@@ -113,14 +86,25 @@ pub fn deinit(self: *Self) void {
     self.security_context.unrestrictGlobal(self.global);
     self.global.destroy();
     self.devices.deinit(self.allocator);
+    self.owner.destroyProvider(self.provider);
+    self.owner.deinit();
     self.* = undefined;
+}
+
+/// Shared protocol-neutral authority used by unpublished generated adapters.
+/// Publication and wire-resource ownership remain frontend-local.
+pub fn authority(self: *Self) *VirtualPointerOwner {
+    return &self.owner;
 }
 
 fn transientSeatRemoved(context: *anyopaque, seat: *Seat) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    for (self.devices.items) |device| {
-        if (device.seat == seat) device.deactivate();
-    }
+    self.owner.deactivateSeat(seat);
+}
+
+fn releaseTransientSeat(context: *anyopaque, seat: *Seat) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.transient_seat.releaseSeat(seat);
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -178,12 +162,7 @@ fn createDevice(
 const Device = struct {
     manager: *Self,
     resource: *zwlr.VirtualPointerV1,
-    seat: ?*Seat,
-    output: ?OutputLayout.Id,
-    source: u64,
-    retained_transient_seat: bool,
-    active: bool,
-    pressed_buttons: std.ArrayList(u32),
+    neutral: ?*VirtualPointerOwner.Device,
 
     fn create(
         manager: *Self,
@@ -204,25 +183,22 @@ const Device = struct {
             target != manager.default_seat and manager.transient_seat.retainSeat(target)
         else
             false;
-        errdefer if (retained_transient_seat) manager.transient_seat.releaseSeat(seat.?);
         if (seat) |target| {
             std.debug.assert(target == manager.default_seat or retained_transient_seat);
         }
-        const source = manager.next_source;
-        manager.next_source = std.math.add(u64, source, 1) catch unreachable;
+        const neutral = if (seat) |target| try manager.owner.createDevice(manager.provider, .{
+            .seat = target,
+            .output = output,
+            .release_context = if (retained_transient_seat) manager else null,
+            .release = if (retained_transient_seat) releaseTransientSeat else null,
+        }) else null;
+        errdefer if (neutral) |device| manager.owner.destroyDevice(device);
         self.* = .{
             .manager = manager,
             .resource = resource,
-            .seat = seat,
-            .output = output,
-            .source = source,
-            .retained_transient_seat = retained_transient_seat,
-            .active = seat != null,
-            .pressed_buttons = .empty,
+            .neutral = neutral,
         };
-        errdefer self.pressed_buttons.deinit(manager.allocator);
         try manager.devices.append(manager.allocator, self);
-        if (seat) |target| target.addVirtualPointer();
         resource.setHandler(*Device, handleRequest, handleDestroy, self);
     }
 
@@ -231,23 +207,17 @@ const Device = struct {
         request: zwlr.VirtualPointerV1.Request,
         self: *Device,
     ) void {
-        if (!self.active) {
+        const neutral = self.neutral orelse {
+            if (request == .destroy) resource.destroy();
+            return;
+        };
+        if (!neutral.active) {
             if (request == .destroy) resource.destroy();
             return;
         }
         switch (request) {
-            .motion => |motion| self.emit(.{ .motion = .{
-                .time = motion.time,
-                .dx = motion.dx.toDouble(),
-                .dy = motion.dy.toDouble(),
-            } }),
-            .motion_absolute => |motion| self.emit(.{ .motion_absolute = .{
-                .time = motion.time,
-                .x = motion.x,
-                .y = motion.y,
-                .x_extent = motion.x_extent,
-                .y_extent = motion.y_extent,
-            } }),
+            .motion => |motion| neutral.motion(motion.time, motion.dx.toDouble(), motion.dy.toDouble()),
+            .motion_absolute => |motion| neutral.motionAbsolute(motion.time, motion.x, motion.y, motion.x_extent, motion.y_extent),
             .button => |event| self.buttonEvent(
                 resource,
                 event.time,
@@ -255,30 +225,25 @@ const Device = struct {
                 event.state,
             ),
             .axis => |axis| {
-                const valid = validateAxis(resource, axis.axis) orelse return;
-                self.emit(.{ .axis = .{
-                    .time = axis.time,
-                    .axis = valid,
-                    .value = axis.value,
-                } });
+                neutral.axis(axis.time, @intFromEnum(axis.axis), axis.value) catch {
+                    resource.postError(.invalid_axis, "invalid virtual pointer axis");
+                };
             },
-            .frame => self.emit(.frame),
+            .frame => neutral.frame(),
             .axis_source => |source| {
-                const valid = validateAxisSource(resource, source.axis_source) orelse return;
-                self.emit(.{ .axis_source = valid });
+                neutral.axisSource(@intFromEnum(source.axis_source)) catch {
+                    resource.postError(.invalid_axis_source, "invalid virtual pointer axis source");
+                };
             },
             .axis_stop => |stop| {
-                const valid = validateAxis(resource, stop.axis) orelse return;
-                self.emit(.{ .axis_stop = .{ .time = stop.time, .axis = valid } });
+                neutral.axisStop(stop.time, @intFromEnum(stop.axis)) catch {
+                    resource.postError(.invalid_axis, "invalid virtual pointer axis");
+                };
             },
             .axis_discrete => |axis| {
-                const valid = validateAxis(resource, axis.axis) orelse return;
-                self.emit(.{ .axis_discrete = .{
-                    .time = axis.time,
-                    .axis = valid,
-                    .value = axis.value,
-                    .discrete = axis.discrete,
-                } });
+                neutral.axisDiscrete(axis.time, @intFromEnum(axis.axis), axis.value, axis.discrete) catch {
+                    resource.postError(.invalid_axis, "invalid virtual pointer axis");
+                };
             },
             .destroy => resource.destroy(),
         }
@@ -291,94 +256,20 @@ const Device = struct {
         button_code: u32,
         state: wl.Pointer.ButtonState,
     ) void {
-        switch (state) {
-            .pressed => {
-                for (self.pressed_buttons.items) |pressed| {
-                    if (pressed == button_code) return;
-                }
-                self.pressed_buttons.append(self.manager.allocator, button_code) catch {
-                    resource.postNoMemory();
-                    return;
-                };
-            },
-            .released => {
-                for (self.pressed_buttons.items, 0..) |pressed, index| {
-                    if (pressed != button_code) continue;
-                    _ = self.pressed_buttons.orderedRemove(index);
-                    break;
-                } else return;
-            },
-            else => return,
-        }
-        self.emit(.{ .button = .{
-            .time = time,
-            .button = button_code,
-            .state = state,
-        } });
-    }
-
-    fn emit(self: *Device, event: Event) void {
-        const seat = self.seat orelse return;
-        const listener = self.manager.listener;
-        listener.event(listener.context, seat, self.output, self.source, event);
-    }
-
-    fn deactivate(self: *Device) void {
-        if (!self.active) return;
-        const seat = self.seat orelse unreachable;
-        const had_pressed_buttons = self.pressed_buttons.items.len != 0;
-        while (self.pressed_buttons.pop()) |button_code| {
-            self.emit(.{ .button = .{
-                .time = 0,
-                .button = button_code,
-                .state = .released,
-            } });
-        }
-        if (had_pressed_buttons) self.emit(.frame);
-        seat.removeVirtualPointer();
-        self.active = false;
-        self.seat = null;
-        if (self.retained_transient_seat) {
-            self.retained_transient_seat = false;
-            self.manager.transient_seat.releaseSeat(seat);
-        }
+        self.neutral.?.button(time, button_code, @intFromEnum(state)) catch |err| switch (err) {
+            error.OutOfMemory => resource.postNoMemory(),
+            error.InvalidButtonState => {},
+        };
     }
 
     fn handleDestroy(_: *zwlr.VirtualPointerV1, self: *Device) void {
-        self.deactivate();
+        if (self.neutral) |neutral| self.manager.owner.destroyDevice(neutral);
         for (self.manager.devices.items, 0..) |device, index| {
             if (device != self) continue;
             _ = self.manager.devices.orderedRemove(index);
-            self.pressed_buttons.deinit(self.manager.allocator);
             self.manager.allocator.destroy(self);
             return;
         }
         unreachable;
     }
 };
-
-fn validateAxis(
-    resource: *zwlr.VirtualPointerV1,
-    axis: wl.Pointer.Axis,
-) ?wl.Pointer.Axis {
-    return switch (axis) {
-        .vertical_scroll, .horizontal_scroll => axis,
-        else => {
-            resource.postError(.invalid_axis, "invalid virtual pointer axis");
-            return null;
-        },
-    };
-}
-
-fn validateAxisSource(
-    resource: *zwlr.VirtualPointerV1,
-    source: wl.Pointer.AxisSource,
-) ?wl.Pointer.AxisSource {
-    return switch (source) {
-        .wheel, .finger, .continuous, .wheel_tilt => source,
-        else => {
-            resource.postError(.invalid_axis_source, "invalid virtual pointer axis source");
-            return null;
-        },
-    };
-}

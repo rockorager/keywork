@@ -1181,6 +1181,8 @@ test {
     _ = @import("wayland/WayringTextInput.zig");
     _ = @import("wayland/WayringDataControl.zig");
     _ = @import("wayland/WayringVirtualKeyboard.zig");
+    _ = @import("VirtualPointer.zig");
+    _ = @import("wayland/WayringVirtualPointer.zig");
     _ = @import("wayland/surface.zig");
     _ = @import("wayland/surface_geometry.zig");
     _ = @import("wayland/region.zig");
