@@ -24,6 +24,7 @@ const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
 const WayringIdleNotification = @import("wayland/WayringIdleNotification.zig");
 const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
 const WayringSessionLock = @import("wayland/WayringSessionLock.zig");
+const WayringWorkspace = @import("wayland/WayringWorkspace.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
@@ -250,6 +251,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_session_lock: WayringSessionLock = undefined;
     var wayring_session_lock_initialized = false;
     var wayring_session_lock_published = false;
+    var wayring_workspace: WayringWorkspace = undefined;
+    var wayring_workspace_initialized = false;
+    var wayring_workspace_published = false;
     const WayringLifecycle = struct {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
@@ -270,9 +274,10 @@ pub fn main(init: std.process.Init) !void {
         idle_notification: ?*WayringIdleNotification,
         layer_shell: ?*WayringLayerShell,
         session_lock: ?*WayringSessionLock,
+        workspace: ?*WayringWorkspace,
 
         fn globalVisible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
-            return if (self.data_control) |data_control| data_control.globalFilter(client, global) else global.visibility() != .restricted;
+            return if (self.workspace) |workspace| workspace.globalFilter(client, global) else if (self.data_control) |data_control| data_control.globalFilter(client, global) else global.visibility() != .restricted;
         }
 
         fn accepted(erased: *anyopaque, client: *wayring.server.Client) !void {
@@ -284,6 +289,7 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            if (self.workspace) |workspace| workspace.destroyClientResources(client);
             if (self.idle_notification) |idle_notification| idle_notification.destroyClientResources(client);
             if (self.session_lock) |generated_session_lock| generated_session_lock.destroyClientResources(client);
             if (self.layer_shell) |layer_shell| layer_shell.destroyClientResources(client);
@@ -317,6 +323,10 @@ pub fn main(init: std.process.Init) !void {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
         if (wayring_protocol_server) |*protocol_server| protocol_server.clearGlobalFilter();
+        if (wayring_workspace_initialized) {
+            if (wayring_workspace_published) wayring_workspace.unpublish();
+            wayring_workspace.deinit();
+        }
         if (wayring_idle_notification_initialized) {
             if (wayring_idle_notification_published) wayring_idle_notification.unpublish();
             wayring_idle_notification.deinit();
@@ -551,6 +561,15 @@ pub fn main(init: std.process.Init) !void {
                 std.os.linux.getuid(),
             );
             wayring_session_lock_initialized = true;
+            wayring_workspace.init(
+                init.gpa,
+                &wayring_protocol_server.?,
+                &wayring_clients,
+                &wayring_outputs,
+                server.neutralWorkspace(),
+                std.os.linux.getuid(),
+            );
+            wayring_workspace_initialized = true;
         }
         wayring_xdg_decoration.init(init.gpa, &wayring_protocol_server.?, &wayring_xdg_shell, server.neutralXdgShell());
         wayring_xdg_decoration_initialized = true;
@@ -614,14 +633,17 @@ pub fn main(init: std.process.Init) !void {
             // presenting headless generated shell/output profile.
             try wayring_layer_shell.publish();
             wayring_layer_shell_published = true;
-            // Idle notification is public, matching the mature frontend, and
-            // is the final public global for the presenting generated profile.
-            try wayring_idle_notification.publish();
-            wayring_idle_notification_published = true;
-            // Restricted lock ownership is published after every public
-            // generated-shell global.
+            // Restricted lock ownership follows the public layer shell.
             try wayring_session_lock.publish();
             wayring_session_lock_published = true;
+            // Idle notification is public, matching the mature frontend, and
+            // follows lock ownership in the deterministic composed profile.
+            try wayring_idle_notification.publish();
+            wayring_idle_notification_published = true;
+            // Restricted workspace control is last so profile ordering is
+            // deterministic and all canonical shell/output owners are live.
+            try wayring_workspace.publish();
+            wayring_workspace_published = true;
         }
         wayring_lifecycle = .{
             .clients = &wayring_clients,
@@ -643,6 +665,7 @@ pub fn main(init: std.process.Init) !void {
             .idle_notification = if (wayring_idle_notification_initialized) &wayring_idle_notification else null,
             .layer_shell = if (wayring_layer_shell_initialized) &wayring_layer_shell else null,
             .session_lock = if (wayring_session_lock_initialized) &wayring_session_lock else null,
+            .workspace = if (wayring_workspace_initialized) &wayring_workspace else null,
         };
         wayring_protocol_server.?.setGlobalFilter(
             WayringLifecycle,
@@ -1010,6 +1033,7 @@ test {
     _ = @import("HeadlessSurfaceForest.zig");
     _ = @import("SurfaceRegistry.zig");
     _ = @import("Workspace.zig");
+    _ = @import("wayland/WayringWorkspace.zig");
     _ = @import("input_configuration.zig");
     _ = @import("output_configuration.zig");
     _ = @import("region.zig");

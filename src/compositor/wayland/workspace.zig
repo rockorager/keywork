@@ -18,13 +18,9 @@ outputs: *OutputLayout,
 clients: *MatureClients,
 model: *Neutral,
 bindings: std.ArrayList(*Binding),
-activation_listener: ?ActivationListener,
+pending: std.ArrayList(Binding.Prepared),
 
-pub const ActivationListener = struct {
-    context: *anyopaque,
-    prepare: *const fn (*anyopaque, []const Neutral.Intent) ?bool,
-    finish: *const fn (*anyopaque) void,
-};
+pub const ActivationListener = Neutral.ActivationListener;
 
 const Binding = struct {
     owner: *Self,
@@ -58,7 +54,9 @@ const Binding = struct {
         errdefer owner.allocator.destroy(self);
         self.* = .{ .owner = owner, .manager = manager, .client = neutral_client };
         errdefer self.deinitLists();
-        try owner.bindings.append(owner.allocator, self);
+        try owner.bindings.ensureUnusedCapacity(owner.allocator, 1);
+        try owner.pending.ensureTotalCapacity(owner.allocator, owner.bindings.items.len + 1);
+        owner.bindings.appendAssumeCapacity(self);
         errdefer _ = owner.bindings.pop();
         var prepared = try self.prepareInitial();
         defer prepared.deinit();
@@ -192,8 +190,12 @@ const Binding = struct {
         const intents = self.owner.model.takeIntents(self.client) catch return;
         defer self.owner.model.clearIntents(self.client);
         if (intents.len == 0) return;
-        const listener = self.owner.activation_listener orelse return;
-        self.owner.activatePrepared(self, intents, listener);
+        self.owner.model.activate(intents, .{ .frontend = self.owner, .context = self, .no_memory = requesterNoMemory });
+    }
+
+    fn requesterNoMemory(context: *anyopaque) void {
+        const self: *Binding = @ptrCast(@alignCast(context));
+        if (self.manager) |manager| manager.postNoMemory();
     }
 
     fn handleManagerRequest(resource: *ext.WorkspaceManagerV1, request: ext.WorkspaceManagerV1.Request, self: *Binding) void {
@@ -270,94 +272,121 @@ const WorkspaceResource = struct {
 };
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server, security_context: *SecurityContext, outputs: *OutputLayout, clients: *MatureClients, model: *Neutral) !void {
-    self.* = .{ .allocator = allocator, .global = undefined, .security_context = security_context, .outputs = outputs, .clients = clients, .model = model, .bindings = .empty, .activation_listener = null };
+    self.* = .{
+        .allocator = allocator,
+        .global = undefined,
+        .security_context = security_context,
+        .outputs = outputs,
+        .clients = clients,
+        .model = model,
+        .bindings = .empty,
+        .pending = .empty,
+    };
     errdefer self.bindings.deinit(allocator);
+    errdefer self.pending.deinit(allocator);
     self.global = try wl.Global.create(display, ext.WorkspaceManagerV1, 1, *Self, self, bind);
     errdefer self.global.destroy();
     try security_context.restrictGlobal(self.global);
     errdefer security_context.unrestrictGlobal(self.global);
     var iterator = outputs.iterator();
     while (iterator.next()) |entry| entry.output.setBindListener(.{ .context = self, .bound = outputBound });
+    model.registerFrontend(.{
+        .context = self,
+        .prepare = frontendPrepare,
+        .commit = frontendCommit,
+        .abort = frontendAbort,
+        .reconcile = frontendReconcile,
+    });
 }
 
 pub fn deinit(self: *Self) void {
-    std.debug.assert(self.activation_listener == null);
+    self.model.unregisterFrontend(self);
     var iterator = self.outputs.iterator();
     while (iterator.next()) |entry| entry.output.clearBindListener();
     self.security_context.unrestrictGlobal(self.global);
     self.global.destroy();
     std.debug.assert(self.bindings.items.len == 0);
+    std.debug.assert(self.pending.items.len == 0);
     self.bindings.deinit(self.allocator);
+    self.pending.deinit(self.allocator);
     self.* = undefined;
 }
 pub fn setActivationListener(self: *Self, listener: ActivationListener) void {
-    std.debug.assert(self.activation_listener == null);
-    self.activation_listener = listener;
+    self.model.setActivationListener(listener);
 }
 pub fn clearActivationListener(self: *Self) void {
-    std.debug.assert(self.activation_listener != null);
-    self.activation_listener = null;
+    self.model.clearActivationListener();
 }
 
-fn activatePrepared(self: *Self, requester: *Binding, intents: []const Neutral.Intent, listener: ActivationListener) void {
-    var proposed: std.ArrayList(Neutral.Snapshot) = .empty;
-    defer proposed.deinit(self.allocator);
-    proposed.appendSlice(self.allocator, self.model.snapshotSlice()) catch {
-        if (requester.manager) |manager| manager.postNoMemory();
-        return;
-    };
-    for (intents) |intent| {
-        var found = false;
-        for (proposed.items) |*snapshot| {
-            if (!std.meta.eql(snapshot.output, intent.output)) continue;
-            if (intent.number == 0 or intent.number > Neutral.workspace_count) return;
-            snapshot.active = intent.number;
-            found = true;
-            break;
-        }
-        if (!found) return;
-    }
-
-    var prepared: std.ArrayList(Binding.Prepared) = .empty;
-    defer {
-        for (prepared.items) |*transaction| {
-            transaction.abort();
-            transaction.deinit();
-        }
-        prepared.deinit(self.allocator);
-    }
-    prepared.ensureTotalCapacity(self.allocator, self.bindings.items.len) catch {
-        if (requester.manager) |manager| manager.postNoMemory();
-        return;
-    };
+fn frontendPrepare(context: *anyopaque, snapshots: []const Neutral.Snapshot, requester: Neutral.Requester) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    std.debug.assert(self.pending.items.len == 0 and self.pending.capacity >= self.bindings.items.len);
     for (self.bindings.items) |binding| {
         if (binding.manager == null) continue;
-        const transaction = binding.prepare(proposed.items) catch |err| {
+        const transaction = binding.prepare(snapshots) catch |err| {
             if (err == error.OutOfMemory) if (binding.manager) |manager| manager.postNoMemory();
-            // The requester must observe preparation success before its intent
-            // can mutate canonical policy. Unrelated failed clients are isolated.
-            if (binding == requester) return;
+            const raw_client = binding.manager.?.getClient();
+            abortPendingClient(self, raw_client);
+            if (requester.frontend == @as(*anyopaque, @ptrCast(self)) and requesterClient(requester) == raw_client) {
+                frontendAbort(self);
+                return false;
+            }
             continue;
         };
-        prepared.appendAssumeCapacity(transaction);
+        self.pending.appendAssumeCapacity(transaction);
     }
-    const needs_finish = listener.prepare(listener.context, intents) orelse return;
-    for (proposed.items) |snapshot| self.model.setSnapshot(snapshot) catch unreachable;
-    for (prepared.items) |*transaction| transaction.binding.finalize(transaction);
-    if (needs_finish) listener.finish(listener.context);
+    return true;
+}
+
+fn requesterClient(requester: Neutral.Requester) *wl.Client {
+    const binding: *Binding = @ptrCast(@alignCast(requester.context));
+    return binding.manager.?.getClient();
+}
+
+fn abortPendingClient(self: *Self, client: *wl.Client) void {
+    var index = self.pending.items.len;
+    while (index > 0) {
+        index -= 1;
+        const manager = self.pending.items[index].binding.manager orelse continue;
+        if (manager.getClient() != client) continue;
+        var transaction = self.pending.swapRemove(index);
+        transaction.abort();
+        transaction.deinit();
+    }
+}
+
+fn frontendCommit(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    for (self.pending.items) |*transaction| {
+        transaction.binding.finalize(transaction);
+        transaction.deinit();
+    }
+    self.pending.clearRetainingCapacity();
+}
+
+fn frontendAbort(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    for (self.pending.items) |*transaction| {
+        transaction.abort();
+        transaction.deinit();
+    }
+    self.pending.clearRetainingCapacity();
+}
+
+fn frontendReconcile(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    for (self.bindings.items) |binding| binding.reconcile() catch |err| switch (err) {
+        error.OutOfMemory => if (binding.manager) |manager| manager.postNoMemory(),
+        error.InvalidClient => {},
+        else => unreachable,
+    };
 }
 
 /// Publishes a canonical WM snapshot. A failing binding is isolated; other
 /// clients still receive their complete atomic reconciliation.
 pub fn publishSnapshot(self: *Self, snapshot: Neutral.Snapshot) error{OutOfMemory}!void {
     try self.model.setSnapshot(snapshot);
-    for (self.bindings.items) |binding| binding.reconcile() catch |err| {
-        switch (err) {
-            error.OutOfMemory => if (binding.manager) |manager| manager.postNoMemory(),
-            error.InvalidClient => {}, // The raw client is already retiring.
-            else => unreachable,
-        }
-    };
+    self.model.reconcileFrontends();
 }
 pub fn addOutput(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!void {
     const value = self.outputs.get(output) orelse return;
@@ -366,9 +395,7 @@ pub fn addOutput(self: *Self, output: OutputLayout.Id) error{OutOfMemory}!void {
 pub fn removeOutput(self: *Self, output: OutputLayout.Id) void {
     if (self.outputs.get(output)) |value| value.clearBindListener();
     self.model.removeOutput(output);
-    for (self.bindings.items) |binding| binding.reconcile() catch {
-        if (binding.manager) |manager| manager.postNoMemory();
-    };
+    self.model.reconcileFrontends();
 }
 
 /// Rolls back canonical initialization before any output state was published.
