@@ -18630,6 +18630,11 @@ const WayringXdgClient = struct {
     expect_idle_notify: bool = false,
     expect_session_lock: bool = false,
     expect_workspace: bool = false,
+    expect_security_context: bool = false,
+    expect_linux_dmabuf: bool = false,
+    expect_output_management: bool = false,
+    expect_screencopy: bool = false,
+    expect_virtual_pointer: bool = false,
     guessed_data_control_name: ?u32 = null,
     guessed_virtual_keyboard_name: ?u32 = null,
     guessed_data_control_bind_issued: bool = false,
@@ -18736,7 +18741,12 @@ const WayringXdgClient = struct {
             @intFromBool(!self.expect_layer_shell) -
             @intFromBool(!self.expect_idle_notify) -
             @intFromBool(!self.expect_session_lock) -
-            @intFromBool(!self.expect_workspace);
+            @intFromBool(!self.expect_workspace) -
+            @intFromBool(!self.expect_security_context) -
+            @intFromBool(!self.expect_linux_dmabuf) -
+            @intFromBool(!self.expect_output_management) -
+            @intFromBool(!self.expect_screencopy) -
+            @intFromBool(!self.expect_virtual_pointer);
     }
 
     fn expectedGlobal(self: *const @This(), visible_index: usize) ?ExpectedGlobal {
@@ -18758,6 +18768,16 @@ const WayringXdgClient = struct {
                 self.expect_session_lock
             else if (std.mem.eql(u8, global.interface, "ext_workspace_manager_v1"))
                 self.expect_workspace
+            else if (std.mem.eql(u8, global.interface, "wp_security_context_manager_v1"))
+                self.expect_security_context
+            else if (std.mem.eql(u8, global.interface, "zwp_linux_dmabuf_v1"))
+                self.expect_linux_dmabuf
+            else if (std.mem.eql(u8, global.interface, "zwlr_output_manager_v1"))
+                self.expect_output_management
+            else if (std.mem.eql(u8, global.interface, "zwlr_screencopy_manager_v1"))
+                self.expect_screencopy
+            else if (std.mem.eql(u8, global.interface, "zwlr_virtual_pointer_manager_v1"))
+                self.expect_virtual_pointer
             else
                 true;
             if (!present) continue;
@@ -26940,6 +26960,11 @@ test "production generated data device completes the exact profile and supports 
     peer.expect_idle_notify = true;
     peer.expect_session_lock = true;
     peer.expect_workspace = true;
+    peer.expect_security_context = true;
+    peer.expect_linux_dmabuf = true;
+    peer.expect_output_management = true;
+    peer.expect_screencopy = true;
+    peer.expect_virtual_pointer = true;
     try virtual_keyboard.publish();
     try layer_shell.publish();
     try session_lock.publish();
@@ -27110,6 +27135,11 @@ test "production generated data device completes the exact profile and supports 
         .expect_idle_notify = true,
         .expect_session_lock = true,
         .expect_workspace = true,
+        .expect_security_context = true,
+        .expect_linux_dmabuf = true,
+        .expect_output_management = true,
+        .expect_screencopy = true,
+        .expect_virtual_pointer = true,
     };
     const profile_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&profile});
     var profile_joined = false;
@@ -27158,6 +27188,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_text_input = true,
         .expect_layer_shell = true,
         .expect_idle_notify = true,
+        .expect_linux_dmabuf = true,
     };
     const denied_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied});
     var denied_joined = false;
@@ -27219,6 +27250,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_text_input = true,
         .expect_layer_shell = true,
         .expect_idle_notify = true,
+        .expect_linux_dmabuf = true,
         .guessed_input_method_name = peer.input_method_manager_name,
     };
     const denied_method_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_method});
@@ -27260,6 +27292,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_text_input = true,
         .expect_layer_shell = true,
         .expect_idle_notify = true,
+        .expect_linux_dmabuf = true,
         .guessed_virtual_keyboard_name = peer.virtual_keyboard_manager_name,
     };
     const denied_virtual_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_virtual});
@@ -27306,6 +27339,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_text_input = true,
         .expect_layer_shell = true,
         .expect_idle_notify = true,
+        .expect_linux_dmabuf = true,
         .guessed_session_lock_name = peer.session_lock_manager_name,
     };
     const denied_lock_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_lock});
@@ -27353,6 +27387,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_text_input = true,
         .expect_layer_shell = true,
         .expect_idle_notify = true,
+        .expect_linux_dmabuf = true,
         .guessed_workspace_name = peer.workspace_manager_name,
     };
     const denied_workspace_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_workspace});
@@ -27873,6 +27908,11 @@ test "production generated data device completes the exact profile and supports 
         .expect_idle_notify = true,
         .expect_session_lock = true,
         .expect_workspace = true,
+        .expect_security_context = true,
+        .expect_linux_dmabuf = true,
+        .expect_output_management = true,
+        .expect_screencopy = true,
+        .expect_virtual_pointer = true,
     };
     const primary_watch_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_watch});
     var primary_watch_joined = false;
@@ -27942,6 +27982,11 @@ test "production generated data device completes the exact profile and supports 
         .expect_idle_notify = true,
         .expect_session_lock = true,
         .expect_workspace = true,
+        .expect_security_context = true,
+        .expect_linux_dmabuf = true,
+        .expect_output_management = true,
+        .expect_screencopy = true,
+        .expect_virtual_pointer = true,
     };
     const primary_rebind_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_rebind});
     var primary_rebind_joined = false;
