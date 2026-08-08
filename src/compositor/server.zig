@@ -23619,7 +23619,9 @@ const GeneratedVirtualPointerClient = struct {
         defer std.heap.page_allocator.free(path);
         const fd = try connectWayringTestSocket(path);
         var fd_owned = true;
-        defer if (fd_owned) _ = std.os.linux.close(fd);
+        defer if (fd_owned) {
+            _ = std.os.linux.close(fd);
+        };
         const raw_wake_fd = std.os.linux.dup(fd);
         if (std.os.linux.errno(raw_wake_fd) != .SUCCESS) return error.WakeFdFailed;
         const wake_fd: i32 = @intCast(raw_wake_fd);
