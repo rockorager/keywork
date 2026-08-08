@@ -15,6 +15,8 @@ const ClientRegistry = @import("../ClientRegistry.zig");
 const CopiedBufferSnapshot = @import("../CopiedBufferSnapshot.zig");
 const HeadlessSurfaceForest = @import("../HeadlessSurfaceForest.zig");
 const linux_dmabuf = @import("linux_dmabuf_buffer.zig");
+const OutputLayout = @import("../output_layout.zig");
+const presentation = @import("../presentation.zig");
 const Region = @import("../region.zig");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const SurfaceFrameCompletion = @import("../SurfaceFrameCompletion.zig");
@@ -82,6 +84,22 @@ pub const AppliedStackEntry = HeadlessSurfaceForest.AppliedStackEntry;
 pub const AppliedParentState = HeadlessSurfaceForest.AppliedParentState;
 pub const AppliedBatch = HeadlessSurfaceForest.AppliedBatch;
 pub const PresentationClass = HeadlessSurfaceForest.PresentationClass;
+
+/// Caller-owned one-shot feedback retained until explicit removal or a
+/// terminal presented/discarded callback. Terminal callbacks must unregister
+/// this exact handler before returning.
+pub const PresentationFeedbackHandler = struct {
+    context: *anyopaque,
+    sampled: *const fn (*anyopaque, OutputLayout.Id) void,
+    presented: *const fn (*anyopaque, presentation.Info) void,
+    discarded: *const fn (*anyopaque) void,
+};
+
+pub const PresentationFeedbackAttachResult = union(enum) {
+    attached: SurfaceId,
+    not_live,
+    wrong_client,
+};
 
 pub const XdgRole = enum { toplevel, popup };
 
@@ -260,12 +278,27 @@ const FrameCallback = struct {
     callback_only: bool = false,
 };
 
+const PresentationFeedback = struct {
+    const State = union(enum) {
+        pending,
+        queued: UpdateToken,
+        active,
+        submitted,
+    };
+
+    handler: *PresentationFeedbackHandler,
+    state: State = .pending,
+};
+
 const Surface = struct {
     const Role = enum { none, subsurface, cursor, drag_icon, input_popup, xdg_toplevel, xdg_popup, layer_surface, session_lock };
     resource: core.wl_surface.Resource,
     id: SurfaceId,
     destroying: bool = false,
     frame_callbacks: std.ArrayList(*FrameCallback) = .empty,
+    presentation_feedbacks: std.ArrayList(PresentationFeedback) = .empty,
+    presentation_output: ?OutputLayout.Id = null,
+    commit_after_submission: bool = false,
     pending_attachment: ?PendingAttachment = null,
     has_pending_attachment: bool = false,
     pending_offset_x: i32 = 0,
@@ -448,6 +481,7 @@ const PreparedCommit = struct {
     input: ?InputRegion = null,
     buffer: ?BufferSnapshot = null,
     pending_frame_callback_count: usize,
+    pending_presentation_feedback_count: usize,
     callback_only: bool = false,
     attachment_changed: bool,
     publishes_snapshot: bool = false,
@@ -464,6 +498,7 @@ const PreparedCommit = struct {
         return .{
             .damage = Region.init(),
             .pending_frame_callback_count = pendingFrameCallbackCount(surface),
+            .pending_presentation_feedback_count = pendingPresentationFeedbackCount(surface),
             .attachment_changed = surface.has_pending_attachment,
             .logical_size = surface.current_logical_size,
             .viewport = surface.pending_viewport,
@@ -809,6 +844,35 @@ pub fn surfaceId(self: *const WayringCompositor, client: *const server.Client, o
         return null;
     }
     return null;
+}
+
+pub fn addPresentationFeedback(
+    self: *WayringCompositor,
+    client: *server.Client,
+    object_id: u32,
+    handler: *PresentationFeedbackHandler,
+) error{OutOfMemory}!PresentationFeedbackAttachResult {
+    const objects = self.findClient(client) orelse return .not_live;
+    for (objects.surfaces.items) |surface| if (surface.resource.id() == object_id and !surface.destroying) {
+        try surface.presentation_feedbacks.append(self.allocator, .{ .handler = handler });
+        return .{ .attached = surface.id };
+    };
+    if (client.lookup(object_id)) |resource| if (resource.interface() == &core.wl_surface.interface) return .wrong_client;
+    return .not_live;
+}
+
+pub fn removePresentationFeedback(
+    self: *WayringCompositor,
+    id: SurfaceId,
+    handler: *PresentationFeedbackHandler,
+) void {
+    const surface = self.surfaceForId(id) orelse return;
+    for (surface.presentation_feedbacks.items, 0..) |feedback, index| {
+        if (feedback.handler == handler) {
+            _ = surface.presentation_feedbacks.orderedRemove(index);
+            return;
+        }
+    }
 }
 
 pub fn attachViewport(self: *WayringCompositor, client: *server.Client, object_id: u32, handler: ViewportHandler) ViewportAttachResult {
@@ -1498,6 +1562,63 @@ fn completeFrameThunk(context: *anyopaque, id: SurfaceId, timestamp_ms: u32) voi
     self.completeFrame(id, timestamp_ms);
 }
 
+fn sampledPresentationThunk(context: *anyopaque, id: SurfaceId, output: OutputLayout.Id) bool {
+    const self: *WayringCompositor = @ptrCast(@alignCast(context));
+    var surface = self.surfaceForId(id) orelse return false;
+    if (surface.destroying) return false;
+    if (surface.presentation_output != null) return hasPresentationFeedback(surface, .active);
+    if (!hasPresentationFeedback(surface, .active)) return false;
+    surface.presentation_output = output;
+    surface.commit_after_submission = false;
+    while (presentationFeedbackWithState(surface, .active)) |handler| {
+        const feedback = presentationFeedbackForHandler(surface, handler) orelse unreachable;
+        feedback.state = .submitted;
+        handler.sampled(handler.context, output);
+        surface = self.surfaceForId(id) orelse return false;
+    }
+    return hasPresentationFeedback(surface, .active);
+}
+
+fn presentedPresentationThunk(
+    context: *anyopaque,
+    id: SurfaceId,
+    output: OutputLayout.Id,
+    info: presentation.Info,
+) bool {
+    const self: *WayringCompositor = @ptrCast(@alignCast(context));
+    var surface = self.surfaceForId(id) orelse return false;
+    if (surface.presentation_output == null or !std.meta.eql(surface.presentation_output.?, output))
+        return hasPresentationFeedback(surface, .active);
+    surface.presentation_output = null;
+    surface.commit_after_submission = false;
+    while (presentationFeedbackWithState(surface, .submitted)) |handler| {
+        handler.presented(handler.context, info);
+        surface = self.surfaceForId(id) orelse return false;
+    }
+    return hasPresentationFeedback(surface, .active);
+}
+
+fn discardedPresentationThunk(context: *anyopaque, id: SurfaceId, output: OutputLayout.Id) bool {
+    const self: *WayringCompositor = @ptrCast(@alignCast(context));
+    var surface = self.surfaceForId(id) orelse return false;
+    if (surface.presentation_output == null or !std.meta.eql(surface.presentation_output.?, output))
+        return hasPresentationFeedback(surface, .active);
+    surface.presentation_output = null;
+    const superseded = surface.commit_after_submission;
+    surface.commit_after_submission = false;
+    if (superseded) {
+        while (presentationFeedbackWithState(surface, .submitted)) |handler| {
+            handler.discarded(handler.context);
+            surface = self.surfaceForId(id) orelse return false;
+        }
+    } else {
+        for (surface.presentation_feedbacks.items) |*feedback| {
+            if (feedback.state == .submitted) feedback.state = .active;
+        }
+    }
+    return hasPresentationFeedback(surface, .active);
+}
+
 fn bind(client: *server.Client, id: u32, version: u32, self: *WayringCompositor) !void {
     const objects = try self.clientObjects(client);
     try objects.compositors.ensureUnusedCapacity(self.allocator, 1);
@@ -1772,6 +1893,9 @@ fn createSurface(self: *WayringCompositor, compositor: *core.wl_compositor.Resou
             .complete = completeFrameThunk,
             .has_callback_only = hasCallbackOnlyFrameThunk,
             .complete_callback_only = completeCallbackOnlyFrameThunk,
+            .sampled = sampledPresentationThunk,
+            .presented = presentedPresentationThunk,
+            .discarded = discardedPresentationThunk,
         });
         listener_added = true;
     }
@@ -2249,6 +2373,15 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
         .queued, .committed => {},
     };
     std.debug.assert(callbacks_to_queue == 0);
+    var feedbacks_to_queue = candidate.prepared.pending_presentation_feedback_count;
+    for (surface.presentation_feedbacks.items) |*feedback| switch (feedback.state) {
+        .pending => if (feedbacks_to_queue != 0) {
+            feedback.state = .{ .queued = token };
+            feedbacks_to_queue -= 1;
+        },
+        .queued, .active, .submitted => {},
+    };
+    std.debug.assert(feedbacks_to_queue == 0);
     const publishes_snapshot = candidate.prepared.publishes_snapshot;
     const commits_buffer = candidate.prepared.attachment_changed and candidate.prepared.logical_size != null;
     surface.content_updates.appendAssumeCapacity(candidate);
@@ -2436,6 +2569,7 @@ fn applyScratch(self: *WayringCompositor, scratch: *ApplyScratch) void {
         for (scratch.surfaces.items) |*state| if (std.meta.eql(state.id, surface.id)) {
             state.mapped_size = surface.current_logical_size;
             state.callbacks_committed = state.callbacks_committed or update.callback_count != 0;
+            state.presentation_feedback_active = hasPresentationFeedback(surface, .active);
             state_found = true;
             break;
         };
@@ -2443,6 +2577,7 @@ fn applyScratch(self: *WayringCompositor, scratch: *ApplyScratch) void {
             .id = surface.id,
             .mapped_size = surface.current_logical_size,
             .callbacks_committed = update.callback_count != 0,
+            .presentation_feedback_active = hasPresentationFeedback(surface, .active),
         });
 
         if (update.topology) |topology| {
@@ -2521,6 +2656,9 @@ fn discardUpdateAt(self: *WayringCompositor, surface: *Surface, index: usize) vo
         } else {
             callback_index += 1;
         }
+    }
+    while (presentationFeedbackQueuedFor(surface, token)) |handler| {
+        handler.discarded(handler.context);
     }
     var update = surface.content_updates.orderedRemove(index);
     update.deinit(self.allocator);
@@ -2709,12 +2847,30 @@ fn publishPreparedCommit(
     };
     std.debug.assert(callbacks_to_commit == 0);
 
+    if (surface.presentation_output != null) surface.commit_after_submission = true;
+    while (presentationFeedbackWithState(surface, .active)) |handler| {
+        handler.discarded(handler.context);
+    }
+    if (surface.current_logical_size != null) {
+        for (surface.presentation_feedbacks.items) |*feedback| switch (feedback.state) {
+            .queued => |queued| {
+                if (std.meta.eql(queued, token)) feedback.state = .active;
+            },
+            .pending, .active, .submitted => {},
+        };
+    } else {
+        while (presentationFeedbackQueuedFor(surface, token)) |handler| {
+            handler.discarded(handler.context);
+        }
+    }
+
     std.debug.assert((surface.current != null) == (surface.current_logical_size != null));
     if (notify_listener) if (self.presentation_listener) |listener| {
         const surfaces = [_]AppliedSurfaceState{.{
             .id = surface.id,
             .mapped_size = surface.current_logical_size,
             .callbacks_committed = prepared.pending_frame_callback_count != 0,
+            .presentation_feedback_active = hasPresentationFeedback(surface, .active),
         }};
         listener.applied(listener.context, .{ .surfaces = &surfaces, .parents = &.{} });
     };
@@ -2751,6 +2907,51 @@ fn pendingFrameCallbackCount(surface: *const Surface) usize {
         },
     };
     return count;
+}
+
+const PresentationFeedbackStateTag = std.meta.Tag(PresentationFeedback.State);
+
+fn pendingPresentationFeedbackCount(surface: *const Surface) usize {
+    var count: usize = 0;
+    for (surface.presentation_feedbacks.items) |feedback| {
+        if (feedback.state == .pending) count += 1;
+    }
+    return count;
+}
+
+fn hasPresentationFeedback(surface: *const Surface, state: PresentationFeedbackStateTag) bool {
+    return presentationFeedbackWithState(surface, state) != null;
+}
+
+fn presentationFeedbackWithState(
+    surface: *const Surface,
+    state: PresentationFeedbackStateTag,
+) ?*PresentationFeedbackHandler {
+    for (surface.presentation_feedbacks.items) |feedback| {
+        if (std.meta.activeTag(feedback.state) == state) return feedback.handler;
+    }
+    return null;
+}
+
+fn presentationFeedbackForHandler(
+    surface: *Surface,
+    handler: *PresentationFeedbackHandler,
+) ?*PresentationFeedback {
+    for (surface.presentation_feedbacks.items) |*feedback| {
+        if (feedback.handler == handler) return feedback;
+    }
+    return null;
+}
+
+fn presentationFeedbackQueuedFor(
+    surface: *const Surface,
+    token: UpdateToken,
+) ?*PresentationFeedbackHandler {
+    for (surface.presentation_feedbacks.items) |feedback| switch (feedback.state) {
+        .queued => |queued| if (std.meta.eql(queued, token)) return feedback.handler,
+        .pending, .active, .submitted => {},
+    };
+    return null;
 }
 
 fn clientObjects(self: *WayringCompositor, client: *server.Client) !*ClientObjects {
@@ -2839,6 +3040,12 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     const objects = self.findClient(client) orelse unreachable;
     std.debug.assert(!surface.destroying);
     surface.destroying = true;
+    while (surface.presentation_feedbacks.items.len != 0) {
+        const handler = surface.presentation_feedbacks.items[0].handler;
+        handler.discarded(handler.context);
+    }
+    surface.presentation_output = null;
+    surface.commit_after_submission = false;
     const removed_input_popup = surface.input_popup != null;
     if (surface.viewport_handler) |handler| {
         surface.viewport_handler = null;
@@ -2899,6 +3106,7 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     while (surface.frame_callbacks.items.len > 0)
         destroyFrameCallback(self, surface, 0);
     surface.frame_callbacks.deinit(self.allocator);
+    surface.presentation_feedbacks.deinit(self.allocator);
     surface.content_updates.deinit(self.allocator);
     clearPendingAttachment(surface);
     if (surface.current) |*current| current.deinit();

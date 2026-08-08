@@ -36,6 +36,7 @@ const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
 const WayringHost = @import("wayland/WayringHost.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
+const WayringPresentation = @import("wayland/WayringPresentation.zig");
 const WayringXdgOutput = @import("wayland/WayringXdgOutput.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
@@ -106,7 +107,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 27/18 profile is not default eligible
+    \\                            its limited 28/19 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -268,6 +269,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_xdg_output: WayringXdgOutput = undefined;
     var wayring_xdg_output_initialized = false;
     var wayring_xdg_output_published = false;
+    var wayring_presentation: WayringPresentation = undefined;
+    var wayring_presentation_initialized = false;
+    var wayring_presentation_published = false;
     var wayring_xdg_shell: WayringXdgShell = undefined;
     var wayring_xdg_shell_initialized = false;
     var wayring_xdg_shell_published = false;
@@ -338,6 +342,7 @@ pub fn main(init: std.process.Init) !void {
     const WayringLifecycle = struct {
         clients: *WayringClients,
         outputs: ?*WayringOutput,
+        presentation: ?*WayringPresentation,
         xdg_output: ?*WayringXdgOutput,
         xdg_shell: *WayringXdgShell,
         viewporter: *WayringViewporter,
@@ -402,6 +407,7 @@ pub fn main(init: std.process.Init) !void {
             self.xdg_shell.destroyClientResources(client);
             if (self.xdg_output) |adapter| adapter.destroyClientResources(client);
             if (self.outputs) |outputs| outputs.destroyClientResources(client);
+            if (self.presentation) |adapter| adapter.destroyClientResources(client);
             self.compositor.destroyClientResources(client);
             if (self.clients.id(client) != null) self.clients.unregister(client);
         }
@@ -515,6 +521,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_xdg_output_initialized) {
             if (wayring_xdg_output_published) wayring_xdg_output.unpublish();
             wayring_xdg_output.deinit();
+        }
+        if (wayring_presentation_initialized) {
+            if (wayring_presentation_published) wayring_presentation.unpublish();
+            wayring_presentation.deinit();
         }
         if (wayring_outputs_initialized) wayring_outputs.deinit();
         if (wayring_seat_adapter_initialized) {
@@ -654,6 +664,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_outputs_initialized = true;
             wayring_xdg_output.init(init.gpa, &wayring_protocol_server.?, &wayring_outputs, output_layout);
             wayring_xdg_output_initialized = true;
+            wayring_presentation.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor, &wayring_outputs);
+            wayring_presentation_initialized = true;
         }
         wayring_xdg_shell.init(
             init.gpa,
@@ -724,6 +736,8 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_outputs_initialized) {
             try wayring_xdg_output.publish();
             wayring_xdg_output_published = true;
+            try wayring_presentation.publish();
+            wayring_presentation_published = true;
             try wayring_xdg_shell.publish();
             wayring_xdg_shell_published = true;
             try wayring_viewporter.publish();
@@ -776,6 +790,7 @@ pub fn main(init: std.process.Init) !void {
         wayring_lifecycle = .{
             .clients = &wayring_clients,
             .outputs = if (wayring_outputs_initialized) &wayring_outputs else null,
+            .presentation = if (wayring_presentation_initialized) &wayring_presentation else null,
             .xdg_output = if (wayring_xdg_output_initialized) &wayring_xdg_output else null,
             .xdg_shell = &wayring_xdg_shell,
             .viewporter = &wayring_viewporter,

@@ -2621,6 +2621,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
         self.allocator,
         protocol_output,
     ) catch self.terminate();
+    self.finishGeneratedPresentation(render_output.protocol_id, null);
     Surface.clearFifoBarriersForOutput(
         self.compositor.surfaceStore(),
         self.allocator,
@@ -6635,16 +6636,21 @@ fn completeSampledHeadlessFrames(self: *Self, output_id: OutputLayout.Id) void {
             !std.meta.eql(self.exactEligibleGeneratedSessionLockRoot(root) orelse continue, output_id))
             continue;
         const completion = self.headless_surface_forest.takeFrameCompletion(node.id) orelse unreachable;
+        const feedback_remaining = if (completion.sampled) |sampled|
+            sampled(completion.context, node.id, output_id)
+        else
+            false;
         const timestamp_ms = callback_timestamp_ms orelse timestamp: {
             const value = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io)).milliseconds();
             callback_timestamp_ms = value;
             break :timestamp value;
         };
         completion.complete(completion.context, node.id, timestamp_ms);
+        if (feedback_remaining) self.headless_surface_forest.restoreFeedbackDemand(node.id);
     }
 }
 
-fn completeSampledGeneratedCursorFrames(self: *Self) void {
+fn completeSampledGeneratedCursorFrames(self: *Self, output_id: OutputLayout.Id) void {
     const info = self.seatCursorInfo(&self.seat, self.session_lock.isLocked()) orelse return;
     const generated = switch (info) {
         .generated => |value| value,
@@ -6655,12 +6661,38 @@ fn completeSampledGeneratedCursorFrames(self: *Self) void {
     while (iterator.next()) |entry| {
         if (!self.renderer.wasSampled(surfaceSampleTag(entry.id))) continue;
         const completion = self.headless_surface_forest.takeFrameCompletion(entry.id) orelse continue;
+        const feedback_remaining = if (completion.sampled) |sampled|
+            sampled(completion.context, entry.id, output_id)
+        else
+            false;
         const timestamp = timestamp_ms orelse value: {
             const now = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io)).milliseconds();
             timestamp_ms = now;
             break :value now;
         };
         completion.complete(completion.context, entry.id, timestamp);
+        if (feedback_remaining) self.headless_surface_forest.restoreFeedbackDemand(entry.id);
+    }
+}
+
+fn finishGeneratedPresentation(
+    self: *Self,
+    output: OutputLayout.Id,
+    info: ?presentation.Info,
+) void {
+    var iterator = self.headless_surface_forest.nodeIterator();
+    while (iterator.next()) |node| {
+        const completion = node.frame_completion orelse continue;
+        const remaining = if (info) |presented_info|
+            if (completion.presented) |presented|
+                presented(completion.context, node.id, output, presented_info)
+            else
+                false
+        else if (completion.discarded) |discarded|
+            discarded(completion.context, node.id, output)
+        else
+            false;
+        if (remaining) self.headless_surface_forest.restoreFeedbackDemand(node.id);
     }
 }
 
@@ -7024,6 +7056,7 @@ fn outputPresented(context: *anyopaque, info: presentation.Info) void {
         protocol_output,
         info,
     ) catch self.terminate();
+    self.finishGeneratedPresentation(output.protocol_id, info);
     output.frame_callback_deadline_nanoseconds = nowNanoseconds(self.io);
     if (protocol_output.hasCallbackOnlyFrameCallbacks()) self.scheduleFrameCallback(output);
     if (output.lock_frame_pending) {
@@ -7043,6 +7076,7 @@ fn outputDiscarded(context: *anyopaque) void {
         self.allocator,
         self.outputs.get(output.protocol_id).?,
     ) catch self.terminate();
+    self.finishGeneratedPresentation(output.protocol_id, null);
     requestRepaint(self);
 }
 
@@ -11155,7 +11189,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     self.rememberSampledSurfaces(render_output);
     output.endFrame();
     self.completeSampledHeadlessFrames(render_output.protocol_id);
-    self.completeSampledGeneratedCursorFrames();
+    self.completeSampledGeneratedCursorFrames(render_output.protocol_id);
     self.scheduleGeneratedCallbackOnlyFrames(render_output);
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(render_output.protocol_id);
@@ -11458,7 +11492,7 @@ fn presentSessionLockFrame(
     self.rememberSampledSurfaces(frame.render_output);
     frame.output.endFrame();
     self.completeSampledHeadlessFrames(frame.render_output.protocol_id);
-    self.completeSampledGeneratedCursorFrames();
+    self.completeSampledGeneratedCursorFrames(frame.render_output.protocol_id);
     self.scheduleGeneratedCallbackOnlyFrames(frame.render_output);
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);

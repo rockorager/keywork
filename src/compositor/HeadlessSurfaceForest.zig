@@ -23,6 +23,7 @@ pub const AppliedSurfaceState = struct {
     id: SurfaceRegistry.Id,
     mapped_size: ?render.Size,
     callbacks_committed: bool,
+    presentation_feedback_active: bool = false,
 };
 
 pub const AppliedStackEntry = union(enum) {
@@ -119,6 +120,8 @@ const Node = struct {
     mapped_size: ?render.Size = null,
     frame_completion: ?SurfaceFrameCompletion = null,
     frame_demand: bool = false,
+    callback_demand: bool = false,
+    feedback_demand: bool = false,
     presentation_class: PresentationClass = .background,
 
     placement: PlacementTag = .detached,
@@ -245,8 +248,10 @@ pub fn apply(self: *HeadlessSurfaceForest, batch: AppliedBatch) void {
         target.mapped_size = surface.mapped_size;
         if (surface.callbacks_committed) {
             std.debug.assert(target.frame_completion != null);
-            target.frame_demand = true;
+            target.callback_demand = true;
         }
+        target.feedback_demand = surface.presentation_feedback_active;
+        updateFrameDemand(target);
     }
     self.validateAfterMutation();
 }
@@ -282,9 +287,19 @@ pub fn takeFrameCompletion(
     const target = self.node(id) orelse return null;
     if (!target.frame_demand) return null;
     const completion = target.frame_completion orelse unreachable;
-    target.frame_demand = false;
+    target.callback_demand = false;
+    target.feedback_demand = false;
+    updateFrameDemand(target);
     self.validateAfterMutation();
     return completion;
+}
+
+pub fn restoreFeedbackDemand(self: *HeadlessSurfaceForest, id: SurfaceRegistry.Id) void {
+    const target = self.node(id) orelse return;
+    std.debug.assert(target.frame_completion != null);
+    target.feedback_demand = true;
+    updateFrameDemand(target);
+    self.validateAfterMutation();
 }
 
 pub fn hasCallbackOnlyFrameDemand(
@@ -313,11 +328,16 @@ pub fn completeCallbackOnlyFrame(
         .none => false,
         .remaining => true,
         .drained => drained: {
-            target.frame_demand = false;
+            target.callback_demand = false;
+            updateFrameDemand(target);
             self.validateAfterMutation();
             break :drained true;
         },
     };
+}
+
+fn updateFrameDemand(target: *Node) void {
+    target.frame_demand = target.callback_demand or target.feedback_demand;
 }
 
 /// Applies one allocation-free root presentation transition. Detached and
@@ -743,6 +763,7 @@ pub fn validate(self: *const HeadlessSurfaceForest) void {
         std.debug.assert(target.id.generation == slot.generation);
         if (target.mapped_size) |size|
             std.debug.assert(size.width > 0 and size.height > 0);
+        std.debug.assert(target.frame_demand == (target.callback_demand or target.feedback_demand));
         std.debug.assert(!target.frame_demand or target.frame_completion != null);
         if (target.presentation_class != .background)
             std.debug.assert(target.placement == .root);
