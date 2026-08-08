@@ -130,6 +130,9 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/upstream/wlr-layer-shell-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-session-lock/ext-session-lock-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-workspace/ext-workspace-v1.xml"));
+    // Security-context is generated for the unpublished ingress fixture only;
+    // no production profile publishes its manager global.
+    generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/security-context/security-context-v1.xml"));
     const generated_xdg_source = generate_xdg_protocol.captureStdOut(.{ .basename = "wayring_xdg_protocol.zig" });
     const xdg_protocol = b.createModule(.{
         .root_source_file = generated_xdg_source,
@@ -279,6 +282,7 @@ pub fn build(b: *std.Build) void {
         wayland.wayland_xml,
         wayland.protocols,
         test_step,
+        test_wayring_step,
     );
     const parity_run = b.addSystemCommand(&.{ "python3", "scripts/keywork_wayland_benchmark.py" });
     parity_run.step.dependOn(&install_benchmark_client.step);

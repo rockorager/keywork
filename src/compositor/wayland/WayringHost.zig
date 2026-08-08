@@ -117,6 +117,47 @@ pub fn createWithOptions(
         .transport_provenance = options.transport_provenance,
     });
     errdefer self.transport.deinit() catch {};
+    try self.finishCreate(event_loop);
+    return self;
+}
+
+/// Creates a derived host from a caller-verified listening descriptor.
+///
+/// The descriptor remains caller-owned on error and transfers to the host only
+/// when this function returns successfully. Derived transports intentionally
+/// have no display name, socket pathname, or lock-file ownership.
+pub fn createFromListenerFd(
+    allocator: std.mem.Allocator,
+    event_loop: *wl.EventLoop,
+    protocol_server: *server.Server,
+    listener_fd: linux.fd_t,
+    lifecycle: ClientLifecycle,
+) !*WayringHost {
+    if (listener_fd < 0) return error.InvalidListener;
+    const duplicated = std.c.fcntl(listener_fd, std.c.F.DUPFD_CLOEXEC, @as(c_int, 0));
+    if (duplicated < 0) return error.DuplicateListenerFailed;
+    const owned_fd: linux.fd_t = duplicated;
+    var transport = wayring.io_uring.Server.initWithOptions(allocator, protocol_server, owned_fd, .{
+        .transport_provenance = .security_context,
+    }) catch |err| {
+        _ = linux.close(owned_fd);
+        return err;
+    };
+    errdefer transport.deinit() catch {};
+    const self = try allocator.create(WayringHost);
+    errdefer allocator.destroy(self);
+    self.* = undefined;
+    self.allocator = allocator;
+    self.lifecycle = lifecycle;
+    self.transport = transport;
+    try self.finishCreate(event_loop);
+    // Closing the caller's descriptor is the final, infallible ownership
+    // transfer. The host retains the duplicate referring to the same socket.
+    _ = linux.close(listener_fd);
+    return self;
+}
+
+fn finishCreate(self: *WayringHost, event_loop: *wl.EventLoop) !void {
     self.ring = try linux.IoUring.init(submission_capacity, 0);
     errdefer self.ring.deinit();
     self.alarm_fd = try linuxFd(linux.timerfd_create(.MONOTONIC, .{
@@ -146,7 +187,6 @@ pub fn createWithOptions(
     errdefer self.event_source.?.remove();
     try self.ensureAlarmPoll();
     self.prepareAndSubmit() catch |err| self.fail(err);
-    return self;
 }
 
 /// Returns only after every client resource and transport operation is gone
@@ -739,6 +779,33 @@ fn connectSocket(path: [:0]const u8) !linux.fd_t {
     return fd;
 }
 
+fn createAbstractListener(name: []const u8) !linux.fd_t {
+    var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
+    if (name.len + 1 > address.path.len) return error.InvalidSocketPath;
+    @memcpy(address.path[1 .. name.len + 1], name);
+    const raw_fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(raw_fd) != .SUCCESS) return error.SocketFailed;
+    const fd: linux.fd_t = @intCast(raw_fd);
+    errdefer _ = linux.close(fd);
+    const length: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + name.len + 1);
+    if (linux.errno(linux.bind(fd, @ptrCast(&address), length)) != .SUCCESS) return error.BindFailed;
+    if (linux.errno(linux.listen(fd, 8)) != .SUCCESS) return error.ListenFailed;
+    return fd;
+}
+
+fn connectAbstract(name: []const u8) !linux.fd_t {
+    var address: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
+    if (name.len + 1 > address.path.len) return error.InvalidSocketPath;
+    @memcpy(address.path[1 .. name.len + 1], name);
+    const raw_fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(raw_fd) != .SUCCESS) return error.SocketFailed;
+    const fd: linux.fd_t = @intCast(raw_fd);
+    errdefer _ = linux.close(fd);
+    const length: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + name.len + 1);
+    if (linux.errno(linux.connect(fd, @ptrCast(&address), length)) != .SUCCESS) return error.ConnectFailed;
+    return fd;
+}
+
 const CleanupProbe = struct {
     callback_count: usize = 0,
     callback_client: ?*server.Client = null,
@@ -761,6 +828,96 @@ const CleanupProbe = struct {
         self.resource = null;
     }
 };
+
+test "external listener accepts libwayland client with immutable security-context identity before receive" {
+    const event_loop = try wl.EventLoop.create();
+    defer event_loop.destroy();
+    var protocol_server: server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    const Probe = struct {
+        accepted_count: usize = 0,
+        destroy_count: usize = 0,
+        identity: ?server.Client.SecurityIdentity = null,
+        before_receive: bool = false,
+
+        fn accepted(erased: *anyopaque, client: *server.Client) !void {
+            const self: *@This() = @ptrCast(@alignCast(erased));
+            self.accepted_count += 1;
+            self.identity = client.securityIdentity();
+            self.before_receive = client.lookup(2) == null;
+        }
+
+        fn destroy(erased: *anyopaque, _: *server.Client) void {
+            const self: *@This() = @ptrCast(@alignCast(erased));
+            self.destroy_count += 1;
+        }
+    };
+    var probe: Probe = .{};
+    var marker: u8 = 0;
+    const name = try std.fmt.allocPrint(std.testing.allocator, "keywork-derived-{d}-{x}", .{ linux.getpid(), @intFromPtr(&marker) });
+    defer std.testing.allocator.free(name);
+    const listener_fd = try createAbstractListener(name);
+    var listener_owned = true;
+    defer if (listener_owned) {
+        _ = linux.close(listener_fd);
+    };
+    const host = try WayringHost.createFromListenerFd(
+        std.testing.allocator,
+        event_loop,
+        &protocol_server,
+        listener_fd,
+        .{ .context = &probe, .accepted = Probe.accepted, .destroy_resources = Probe.destroy },
+    );
+    listener_owned = false;
+    var host_live = true;
+    defer if (host_live) host.destroy() catch {};
+    try std.testing.expectEqual(linux.E.BADF, linux.errno(linux.fcntl(listener_fd, linux.F.GETFD, 0)));
+    try std.testing.expect(host.transport.socketName() == null);
+
+    const peer_fd = try connectAbstract(name);
+    var peer_owned = true;
+    defer if (peer_owned) {
+        _ = linux.close(peer_fd);
+    };
+    const display = try wayland.client.wl.Display.connectToFd(peer_fd);
+    peer_owned = false;
+    defer display.disconnect();
+    for (0..200) |_| {
+        try event_loop.dispatch(10);
+        if (probe.accepted_count != 0) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.accepted_count);
+    try std.testing.expect(probe.before_receive);
+    try std.testing.expectEqual(server.Client.TransportProvenance.security_context, probe.identity.?.provenance);
+    try std.testing.expectEqual(linux.getuid(), probe.identity.?.credentials.?.uid);
+    try std.testing.expect(host.failure() == null);
+
+    host_live = false;
+    try host.destroy();
+    try std.testing.expectEqual(@as(usize, 1), probe.destroy_count);
+}
+
+test "external listener ownership stays with caller when host creation fails" {
+    const event_loop = try wl.EventLoop.create();
+    defer event_loop.destroy();
+    var protocol_server: server.Server = .init(std.testing.allocator);
+    defer protocol_server.deinit();
+    var marker: u8 = 0;
+    const name = try std.fmt.allocPrint(std.testing.allocator, "keywork-derived-fail-{d}-{x}", .{ linux.getpid(), @intFromPtr(&marker) });
+    defer std.testing.allocator.free(name);
+    const listener_fd = try createAbstractListener(name);
+    defer _ = linux.close(listener_fd);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var context: u8 = 0;
+    try std.testing.expectError(error.OutOfMemory, WayringHost.createFromListenerFd(
+        failing.allocator(),
+        event_loop,
+        &protocol_server,
+        listener_fd,
+        .{ .context = &context, .accepted = CleanupProbe.accepted, .destroy_resources = CleanupProbe.destroy },
+    ));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fcntl(listener_fd, linux.F.GETFD, 0)));
+}
 
 const cleanup_test_interface: wayring.wire.Interface = .{
     .name = "keywork_cleanup_test",
