@@ -22,6 +22,7 @@ const route_capacity = submission_capacity * 2;
 pub const Alarm = struct {
     context: *anyopaque,
     fired: *const fn (*anyopaque, u64) void,
+    failed: *const fn (*anyopaque) void,
 };
 
 pub const ClientLifecycle = struct {
@@ -572,8 +573,16 @@ fn takeRoute(self: *WayringHost, external: u64) ?Route {
 }
 
 fn fail(self: *WayringHost, err: anyerror) void {
+    const first_failure = self.failure_value == null;
     self.recordFailure(err);
+    if (first_failure) if (self.alarm_callback) |callback|
+        callback.failed(callback.context);
     self.beginShutdown();
+}
+
+pub fn failForTesting(self: *WayringHost, err: anyerror) void {
+    std.debug.assert(builtin.is_test);
+    self.fail(err);
 }
 
 fn recordFailure(self: *WayringHost, err: anyerror) void {

@@ -111,20 +111,16 @@ fn createNotification(self: *WayringIdleNotification, manager: *Manager, id: u32
     }
 
     try self.notifications.ensureUnusedCapacity(self.allocator, 1);
+    const resource_generation = try self.generation();
     const value = try self.allocator.create(Notification);
     errdefer self.allocator.destroy(value);
-    value.* = .{ .owner = self, .client = manager.client, .resource = .init(self.allocator, id, manager.resource.version(), .client, manager.client.ownerHooks()), .generation = try self.generation() };
-    var materialized = false;
+    value.* = .{ .owner = self, .client = manager.client, .resource = .init(self.allocator, id, manager.resource.version(), .client, manager.client.ownerHooks()), .generation = resource_generation };
     errdefer {
-        if (!materialized) {
-            value.resource.destroy();
-            value.resource.deinit();
-        }
+        value.resource.destroy();
+        value.resource.deinit();
     }
     try value.resource.setHandler(Notification, value, notificationRequest, null);
     try manager.client.materialize(&value.resource.runtime);
-    materialized = true;
-    errdefer self.destroyNotification(value);
     value.core_id = self.core.create(client_id, self.seat_ref, timeout_ms, obey_inhibitors, endpoint(value)) catch |err| switch (err) {
         error.ScheduleFailed, error.TimerGenerationExhausted => {
             // Keep the already materialized child valid until orderly server
