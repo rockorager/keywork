@@ -23462,12 +23462,15 @@ const GeneratedTextInputClient = struct {
         switch (event) {
             .global => |global| {
                 const interface = std.mem.span(global.interface);
+                // Negotiate the last wl_pointer version that carries
+                // axis_discrete so this external client verifies that exact
+                // wire event rather than its v8 axis_value120 replacement.
                 if (std.mem.eql(u8, interface, "wl_compositor"))
                     self.compositor = registry.bind(global.name, client_wl.Compositor, @min(global.version, 6)) catch null
                 else if (std.mem.eql(u8, interface, "wl_shm"))
                     self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null
                 else if (std.mem.eql(u8, interface, "wl_seat"))
-                    self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 10)) catch null
+                    self.seat = registry.bind(global.name, client_wl.Seat, @min(global.version, 7)) catch null
                 else if (std.mem.eql(u8, interface, "xdg_wm_base"))
                     self.wm_base = registry.bind(global.name, client_xdg.WmBase, @min(global.version, 7)) catch null
                 else if (std.mem.eql(u8, interface, "zwp_text_input_manager_v3"))
