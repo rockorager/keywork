@@ -303,8 +303,8 @@ test "typed bind requires direct exact UID and accepts both manager versions" {
     });
     defer managed.destroy();
     try prepareRegistry(managed.client());
-    try registryBind(&adapter, managed.client(), 2, 1);
-    try registryBind(&adapter, managed.client(), 3, 2);
+    try registryBind(&adapter, managed.client(), 3, 1);
+    try registryBind(&adapter, managed.client(), 4, 2);
     try std.testing.expectEqual(@as(usize, 2), adapter.managers.items.len);
     try std.testing.expectEqual(@as(usize, 1), neutral.providers.items.len);
     adapter.destroyClientResources(managed.client());

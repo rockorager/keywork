@@ -23332,7 +23332,8 @@ const GeneratedTextInputClient = struct {
     keyboard_states: [2]client_wl.Keyboard.KeyState = undefined,
     keyboard_event_count: usize = 0,
     keyboard_modifiers_seen: bool = false,
-    pointer_enter_serial: u32 = 0,
+    pointer_enter_serial: std.atomic.Value(u32) = .init(0),
+    pointer_capture_enabled: std.atomic.Value(bool) = .init(false),
     pointer_motion_times: [2]u32 = @splat(0),
     pointer_motion_count: usize = 0,
     pointer_button_times: [4]u32 = @splat(0),
@@ -23554,8 +23555,8 @@ const GeneratedTextInputClient = struct {
 
     fn pointerEvent(_: *client_wl.Pointer, event: client_wl.Pointer.Event, self: *@This()) void {
         switch (event) {
-            .enter => |value| self.pointer_enter_serial = value.serial,
-            .motion => |value| if (self.pointer_motion_count < self.pointer_motion_times.len) {
+            .enter => |value| self.pointer_enter_serial.store(value.serial, .release),
+            .motion => |value| if (self.pointer_capture_enabled.load(.acquire) and self.pointer_motion_count < self.pointer_motion_times.len) {
                 self.pointer_motion_times[self.pointer_motion_count] = value.time;
                 self.pointer_motion_count += 1;
             },
@@ -23595,7 +23596,7 @@ const GeneratedTextInputClient = struct {
 const GeneratedVirtualPointerClient = struct {
     const client_wl = wayland.client.wl;
     const client_zwlr = wayland.client.zwlr;
-    const Stage = enum(u8) { starting, ready, sent, disconnected, failed };
+    const Stage = enum(u8) { starting, ready, focused, sent, disconnected, failed };
 
     runtime_directory: []const u8,
     display_name: []const u8,
@@ -23653,6 +23654,12 @@ const GeneratedVirtualPointerClient = struct {
         defer pointer.destroy();
         try expectClientRoundtrip(display);
         try self.pause(display, .ready);
+        // Establish canonical pointer focus before the timestamped sequence so
+        // the first asserted motion is not represented only by wl_pointer.enter.
+        pointer.motionAbsolute(100, self.target_x, self.target_y, self.target_width, self.target_height);
+        pointer.frame();
+        try expectClientRoundtrip(display);
+        try self.pause(display, .focused);
         pointer.motionAbsolute(101, self.target_x, self.target_y, self.target_width, self.target_height);
         pointer.motion(102, client_wl.Fixed.fromDouble(1.5), client_wl.Fixed.fromDouble(-2.0));
         pointer.button(103, linux_button_left, .pressed);
@@ -27803,6 +27810,15 @@ test "production generated data device completes the exact profile and supports 
     // injecting client routes events through canonical hit testing.
     try signalWayringCommand(text_command);
     try signalWayringCommand(virtual_pointer_command);
+    try waitForGeneratedVirtualPointerStage(server, host, &generated_pointer_client, .focused);
+    for (0..2_000) |_| {
+        if (generated_text.pointer_enter_serial.load(.acquire) != 0) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedVirtualPointerFocusTimedOut;
+    generated_text.pointer_capture_enabled.store(true, .release);
+    try signalWayringCommand(virtual_pointer_command);
     try waitForGeneratedVirtualPointerStage(server, host, &generated_pointer_client, .sent);
     for (0..2_000) |_| {
         if (generated_text.pointer_button_count == 3 and generated_text.pointer_axis_stop_seen) break;
@@ -27811,7 +27827,7 @@ test "production generated data device completes the exact profile and supports 
         if (host.failure()) |err| return err;
     } else return error.GeneratedVirtualPointerDeliveryTimedOut;
     try waitForGeneratedTextInputStage(server, host, &generated_text, .pointer_observed);
-    try std.testing.expect(generated_text.pointer_enter_serial != 0);
+    try std.testing.expect(generated_text.pointer_enter_serial.load(.acquire) != 0);
     try std.testing.expectEqualSlices(u32, &.{ 101, 102 }, &generated_text.pointer_motion_times);
     try std.testing.expectEqualSlices(u32, &.{ 103, 107, 108 }, generated_text.pointer_button_times[0..3]);
     try std.testing.expectEqualSlices(wayland.client.wl.Pointer.ButtonState, &.{ .pressed, .released, .pressed }, generated_text.pointer_button_states[0..3]);
