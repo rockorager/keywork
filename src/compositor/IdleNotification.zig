@@ -155,6 +155,14 @@ pub fn setInhibited(self: *IdleNotification, inhibited: bool) UpdateError!void {
     self.applyProposal(timestamp, proposal);
 }
 
+/// Invalidates any callback issued by the previous transport and recreates
+/// the one canonical alarm on the scheduler's current route.
+pub fn rearm(self: *IdleNotification) UpdateError!void {
+    const timestamp = self.clock.now(self.clock.context);
+    try self.armFor(timestamp, .current);
+    self.applyProposal(timestamp, .current);
+}
+
 /// Returns false for stale callbacks without touching state or the scheduler.
 pub fn timerFired(self: *IdleNotification, generation: TimerGeneration) UpdateError!bool {
     if (self.armed_generation == null or self.armed_generation.? != generation) return false;

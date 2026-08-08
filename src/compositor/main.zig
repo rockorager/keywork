@@ -3,6 +3,7 @@
 const std = @import("std");
 const build_options = @import("build-options");
 const ControlProtocol = @import("keywork-control");
+const IdleNotification = @import("IdleNotification.zig");
 const OutputBackend = @import("backend/output.zig");
 const Config = @import("config.zig");
 const Launcher = @import("launcher.zig");
@@ -20,6 +21,7 @@ const WayringPrimarySelection = @import("wayland/WayringPrimarySelection.zig");
 const WayringTextInput = @import("wayland/WayringTextInput.zig");
 const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
 const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
+const WayringIdleNotification = @import("wayland/WayringIdleNotification.zig");
 const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
 const WayringSessionLock = @import("wayland/WayringSessionLock.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
@@ -239,6 +241,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_virtual_keyboard: WayringVirtualKeyboard = undefined;
     var wayring_virtual_keyboard_initialized = false;
     var wayring_virtual_keyboard_published = false;
+    var wayring_idle_notification: WayringIdleNotification = undefined;
+    var wayring_idle_notification_initialized = false;
+    var wayring_idle_notification_published = false;
     var wayring_layer_shell: WayringLayerShell = undefined;
     var wayring_layer_shell_initialized = false;
     var wayring_layer_shell_published = false;
@@ -262,6 +267,7 @@ pub fn main(init: std.process.Init) !void {
         data_control: ?*WayringDataControl,
         input_method: ?*WayringInputMethod,
         virtual_keyboard: ?*WayringVirtualKeyboard,
+        idle_notification: ?*WayringIdleNotification,
         layer_shell: ?*WayringLayerShell,
         session_lock: ?*WayringSessionLock,
 
@@ -279,6 +285,7 @@ pub fn main(init: std.process.Init) !void {
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
             if (self.session_lock) |generated_session_lock| generated_session_lock.destroyClientResources(client);
+            if (self.idle_notification) |idle_notification| idle_notification.destroyClientResources(client);
             if (self.layer_shell) |layer_shell| layer_shell.destroyClientResources(client);
             if (self.virtual_keyboard) |keyboard| keyboard.destroyClientResources(client);
             if (self.input_method) |input_method| input_method.destroyClientResources(client);
@@ -301,7 +308,12 @@ pub fn main(init: std.process.Init) !void {
     };
     var wayring_lifecycle: WayringLifecycle = undefined;
     var wayring_host: ?*WayringHost = null;
+    var wayring_idle_alarm_attached = false;
     defer {
+        if (wayring_idle_alarm_attached) if (wayring_host) |host| {
+            server.detachIdleAlarmHost(host) catch |err|
+                log.err("failed to restore the canonical idle timer: {t}", .{err});
+        };
         if (wayring_host) |host| host.destroy() catch |err| {
             log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
         };
@@ -309,6 +321,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_session_lock_initialized) {
             if (wayring_session_lock_published) wayring_session_lock.unpublish();
             wayring_session_lock.deinit();
+        }
+        if (wayring_idle_notification_initialized) {
+            if (wayring_idle_notification_published) wayring_idle_notification.unpublish();
+            wayring_idle_notification.deinit();
         }
         if (wayring_layer_shell_initialized) {
             if (wayring_layer_shell_published) wayring_layer_shell.unpublish();
@@ -437,6 +453,16 @@ pub fn main(init: std.process.Init) !void {
             std.os.linux.getuid(),
         );
         wayring_virtual_keyboard_initialized = true;
+        wayring_idle_notification.init(
+            init.gpa,
+            &wayring_protocol_server.?,
+            &wayring_clients,
+            &wayring_seat_adapter,
+            IdleNotification.SeatRef.fromPointer(server.canonicalSeat()),
+            server.neutralIdleNotification(),
+            .{ .context = server, .failed = Server.idleNotificationFrontendFailed },
+        );
+        wayring_idle_notification_initialized = true;
         server.setGeneratedInputMethodObserver(.{
             .context = &wayring_input_method,
             .set_inhibited = WayringInputMethod.observerSetInhibited,
@@ -589,6 +615,10 @@ pub fn main(init: std.process.Init) !void {
             // presenting headless generated shell/output profile.
             try wayring_layer_shell.publish();
             wayring_layer_shell_published = true;
+            // Idle notification is public, matching the mature frontend, and
+            // is the final public global for the presenting generated profile.
+            try wayring_idle_notification.publish();
+            wayring_idle_notification_published = true;
             // Restricted lock ownership is published after every public
             // generated-shell global.
             try wayring_session_lock.publish();
@@ -611,6 +641,7 @@ pub fn main(init: std.process.Init) !void {
             .data_control = if (wayring_data_control_initialized) &wayring_data_control else null,
             .input_method = if (wayring_input_method_initialized) &wayring_input_method else null,
             .virtual_keyboard = if (wayring_virtual_keyboard_initialized) &wayring_virtual_keyboard else null,
+            .idle_notification = if (wayring_idle_notification_initialized) &wayring_idle_notification else null,
             .layer_shell = if (wayring_layer_shell_initialized) &wayring_layer_shell else null,
             .session_lock = if (wayring_session_lock_initialized) &wayring_session_lock else null,
         };
@@ -630,6 +661,8 @@ pub fn main(init: std.process.Init) !void {
                 .destroy_resources = WayringLifecycle.destroy,
             },
         );
+        try server.attachIdleAlarmHost(wayring_host.?);
+        wayring_idle_alarm_attached = true;
         if (wayring_host.?.failure()) |err| return err;
     }
     try server.configureXdgSessionStorage(
