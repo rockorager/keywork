@@ -23297,7 +23297,7 @@ const GeneratedTextInputClient = struct {
     const client_wl = wayland.client.wl;
     const client_xdg = wayland.client.xdg;
     const client_zwp = wayland.client.zwp;
-    const Stage = enum(u8) { starting, mapped, state_sent, edit_received, left, disconnected, failed };
+    const Stage = enum(u8) { starting, mapped, pointer_observed, state_sent, edit_received, left, disconnected, failed };
     const EditTag = enum { preedit, delete, commit, done };
 
     runtime_directory: []const u8,
@@ -23413,17 +23413,17 @@ const GeneratedTextInputClient = struct {
 
         const shm_fd = try std.posix.memfd_create("keywork-generated-text", std.os.linux.MFD.CLOEXEC);
         defer _ = std.os.linux.close(shm_fd);
-        const pixel: u32 = 0xff33_6699;
-        if (std.os.linux.errno(std.os.linux.ftruncate(shm_fd, @sizeOf(u32))) != .SUCCESS)
+        const pixels: [64]u32 = @splat(0xff33_6699);
+        if (std.os.linux.errno(std.os.linux.ftruncate(shm_fd, @sizeOf(@TypeOf(pixels)))) != .SUCCESS)
             return error.ShmResizeFailed;
-        if (std.c.pwrite(shm_fd, @ptrCast(&pixel), @sizeOf(u32), 0) != @sizeOf(u32))
+        if (std.c.pwrite(shm_fd, @ptrCast(&pixels), @sizeOf(@TypeOf(pixels)), 0) != @sizeOf(@TypeOf(pixels)))
             return error.ShmWriteFailed;
-        const pool = try shm.createPool(shm_fd, @sizeOf(u32));
+        const pool = try shm.createPool(shm_fd, @sizeOf(@TypeOf(pixels)));
         defer pool.destroy();
-        const buffer = try pool.createBuffer(0, 1, 1, @sizeOf(u32), .argb8888);
+        const buffer = try pool.createBuffer(0, 8, 8, 8 * @sizeOf(u32), .argb8888);
         defer buffer.destroy();
         surface.attach(buffer, 0, 0);
-        surface.damageBuffer(0, 0, 1, 1);
+        surface.damageBuffer(0, 0, 8, 8);
         surface.commit();
         try expectClientRoundtrip(display);
 
@@ -23432,6 +23432,8 @@ const GeneratedTextInputClient = struct {
         input.setListener(*@This(), textEvent, self);
         try expectClientRoundtrip(display);
         try self.pause(display, .mapped);
+        while (self.pointer_button_count < 3 or !self.pointer_axis_stop_seen) try expectClientRoundtrip(display);
+        try self.pause(display, .pointer_observed);
         while (!self.entered) try expectClientRoundtrip(display);
         input.enable();
         input.setSurroundingText("héllo", 3, 1);
@@ -23604,6 +23606,10 @@ const GeneratedVirtualPointerClient = struct {
     seat: ?*client_wl.Seat = null,
     output: ?*client_wl.Output = null,
     manager: ?*client_zwlr.VirtualPointerManagerV1 = null,
+    target_x: u32,
+    target_y: u32,
+    target_width: u32,
+    target_height: u32,
 
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
@@ -23647,7 +23653,7 @@ const GeneratedVirtualPointerClient = struct {
         defer pointer.destroy();
         try expectClientRoundtrip(display);
         try self.pause(display, .ready);
-        pointer.motionAbsolute(101, 128, 128, 256, 256);
+        pointer.motionAbsolute(101, self.target_x, self.target_y, self.target_width, self.target_height);
         pointer.motion(102, client_wl.Fixed.fromDouble(1.5), client_wl.Fixed.fromDouble(-2.0));
         pointer.button(103, linux_button_left, .pressed);
         pointer.axisSource(.finger);
@@ -27761,6 +27767,11 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(generated_text_surface, server.window_manager.focusedSurface().?);
     try std.testing.expect(server.focusGeneratedSurface(generated_text_surface));
     try std.testing.expect(server.seat.generatedKeyboardFocus() != null);
+    const generated_text_info = server.managedGeneratedWindow(generated_text_surface) orelse
+        return error.GeneratedTextWindowMissing;
+    const generated_text_position = server.scene.windowPosition(generated_text_info.scene_id) orelse
+        return error.GeneratedTextWindowPositionMissing;
+    const pointer_bounds = server.virtualPointerBounds(null) orelse return error.VirtualPointerBoundsMissing;
 
     // Virtual pointer is intentionally absent from the production profile;
     // expose it only for this authentic generated-client integration phase.
@@ -27774,6 +27785,10 @@ test "production generated data device completes the exact profile and supports 
         .runtime_directory = runtime_directory,
         .display_name = host.displayName(),
         .command_fd = virtual_pointer_command,
+        .target_x = @intCast(generated_text_position.x + 4 - @as(i32, @intFromFloat(pointer_bounds.x))),
+        .target_y = @intCast(generated_text_position.y + 4 - @as(i32, @intFromFloat(pointer_bounds.y))),
+        .target_width = @intFromFloat(pointer_bounds.width - 1),
+        .target_height = @intFromFloat(pointer_bounds.height - 1),
     };
     const generated_pointer_thread = try std.Thread.spawn(.{}, GeneratedVirtualPointerClient.run, .{&generated_pointer_client});
     var generated_pointer_joined = false;
@@ -27784,6 +27799,9 @@ test "production generated data device completes the exact profile and supports 
     try waitForGeneratedVirtualPointerStage(server, host, &generated_pointer_client, .ready);
     try std.testing.expectEqual(@as(usize, 1), generated_virtual_pointer.managers.items.len);
     try std.testing.expectEqual(@as(usize, 1), generated_virtual_pointer.devices.items.len);
+    // Let the target's external libwayland thread pump its display while the
+    // injecting client routes events through canonical hit testing.
+    try signalWayringCommand(text_command);
     try signalWayringCommand(virtual_pointer_command);
     try waitForGeneratedVirtualPointerStage(server, host, &generated_pointer_client, .sent);
     for (0..2_000) |_| {
@@ -27792,6 +27810,7 @@ test "production generated data device completes the exact profile and supports 
         server.display.flushClients();
         if (host.failure()) |err| return err;
     } else return error.GeneratedVirtualPointerDeliveryTimedOut;
+    try waitForGeneratedTextInputStage(server, host, &generated_text, .pointer_observed);
     try std.testing.expect(generated_text.pointer_enter_serial != 0);
     try std.testing.expectEqualSlices(u32, &.{ 101, 102 }, &generated_text.pointer_motion_times);
     try std.testing.expectEqualSlices(u32, &.{ 103, 107, 108 }, generated_text.pointer_button_times[0..3]);

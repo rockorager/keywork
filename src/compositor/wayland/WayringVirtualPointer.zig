@@ -94,6 +94,10 @@ pub fn unpublish(self: *WayringVirtualPointer) void {
     self.global = null;
 }
 
+pub fn globalFilter(self: *const WayringVirtualPointer, client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
+    return global.visibility() != .restricted or client.isAuthorizedDirectPeer(self.authorized_uid);
+}
+
 fn bindManager(client: *wayring.server.Client, id: u32, version: u32, self: *WayringVirtualPointer) !void {
     try self.bind(client, id, version);
 }
@@ -267,6 +271,11 @@ test "typed bind requires direct exact UID and accepts both manager versions" {
     );
     defer adapter.deinit();
 
+    try adapter.publish();
+    defer adapter.unpublish();
+    protocol_server.setGlobalFilter(WayringVirtualPointer, &adapter, globalFilter);
+    defer protocol_server.clearGlobalFilter();
+
     const credentials: wayring.server.Client.Credentials = .{ .pid = 1, .uid = 42, .gid = 1 };
     var direct: wayring.server.Client = .init(std.testing.allocator, .{
         .credentials = credentials,
@@ -288,11 +297,17 @@ test "typed bind requires direct exact UID and accepts both manager versions" {
     try std.testing.expectError(error.InvalidVersion, adapter.bind(&direct, 2, 3));
     try std.testing.expectError(error.AccessDenied, adapter.bind(&wrong_uid, 2, 1));
     try std.testing.expectError(error.AccessDenied, adapter.bind(&derived, 2, 2));
-    try adapter.bind(&direct, 2, 1);
-    try adapter.bind(&direct, 3, 2);
+    const managed = try wayring.server.CoreClient.create(std.testing.allocator, &protocol_server, .{
+        .credentials = credentials,
+        .transport_provenance = .direct,
+    });
+    defer managed.destroy();
+    try prepareRegistry(managed.client());
+    try registryBind(&adapter, managed.client(), 2, 1);
+    try registryBind(&adapter, managed.client(), 3, 2);
     try std.testing.expectEqual(@as(usize, 2), adapter.managers.items.len);
     try std.testing.expectEqual(@as(usize, 1), neutral.providers.items.len);
-    adapter.destroyClientResources(&direct);
+    adapter.destroyClientResources(managed.client());
     try std.testing.expectEqual(@as(usize, 0), adapter.managers.items.len);
     try std.testing.expectEqual(@as(usize, 0), adapter.devices.items.len);
 }
@@ -311,6 +326,7 @@ const BindFixture = struct {
 
     fn init(self: *BindFixture, allocator: std.mem.Allocator) !void {
         self.* = .{ .protocol_server = .init(std.testing.allocator) };
+        errdefer self.protocol_server.deinit();
         self.neutral = VirtualPointer.init(allocator, &self.output_layout, .{
             .context = &self.context,
             .event = event,
@@ -325,81 +341,145 @@ const BindFixture = struct {
             &self.seat,
             42,
         );
+        errdefer self.adapter.deinit();
+        try self.adapter.publish();
+        self.protocol_server.setGlobalFilter(WayringVirtualPointer, &self.adapter, globalFilter);
     }
 
     fn deinit(self: *BindFixture) void {
+        self.protocol_server.clearGlobalFilter();
+        self.adapter.unpublish();
         self.adapter.deinit();
         self.neutral.deinit();
         self.protocol_server.deinit();
         self.* = undefined;
     }
 
-    fn client(allocator: std.mem.Allocator) wayring.server.Client {
-        return .init(allocator, .{
+    fn client(self: *BindFixture, allocator: std.mem.Allocator) !*wayring.server.CoreClient {
+        return wayring.server.CoreClient.create(allocator, &self.protocol_server, .{
             .credentials = .{ .pid = 1, .uid = 42, .gid = 1 },
             .transport_provenance = .direct,
         });
     }
 };
 
+const test_display_get_registry: wayring.wire.MessageDescriptor = .{
+    .name = "get_registry",
+    .arguments = &.{.{ .name = "registry", .kind = .{ .new_id = &.{ .name = "wl_registry", .version = 1 } } }},
+};
+const test_registry_bind: wayring.wire.MessageDescriptor = .{ .name = "bind", .arguments = &.{
+    .{ .name = "name", .kind = .uint },
+    .{ .name = "id", .kind = .{ .new_id = null } },
+} };
+
+fn testSend(client: *wayring.server.Client, object_id: u32, opcode: u16, descriptor: *const wayring.wire.MessageDescriptor, values: []const wayring.wire.Value) !void {
+    var output: wayring.wire.Output = .init(std.testing.allocator);
+    defer output.deinit();
+    try output.enqueue(object_id, opcode, descriptor, values);
+    const batch = (try output.beginSend()).?;
+    try client.receive(batch.bytes, &.{});
+    try output.completeSend(batch.token, batch.bytes.len);
+    try client.dispatch();
+}
+
+fn prepareRegistry(client: *wayring.server.Client) !void {
+    try testSend(client, 1, 1, &test_display_get_registry, &.{.{ .new_id = .{ .typed = 2 } }});
+    while (try client.beginSend()) |batch| try client.completeSend(batch.token, batch.bytes.len);
+}
+
+fn registryBind(adapter: *WayringVirtualPointer, client: *wayring.server.Client, id: u32, version: u32) !void {
+    try testSend(client, 2, 0, &test_registry_bind, &.{
+        .{ .uint = adapter.global.?.name() },
+        .{ .new_id = .{ .generic = .{
+            .interface = protocol.zwlr_virtual_pointer_manager_v1.interface.name,
+            .version = version,
+            .id = id,
+        } } },
+    });
+}
+
 test "every manager bind allocation failure rolls back without half-live state" {
     var measuring_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var measuring_fixture: BindFixture = undefined;
-    try measuring_fixture.init(measuring_allocator.allocator());
-    var measuring_client = BindFixture.client(std.testing.allocator);
-    const allocation_start = measuring_allocator.alloc_index;
-    try measuring_fixture.adapter.bind(&measuring_client, 2, 2);
-    const allocation_end = measuring_allocator.alloc_index;
-    try std.testing.expect(allocation_end > allocation_start);
-    measuring_fixture.adapter.destroyClientResources(&measuring_client);
-    measuring_client.deinit();
-    measuring_fixture.deinit();
+    const allocation_range = range: {
+        var fixture: BindFixture = undefined;
+        try fixture.init(measuring_allocator.allocator());
+        defer fixture.deinit();
+        const client = try fixture.client(std.testing.allocator);
+        defer {
+            fixture.adapter.destroyClientResources(client.client());
+            client.destroy();
+        }
+        try prepareRegistry(client.client());
+        const allocation_start = measuring_allocator.alloc_index;
+        try registryBind(&fixture.adapter, client.client(), 3, 2);
+        const allocation_end = measuring_allocator.alloc_index;
+        try std.testing.expect(allocation_end > allocation_start);
+        break :range .{ allocation_start, allocation_end };
+    };
     try std.testing.expectEqual(measuring_allocator.allocated_bytes, measuring_allocator.freed_bytes);
 
-    for (allocation_start..allocation_end) |fail_index| {
+    for (allocation_range[0]..allocation_range[1]) |fail_index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-        var fixture: BindFixture = undefined;
-        try fixture.init(failing.allocator());
-        var client = BindFixture.client(std.testing.allocator);
-        failing.fail_index = fail_index;
-        try std.testing.expectError(error.OutOfMemory, fixture.adapter.bind(&client, 2, 2));
-        try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expectEqual(@as(usize, 0), fixture.adapter.managers.items.len);
-        try std.testing.expect(client.lookup(2) == null);
-        client.deinit();
-        failing.fail_index = std.math.maxInt(usize);
-        fixture.deinit();
+        {
+            var fixture: BindFixture = undefined;
+            try fixture.init(failing.allocator());
+            defer fixture.deinit();
+            const client = try fixture.client(std.testing.allocator);
+            defer client.destroy();
+            try prepareRegistry(client.client());
+            try std.testing.expectEqual(allocation_range[0], failing.alloc_index);
+            failing.fail_index = fail_index;
+            defer failing.fail_index = std.math.maxInt(usize);
+            registryBind(&fixture.adapter, client.client(), 3, 2) catch |err|
+                try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(wayring.server.Fatal.Kind.out_of_memory, client.client().fatal().?.kind);
+            try std.testing.expectEqual(@as(usize, 0), fixture.adapter.managers.items.len);
+            try std.testing.expect(client.client().lookup(3) == null);
+        }
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
 }
 
 test "every client materialization failure rolls back manager storage" {
-    var measuring_fixture: BindFixture = undefined;
-    try measuring_fixture.init(std.testing.allocator);
     var measuring_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var measuring_client = BindFixture.client(measuring_allocator.allocator());
-    const allocation_start = measuring_allocator.alloc_index;
-    try measuring_fixture.adapter.bind(&measuring_client, 2, 2);
-    const allocation_end = measuring_allocator.alloc_index;
-    try std.testing.expect(allocation_end > allocation_start);
-    measuring_fixture.adapter.destroyClientResources(&measuring_client);
-    measuring_client.deinit();
-    measuring_fixture.deinit();
-    try std.testing.expectEqual(measuring_allocator.allocated_bytes, measuring_allocator.freed_bytes);
-
-    for (allocation_start..allocation_end) |fail_index| {
+    const allocation_range = range: {
         var fixture: BindFixture = undefined;
         try fixture.init(std.testing.allocator);
+        defer fixture.deinit();
+        const client = try fixture.client(measuring_allocator.allocator());
+        defer {
+            fixture.adapter.destroyClientResources(client.client());
+            client.destroy();
+        }
+        try prepareRegistry(client.client());
+        const allocation_start = measuring_allocator.alloc_index;
+        try registryBind(&fixture.adapter, client.client(), 3, 2);
+        const allocation_end = measuring_allocator.alloc_index;
+        try std.testing.expect(allocation_end > allocation_start);
+        break :range .{ allocation_start, allocation_end };
+    };
+    try std.testing.expectEqual(measuring_allocator.allocated_bytes, measuring_allocator.freed_bytes);
+
+    for (allocation_range[0]..allocation_range[1]) |fail_index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-        var client = BindFixture.client(failing.allocator());
-        failing.fail_index = fail_index;
-        try std.testing.expectError(error.OutOfMemory, fixture.adapter.bind(&client, 2, 2));
-        try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expectEqual(@as(usize, 0), fixture.adapter.managers.items.len);
-        try std.testing.expect(client.lookup(2) == null);
-        failing.fail_index = std.math.maxInt(usize);
-        client.deinit();
-        fixture.deinit();
+        {
+            var fixture: BindFixture = undefined;
+            try fixture.init(std.testing.allocator);
+            defer fixture.deinit();
+            const client = try fixture.client(failing.allocator());
+            defer client.destroy();
+            try prepareRegistry(client.client());
+            try std.testing.expectEqual(allocation_range[0], failing.alloc_index);
+            failing.fail_index = fail_index;
+            defer failing.fail_index = std.math.maxInt(usize);
+            registryBind(&fixture.adapter, client.client(), 3, 2) catch |err|
+                try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            try std.testing.expectEqual(wayring.server.Fatal.Kind.out_of_memory, client.client().fatal().?.kind);
+            try std.testing.expectEqual(@as(usize, 0), fixture.adapter.managers.items.len);
+            try std.testing.expect(client.client().lookup(3) == null);
+        }
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
 }
