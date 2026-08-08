@@ -285,7 +285,12 @@ const TestFixture = struct {
             &self.surface_registry,
         );
         errdefer self.seat.deinit();
-        self.outputs.init(std.testing.allocator, display, &self.surfaces);
+        self.outputs.init(
+            std.testing.allocator,
+            display,
+            &self.surface_registry,
+            &self.surfaces,
+        );
     }
 
     fn deinit(self: *TestFixture) void {

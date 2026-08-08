@@ -25,17 +25,7 @@ owner: VirtualPointerOwner,
 provider: *VirtualPointerOwner.Provider,
 
 pub const Event = VirtualPointerOwner.Event;
-
-pub const Listener = struct {
-    context: *anyopaque,
-    event: *const fn (
-        *anyopaque,
-        *Seat,
-        ?OutputLayout.Id,
-        u64,
-        Event,
-    ) void,
-};
+pub const Listener = VirtualPointerOwner.Listener;
 
 pub fn init(
     self: *Self,
@@ -225,23 +215,23 @@ const Device = struct {
                 event.state,
             ),
             .axis => |axis| {
-                neutral.axis(axis.time, @intFromEnum(axis.axis), axis.value) catch {
+                neutral.axis(axis.time, @intCast(@intFromEnum(axis.axis)), axis.value) catch {
                     resource.postError(.invalid_axis, "invalid virtual pointer axis");
                 };
             },
             .frame => neutral.frame(),
             .axis_source => |source| {
-                neutral.axisSource(@intFromEnum(source.axis_source)) catch {
+                neutral.axisSource(@intCast(@intFromEnum(source.axis_source))) catch {
                     resource.postError(.invalid_axis_source, "invalid virtual pointer axis source");
                 };
             },
             .axis_stop => |stop| {
-                neutral.axisStop(stop.time, @intFromEnum(stop.axis)) catch {
+                neutral.axisStop(stop.time, @intCast(@intFromEnum(stop.axis))) catch {
                     resource.postError(.invalid_axis, "invalid virtual pointer axis");
                 };
             },
             .axis_discrete => |axis| {
-                neutral.axisDiscrete(axis.time, @intFromEnum(axis.axis), axis.value, axis.discrete) catch {
+                neutral.axisDiscrete(axis.time, @intCast(@intFromEnum(axis.axis)), axis.value, axis.discrete) catch {
                     resource.postError(.invalid_axis, "invalid virtual pointer axis");
                 };
             },
@@ -256,7 +246,7 @@ const Device = struct {
         button_code: u32,
         state: wl.Pointer.ButtonState,
     ) void {
-        self.neutral.?.button(time, button_code, @intFromEnum(state)) catch |err| switch (err) {
+        self.neutral.?.button(time, button_code, @intCast(@intFromEnum(state))) catch |err| switch (err) {
             error.OutOfMemory => resource.postNoMemory(),
             error.InvalidButtonState => {},
         };

@@ -122,8 +122,8 @@ pub fn bind(self: *WayringVirtualPointer, client: *wayring.server.Client, id: u3
 fn managerRequest(_: *ManagerResource, request: protocol.zwlr_virtual_pointer_manager_v1.Request, manager: *Manager) !void {
     if (!manager.owner.authorized(manager.client, &manager.resource.runtime)) return;
     switch (request) {
-        .create_virtual_pointer => |args| manager.owner.createDevice(manager, args.seat, null, args.id),
-        .create_virtual_pointer_with_output => |args| manager.owner.createDevice(manager, args.seat, args.output, args.id),
+        .create_virtual_pointer => |args| try manager.owner.createDevice(manager, args.seat, null, args.id),
+        .create_virtual_pointer_with_output => |args| try manager.owner.createDevice(manager, args.seat, args.output, args.id),
         .destroy => manager.owner.destroyManager(manager),
     }
 }
@@ -170,11 +170,11 @@ fn deviceRequest(_: *DeviceResource, request: protocol.zwlr_virtual_pointer_v1.R
             error.OutOfMemory => device.client.postOutOfMemory(&device.resource.runtime, "recording virtual pointer button"),
             error.InvalidButtonState => device.client.postImplementationError(&device.resource.runtime, "invalid virtual pointer button state"),
         },
-        .axis => |args| device.neutral.axis(args.time, args.axis, fixed(args.value)) catch device.invalidAxis(),
+        .axis => |args| device.neutral.axis(args.time, args.axis, fixed(args.value)) catch invalidAxis(device),
         .frame => device.neutral.frame(),
-        .axis_source => |args| device.neutral.axisSource(args.axis_source) catch device.invalidAxisSource(),
-        .axis_stop => |args| device.neutral.axisStop(args.time, args.axis) catch device.invalidAxis(),
-        .axis_discrete => |args| device.neutral.axisDiscrete(args.time, args.axis, fixed(args.value), args.discrete) catch device.invalidAxis(),
+        .axis_source => |args| device.neutral.axisSource(args.axis_source) catch invalidAxisSource(device),
+        .axis_stop => |args| device.neutral.axisStop(args.time, args.axis) catch invalidAxis(device),
+        .axis_discrete => |args| device.neutral.axisDiscrete(args.time, args.axis, fixed(args.value), args.discrete) catch invalidAxis(device),
         .destroy => device.owner.destroyDevice(device),
     }
 }
