@@ -60,14 +60,6 @@ pub fn scheduler(self: *Self) NeutralIdleNotification.Scheduler {
     return .{ .context = self, .arm = armTimer };
 }
 
-pub fn notifyActivity(self: *Self, seat: *Seat) void {
-    self.core.observeActivity(NeutralIdleNotification.SeatRef.fromPointer(seat)) catch self.fail();
-}
-
-pub fn setInhibited(self: *Self, inhibited: bool) void {
-    self.core.setInhibited(inhibited) catch self.fail();
-}
-
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
     const resource = ext.IdleNotifierV1.create(client, version, id) catch {
         client.postNoMemory();
@@ -170,7 +162,7 @@ fn handleTimer(self: *Self) c_int {
     return 0;
 }
 
-fn armTimer(
+pub fn armTimer(
     context: *anyopaque,
     delay: NeutralIdleNotification.TimerDelay,
     generation: NeutralIdleNotification.TimerGeneration,

@@ -19,6 +19,11 @@ const log = std.log.scoped(.wayring_host);
 const submission_capacity = 64;
 const route_capacity = submission_capacity * 2;
 
+pub const Alarm = struct {
+    context: *anyopaque,
+    fired: *const fn (*anyopaque, u64) void,
+};
+
 pub const ClientLifecycle = struct {
     context: *anyopaque,
     accepted: *const fn (*anyopaque, *server.Client) anyerror!void,
@@ -34,7 +39,11 @@ const AddConnectionResult = enum { published, rejected };
 
 const Route = struct {
     external: u64,
-    token: wayring.io_uring.OperationToken,
+    operation: union(enum) {
+        transport: wayring.io_uring.OperationToken,
+        alarm_poll,
+        alarm_cancel,
+    },
 };
 
 const ManagedConnection = struct {
@@ -65,12 +74,16 @@ allocator: std.mem.Allocator,
 lifecycle: ClientLifecycle,
 transport: wayring.io_uring.Server,
 ring: linux.IoUring,
+alarm_fd: i32,
 event_source: ?*wl.EventSource,
 connections: std.ArrayList(*ManagedConnection) = .empty,
 routes: [route_capacity]Route = undefined,
 route_count: usize = 0,
 next_external: u64 = 1,
 submission_pending: bool = false,
+alarm_callback: ?Alarm = null,
+alarm_generation: ?u64 = null,
+alarm_poll_active: ?u64 = null,
 shutting_down: bool = false,
 failure_value: ?anyerror = null,
 acceptance_fault: if (builtin.is_test) ?AcceptanceFault else void,
@@ -105,11 +118,19 @@ pub fn createWithOptions(
     errdefer self.transport.deinit() catch {};
     self.ring = try linux.IoUring.init(submission_capacity, 0);
     errdefer self.ring.deinit();
+    self.alarm_fd = try linuxFd(linux.timerfd_create(.MONOTONIC, .{
+        .CLOEXEC = true,
+        .NONBLOCK = true,
+    }));
+    errdefer _ = linux.close(self.alarm_fd);
     self.event_source = null;
     self.connections = .empty;
     self.route_count = 0;
     self.next_external = 1;
     self.submission_pending = false;
+    self.alarm_callback = null;
+    self.alarm_generation = null;
+    self.alarm_poll_active = null;
     self.shutting_down = false;
     self.failure_value = null;
     self.acceptance_fault = if (builtin.is_test) null else {};
@@ -122,6 +143,7 @@ pub fn createWithOptions(
         self,
     );
     errdefer self.event_source.?.remove();
+    try self.ensureAlarmPoll();
     self.prepareAndSubmit() catch |err| self.fail(err);
     return self;
 }
@@ -184,6 +206,7 @@ fn finishDestroy(self: *WayringHost) !void {
         if (err != error.SocketCleanupFailed) fatalDestroy(err);
         transport_failure = error.SocketCleanupFailed;
     };
+    _ = linux.close(self.alarm_fd);
     self.ring.deinit();
     self.connections.deinit(self.allocator);
     const host_failure = self.failure_value;
@@ -211,9 +234,113 @@ pub fn failure(self: *const WayringHost) ?anyerror {
     return self.failure_value;
 }
 
+/// Installs the host-level one-shot notification endpoint. The callback may
+/// rearm the alarm. It is never called for canceled or superseded operations.
+pub fn setAlarmCallback(self: *WayringHost, callback: ?Alarm) void {
+    self.alarm_callback = callback;
+}
+
+/// Arms a monotonic relative one-shot timeout. `null` disarms it; a present
+/// delay must be positive. The generation is opaque and returned unchanged.
+pub fn armAlarm(self: *WayringHost, delay_ns: ?u64, generation: u64) !void {
+    if (self.shutting_down) return error.HostShuttingDown;
+    if (delay_ns == 0) return error.InvalidAlarmDelay;
+
+    // Disarm before draining so an old expiry cannot race between the drain
+    // and replacement. Updating this fd allocates no io_uring route, so input
+    // bursts can rearm indefinitely while the one poll remains outstanding.
+    try setAlarmTimer(self.alarm_fd, null);
+    _ = try drainAlarm(self.alarm_fd);
+    if (delay_ns) |delay| try setAlarmTimer(self.alarm_fd, delay);
+    self.alarm_generation = if (delay_ns != null) generation else null;
+}
+
+fn cancelAlarm(self: *WayringHost) !void {
+    self.alarm_generation = null;
+    setAlarmTimer(self.alarm_fd, null) catch |err| self.recordFailure(err);
+    const target = self.alarm_poll_active orelse return;
+    if (self.route_count == self.routes.len) return error.RouteCapacityExhausted;
+    const external = try self.takeExternal();
+    _ = self.ring.poll_remove(external, target) catch |err| switch (err) {
+        error.SubmissionQueueFull => {
+            try self.submitPending();
+            _ = try self.ring.poll_remove(external, target);
+        },
+    };
+    self.routes[self.route_count] = .{ .external = external, .operation = .alarm_cancel };
+    self.route_count += 1;
+    self.submission_pending = true;
+    self.alarm_poll_active = null;
+}
+
+fn takeExternal(self: *WayringHost) !u64 {
+    const external = self.next_external;
+    self.next_external +%= 1;
+    if (self.next_external == 0) return error.ExternalUserDataExhausted;
+    return external;
+}
+
+fn ensureAlarmPoll(self: *WayringHost) !void {
+    if (self.shutting_down or self.alarm_poll_active != null) return;
+    if (self.route_count == self.routes.len) return error.RouteCapacityExhausted;
+    const external = try self.takeExternal();
+    _ = try self.ring.poll_add(external, self.alarm_fd, linux.POLL.IN);
+    self.routes[self.route_count] = .{ .external = external, .operation = .alarm_poll };
+    self.route_count += 1;
+    self.submission_pending = true;
+    self.alarm_poll_active = external;
+}
+
+fn setAlarmTimer(fd: i32, delay_ns: ?u64) !void {
+    const zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
+    const value = if (delay_ns) |delay| alarmTime(delay) else zero;
+    const spec: linux.itimerspec = .{ .it_interval = zero, .it_value = value };
+    try linuxVoid(linux.timerfd_settime(fd, .{ .ABSTIME = false }, &spec, null));
+}
+
+fn alarmTime(delay_ns: u64) linux.timespec {
+    std.debug.assert(delay_ns > 0);
+    return .{
+        .sec = @intCast(delay_ns / std.time.ns_per_s),
+        .nsec = @intCast(delay_ns % std.time.ns_per_s),
+    };
+}
+
+fn drainAlarm(fd: i32) !bool {
+    var expirations: u64 = 0;
+    var expired = false;
+    while (true) {
+        const result = linux.read(fd, @ptrCast(&expirations), @sizeOf(u64));
+        switch (linux.errno(result)) {
+            .SUCCESS => {
+                if (result != @sizeOf(u64)) return error.AlarmReadFailed;
+                expired = true;
+            },
+            .AGAIN => return expired,
+            .INTR => continue,
+            else => return error.AlarmReadFailed,
+        }
+    }
+}
+
+fn linuxFd(result: usize) !i32 {
+    return switch (linux.errno(result)) {
+        .SUCCESS => @intCast(result),
+        else => error.LinuxSyscallFailed,
+    };
+}
+
+fn linuxVoid(result: usize) !void {
+    return switch (linux.errno(result)) {
+        .SUCCESS => {},
+        else => error.LinuxSyscallFailed,
+    };
+}
+
 pub fn beginShutdown(self: *WayringHost) void {
     if (!self.shutting_down) {
         self.shutting_down = true;
+        self.cancelAlarm() catch |err| self.recordFailure(err);
         self.transport.beginShutdown();
     }
     self.releaseReady(true) catch |err| self.recordFailure(err);
@@ -250,14 +377,17 @@ fn dispatchReady(self: *WayringHost) !void {
 
 fn prepareAndSubmit(self: *WayringHost) !void {
     try self.submitPending();
-    while (self.route_count < self.routes.len) {
+    // Keep one route available for poll_remove while the persistent alarm
+    // poll is live. Once shutdown has queued that cancellation, transport
+    // teardown may use the complete route table.
+    const route_limit = if (self.shutting_down) self.routes.len else self.routes.len - 1;
+    while (self.route_count < route_limit) {
         switch (try self.transport.prepareNext(&self.ring, self.next_external)) {
             .prepared => |token| {
-                self.routes[self.route_count] = .{ .external = self.next_external, .token = token };
+                self.routes[self.route_count] = .{ .external = self.next_external, .operation = .{ .transport = token } };
                 self.route_count += 1;
                 self.submission_pending = true;
-                self.next_external +%= 1;
-                if (self.next_external == 0) return error.ExternalUserDataExhausted;
+                _ = try self.takeExternal();
             },
             .idle => break,
             .submission_queue_full => {
@@ -290,7 +420,31 @@ fn completeBatch(self: *WayringHost, cqes: []const linux.io_uring_cqe) !void {
 }
 
 fn completeOne(self: *WayringHost, cqe: linux.io_uring_cqe) !void {
-    const token = self.takeRoute(cqe.user_data) orelse return error.UnknownCompletion;
+    const route = self.takeRoute(cqe.user_data) orelse return error.UnknownCompletion;
+    switch (route.operation) {
+        .alarm_poll => {
+            if (self.alarm_poll_active != route.external) return;
+            self.alarm_poll_active = null;
+            if (cqe.res == -@as(i32, @intFromEnum(linux.E.CANCELED))) return;
+            if (cqe.res < 0) return error.AlarmFailed;
+            const expired = try drainAlarm(self.alarm_fd);
+            const generation = if (expired) self.alarm_generation else null;
+            if (expired) self.alarm_generation = null;
+            try self.ensureAlarmPoll();
+            if (!self.shutting_down) if (generation) |value| if (self.alarm_callback) |callback|
+                callback.fired(callback.context, value);
+            return;
+        },
+        .alarm_cancel => {
+            if (cqe.res < 0 and cqe.res != -@as(i32, @intFromEnum(linux.E.ALREADY)) and
+                cqe.res != -@as(i32, @intFromEnum(linux.E.NOENT))) return error.AlarmCancellationFailed;
+            return;
+        },
+        .transport => |token| return self.completeTransport(token, cqe),
+    }
+}
+
+fn completeTransport(self: *WayringHost, token: wayring.io_uring.OperationToken, cqe: linux.io_uring_cqe) !void {
     const completed = try self.transport.complete(token, cqe.res, cqe.flags);
     switch (completed) {
         .accepted => |connection| _ = try self.addConnection(connection),
@@ -407,13 +561,12 @@ fn releaseReady(self: *WayringHost, release_all: bool) !void {
     if (first_failure) |err| return err;
 }
 
-fn takeRoute(self: *WayringHost, external: u64) ?wayring.io_uring.OperationToken {
+fn takeRoute(self: *WayringHost, external: u64) ?Route {
     for (self.routes[0..self.route_count], 0..) |route, index| {
         if (route.external != external) continue;
-        const token = route.token;
         self.routes[index] = self.routes[self.route_count - 1];
         self.route_count -= 1;
-        return token;
+        return route;
     }
     return null;
 }
@@ -425,6 +578,69 @@ fn fail(self: *WayringHost, err: anyerror) void {
 
 fn recordFailure(self: *WayringHost, err: anyerror) void {
     if (self.failure_value == null) self.failure_value = err;
+}
+
+test "stale alarm poll completions are harmless" {
+    var host: WayringHost = undefined;
+    host.route_count = 1;
+    host.routes[0] = .{ .external = 41, .operation = .alarm_poll };
+    host.alarm_generation = std.math.maxInt(u64);
+    host.alarm_poll_active = 42;
+    host.shutting_down = false;
+
+    try host.completeOne(.{ .user_data = 41, .res = 0, .flags = 0 });
+    try std.testing.expectEqual(std.math.maxInt(u64), host.alarm_generation.?);
+    try std.testing.expectEqual(@as(?u64, 42), host.alarm_poll_active);
+    try std.testing.expectEqual(@as(usize, 0), host.route_count);
+}
+
+test "alarm nanoseconds preserve positive boundaries and maximum delay" {
+    try std.testing.expectEqual(linux.timespec{ .sec = 0, .nsec = 1 }, alarmTime(1));
+    try std.testing.expectEqual(
+        linux.timespec{ .sec = 1, .nsec = 0 },
+        alarmTime(std.time.ns_per_s),
+    );
+    try std.testing.expectEqual(
+        linux.timespec{
+            .sec = @intCast(std.math.maxInt(u64) / std.time.ns_per_s),
+            .nsec = @intCast(std.math.maxInt(u64) % std.time.ns_per_s),
+        },
+        alarmTime(std.math.maxInt(u64)),
+    );
+}
+
+test "alarm cancellation completion drains its route" {
+    var host: WayringHost = undefined;
+    host.route_count = 1;
+    host.routes[0] = .{ .external = 52, .operation = .alarm_cancel };
+    host.shutting_down = true;
+
+    try host.completeOne(.{ .user_data = 52, .res = 0, .flags = 0 });
+    try std.testing.expectEqual(@as(usize, 0), host.route_count);
+}
+
+test "normal route reservation leaves capacity to cancel alarm poll" {
+    var host: WayringHost = undefined;
+    host.ring = try linux.IoUring.init(submission_capacity, 0);
+    defer host.ring.deinit();
+    host.alarm_fd = try linuxFd(linux.timerfd_create(.MONOTONIC, .{
+        .CLOEXEC = true,
+        .NONBLOCK = true,
+    }));
+    defer _ = linux.close(host.alarm_fd);
+    host.route_count = host.routes.len - 1;
+    host.next_external = 2;
+    host.submission_pending = false;
+    host.alarm_generation = 7;
+    host.alarm_poll_active = 1;
+
+    try host.cancelAlarm();
+    try std.testing.expectEqual(host.routes.len, host.route_count);
+    switch (host.routes[host.routes.len - 1].operation) {
+        .alarm_cancel => {},
+        else => return error.ExpectedAlarmCancelRoute,
+    }
+    try std.testing.expectEqual(@as(?u64, null), host.alarm_poll_active);
 }
 
 const TestClient = struct {
@@ -942,7 +1158,7 @@ test "destroy drains resources and routes after a completion error" {
     try std.testing.expectEqual(@as(usize, 0), routes_before_return);
     try std.testing.expectEqual(@as(usize, 0), connections_before_return);
     try std.testing.expect(transport_drained_before_return);
-    try std.testing.expectEqual(error.UnexpectedCancellationResult, destroy_failure.?);
+    try std.testing.expectEqual(error.AlarmCancellationFailed, destroy_failure.?);
 }
 
 test "completion read failure and stalled destroy are undrainable without repeated callbacks" {

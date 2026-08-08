@@ -113,6 +113,7 @@ const WayringOutput = @import("wayland/WayringOutput.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
+const IdleAlarmHost = @import("wayland/WayringHost.zig");
 const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
 const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
 const WayringSessionLock = @import("wayland/WayringSessionLock.zig");
@@ -360,6 +361,7 @@ keyboard_shortcuts_inhibit: KeyboardShortcutsInhibit,
 idle_notification: NeutralIdleNotification,
 idle_notify: IdleNotify,
 idle_notify_initialized: bool,
+idle_alarm_host: ?*IdleAlarmHost,
 compositor: Compositor,
 subcompositor: Subcompositor,
 scene: Scene,
@@ -1197,6 +1199,7 @@ pub fn createWithVirtualOutput(
         .idle_notification = undefined,
         .idle_notify = undefined,
         .idle_notify_initialized = false,
+        .idle_alarm_host = null,
         .compositor = undefined,
         .subcompositor = undefined,
         .scene = undefined,
@@ -1625,7 +1628,7 @@ pub fn createWithVirtualOutput(
         allocator,
         &self.client_registry,
         self.idle_notify.clock(),
-        self.idle_notify.scheduler(),
+        .{ .context = self, .arm = scheduleIdleAlarm },
     );
     errdefer self.idle_notification.deinit();
     try self.client_registry.addDisconnectListener(.{
@@ -6558,10 +6561,59 @@ fn idleNotificationSeatDestroyed(context: *anyopaque, seat: *Seat) void {
 
 fn refreshIdleInhibition(self: *Self) void {
     if (!self.idle_notify_initialized) return;
-    self.idle_notify.setInhibited(self.idle_inhibit.hasVisibleInhibitor(
+    self.setIdleInhibited(self.idle_inhibit.hasVisibleInhibitor(
         self,
         idleInhibitorSurfaceVisible,
     ));
+}
+
+pub fn neutralIdleNotification(self: *Self) *NeutralIdleNotification {
+    return &self.idle_notification;
+}
+
+pub fn idleNotificationFrontendFailed(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.terminate();
+}
+
+pub fn attachIdleAlarmHost(self: *Self, host: *IdleAlarmHost) error{ ScheduleFailed, TimerGenerationExhausted }!void {
+    std.debug.assert(self.idle_alarm_host == null);
+    host.setAlarmCallback(.{ .context = self, .fired = idleHostAlarmFired });
+    self.idle_alarm_host = host;
+    self.idle_notification.rearm() catch |err| {
+        self.idle_alarm_host = null;
+        host.setAlarmCallback(null);
+        return err;
+    };
+}
+
+pub fn detachIdleAlarmHost(self: *Self, host: *IdleAlarmHost) error{ ScheduleFailed, TimerGenerationExhausted }!void {
+    std.debug.assert(self.idle_alarm_host == host);
+    self.idle_alarm_host = null;
+    try self.idle_notification.rearm();
+    host.armAlarm(null, 0) catch return error.ScheduleFailed;
+    host.setAlarmCallback(null);
+}
+
+fn scheduleIdleAlarm(context: *anyopaque, delay: NeutralIdleNotification.TimerDelay, generation: NeutralIdleNotification.TimerGeneration) error{ScheduleFailed}!void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    if (self.idle_alarm_host) |host| {
+        const host_delay: ?u64 = if (delay) |value| @intCast(value) else null;
+        host.armAlarm(host_delay, generation) catch return error.ScheduleFailed;
+    } else try IdleNotify.armTimer(&self.idle_notify, delay, generation);
+}
+
+fn idleHostAlarmFired(context: *anyopaque, generation: u64) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    _ = self.idle_notification.timerFired(generation) catch self.terminate();
+}
+
+fn observeIdleActivity(self: *Self, seat: *Seat) void {
+    self.idle_notification.observeActivity(NeutralIdleNotification.SeatRef.fromPointer(seat)) catch self.terminate();
+}
+
+fn setIdleInhibited(self: *Self, inhibited: bool) void {
+    self.idle_notification.setInhibited(inhibited) catch self.terminate();
 }
 
 fn idleInhibitorSurfaceVisible(context: *anyopaque, surface_id: Surface.Id) bool {
@@ -6901,7 +6953,7 @@ fn nativePointerButton(context: *anyopaque, id: NativeInput.DeviceId, time: u32,
 fn nativePointerAxis(context: *anyopaque, id: NativeInput.DeviceId, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
     const self = serverForOutput(context);
     const seat = self.seatForDevice(id);
-    self.idle_notify.notifyActivity(seat);
+    self.observeIdleActivity(seat);
     seat.pointerAxis(time, axis, value);
 }
 fn nativePointerFrame(context: *anyopaque, id: NativeInput.DeviceId) void {
@@ -6925,7 +6977,7 @@ fn nativeSwipeBegin(context: *anyopaque, id: NativeInput.DeviceId, time: u32, fi
 fn nativeSwipeUpdate(context: *anyopaque, id: NativeInput.DeviceId, time: u32, dx: f64, dy: f64) void {
     const self = serverForOutput(context);
     const seat = self.gestureSeat(id, .swipe) orelse return;
-    self.idle_notify.notifyActivity(seat);
+    self.observeIdleActivity(seat);
     self.pointer_gestures.updateSwipe(seat, time, dx, dy);
 }
 fn nativeSwipeEnd(context: *anyopaque, id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
@@ -6945,7 +6997,7 @@ fn nativePinchUpdate(
 ) void {
     const self = serverForOutput(context);
     const seat = self.gestureSeat(id, .pinch) orelse return;
-    self.idle_notify.notifyActivity(seat);
+    self.observeIdleActivity(seat);
     self.pointer_gestures.updatePinch(seat, time, dx, dy, scale, rotation);
 }
 fn nativePinchEnd(context: *anyopaque, id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
@@ -6972,7 +7024,7 @@ fn nativeTabletToolProximity(
     const info = self.native_input.tabletToolInfo(tool_id) orelse return;
     const target = if (in_proximity) tabletFocus(output, x, y) else null;
     const routed_axes = tabletAxesRoute(output, axes).axes;
-    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.observeIdleActivity(self.seatForDevice(device_id));
     self.tablet.proximity(
         device_id,
         info,
@@ -6992,7 +7044,7 @@ fn nativeTabletToolAxis(
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
     const route = tabletAxesRoute(output, axes);
-    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.observeIdleActivity(self.seatForDevice(device_id));
     self.tablet.axis(device_id, tool_id, time, route.focus, route.axes);
 }
 fn nativeTabletToolTip(
@@ -7006,7 +7058,7 @@ fn nativeTabletToolTip(
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
     const route = tabletAxesRoute(output, axes);
-    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.observeIdleActivity(self.seatForDevice(device_id));
     self.tablet.tip(device_id, tool_id, time, route.focus, route.axes, down);
 }
 fn nativeTabletToolButton(
@@ -7021,7 +7073,7 @@ fn nativeTabletToolButton(
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
     const route = tabletAxesRoute(output, axes);
-    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.observeIdleActivity(self.seatForDevice(device_id));
     self.tablet.button(
         device_id,
         tool_id,
@@ -7043,7 +7095,7 @@ fn nativeTabletPadButton(
     mode: u32,
 ) void {
     const self = serverForOutput(context);
-    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.observeIdleActivity(self.seatForDevice(device_id));
     self.tablet.padButton(device_id, time, button, pressed, group, mode);
 }
 
@@ -7058,7 +7110,7 @@ fn nativeTabletPadRing(
     mode: u32,
 ) void {
     const self = serverForOutput(context);
-    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.observeIdleActivity(self.seatForDevice(device_id));
     self.tablet.padRing(device_id, time, ring, position, finger, group, mode);
 }
 
@@ -7073,7 +7125,7 @@ fn nativeTabletPadStrip(
     mode: u32,
 ) void {
     const self = serverForOutput(context);
-    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.observeIdleActivity(self.seatForDevice(device_id));
     self.tablet.padStrip(device_id, time, strip, position, finger, group, mode);
 }
 
@@ -7087,7 +7139,7 @@ fn nativeTabletPadDial(
     mode: u32,
 ) void {
     const self = serverForOutput(context);
-    self.idle_notify.notifyActivity(self.seatForDevice(device_id));
+    self.observeIdleActivity(self.seatForDevice(device_id));
     self.tablet.padDial(device_id, time, dial, value120, group, mode);
 }
 
@@ -7155,7 +7207,7 @@ fn routeKeyboardKey(
     state: wl.Keyboard.KeyState,
 ) void {
     const seat = self.seatForDevice(device_id);
-    self.idle_notify.notifyActivity(seat);
+    self.observeIdleActivity(seat);
     if (state == .pressed and self.window_transitions.items.len != 0) {
         finishAllWindowTransitions(self);
         requestRepaint(self);
@@ -7229,7 +7281,7 @@ fn routePointerButtonFromSource(
     button: u32,
     state: wl.Pointer.ButtonState,
 ) void {
-    self.idle_notify.notifyActivity(seat);
+    self.observeIdleActivity(seat);
     if (state == .pressed and self.window_transitions.items.len != 0) {
         finishAllWindowTransitions(self);
         requestRepaint(self);
@@ -7320,7 +7372,7 @@ fn beginGesture(
         .seat = seat,
         .kind = kind,
     }) catch return self.terminate();
-    self.idle_notify.notifyActivity(seat);
+    self.observeIdleActivity(seat);
     switch (kind) {
         .swipe => self.pointer_gestures.beginSwipe(seat, time, fingers),
         .pinch => self.pointer_gestures.beginPinch(seat, time, fingers),
@@ -7338,7 +7390,7 @@ fn endGesture(
     for (self.routed_gestures.items, 0..) |routed, index| {
         if (routed.device_id != device_id or routed.kind != kind) continue;
         _ = self.routed_gestures.orderedRemove(index);
-        self.idle_notify.notifyActivity(routed.seat);
+        self.observeIdleActivity(routed.seat);
         self.sendGestureEnd(routed.seat, time, kind, cancelled);
         return;
     }
@@ -7409,7 +7461,7 @@ fn routeTouchDown(
         requestRepaint(self);
     }
     const seat = self.seatForDevice(device_id);
-    self.idle_notify.notifyActivity(seat);
+    self.observeIdleActivity(seat);
     const protocol_id = self.allocateTouchId(seat);
     self.routed_touches.append(self.allocator, .{
         .device_id = device_id,
@@ -7462,7 +7514,7 @@ fn routeTouchDown(
 fn routeTouchUp(self: *Self, device_id: NativeInput.DeviceId, time: u32, native_id: i32) void {
     for (self.routed_touches.items, 0..) |touch, index| {
         if (touch.device_id != device_id or touch.native_id != native_id) continue;
-        self.idle_notify.notifyActivity(touch.seat);
+        self.observeIdleActivity(touch.seat);
         _ = self.routed_touches.orderedRemove(index);
         touch.seat.touchUp(time, touch.protocol_id);
         return;
@@ -7480,7 +7532,7 @@ fn routeTouchMotion(
 ) void {
     for (self.routed_touches.items) |touch| {
         if (touch.device_id != device_id or touch.native_id != native_id) continue;
-        self.idle_notify.notifyActivity(touch.seat);
+        self.observeIdleActivity(touch.seat);
         const point = output.globalPoint(x, y);
         touch.seat.touchMotion(time, touch.protocol_id, point.x, point.y);
         return;
@@ -7563,7 +7615,7 @@ fn keyboardKey(
     state: wl.Keyboard.KeyState,
 ) void {
     const self = serverForOutput(context);
-    self.idle_notify.notifyActivity(&self.seat);
+    self.observeIdleActivity(&self.seat);
     if (state == .pressed and self.window_transitions.items.len != 0) {
         finishAllWindowTransitions(self);
         requestRepaint(self);
@@ -7667,7 +7719,7 @@ fn pointerMotionGlobalForSeat(
     x: f64,
     y: f64,
 ) void {
-    self.idle_notify.notifyActivity(seat);
+    self.observeIdleActivity(seat);
     if (self.session_lock.isLocked()) {
         seat.pointerMotion(
             time,
@@ -7908,14 +7960,14 @@ fn virtualPointerEvent(
             button.state,
         ),
         .axis => |axis| {
-            self.idle_notify.notifyActivity(seat);
+            self.observeIdleActivity(seat);
             seat.pointerAxis(axis.time, axis.axis, axis.value);
         },
         .frame => seat.pointerFrame(),
         .axis_source => |axis_source| seat.pointerAxisSource(axis_source),
         .axis_stop => |stop| seat.pointerAxisStop(stop.time, stop.axis),
         .axis_discrete => |axis| {
-            self.idle_notify.notifyActivity(seat);
+            self.observeIdleActivity(seat);
             seat.pointerAxisDiscrete(axis.axis, axis.discrete);
             seat.pointerAxisValue120(axis.axis, axis.discrete *| 120);
             seat.pointerAxis(axis.time, axis.axis, axis.value);
@@ -7961,7 +8013,7 @@ fn pointerButton(
     state: wl.Pointer.ButtonState,
 ) void {
     const self = serverForOutput(context);
-    self.idle_notify.notifyActivity(&self.seat);
+    self.observeIdleActivity(&self.seat);
     self.pointerButtonForSeat(&self.seat, time, button, state);
 }
 
@@ -8425,7 +8477,7 @@ fn routeActiveDrag(
 
 fn pointerAxis(context: *anyopaque, time: u32, axis: wl.Pointer.Axis, value: wl.Fixed) void {
     const self = serverForOutput(context);
-    self.idle_notify.notifyActivity(&self.seat);
+    self.observeIdleActivity(&self.seat);
     self.seat.pointerAxis(time, axis, value);
 }
 
@@ -8475,7 +8527,7 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
         finishAllWindowTransitions(self);
         requestRepaint(self);
     }
-    self.idle_notify.notifyActivity(&self.seat);
+    self.observeIdleActivity(&self.seat);
     const point = output.globalPoint(x, y);
     const route = self.pointerRoute(point.x, point.y);
     const focus = route.focus;
@@ -8518,14 +8570,14 @@ fn touchDown(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
 
 fn touchUp(context: *anyopaque, time: u32, id: i32) void {
     const self = serverForOutput(context);
-    self.idle_notify.notifyActivity(&self.seat);
+    self.observeIdleActivity(&self.seat);
     self.seat.touchUp(time, id);
 }
 
 fn touchMotion(context: *anyopaque, time: u32, id: i32, x: f64, y: f64) void {
     const output: *RenderOutput = @ptrCast(@alignCast(context));
     const self = output.server;
-    self.idle_notify.notifyActivity(&self.seat);
+    self.observeIdleActivity(&self.seat);
     const point = output.globalPoint(x, y);
     self.seat.touchMotion(time, id, point.x, point.y);
 }
@@ -18408,6 +18460,7 @@ const WayringXdgClient = struct {
     expect_data_control: bool = false,
     expect_virtual_keyboard: bool = false,
     expect_layer_shell: bool = false,
+    expect_idle_notify: bool = false,
     expect_session_lock: bool = false,
     guessed_data_control_name: ?u32 = null,
     guessed_virtual_keyboard_name: ?u32 = null,
@@ -18463,6 +18516,10 @@ const WayringXdgClient = struct {
     layer_shell_version: u32 = 0,
     layer_shell_name: u32 = 0,
     layer_shell_removed: bool = false,
+    idle_notifier_count: usize = 0,
+    idle_notifier_version: u32 = 0,
+    idle_notifier_name: u32 = 0,
+    idle_notifier_removed: bool = false,
     session_lock_manager_count: usize = 0,
     session_lock_manager_version: u32 = 0,
     session_lock_manager_name: u32 = 0,
@@ -18515,6 +18572,7 @@ const WayringXdgClient = struct {
         .{ .name = "zwp_input_method_manager_v2", .version = 1 },
         .{ .name = "zwp_virtual_keyboard_manager_v1", .version = 1 },
         .{ .name = "zwlr_layer_shell_v1", .version = 5 },
+        .{ .name = "ext_idle_notifier_v1", .version = 2 },
         .{ .name = "ext_session_lock_manager_v1", .version = 1 },
     };
 
@@ -18524,6 +18582,7 @@ const WayringXdgClient = struct {
             @intFromBool(!self.expect_input_method) -
             @intFromBool(!self.expect_virtual_keyboard) -
             @intFromBool(!self.expect_layer_shell) -
+            @intFromBool(!self.expect_idle_notify) -
             @intFromBool(!self.expect_session_lock);
     }
 
@@ -18540,6 +18599,8 @@ const WayringXdgClient = struct {
                 self.expect_virtual_keyboard
             else if (std.mem.eql(u8, global.name, "zwlr_layer_shell_v1"))
                 self.expect_layer_shell
+            else if (std.mem.eql(u8, global.name, "ext_idle_notifier_v1"))
+                self.expect_idle_notify
             else if (std.mem.eql(u8, global.name, "ext_session_lock_manager_v1"))
                 self.expect_session_lock
             else
@@ -18936,6 +18997,10 @@ const WayringXdgClient = struct {
                     self.layer_shell_version = global.version;
                     self.layer_shell_name = global.name;
                     self.layer_shell = registry.bind(global.name, client_zwlr.LayerShellV1, 5) catch null;
+                } else if (std.mem.eql(u8, interface, "ext_idle_notifier_v1")) {
+                    self.idle_notifier_count += 1;
+                    self.idle_notifier_version = global.version;
+                    self.idle_notifier_name = global.name;
                 } else if (std.mem.eql(u8, interface, "ext_session_lock_manager_v1")) {
                     self.session_lock_manager_count += 1;
                     self.session_lock_manager_version = global.version;
@@ -18961,6 +19026,8 @@ const WayringXdgClient = struct {
                     self.virtual_keyboard_manager_removed = true;
                 if (removed.name == self.layer_shell_name)
                     self.layer_shell_removed = true;
+                if (removed.name == self.idle_notifier_name)
+                    self.idle_notifier_removed = true;
                 if (removed.name == self.session_lock_manager_name)
                     self.session_lock_manager_removed = true;
             },
@@ -20120,6 +20187,7 @@ const MatureIdleNotifyClient = struct {
     notifier_global_version: u32 = 0,
     idled_count: u8 = 0,
     resumed_count: u8 = 0,
+    timeout_ms: u32 = 20,
 
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
@@ -20160,7 +20228,7 @@ const MatureIdleNotifyClient = struct {
         const notifier = self.notifier orelse return error.IdleNotifierMissing;
         defer notifier.destroy();
         if (notifier.getVersion() != 2) return error.IdleNotifierVersionMismatch;
-        const notification = try notifier.getIdleNotification(20, seat);
+        const notification = try notifier.getIdleNotification(self.timeout_ms, seat);
         notification.setListener(*@This(), notificationEvent, self);
         while (self.idled_count == 0)
             if (display.dispatch() != .SUCCESS) return error.WaylandDispatchFailed;
@@ -25655,6 +25723,7 @@ test "production Wayring XDG publication accepts a real registry client and surv
 
 test "production generated data device completes the exact profile and supports unpublish" {
     const WayringHost = @import("wayland/WayringHost.zig");
+    const WayringIdleNotification = @import("wayland/WayringIdleNotification.zig");
     const WayringDataControl = @import("wayland/WayringDataControl.zig");
     const WayringTextInput = @import("wayland/WayringTextInput.zig");
     const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
@@ -25950,6 +26019,20 @@ test "production generated data device completes the exact profile and supports 
         if (session_lock.global != null) session_lock.unpublish();
         session_lock.deinit();
     }
+    var idle_notify: WayringIdleNotification = undefined;
+    idle_notify.init(
+        std.testing.allocator,
+        &protocol_server,
+        &clients,
+        &seat,
+        NeutralIdleNotification.SeatRef.fromPointer(server.canonicalSeat()),
+        server.neutralIdleNotification(),
+        .{ .context = server, .failed = Self.idleNotificationFrontendFailed },
+    );
+    defer {
+        if (idle_notify.global != null) idle_notify.unpublish();
+        idle_notify.deinit();
+    }
 
     const Lifecycle = struct {
         const FatalEvidence = struct {
@@ -25985,6 +26068,7 @@ test "production generated data device completes the exact profile and supports 
         input_method: *WayringInputMethod,
         virtual_keyboard: *WayringVirtualKeyboard,
         layer_shell: *WayringLayerShell,
+        idle_notify: *WayringIdleNotification,
         session_lock: *WayringSessionLock,
         generated_client: ?ClientRegistry.Id = null,
         generated_raw: ?*wayring.server.Client = null,
@@ -26007,6 +26091,7 @@ test "production generated data device completes the exact profile and supports 
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.session_lock.destroyClientResources(client);
+            self.idle_notify.destroyClientResources(client);
             self.layer_shell.destroyClientResources(client);
             if (client.fatal()) |fatal| {
                 const provenance = client.transportProvenance();
@@ -26070,6 +26155,7 @@ test "production generated data device completes the exact profile and supports 
         .input_method = &input_method,
         .virtual_keyboard = &virtual_keyboard,
         .layer_shell = &layer_shell,
+        .idle_notify = &idle_notify,
         .session_lock = &session_lock,
     };
     const GlobalFilter = struct {
@@ -26094,6 +26180,9 @@ test "production generated data device completes the exact profile and supports 
     );
     var host_live = true;
     defer if (host_live) host.destroy() catch {};
+    try server.attachIdleAlarmHost(host);
+    var idle_alarm_attached = true;
+    defer if (idle_alarm_attached) server.detachIdleAlarmHost(host) catch {};
 
     const raw_command_fd = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_command_fd) != .SUCCESS) return error.EventFdFailed;
@@ -26133,9 +26222,11 @@ test "production generated data device completes the exact profile and supports 
 
     peer.expect_virtual_keyboard = true;
     peer.expect_layer_shell = true;
+    peer.expect_idle_notify = true;
     peer.expect_session_lock = true;
     try virtual_keyboard.publish();
     try layer_shell.publish();
+    try idle_notify.publish();
     try session_lock.publish();
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .manager_added);
@@ -26143,11 +26234,49 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(@as(usize, 1), peer.virtual_keyboard_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.virtual_keyboard_manager_version);
-    try std.testing.expectEqual(@as(usize, 19), peer.global_count);
+    try std.testing.expectEqual(@as(usize, 20), peer.global_count);
     try std.testing.expectEqual(@as(usize, 1), peer.layer_shell_count);
     try std.testing.expectEqual(@as(u32, 5), peer.layer_shell_version);
+    try std.testing.expectEqual(@as(usize, 1), peer.idle_notifier_count);
+    try std.testing.expectEqual(@as(u32, 2), peer.idle_notifier_version);
     try std.testing.expectEqual(@as(usize, 1), peer.session_lock_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.session_lock_manager_version);
+
+    // Recheck the composed post-Wave5 production profile independently.
+    const raw_profile_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_profile_command) != .SUCCESS) return error.EventFdFailed;
+    const profile_command: std.posix.fd_t = @intCast(raw_profile_command);
+    defer _ = linux.close(profile_command);
+    var profile: WayringXdgClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = profile_command,
+        .registry_only = true,
+        .expect_text_input = true,
+        .expect_data_control = true,
+        .expect_input_method = true,
+        .expect_virtual_keyboard = true,
+        .expect_layer_shell = true,
+        .expect_idle_notify = true,
+        .expect_session_lock = true,
+    };
+    const profile_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&profile});
+    var profile_joined = false;
+    defer if (!profile_joined) {
+        profile.shutdown();
+        profile_thread.join();
+    };
+    try waitForWayringXdgStage(server, host, &profile, .registry_ready);
+    try std.testing.expect(profile.globals_exact);
+    try std.testing.expectEqual(@as(usize, 20), profile.global_count);
+    try std.testing.expectEqual(@as(usize, 1), profile.idle_notifier_count);
+    try std.testing.expectEqual(@as(u32, 2), profile.idle_notifier_version);
+    try std.testing.expectEqual(@as(usize, 1), profile.session_lock_manager_count);
+    try std.testing.expectEqual(@as(u32, 1), profile.session_lock_manager_version);
+    try signalWayringCommand(profile_command);
+    try waitForWayringXdgStage(server, host, &profile, .disconnected);
+    profile_thread.join();
+    profile_joined = true;
 
     // A same-UID security-context transport gets the public registry but not
     // the privileged data-control global. Keep the direct peer connected so a
@@ -26177,6 +26306,7 @@ test "production generated data device completes the exact profile and supports 
         .registry_only = true,
         .expect_text_input = true,
         .expect_layer_shell = true,
+        .expect_idle_notify = true,
     };
     const denied_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied});
     var denied_joined = false;
@@ -26186,7 +26316,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, denied_host, &denied, .registry_ready);
     try std.testing.expect(denied.globals_exact);
-    try std.testing.expectEqual(@as(usize, 15), denied.global_count);
+    try std.testing.expectEqual(@as(usize, 16), denied.global_count);
     try std.testing.expectEqual(@as(usize, 1), denied.layer_shell_count);
     try std.testing.expectEqual(@as(u32, 5), denied.layer_shell_version);
     try std.testing.expectEqual(@as(usize, 0), denied.data_control_manager_count);
@@ -26195,11 +26325,11 @@ test "production generated data device completes the exact profile and supports 
     try data_control.publish();
     // Global names are allocated monotonically by the protocol server. No
     // other publication occurs between these two operations.
-    denied.guessed_data_control_name = peer.layer_shell_name + 1;
+    denied.guessed_data_control_name = profile.session_lock_manager_name + 1;
     try signalWayringCommand(denied_command);
     try waitForWayringXdgStage(server, denied_host, &denied, .manager_added);
     try std.testing.expect(denied.globals_exact);
-    try std.testing.expectEqual(@as(usize, 15), denied.global_count);
+    try std.testing.expectEqual(@as(usize, 16), denied.global_count);
     try std.testing.expectEqual(@as(usize, 0), denied.data_control_manager_count);
     try std.testing.expect(denied.data_control_manager == null);
     const managers_before_denied_bind = data_control.managers.items.len;
@@ -26238,6 +26368,7 @@ test "production generated data device completes the exact profile and supports 
         .registry_only = true,
         .expect_text_input = true,
         .expect_layer_shell = true,
+        .expect_idle_notify = true,
         .guessed_input_method_name = peer.input_method_manager_name,
     };
     const denied_method_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_method});
@@ -26248,7 +26379,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, denied_host, &denied_method, .registry_ready);
     try std.testing.expect(denied_method.globals_exact);
-    try std.testing.expectEqual(@as(usize, 15), denied_method.global_count);
+    try std.testing.expectEqual(@as(usize, 16), denied_method.global_count);
     try std.testing.expectEqual(@as(usize, 0), denied_method.input_method_manager_count);
     const method_managers_before_denied_bind = input_method.managers.items.len;
     try signalWayringCommand(denied_method_command);
@@ -26278,6 +26409,7 @@ test "production generated data device completes the exact profile and supports 
         .registry_only = true,
         .expect_text_input = true,
         .expect_layer_shell = true,
+        .expect_idle_notify = true,
         .guessed_virtual_keyboard_name = peer.virtual_keyboard_manager_name,
     };
     const denied_virtual_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_virtual});
@@ -26288,7 +26420,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, denied_host, &denied_virtual, .registry_ready);
     try std.testing.expect(denied_virtual.globals_exact);
-    try std.testing.expectEqual(@as(usize, 15), denied_virtual.global_count);
+    try std.testing.expectEqual(@as(usize, 16), denied_virtual.global_count);
     try std.testing.expectEqual(@as(usize, 0), denied_virtual.virtual_keyboard_manager_count);
     try signalWayringCommand(denied_virtual_command);
     try waitForWayringXdgStage(server, denied_host, &denied_virtual, .manager_added);
@@ -26323,6 +26455,7 @@ test "production generated data device completes the exact profile and supports 
         .registry_only = true,
         .expect_text_input = true,
         .expect_layer_shell = true,
+        .expect_idle_notify = true,
         .guessed_session_lock_name = peer.session_lock_manager_name,
     };
     const denied_lock_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_lock});
@@ -26333,7 +26466,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, denied_host, &denied_lock, .registry_ready);
     try std.testing.expect(denied_lock.globals_exact);
-    try std.testing.expectEqual(@as(usize, 15), denied_lock.global_count);
+    try std.testing.expectEqual(@as(usize, 16), denied_lock.global_count);
     try std.testing.expectEqual(@as(usize, 0), denied_lock.session_lock_manager_count);
     try signalWayringCommand(denied_lock_command);
     try waitForWayringXdgStage(server, denied_host, &denied_lock, .manager_added);
@@ -26360,6 +26493,7 @@ test "production generated data device completes the exact profile and supports 
     denied_host_live = false;
 
     session_lock.unpublish();
+    idle_notify.unpublish();
     layer_shell.unpublish();
     virtual_keyboard.unpublish();
     try std.testing.expectEqual(@as(usize, 1), peer.input_method_manager_count);
@@ -26379,6 +26513,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(peer.input_method_manager_removed);
     try std.testing.expect(peer.virtual_keyboard_manager_removed);
     try std.testing.expect(peer.layer_shell_removed);
+    try std.testing.expect(peer.idle_notifier_removed);
     try std.testing.expect(peer.session_lock_manager_removed);
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .disconnected);
@@ -26396,6 +26531,7 @@ test "production generated data device completes the exact profile and supports 
     try input_method.publish();
     try virtual_keyboard.publish();
     try layer_shell.publish();
+    try idle_notify.publish();
     try session_lock.publish();
 
     const raw_layer_command = linux.eventfd(0, linux.EFD.CLOEXEC);
@@ -26829,6 +26965,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_input_method = true,
         .expect_virtual_keyboard = true,
         .expect_layer_shell = true,
+        .expect_idle_notify = true,
         .expect_session_lock = true,
     };
     const primary_watch_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_watch});
@@ -26841,6 +26978,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(primary_watch.globals_exact);
     try std.testing.expectEqual(@as(usize, 1), primary_watch.primary_selection_manager_count);
     session_lock.unpublish();
+    idle_notify.unpublish();
     layer_shell.unpublish();
     virtual_keyboard.unpublish();
     input_method.unpublish();
@@ -26853,6 +26991,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(primary_watch.input_method_manager_removed);
     try std.testing.expect(primary_watch.layer_shell_removed);
     try std.testing.expect(primary_watch.session_lock_manager_removed);
+    try std.testing.expect(primary_watch.idle_notifier_removed);
     try signalWayringCommand(primary_watch_command);
     try waitForWayringXdgStage(server, host, &primary_watch, .disconnected);
     primary_watch_thread.join();
@@ -26865,6 +27004,7 @@ test "production generated data device completes the exact profile and supports 
     try input_method.publish();
     try virtual_keyboard.publish();
     try layer_shell.publish();
+    try idle_notify.publish();
     try session_lock.publish();
     const raw_primary_rebind_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_primary_rebind_command) != .SUCCESS) return error.EventFdFailed;
@@ -26880,6 +27020,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_input_method = true,
         .expect_virtual_keyboard = true,
         .expect_layer_shell = true,
+        .expect_idle_notify = true,
         .expect_session_lock = true,
     };
     const primary_rebind_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_rebind});
@@ -26890,7 +27031,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, host, &primary_rebind, .registry_ready);
     try std.testing.expect(primary_rebind.globals_exact);
-    try std.testing.expectEqual(@as(usize, 19), primary_rebind.global_count);
+    try std.testing.expectEqual(@as(usize, 20), primary_rebind.global_count);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.primary_selection_manager_count);
     try std.testing.expectEqual(@as(u32, 1), primary_rebind.primary_selection_manager_version);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.input_method_manager_count);
@@ -27956,6 +28097,91 @@ test "production generated data device completes the exact profile and supports 
         } else return error.NullableGeneratedDndCleanupTimedOut;
     }
 
+    // Both frontends share one neutral Seat timeline and the host-owned
+    // io_uring alarm. Their wire ordering is intentionally observed only per
+    // resource: canonical physical pointer activity resumes each
+    // independently. Run this timing phase after other production clients
+    // disconnect so no paused test client accumulates unrelated Seat events.
+    {
+        const notification_baseline = server.idle_notification.len();
+        const raw_generated_idle_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+        const raw_mature_idle_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+        if (linux.errno(raw_generated_idle_command) != .SUCCESS or
+            linux.errno(raw_mature_idle_command) != .SUCCESS)
+            return error.EventFdFailed;
+        const generated_idle_command: std.posix.fd_t = @intCast(raw_generated_idle_command);
+        const mature_idle_command: std.posix.fd_t = @intCast(raw_mature_idle_command);
+        defer _ = linux.close(generated_idle_command);
+        defer _ = linux.close(mature_idle_command);
+        var generated_idle: MatureIdleNotifyClient = .{
+            .runtime_directory = runtime_directory,
+            .display_name = host.displayName(),
+            .command_fd = generated_idle_command,
+            .timeout_ms = 0,
+        };
+        var mature_idle: MatureIdleNotifyClient = .{
+            .runtime_directory = runtime_directory,
+            .display_name = mature_socket_name,
+            .command_fd = mature_idle_command,
+        };
+        const generated_idle_thread = try std.Thread.spawn(.{}, MatureIdleNotifyClient.run, .{&generated_idle});
+        const mature_idle_thread = try std.Thread.spawn(.{}, MatureIdleNotifyClient.run, .{&mature_idle});
+        var generated_idle_joined = false;
+        var mature_idle_joined = false;
+        defer if (!generated_idle_joined) {
+            generated_idle.shutdown();
+            generated_idle_thread.join();
+        };
+        defer if (!mature_idle_joined) {
+            mature_idle.shutdown();
+            mature_idle_thread.join();
+        };
+        try waitForMatureIdleNotifyStage(server, &generated_idle, .idled);
+        try waitForMatureIdleNotifyStage(server, &mature_idle, .idled);
+        try std.testing.expectEqual(notification_baseline + 2, server.idle_notification.len());
+        try std.testing.expectEqual(@as(u8, 1), generated_idle.idled_count);
+        try std.testing.expectEqual(@as(u8, 1), mature_idle.idled_count);
+
+        pointerMotion(output, 401, 0.5, 0.5);
+        pointerFrame(output);
+        try signalWayringCommand(generated_idle_command);
+        try signalWayringCommand(mature_idle_command);
+        try waitForMatureIdleNotifyStage(server, &generated_idle, .resumed);
+        try waitForMatureIdleNotifyStage(server, &mature_idle, .resumed);
+        try std.testing.expectEqual(@as(u8, 1), generated_idle.resumed_count);
+        try std.testing.expectEqual(@as(u8, 1), mature_idle.resumed_count);
+
+        try signalWayringCommand(generated_idle_command);
+        try signalWayringCommand(mature_idle_command);
+        try waitForMatureIdleNotifyStage(server, &generated_idle, .reidled);
+        try waitForMatureIdleNotifyStage(server, &mature_idle, .reidled);
+        try std.testing.expectEqual(@as(u8, 2), generated_idle.idled_count);
+        try std.testing.expectEqual(@as(u8, 2), mature_idle.idled_count);
+
+        try signalWayringCommand(generated_idle_command);
+        try signalWayringCommand(mature_idle_command);
+        try waitForMatureIdleNotifyStage(server, &generated_idle, .destroyed);
+        try waitForMatureIdleNotifyStage(server, &mature_idle, .destroyed);
+        try std.testing.expectEqual(notification_baseline, server.idle_notification.len());
+        try signalWayringCommand(generated_idle_command);
+        try signalWayringCommand(mature_idle_command);
+        try waitForMatureIdleNotifyStage(server, &generated_idle, .disconnected);
+        try waitForMatureIdleNotifyStage(server, &mature_idle, .disconnected);
+        generated_idle_thread.join();
+        generated_idle_joined = true;
+        mature_idle_thread.join();
+        mature_idle_joined = true;
+        try waitForWayringDisconnect(server, host, &compositor);
+        try std.testing.expectEqual(notification_baseline, server.idle_notification.len());
+        try std.testing.expectEqual(@as(usize, 0), host.connectionCount());
+    }
+    for (0..1_000) |_| {
+        if (try countMatureDataDeviceFds() == fd_baseline) break;
+        try server.eventLoop().dispatch(1);
+        server.display.flushClients();
+        if (host.failure()) |err| return err;
+    } else return error.IdleNotificationCleanupTimedOut;
+
     const final = server.dataDeviceResourceSnapshot();
     try std.testing.expect(final.selection_generation >= resource_baseline.selection_generation);
     try std.testing.expect(server.scene.topWindowSurface() == null);
@@ -27963,6 +28189,8 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(server.seat.matureKeyboardFocus() == null);
     try std.testing.expectEqual(fd_baseline, try countMatureDataDeviceFds());
     data_device.unpublish();
+    try server.detachIdleAlarmHost(host);
+    idle_alarm_attached = false;
     try host.destroy();
     host_live = false;
 }
