@@ -63,6 +63,17 @@ pub const FractionalScaleAttachResult = union(enum) {
     not_live,
     wrong_client,
 };
+pub const ContentType = enum(u32) { none, photo, video, game, _ };
+pub const ContentTypeHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+pub const ContentTypeAttachResult = union(enum) {
+    attached: SurfaceId,
+    already_constructed,
+    not_live,
+    wrong_client,
+};
 
 /// Frontend-local delivery endpoint borrowed for one synchronous event fanout.
 /// Callers must not retain either pointer or use it after returning to the
@@ -323,6 +334,9 @@ const Surface = struct {
     current_viewport: ViewportState = .{},
     viewport_handler: ?ViewportHandler = null,
     fractional_scale_handler: ?FractionalScaleHandler = null,
+    content_type_handler: ?ContentTypeHandler = null,
+    pending_content_type: ContentType = .none,
+    current_content_type: ContentType = .none,
     current_source: ?render.SourceRect = null,
     source_cache_id: u64,
     next_source_version: u64 = 1,
@@ -488,6 +502,7 @@ const PreparedCommit = struct {
     physical_size: ?render.Size = null,
     logical_size: ?render.Size,
     viewport: ViewportState,
+    content_type: ContentType,
     source: ?render.SourceRect = null,
     scale: i32,
     transform: render.BufferTransform,
@@ -502,6 +517,7 @@ const PreparedCommit = struct {
             .attachment_changed = surface.has_pending_attachment,
             .logical_size = surface.current_logical_size,
             .viewport = surface.pending_viewport,
+            .content_type = surface.pending_content_type,
             .scale = surface.pending_scale,
             .transform = surface.pending_transform,
             .offset_x = surface.pending_offset_x,
@@ -907,6 +923,37 @@ pub fn detachFractionalScale(self: *WayringCompositor, id: SurfaceId, handler_co
     const handler = surface.fractional_scale_handler orelse return;
     if (handler.context != handler_context) return;
     surface.fractional_scale_handler = null;
+}
+
+pub fn attachContentType(self: *WayringCompositor, client: *server.Client, object_id: u32, handler: ContentTypeHandler) ContentTypeAttachResult {
+    const objects = self.findClient(client) orelse return .not_live;
+    for (objects.surfaces.items) |surface| if (surface.resource.id() == object_id and !surface.destroying) {
+        if (surface.content_type_handler != null) return .already_constructed;
+        surface.content_type_handler = handler;
+        return .{ .attached = surface.id };
+    };
+    if (client.lookup(object_id)) |resource| if (resource.interface() == &core.wl_surface.interface) return .wrong_client;
+    return .not_live;
+}
+
+pub fn detachContentType(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque) void {
+    const surface = self.surfaceForId(id) orelse return;
+    const handler = surface.content_type_handler orelse return;
+    if (handler.context != handler_context) return;
+    surface.content_type_handler = null;
+    surface.pending_content_type = .none;
+}
+
+pub fn setPendingContentType(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque, value: ContentType) bool {
+    const surface = self.surfaceForId(id) orelse return false;
+    const handler = surface.content_type_handler orelse return false;
+    if (handler.context != handler_context) return false;
+    surface.pending_content_type = value;
+    return true;
+}
+
+pub fn currentContentType(self: *const WayringCompositor, id: SurfaceId) ?ContentType {
+    return (self.surfaceForId(id) orelse return null).current_content_type;
 }
 
 pub fn setViewportSource(
@@ -2701,6 +2748,7 @@ fn prepareCommit(self: *WayringCompositor, surface: *Surface) !PreparedCommit {
         prepared.scale == surface.current_scale and
         prepared.transform == surface.current_transform and
         std.meta.eql(prepared.viewport, surface.current_viewport) and
+        prepared.content_type == surface.current_content_type and
         prepared.offset_x == 0 and prepared.offset_y == 0 and
         !surface.topology_dirty;
 
@@ -2817,6 +2865,7 @@ fn publishPreparedCommit(
     if (prepared.input) |*input| std.mem.swap(InputRegion, &surface.current_input, input);
     surface.current_logical_size = prepared.logical_size;
     surface.current_viewport = prepared.viewport;
+    surface.current_content_type = prepared.content_type;
     surface.current_source = prepared.source;
     surface.current_scale = prepared.scale;
     surface.current_transform = prepared.transform;
@@ -3053,6 +3102,10 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     }
     if (surface.fractional_scale_handler) |handler| {
         surface.fractional_scale_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (surface.content_type_handler) |handler| {
+        surface.content_type_handler = null;
         handler.surface_destroyed(handler.context);
     }
     if (surface.xdg_association) |association| {
@@ -8560,6 +8613,59 @@ test "viewport state commits atomically persists through null buffers and valida
     try send(client, 5, 0, &core.wl_surface.request_messages[0], &.{});
     try std.testing.expect(recorder.surface_destroyed);
     try std.testing.expect(!compositor.containsSurface(surface_id));
+}
+
+test "content type attachment is unique double buffered and safe across destruction order" {
+    const Recorder = struct {
+        destroyed: bool = false,
+
+        fn handler(self: *@This()) ContentTypeHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn surfaceDestroyed(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.destroyed = true;
+        }
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try createSurfaceResource(client, 3, 4);
+    const id = compositor.surfaceId(client, 4).?;
+    var first: Recorder = .{};
+    var second: Recorder = .{};
+    try std.testing.expect(compositor.attachContentType(client, 4, first.handler()) == .attached);
+    try std.testing.expectEqual(ContentTypeAttachResult.already_constructed, compositor.attachContentType(client, 4, second.handler()));
+    try std.testing.expect(compositor.setPendingContentType(id, &first, .video));
+    try std.testing.expectEqual(ContentType.none, compositor.currentContentType(id).?);
+    try commitSurfaceResource(client, 4);
+    try std.testing.expectEqual(ContentType.video, compositor.currentContentType(id).?);
+    const unknown: ContentType = @enumFromInt(99);
+    try std.testing.expect(compositor.setPendingContentType(id, &first, unknown));
+    try commitSurfaceResource(client, 4);
+    try std.testing.expectEqual(unknown, compositor.currentContentType(id).?);
+
+    compositor.detachContentType(id, &first);
+    try commitSurfaceResource(client, 4);
+    try std.testing.expectEqual(ContentType.none, compositor.currentContentType(id).?);
+    try std.testing.expect(compositor.attachContentType(client, 4, second.handler()) == .attached);
+    try send(client, 4, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expect(second.destroyed);
+    try std.testing.expect(compositor.currentContentType(id) == null);
 }
 
 test "layer root reservation is permanent after release and abort is reversible" {
