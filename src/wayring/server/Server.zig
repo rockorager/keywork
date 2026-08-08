@@ -33,7 +33,10 @@ pub const Global = opaque {
     }
 };
 
-pub const GlobalVisibility = enum { public, restricted };
+/// Immutable publication class. Private globals require an owner-specific
+/// capability layered above the generic profile policy and therefore fail
+/// closed by default.
+pub const GlobalVisibility = enum { public, restricted, private };
 
 pub const GlobalOptions = struct {
     visibility: GlobalVisibility = .public,
@@ -283,7 +286,7 @@ pub fn clearGlobalFilter(self: *Server) void {
 }
 
 pub fn globalVisible(self: *const Server, client: *const Client, global: *const Global) bool {
-    const filter = self.global_filter orelse return true;
+    const filter = self.global_filter orelse return global.visibility() == .public;
     return filter.allow(filter.context, client, global);
 }
 
@@ -483,6 +486,44 @@ test "bind rejects each validation boundary before binder entry" {
     try std.testing.expectError(error.ZeroVersion, server.bind(&client, live.name(), "wl_test", 0, 2));
     try std.testing.expectError(error.VersionTooHigh, server.bind(&client, live.name(), "wl_test", 3, 2));
     try std.testing.expectError(error.OutsideDispatch, server.bind(&client, live.name(), "wl_test", 2, 2));
+    try std.testing.expectEqual(@as(usize, 0), context.calls);
+}
+
+test "visibility defaults fail closed and bind rechecks installed policy" {
+    const Context = struct {
+        calls: usize = 0,
+        fn bind(_: *Client, _: u32, _: u32, self: *@This()) !void {
+            self.calls += 1;
+        }
+    };
+    const Filter = struct {
+        fn visible(_: *@This(), _: *const Client, _: *const Global) bool {
+            return true;
+        }
+    };
+
+    var server: Server = .init(std.testing.allocator);
+    defer server.deinit();
+    var context: Context = .{};
+    const public = try server.addGlobal(TestProtocol, 1, Context, &context, Context.bind);
+    const restricted = try server.addGlobalWithOptions(TestProtocol, 1, Context, &context, Context.bind, .{ .visibility = .restricted });
+    const private = try server.addGlobalWithOptions(TestProtocol, 1, Context, &context, Context.bind, .{ .visibility = .private });
+    var client: Client = .init(std.testing.allocator, .{});
+    defer client.deinit();
+
+    try std.testing.expect(server.globalVisible(&client, public));
+    try std.testing.expect(!server.globalVisible(&client, restricted));
+    try std.testing.expect(!server.globalVisible(&client, private));
+    try std.testing.expectError(error.OutsideDispatch, server.bind(&client, public.name(), "wl_test", 1, 2));
+    try std.testing.expectError(error.HiddenGlobal, server.bind(&client, restricted.name(), "wl_test", 1, 2));
+    try std.testing.expectError(error.HiddenGlobal, server.bind(&client, private.name(), "wl_test", 1, 2));
+
+    var filter: Filter = .{};
+    server.setGlobalFilter(Filter, &filter, Filter.visible);
+    try std.testing.expect(server.globalVisible(&client, restricted));
+    try std.testing.expect(server.globalVisible(&client, private));
+    try std.testing.expectError(error.OutsideDispatch, server.bind(&client, restricted.name(), "wl_test", 1, 2));
+    try std.testing.expectError(error.OutsideDispatch, server.bind(&client, private.name(), "wl_test", 1, 2));
     try std.testing.expectEqual(@as(usize, 0), context.calls);
 }
 

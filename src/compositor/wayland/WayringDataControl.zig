@@ -15,6 +15,7 @@ const SeatDelivery = @import("../SeatDelivery.zig");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const WayringClients = @import("WayringClients.zig");
 const WayringCompositor = @import("WayringCompositor.zig");
+const WayringProfile = @import("WayringProfile.zig");
 const WayringSeatAdapter = @import("WayringSeatAdapter.zig");
 const wire = wayring.wire;
 
@@ -74,12 +75,12 @@ pub fn unpublish(self: *WayringDataControl) void {
 
 /// Suitable for Server.setGlobalFilter. The integration owns filter lifetime.
 pub fn globalFilter(self: *WayringDataControl, client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
-    if (global.visibility() != .restricted) return true;
-    return client.isAuthorizedDirectPeer(self.authorized_uid);
+    return WayringProfile.securityVisible(self.authorized_uid, client, global);
 }
 
 fn bindManager(client: *wayring.server.Client, id: u32, version: u32, self: *WayringDataControl) !void {
     if (version != 1) return error.InvalidVersion;
+    if (!client.isAuthorizedDirectPeer(self.authorized_uid)) return error.Unauthorized;
     try self.managers.ensureUnusedCapacity(self.allocator, 1);
     const value = try self.allocator.create(Manager);
     errdefer self.allocator.destroy(value);
