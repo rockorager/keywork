@@ -117,6 +117,7 @@ const IdleAlarmHost = @import("wayland/WayringHost.zig");
 const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
 const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
 const WayringSessionLock = @import("wayland/WayringSessionLock.zig");
+const WayringWorkspace = @import("wayland/WayringWorkspace.zig");
 const Viewporter = @import("wayland/viewporter.zig");
 const InputManager = @import("input_manager.zig");
 const BuiltinKeybindings = @import("builtin_keybindings.zig");
@@ -4395,6 +4396,10 @@ fn wayringSurfacePresentationClass(
 pub fn wayringOutputLayout(self: *Self) ?*OutputLayout {
     if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return null;
     return &self.outputs;
+}
+
+pub fn neutralWorkspace(self: *Self) *NeutralWorkspace {
+    return &self.neutral_workspace;
 }
 
 pub fn wayringDefaultOutputId(self: *Self) ?OutputLayout.Id {
@@ -18482,6 +18487,7 @@ const WayringXdgClient = struct {
     expect_layer_shell: bool = false,
     expect_idle_notify: bool = false,
     expect_session_lock: bool = false,
+    expect_workspace: bool = false,
     guessed_data_control_name: ?u32 = null,
     guessed_virtual_keyboard_name: ?u32 = null,
     guessed_data_control_bind_issued: bool = false,
@@ -18491,6 +18497,8 @@ const WayringXdgClient = struct {
     guessed_virtual_keyboard_bind_issued: bool = false,
     guessed_session_lock_name: ?u32 = null,
     guessed_session_lock_bind_issued: bool = false,
+    guessed_workspace_name: ?u32 = null,
+    guessed_workspace_bind_issued: bool = false,
     offense: ?Offense = null,
     activation_role: ?ActivationRole = null,
     activation_exchange: ?*ActivationExchange = null,
@@ -18544,6 +18552,9 @@ const WayringXdgClient = struct {
     session_lock_manager_version: u32 = 0,
     session_lock_manager_name: u32 = 0,
     session_lock_manager_removed: bool = false,
+    workspace_manager_count: usize = 0,
+    workspace_manager_version: u32 = 0,
+    workspace_manager_name: u32 = 0,
     configure_serial: u32 = 0,
     configure_count: u8 = 0,
     toplevel_configure_count: u8 = 0,
@@ -18592,8 +18603,9 @@ const WayringXdgClient = struct {
         .{ .name = "zwp_input_method_manager_v2", .version = 1 },
         .{ .name = "zwp_virtual_keyboard_manager_v1", .version = 1 },
         .{ .name = "zwlr_layer_shell_v1", .version = 5 },
-        .{ .name = "ext_idle_notifier_v1", .version = 2 },
         .{ .name = "ext_session_lock_manager_v1", .version = 1 },
+        .{ .name = "ext_idle_notifier_v1", .version = 2 },
+        .{ .name = "ext_workspace_manager_v1", .version = 1 },
     };
 
     fn expectedGlobalCount(self: *const @This()) usize {
@@ -18603,7 +18615,8 @@ const WayringXdgClient = struct {
             @intFromBool(!self.expect_virtual_keyboard) -
             @intFromBool(!self.expect_layer_shell) -
             @intFromBool(!self.expect_idle_notify) -
-            @intFromBool(!self.expect_session_lock);
+            @intFromBool(!self.expect_session_lock) -
+            @intFromBool(!self.expect_workspace);
     }
 
     fn expectedGlobal(self: *const @This(), visible_index: usize) ?ExpectedGlobal {
@@ -18623,6 +18636,8 @@ const WayringXdgClient = struct {
                 self.expect_idle_notify
             else if (std.mem.eql(u8, global.name, "ext_session_lock_manager_v1"))
                 self.expect_session_lock
+            else if (std.mem.eql(u8, global.name, "ext_workspace_manager_v1"))
+                self.expect_workspace
             else
                 true;
             if (!present) continue;
@@ -18750,6 +18765,17 @@ const WayringXdgClient = struct {
                 try self.pause(.manager_added);
                 _ = try registry.bind(name, client_ext.SessionLockManagerV1, 1);
                 self.guessed_session_lock_bind_issued = true;
+                expectClientRoundtrip(display) catch return;
+                return error.RestrictedGlobalBindAccepted;
+            }
+            if (self.guessed_workspace_name) |name| {
+                try expectClientRoundtrip(display);
+                if (!self.globals_exact or self.global_count != self.expectedGlobalCount() or
+                    self.workspace_manager_count != 0)
+                    return error.RestrictedGlobalAdvertised;
+                try self.pause(.manager_added);
+                _ = try registry.bind(name, client_ext.WorkspaceManagerV1, 1);
+                self.guessed_workspace_bind_issued = true;
                 expectClientRoundtrip(display) catch return;
                 return error.RestrictedGlobalBindAccepted;
             }
@@ -19025,6 +19051,10 @@ const WayringXdgClient = struct {
                     self.session_lock_manager_count += 1;
                     self.session_lock_manager_version = global.version;
                     self.session_lock_manager_name = global.name;
+                } else if (std.mem.eql(u8, interface, "ext_workspace_manager_v1")) {
+                    self.workspace_manager_count += 1;
+                    self.workspace_manager_version = global.version;
+                    self.workspace_manager_name = global.name;
                 }
                 const index = self.global_count;
                 self.global_count += 1;
@@ -20678,6 +20708,7 @@ const MatureWorkspaceClient = struct {
     workspace_count: usize = 0,
     done_count: usize = 0,
     finished_count: usize = 0,
+    workspace_only_disconnect: bool = false,
     groups: [2]?*client_ext.WorkspaceGroupHandleV1 = .{ null, null },
     workspaces: [4]?*client_ext.WorkspaceHandleV1 = .{ null, null, null, null },
     names: [4][8]u8 = @splat(@splat(0)),
@@ -20722,6 +20753,18 @@ const MatureWorkspaceClient = struct {
         try expectClientRoundtrip(display);
         if (self.output == null or self.done_count != 1 or self.workspace_count != 1) return error.InitialWorkspaceSnapshotMismatch;
         try self.pause(.initial);
+        if (self.workspace_only_disconnect) {
+            for (&self.groups) |*group| if (group.*) |value| {
+                value.destroy();
+                group.* = null;
+            };
+            try expectClientRoundtrip(display);
+            manager.stop();
+            while (self.finished_count == 0) try expectClientRoundtrip(display);
+            self.stage.store(@intFromEnum(Stage.finished), .release);
+            try waitForWayringCommand(self.command_fd);
+            return;
+        }
 
         const compositor = self.compositor orelse return error.CompositorMissing;
         defer compositor.destroy();
@@ -20768,16 +20811,9 @@ const MatureWorkspaceClient = struct {
         while (self.finished_count == 0) try expectClientRoundtrip(display);
         self.stage.store(@intFromEnum(Stage.finished), .release);
         try waitForWayringCommand(self.command_fd);
-        for (&self.workspaces) |*workspace| if (workspace.*) |value| {
-            if (value != first) value.destroy();
-            workspace.* = null;
-        };
-        for (&self.groups) |*group| if (group.*) |value| {
-            value.destroy();
-            group.* = null;
-        };
-        if (self.output) |output| output.release();
-        try expectClientRoundtrip(display);
+        // Leave every remaining group/workspace child alive. Returning closes
+        // the display abruptly after stop/finished so production disconnect
+        // cleanup must tear down the managerless binding child-first.
     }
     fn registryEvent(registry: *client_wl.Registry, event: client_wl.Registry.Event, self: *@This()) void {
         switch (event) {
@@ -26058,6 +26094,19 @@ test "production generated data device completes the exact profile and supports 
         if (idle_notify.global != null) idle_notify.unpublish();
         idle_notify.deinit();
     }
+    var generated_workspace: WayringWorkspace = undefined;
+    generated_workspace.init(
+        std.testing.allocator,
+        &protocol_server,
+        &clients,
+        &outputs,
+        server.neutralWorkspace(),
+        linux.getuid(),
+    );
+    defer {
+        if (generated_workspace.global != null) generated_workspace.unpublish();
+        generated_workspace.deinit();
+    }
 
     const Lifecycle = struct {
         const FatalEvidence = struct {
@@ -26095,6 +26144,7 @@ test "production generated data device completes the exact profile and supports 
         layer_shell: *WayringLayerShell,
         idle_notify: *WayringIdleNotification,
         session_lock: *WayringSessionLock,
+        workspace: *WayringWorkspace,
         generated_client: ?ClientRegistry.Id = null,
         generated_raw: ?*wayring.server.Client = null,
         offender_fatal: ?FatalEvidence = null,
@@ -26115,6 +26165,7 @@ test "production generated data device completes the exact profile and supports 
         }
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            self.workspace.destroyClientResources(client);
             self.idle_notify.destroyClientResources(client);
             self.session_lock.destroyClientResources(client);
             self.layer_shell.destroyClientResources(client);
@@ -26182,14 +26233,16 @@ test "production generated data device completes the exact profile and supports 
         .layer_shell = &layer_shell,
         .idle_notify = &idle_notify,
         .session_lock = &session_lock,
+        .workspace = &generated_workspace,
     };
     const GlobalFilter = struct {
         data_control: *WayringDataControl,
+        workspace: *WayringWorkspace,
         fn visible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
-            return self.data_control.globalFilter(client, global);
+            return self.data_control.globalFilter(client, global) and self.workspace.globalFilter(client, global);
         }
     };
-    var global_filter: GlobalFilter = .{ .data_control = &data_control };
+    var global_filter: GlobalFilter = .{ .data_control = &data_control, .workspace = &generated_workspace };
     protocol_server.setGlobalFilter(GlobalFilter, &global_filter, GlobalFilter.visible);
     defer protocol_server.clearGlobalFilter();
     const host = try WayringHost.create(
@@ -26249,25 +26302,154 @@ test "production generated data device completes the exact profile and supports 
     peer.expect_layer_shell = true;
     peer.expect_idle_notify = true;
     peer.expect_session_lock = true;
+    peer.expect_workspace = true;
     try virtual_keyboard.publish();
     try layer_shell.publish();
-    try idle_notify.publish();
     try session_lock.publish();
+    try idle_notify.publish();
+    try generated_workspace.publish();
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .manager_added);
     try std.testing.expect(peer.globals_exact);
     try std.testing.expect(peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(@as(usize, 1), peer.virtual_keyboard_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.virtual_keyboard_manager_version);
-    try std.testing.expectEqual(@as(usize, 20), peer.global_count);
+    try std.testing.expectEqual(@as(usize, 21), peer.global_count);
     try std.testing.expectEqual(@as(usize, 1), peer.layer_shell_count);
     try std.testing.expectEqual(@as(u32, 5), peer.layer_shell_version);
     try std.testing.expectEqual(@as(usize, 1), peer.idle_notifier_count);
     try std.testing.expectEqual(@as(u32, 2), peer.idle_notifier_version);
     try std.testing.expectEqual(@as(usize, 1), peer.session_lock_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.session_lock_manager_version);
+    try std.testing.expectEqual(@as(usize, 1), peer.workspace_manager_count);
+    try std.testing.expectEqual(@as(u32, 1), peer.workspace_manager_version);
 
-    // Recheck the composed post-Wave5 production profile independently.
+    // Drive the scanner-generated manager with the same real libwayland
+    // client fixture used for the mature frontend. Keep the registry peer
+    // alive to verify an unrelated direct client survives the full lifecycle.
+    const raw_workspace_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_workspace_command) != .SUCCESS) return error.EventFdFailed;
+    const workspace_command: std.posix.fd_t = @intCast(raw_workspace_command);
+    defer _ = linux.close(workspace_command);
+    const registry_peer_raw = lifecycle.generated_raw;
+    const registry_peer_id = lifecycle.generated_client;
+    const workspace_binding_baseline = generated_workspace.bindings.items.len;
+    const workspace_fd_baseline = try countMatureDataDeviceFds();
+    var workspace_client: MatureWorkspaceClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = workspace_command,
+    };
+    const workspace_thread = try std.Thread.spawn(.{}, MatureWorkspaceClient.run, .{&workspace_client});
+    var workspace_joined = false;
+    defer if (!workspace_joined) {
+        workspace_client.shutdown();
+        workspace_thread.join();
+    };
+    try waitForMatureWorkspaceStage(server, &workspace_client, .initial);
+    try std.testing.expectEqual(@as(usize, 1), workspace_client.group_count);
+    try std.testing.expectEqual(@as(usize, 1), workspace_client.output_enter_count);
+    try std.testing.expectEqualStrings("1", workspace_client.names[0][0..workspace_client.name_lens[0]]);
+    try std.testing.expectEqual(@as(u32, 0), workspace_client.coordinates[0]);
+    try std.testing.expect(workspace_client.active[0] and workspace_client.activate_capable[0]);
+    try signalWayringCommand(workspace_command);
+    try waitForMatureWorkspaceStage(server, &workspace_client, .mapped);
+    server.window_manager.settleConfigureTransactionForTest();
+    const generated_workspace_focus = server.window_manager.focusedSurface() orelse return error.GeneratedWorkspaceFocusMissing;
+    const workspace_output = output.protocol_id;
+    try std.testing.expect(server.neutralWorkspace().snapshot(workspace_output).?.occupied[0]);
+    server.window_manager.switchWorkspace(2);
+    try renderPendingTestOutput(server, output);
+    try renderPendingTestOutput(server, output);
+    try signalWayringCommand(workspace_command);
+    try waitForMatureWorkspaceStage(server, &workspace_client, .second_workspace);
+    try std.testing.expect(workspace_client.active[1]);
+    try std.testing.expect(server.window_manager.focusedSurface() == null);
+    try signalWayringCommand(workspace_command);
+    try waitForMatureWorkspaceStage(server, &workspace_client, .activated);
+    try std.testing.expectEqual(@as(u8, 1), server.neutralWorkspace().snapshot(workspace_output).?.active);
+    try std.testing.expectEqual(generated_workspace_focus, server.window_manager.focusedSurface().?);
+    try signalWayringCommand(workspace_command);
+    try waitForMatureWorkspaceStage(server, &workspace_client, .child_destroyed);
+    server.window_manager.switchWorkspace(2);
+    try renderPendingTestOutput(server, output);
+    try renderPendingTestOutput(server, output);
+    try signalWayringCommand(workspace_command);
+    try waitForMatureWorkspaceStage(server, &workspace_client, .readvertised);
+    try std.testing.expectEqual(@as(usize, 4), workspace_client.workspace_count);
+    try signalWayringCommand(workspace_command);
+    try waitForMatureWorkspaceStage(server, &workspace_client, .finished);
+    server.window_manager.switchWorkspace(1);
+    try renderPendingTestOutput(server, output);
+    try renderPendingTestOutput(server, output);
+    finishAllWorkspaceTransitions(server);
+    try signalWayringCommand(workspace_command);
+    try waitForMatureWorkspaceStage(server, &workspace_client, .disconnected);
+    workspace_thread.join();
+    workspace_joined = true;
+    lifecycle.generated_raw = registry_peer_raw;
+    lifecycle.generated_client = registry_peer_id;
+    for (0..1_000) |_| {
+        if (!server.surface_registry.contains(generated_workspace_focus) and
+            host.connectionCount() == 1 and
+            server.client_registry.len() == client_baseline + 1 and
+            server.surface_registry.len() == surface_baseline and
+            server.compositor.surfaceStore().len() == mature_surface_baseline and
+            server.headless_surface_forest.len() == forest_baseline and
+            generated_workspace.bindings.items.len == workspace_binding_baseline and
+            std.meta.eql(server.dataDeviceResourceSnapshot(), resource_baseline)) break;
+        try server.eventLoop().dispatch(1);
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedWorkspaceAbruptCleanupTimedOut;
+    try std.testing.expect(!server.surface_registry.contains(generated_workspace_focus));
+    try std.testing.expectEqual(workspace_fd_baseline, try countMatureDataDeviceFds());
+
+    // Repeat stop/finished/disconnect after the client destroys every group
+    // while retaining its workspace. This exercises managerless cleanup where
+    // the final workspace itself can reclaim the binding.
+    const raw_workspace_only_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_workspace_only_command) != .SUCCESS) return error.EventFdFailed;
+    const workspace_only_command: std.posix.fd_t = @intCast(raw_workspace_only_command);
+    defer _ = linux.close(workspace_only_command);
+    const workspace_only_binding_baseline = generated_workspace.bindings.items.len;
+    const workspace_only_fd_baseline = try countMatureDataDeviceFds();
+    var workspace_only_client: MatureWorkspaceClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = host.displayName(),
+        .command_fd = workspace_only_command,
+        .workspace_only_disconnect = true,
+    };
+    const workspace_only_thread = try std.Thread.spawn(.{}, MatureWorkspaceClient.run, .{&workspace_only_client});
+    var workspace_only_joined = false;
+    defer if (!workspace_only_joined) {
+        workspace_only_client.shutdown();
+        workspace_only_thread.join();
+    };
+    try waitForMatureWorkspaceStage(server, &workspace_only_client, .initial);
+    try std.testing.expectEqual(@as(usize, 1), workspace_only_client.group_count);
+    try std.testing.expectEqual(@as(usize, 1), workspace_only_client.workspace_count);
+    try signalWayringCommand(workspace_only_command);
+    try waitForMatureWorkspaceStage(server, &workspace_only_client, .finished);
+    try signalWayringCommand(workspace_only_command);
+    try waitForMatureWorkspaceStage(server, &workspace_only_client, .disconnected);
+    workspace_only_thread.join();
+    workspace_only_joined = true;
+    lifecycle.generated_raw = registry_peer_raw;
+    lifecycle.generated_client = registry_peer_id;
+    for (0..1_000) |_| {
+        if (host.connectionCount() == 1 and
+            server.client_registry.len() == client_baseline + 1 and
+            server.surface_registry.len() == surface_baseline and
+            server.compositor.surfaceStore().len() == mature_surface_baseline and
+            server.headless_surface_forest.len() == forest_baseline and
+            generated_workspace.bindings.items.len == workspace_only_binding_baseline and
+            std.meta.eql(server.dataDeviceResourceSnapshot(), resource_baseline)) break;
+        try server.eventLoop().dispatch(1);
+        if (host.failure()) |err| return err;
+    } else return error.GeneratedWorkspaceOnlyAbruptCleanupTimedOut;
+    try std.testing.expectEqual(workspace_only_fd_baseline, try countMatureDataDeviceFds());
+
+    // Recheck the composed Wave7 production profile independently.
     const raw_profile_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_profile_command) != .SUCCESS) return error.EventFdFailed;
     const profile_command: std.posix.fd_t = @intCast(raw_profile_command);
@@ -26284,6 +26466,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_layer_shell = true,
         .expect_idle_notify = true,
         .expect_session_lock = true,
+        .expect_workspace = true,
     };
     const profile_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&profile});
     var profile_joined = false;
@@ -26293,7 +26476,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, host, &profile, .registry_ready);
     try std.testing.expect(profile.globals_exact);
-    try std.testing.expectEqual(@as(usize, 20), profile.global_count);
+    try std.testing.expectEqual(@as(usize, 21), profile.global_count);
     try std.testing.expectEqual(@as(usize, 1), profile.idle_notifier_count);
     try std.testing.expectEqual(@as(u32, 2), profile.idle_notifier_version);
     try std.testing.expectEqual(@as(usize, 1), profile.session_lock_manager_count);
@@ -26345,12 +26528,13 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(usize, 1), denied.layer_shell_count);
     try std.testing.expectEqual(@as(u32, 5), denied.layer_shell_version);
     try std.testing.expectEqual(@as(usize, 0), denied.data_control_manager_count);
+    try std.testing.expectEqual(@as(usize, 0), denied.workspace_manager_count);
     const before_denied_bind = server.dataDeviceResourceSnapshot();
     data_control.unpublish();
     try data_control.publish();
     // Global names are allocated monotonically by the protocol server. No
-    // other publication occurs between these two operations.
-    denied.guessed_data_control_name = profile.session_lock_manager_name + 1;
+    // other publication occurs after workspace and before this re-publication.
+    denied.guessed_data_control_name = profile.workspace_manager_name + 1;
     try signalWayringCommand(denied_command);
     try waitForWayringXdgStage(server, denied_host, &denied, .manager_added);
     try std.testing.expect(denied.globals_exact);
@@ -26514,9 +26698,49 @@ test "production generated data device completes the exact profile and supports 
         WayringXdgClient.Stage.manager_added,
         @as(WayringXdgClient.Stage, @enumFromInt(peer.stage.load(.acquire))),
     );
+
+    lifecycle.denied_fatal = null;
+    const raw_denied_workspace_command = linux.eventfd(0, linux.EFD.CLOEXEC);
+    if (linux.errno(raw_denied_workspace_command) != .SUCCESS) return error.EventFdFailed;
+    const denied_workspace_command: std.posix.fd_t = @intCast(raw_denied_workspace_command);
+    defer _ = linux.close(denied_workspace_command);
+    var denied_workspace: WayringXdgClient = .{
+        .runtime_directory = runtime_directory,
+        .display_name = denied_host.displayName(),
+        .command_fd = denied_workspace_command,
+        .registry_only = true,
+        .expect_text_input = true,
+        .expect_layer_shell = true,
+        .expect_idle_notify = true,
+        .guessed_workspace_name = peer.workspace_manager_name,
+    };
+    const denied_workspace_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&denied_workspace});
+    var denied_workspace_joined = false;
+    defer if (!denied_workspace_joined) {
+        denied_workspace.shutdown();
+        denied_workspace_thread.join();
+    };
+    try waitForWayringXdgStage(server, denied_host, &denied_workspace, .registry_ready);
+    try std.testing.expectEqual(@as(usize, 16), denied_workspace.global_count);
+    try std.testing.expectEqual(@as(usize, 0), denied_workspace.workspace_manager_count);
+    try signalWayringCommand(denied_workspace_command);
+    try waitForWayringXdgStage(server, denied_host, &denied_workspace, .manager_added);
+    try signalWayringCommand(denied_workspace_command);
+    try waitForWayringXdgStage(server, denied_host, &denied_workspace, .disconnected);
+    denied_workspace_thread.join();
+    denied_workspace_joined = true;
+    try std.testing.expect(denied_workspace.guessed_workspace_bind_issued);
+    const denied_workspace_fatal = lifecycle.denied_fatal orelse return error.RestrictedWorkspaceBindFatalMissing;
+    try std.testing.expectEqual(wayring.server.Fatal.Kind.protocol, denied_workspace_fatal.kind);
+    try std.testing.expectEqualStrings("wl_registry", denied_workspace_fatal.interface.?.name);
+    try std.testing.expectEqual(
+        WayringXdgClient.Stage.manager_added,
+        @as(WayringXdgClient.Stage, @enumFromInt(peer.stage.load(.acquire))),
+    );
     try denied_host.destroy();
     denied_host_live = false;
 
+    generated_workspace.unpublish();
     idle_notify.unpublish();
     session_lock.unpublish();
     layer_shell.unpublish();
@@ -26556,8 +26780,8 @@ test "production generated data device completes the exact profile and supports 
     try input_method.publish();
     try virtual_keyboard.publish();
     try layer_shell.publish();
-    try idle_notify.publish();
     try session_lock.publish();
+    try idle_notify.publish();
 
     const raw_layer_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_layer_command) != .SUCCESS) return error.EventFdFailed;
@@ -27029,8 +27253,8 @@ test "production generated data device completes the exact profile and supports 
     try input_method.publish();
     try virtual_keyboard.publish();
     try layer_shell.publish();
-    try idle_notify.publish();
     try session_lock.publish();
+    try idle_notify.publish();
     const raw_primary_rebind_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_primary_rebind_command) != .SUCCESS) return error.EventFdFailed;
     const primary_rebind_command: std.posix.fd_t = @intCast(raw_primary_rebind_command);

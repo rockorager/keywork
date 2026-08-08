@@ -129,6 +129,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/virtual-keyboard-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/upstream/wlr-layer-shell-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-session-lock/ext-session-lock-v1.xml"));
+    generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-workspace/ext-workspace-v1.xml"));
     const generated_xdg_source = generate_xdg_protocol.captureStdOut(.{ .basename = "wayring_xdg_protocol.zig" });
     const xdg_protocol = b.createModule(.{
         .root_source_file = generated_xdg_source,

@@ -46,6 +46,23 @@ pub const Event = union(enum) {
     done,
 };
 pub const Intent = struct { output: OutputLayout.Id, number: u8, source: HandleId };
+pub const ActivationListener = struct {
+    context: *anyopaque,
+    prepare: *const fn (*anyopaque, []const Intent) ?bool,
+    finish: *const fn (*anyopaque) void,
+};
+pub const Requester = struct {
+    frontend: *anyopaque,
+    context: *anyopaque,
+    no_memory: *const fn (*anyopaque) void,
+};
+pub const Frontend = struct {
+    context: *anyopaque,
+    prepare: *const fn (*anyopaque, []const Snapshot, Requester) bool,
+    commit: *const fn (*anyopaque) void,
+    abort: *const fn (*anyopaque) void,
+    reconcile: *const fn (*anyopaque) void,
+};
 pub const Prepared = struct {
     allocator: std.mem.Allocator,
     client: ClientId,
@@ -87,18 +104,101 @@ clients: ClientStore = .{},
 groups: GroupStore = .{},
 handles: HandleStore = .{},
 snapshots: std.ArrayList(Snapshot) = .empty,
+frontends: [2]?Frontend = .{ null, null },
+activation_listener: ?ActivationListener = null,
+transaction_active: bool = false,
 
 pub fn init(allocator: std.mem.Allocator, clients: *const ClientRegistry) Workspace {
     return .{ .allocator = allocator, .clients_registry = clients };
 }
 
 pub fn deinit(self: *Workspace) void {
-    std.debug.assert(self.clients.len() == 0 and self.groups.len() == 0 and self.handles.len() == 0);
+    std.debug.assert(self.clients.len() == 0 and self.groups.len() == 0 and self.handles.len() == 0 and
+        self.frontends[0] == null and self.frontends[1] == null and self.activation_listener == null and
+        !self.transaction_active);
     self.clients.deinit(self.allocator);
     self.groups.deinit(self.allocator);
     self.handles.deinit(self.allocator);
     self.snapshots.deinit(self.allocator);
     self.* = undefined;
+}
+
+pub fn registerFrontend(self: *Workspace, frontend: Frontend) void {
+    std.debug.assert(!self.transaction_active);
+    for (&self.frontends) |*slot| {
+        if (slot.* != null) continue;
+        slot.* = frontend;
+        return;
+    }
+    unreachable;
+}
+
+pub fn unregisterFrontend(self: *Workspace, context: *anyopaque) void {
+    std.debug.assert(!self.transaction_active);
+    for (&self.frontends) |*slot| {
+        if (slot.* == null or slot.*.?.context != context) continue;
+        slot.* = null;
+        return;
+    }
+    unreachable;
+}
+
+pub fn setActivationListener(self: *Workspace, listener: ActivationListener) void {
+    std.debug.assert(self.activation_listener == null);
+    self.activation_listener = listener;
+}
+
+pub fn clearActivationListener(self: *Workspace) void {
+    std.debug.assert(self.activation_listener != null and !self.transaction_active);
+    self.activation_listener = null;
+}
+
+/// Runs the frontend half of a protocol-requested canonical mutation. Every
+/// frontend stages a complete transaction before WindowManager mutates; wire
+/// commits complete before relayout/focus finishing may publish again.
+pub fn activate(self: *Workspace, intents: []const Intent, requester: Requester) void {
+    const listener = self.activation_listener orelse return;
+    if (self.transaction_active) return;
+    self.transaction_active = true;
+    defer self.transaction_active = false;
+
+    var proposed: std.ArrayList(Snapshot) = .empty;
+    defer proposed.deinit(self.allocator);
+    proposed.appendSlice(self.allocator, self.snapshots.items) catch {
+        requester.no_memory(requester.context);
+        return;
+    };
+    for (intents) |intent| {
+        if (intent.number == 0 or intent.number > workspace_count) return;
+        const snapshot_value = snapshotPtrIn(proposed.items, intent.output) orelse return;
+        snapshot_value.active = intent.number;
+    }
+
+    var prepared: [2]bool = @splat(false);
+    defer for (self.frontends, prepared) |frontend, is_prepared| {
+        if (is_prepared) frontend.?.abort(frontend.?.context);
+    };
+    for (self.frontends, 0..) |frontend, index| if (frontend) |value| {
+        if (!value.prepare(value.context, proposed.items, requester)) return;
+        prepared[index] = true;
+    };
+
+    const needs_finish = listener.prepare(listener.context, intents) orelse return;
+    for (proposed.items) |snapshot_value| self.setSnapshot(snapshot_value) catch unreachable;
+    for (self.frontends, 0..) |frontend, index| if (frontend) |value| {
+        value.commit(value.context);
+        prepared[index] = false;
+    };
+
+    // Finishing may synchronously publish urgency/focus changes. That is the
+    // next transaction, not reentry into the protected mutation phase.
+    self.transaction_active = false;
+    if (needs_finish) listener.finish(listener.context);
+}
+
+pub fn reconcileFrontends(self: *Workspace) void {
+    std.debug.assert(!self.transaction_active);
+    for (self.frontends) |frontend| if (frontend) |value| value.reconcile(value.context);
 }
 
 pub fn setSnapshot(self: *Workspace, snapshot_value: Snapshot) error{OutOfMemory}!void {
@@ -229,6 +329,11 @@ fn prepareAgainst(self: *Workspace, client_id: ClientId, snapshots: []const Snap
 
 fn snapshotIn(snapshots: []const Snapshot, output: OutputLayout.Id) ?Snapshot {
     for (snapshots) |value| if (std.meta.eql(value.output, output)) return value;
+    return null;
+}
+
+fn snapshotPtrIn(snapshots: []Snapshot, output: OutputLayout.Id) ?*Snapshot {
+    for (snapshots) |*value| if (std.meta.eql(value.output, output)) return value;
     return null;
 }
 
@@ -682,5 +787,115 @@ test "one client can abort proposed update while another commits" {
     defer second_update.deinit();
     model.rollbackPrepared(&first_update);
     try model.commitPrepared(&second_update);
+    try std.testing.expectEqual(@as(u8, 1), model.snapshot(output).?.active);
+}
+
+test "activation coordinator stages all frontends and permits finish publication" {
+    var registry = ClientRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var model = Workspace.init(std.testing.allocator, &registry);
+    defer model.deinit();
+    const output: OutputLayout.Id = .{ .index = 12, .generation = 4 };
+    try model.setSnapshot(.{ .output = output });
+
+    const FrontendProbe = struct {
+        model: *Workspace,
+        prepared: bool = false,
+        committed: bool = false,
+        reconciled: bool = false,
+
+        fn prepare(context: *anyopaque, snapshots: []const Snapshot, _: Requester) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.prepared = snapshots.len == 1 and snapshots[0].active == 2 and
+                self.model.snapshot(snapshots[0].output).?.active == 1;
+            return self.prepared;
+        }
+        fn commit(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.committed = self.prepared;
+        }
+        fn abort(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.prepared = false;
+        }
+        fn reconcile(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.reconciled = true;
+        }
+    };
+    const MutationProbe = struct {
+        model: *Workspace,
+        first: *FrontendProbe,
+        second: *FrontendProbe,
+        prepared: bool = false,
+        finished: bool = false,
+
+        fn prepare(context: *anyopaque, _: []const Intent) ?bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.prepared = self.first.prepared and self.second.prepared and
+                self.model.snapshot(.{ .index = 12, .generation = 4 }).?.active == 1;
+            return if (self.prepared) true else null;
+        }
+        fn finish(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.finished = self.first.committed and self.second.committed and
+                self.model.snapshot(.{ .index = 12, .generation = 4 }).?.active == 2;
+            self.model.reconcileFrontends();
+        }
+    };
+    var first: FrontendProbe = .{ .model = &model };
+    var second: FrontendProbe = .{ .model = &model };
+    model.registerFrontend(.{ .context = &first, .prepare = FrontendProbe.prepare, .commit = FrontendProbe.commit, .abort = FrontendProbe.abort, .reconcile = FrontendProbe.reconcile });
+    defer model.unregisterFrontend(&first);
+    model.registerFrontend(.{ .context = &second, .prepare = FrontendProbe.prepare, .commit = FrontendProbe.commit, .abort = FrontendProbe.abort, .reconcile = FrontendProbe.reconcile });
+    defer model.unregisterFrontend(&second);
+    var mutation: MutationProbe = .{ .model = &model, .first = &first, .second = &second };
+    model.setActivationListener(.{ .context = &mutation, .prepare = MutationProbe.prepare, .finish = MutationProbe.finish });
+    defer model.clearActivationListener();
+    var requester_oom = false;
+    const Request = struct {
+        fn noMemory(context: *anyopaque) void {
+            const value: *bool = @ptrCast(@alignCast(context));
+            value.* = true;
+        }
+    };
+    model.activate(&.{.{ .output = output, .number = 2, .source = .{ .index = 0, .generation = 0 } }}, .{
+        .frontend = &first,
+        .context = &requester_oom,
+        .no_memory = Request.noMemory,
+    });
+    try std.testing.expect(!requester_oom and mutation.prepared and mutation.finished);
+    try std.testing.expect(first.committed and second.committed and first.reconciled and second.reconciled);
+}
+
+test "activation proposal OOM reports requester without mutation" {
+    var registry = ClientRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var model = Workspace.init(failing.allocator(), &registry);
+    defer model.deinit();
+    const output: OutputLayout.Id = .{ .index = 2, .generation = 7 };
+    try model.setSnapshot(.{ .output = output });
+    const Mutation = struct {
+        fn prepare(_: *anyopaque, _: []const Intent) ?bool {
+            return true;
+        }
+        fn finish(_: *anyopaque) void {}
+        fn noMemory(context: *anyopaque) void {
+            const value: *bool = @ptrCast(@alignCast(context));
+            value.* = true;
+        }
+    };
+    var context: u8 = 0;
+    model.setActivationListener(.{ .context = &context, .prepare = Mutation.prepare, .finish = Mutation.finish });
+    defer model.clearActivationListener();
+    failing.fail_index = failing.alloc_index;
+    var no_memory = false;
+    model.activate(&.{.{ .output = output, .number = 2, .source = .{ .index = 0, .generation = 0 } }}, .{
+        .frontend = &context,
+        .context = &no_memory,
+        .no_memory = Mutation.noMemory,
+    });
+    try std.testing.expect(no_memory);
     try std.testing.expectEqual(@as(u8, 1), model.snapshot(output).?.active);
 }

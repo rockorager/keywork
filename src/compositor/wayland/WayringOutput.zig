@@ -26,11 +26,19 @@ layout: *OutputLayout,
 compositor: *WayringCompositor,
 adapters: std.ArrayList(*Adapter) = .empty,
 scale_listener: ?ScaleListener = null,
+bind_listener: ?BindListener = null,
 
 pub const ScaleListener = struct {
     context: *anyopaque,
     configured: *const fn (*anyopaque, OutputLayout.Id, Output.Changes) void,
     membership_changed: *const fn (*anyopaque, WayringCompositor.SurfaceId, ?OutputLayout.Id) void,
+};
+
+/// Narrow notification used by protocols whose initial snapshot may predate a
+/// same-client wl_output binding. The resource is borrowed for the callback.
+pub const BindListener = struct {
+    context: *anyopaque,
+    bound: *const fn (*anyopaque, OutputLayout.Id, *server.Client, *core.wl_output.Resource) void,
 };
 
 const Binding = struct {
@@ -84,6 +92,7 @@ fn rollbackInit(self: *WayringOutput) void {
 }
 
 pub fn deinit(self: *WayringOutput) void {
+    std.debug.assert(self.bind_listener == null);
     self.layout.clearListener();
     for (self.adapters.items) |adapter| {
         std.debug.assert(adapter.bindings.items.len == 0);
@@ -120,6 +129,47 @@ pub fn setScaleListener(self: *WayringOutput, listener: ScaleListener) void {
 pub fn clearScaleListener(self: *WayringOutput, context: *anyopaque) void {
     std.debug.assert(self.scale_listener != null and self.scale_listener.?.context == context);
     self.scale_listener = null;
+}
+
+pub fn setBindListener(self: *WayringOutput, listener: BindListener) void {
+    std.debug.assert(self.bind_listener == null);
+    self.bind_listener = listener;
+}
+
+pub fn clearBindListener(self: *WayringOutput, context: *anyopaque) void {
+    std.debug.assert(self.bind_listener != null and self.bind_listener.?.context == context);
+    self.bind_listener = null;
+}
+
+/// Visits every currently live generated wl_output for one canonical output
+/// and raw client. Multiple bindings are deliberately preserved.
+pub fn forEachClientResource(
+    self: *const WayringOutput,
+    output: OutputLayout.Id,
+    client: *server.Client,
+    context: *anyopaque,
+    visit: *const fn (*anyopaque, *core.wl_output.Resource) void,
+) void {
+    for (self.adapters.items) |adapter| {
+        if (adapter.retired or !std.meta.eql(adapter.id, output)) continue;
+        for (adapter.bindings.items) |binding| if (binding.client == client and binding.resource.state() == .live)
+            visit(context, &binding.resource);
+    }
+}
+
+pub fn clientResourceCount(
+    self: *const WayringOutput,
+    output: OutputLayout.Id,
+    client: *server.Client,
+) usize {
+    var count: usize = 0;
+    for (self.adapters.items) |adapter| {
+        if (adapter.retired or !std.meta.eql(adapter.id, output)) continue;
+        for (adapter.bindings.items) |binding| {
+            if (binding.client == client and binding.resource.state() == .live) count += 1;
+        }
+    }
+    return count;
 }
 
 /// Resolves only the identity of a currently live generated wl_output owned by
@@ -249,6 +299,8 @@ fn bind(client: *server.Client, id: u32, version: u32, adapter: *Adapter) !void 
     try client.materialize(&binding.resource.runtime);
     adapter.bindings.appendAssumeCapacity(binding);
     sendInitial(binding);
+    if (adapter.manager.bind_listener) |listener|
+        listener.bound(listener.context, adapter.id, client, &binding.resource);
 }
 
 fn sendInitial(binding: *Binding) void {
