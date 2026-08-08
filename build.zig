@@ -167,7 +167,7 @@ pub fn build(b: *std.Build) void {
     run_wayring_example_step.dependOn(&run_wayring_example.step);
     const benchmark_client = b.addExecutable(.{
         .name = "wayring-benchmark-client",
-        .root_module = b.createModule(.{ .target = target, .optimize = .ReleaseFast, .link_libc = true }),
+        .root_module = b.createModule(.{ .target = target, .optimize = .ReleaseSafe, .link_libc = true }),
     });
     benchmark_client.root_module.addCSourceFile(.{ .file = b.path("scripts/wayring_benchmark_client.c"), .flags = &.{"-std=c11"} });
     benchmark_client.root_module.linkSystemLibrary("wayland-client", .{ .use_pkg_config = .force });
@@ -177,7 +177,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/wayring/example_server.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .ReleaseSafe,
             .imports = &.{ .{ .name = "wayring", .module = wayring }, .{ .name = "core_protocol", .module = core_protocol } },
         }),
     });
@@ -186,7 +186,7 @@ pub fn build(b: *std.Build) void {
     benchmark_run.step.dependOn(&install_benchmark_client.step);
     benchmark_run.step.dependOn(&install_benchmark_server.step);
     if (b.args) |args| benchmark_run.addArgs(args);
-    const benchmark_step = b.step("benchmark-wayring", "Benchmark Wayring against headless Sway (writes review artifacts)");
+    const benchmark_step = b.step("microdiagnostic-wayring", "Non-parity Wayring example/Sway microdiagnostic");
     benchmark_step.dependOn(&benchmark_run.step);
     const checkpoint3_test_module = b.createModule(.{
         .root_source_file = b.path("src/wayring/checkpoint3_test.zig"),
@@ -280,6 +280,18 @@ pub fn build(b: *std.Build) void {
         wayland.protocols,
         test_step,
     );
+    const parity_run = b.addSystemCommand(&.{ "python3", "scripts/keywork_wayland_benchmark.py" });
+    parity_run.step.dependOn(&install_benchmark_client.step);
+    parity_run.addArg("--compositor");
+    parity_run.addFileArg(compositor_output.executable.getEmittedBin());
+    if (b.args) |args| parity_run.addArgs(args);
+    const parity_step = b.step("benchmark-wayland-parity", "P3-H same-binary Keywork libwayland/Wayring harness (requires -Doptimize=ReleaseSafe)");
+    if (optimize == .ReleaseSafe) {
+        parity_step.dependOn(&parity_run.step);
+    } else {
+        const require_release_safe = b.addSystemCommand(&.{ "sh", "-c", "echo 'benchmark-wayland-parity requires -Doptimize=ReleaseSafe' >&2; exit 2" });
+        parity_step.dependOn(&require_release_safe.step);
+    }
     release.add(
         b,
         target,

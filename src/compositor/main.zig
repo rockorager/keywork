@@ -60,12 +60,17 @@ const usage =
     \\  --headless-scale SCALE
     \\  --headless-refresh HZ
     \\  --drm-device PATH         use an explicit DRM device
-    \\  --experimental-wayring    open a scanner-backed sidecar socket
+    \\  --wayland-server MODE     select libwayland, dual, or wayring
+    \\                            canonical Wayring is headless-only
+    \\                            its limited 21/16 profile is not default eligible
+    \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
     \\  --help                    show this help
     \\
 ;
+
+const WaylandServerMode = enum { libwayland, dual, wayring };
 
 const StartupOptions = struct {
     help: bool = false,
@@ -77,7 +82,7 @@ const StartupOptions = struct {
     headless_scale: ?render.Scale = null,
     headless_refresh_millihertz: ?i32 = null,
     drm_device: ?[]const u8 = null,
-    experimental_wayring: bool = false,
+    wayland_server: ?WaylandServerMode = null,
     log_level: ?ControlProtocol.LogLevel = null,
 
     fn outputKind(self: StartupOptions) OutputBackend.Kind {
@@ -86,6 +91,10 @@ const StartupOptions = struct {
 
     fn rendererKind(self: StartupOptions) Renderer.Kind {
         return self.renderer orelse if (self.outputKind() == .drm) .vulkan else .cpu;
+    }
+
+    fn waylandServerMode(self: StartupOptions) WaylandServerMode {
+        return self.wayland_server orelse .libwayland;
     }
 };
 
@@ -117,7 +126,12 @@ pub fn main(init: std.process.Init) !void {
     Logging.setLevel(options.log_level orelse Logging.defaultLevel());
     const output_kind = options.outputKind();
     const renderer_kind = options.rendererKind();
+    const wayland_server_mode = options.waylandServerMode();
     const native_session = output_kind == .drm;
+    // This variable is output-only and must never leak from a parent session
+    // into activation or Xwayland. Nested WAYLAND_DISPLAY remains available
+    // until backend creation below.
+    _ = init.environ_map.swapRemove("KEYWORK_WAYRING_DISPLAY");
     if (native_session) {
         _ = init.environ_map.swapRemove("WAYLAND_DISPLAY");
         _ = init.environ_map.swapRemove("DISPLAY");
@@ -196,7 +210,10 @@ pub fn main(init: std.process.Init) !void {
     );
     defer child_signal.remove();
 
-    const socket_name = try server.listen();
+    const mature_socket_name = if (wayland_server_mode != .wayring)
+        try server.listen()
+    else
+        null;
     var wayring_protocol_server: ?wayring.server.Server = null;
     var wayring_clients: WayringClients = undefined;
     var wayring_clients_initialized = false;
@@ -322,7 +339,7 @@ pub fn main(init: std.process.Init) !void {
             server.shutdownIdleAlarmHost(host);
         };
         if (wayring_host) |host| host.destroy() catch |err| {
-            log.warn("failed to shut down experimental Wayring socket: {t}", .{err});
+            log.warn("failed to shut down Wayring socket: {t}", .{err});
         };
         if (wayring_protocol_server) |*protocol_server| protocol_server.clearGlobalFilter();
         if (wayring_workspace_initialized) {
@@ -406,7 +423,7 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_compositor_initialized) wayring_compositor.deinit();
         if (wayring_protocol_server) |*protocol_server| protocol_server.deinit();
     }
-    if (options.experimental_wayring) {
+    if (wayland_server_mode != .libwayland) {
         wayring_protocol_server = .init(init.gpa);
         wayring_clients.init(init.gpa, server.clientRegistry());
         wayring_clients_initialized = true;
@@ -700,11 +717,16 @@ pub fn main(init: std.process.Init) !void {
         wayring_idle_alarm_attached = true;
         if (wayring_host.?.failure()) |err| return err;
     }
+    const canonical_display_name = switch (wayland_server_mode) {
+        .libwayland, .dual => mature_socket_name.?,
+        .wayring => wayring_host.?.displayName(),
+    };
     try server.configureXdgSessionStorage(
         init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
-        if (native_session) "session" else socket_name,
+        if (native_session) "session" else canonical_display_name,
     );
-    try init.environ_map.put("WAYLAND_DISPLAY", socket_name);
+    try init.environ_map.put("WAYLAND_DISPLAY", canonical_display_name);
+    server.markStarted();
     try server.listenControl(
         init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.MissingRuntimeDirectory,
     );
@@ -717,13 +739,13 @@ pub fn main(init: std.process.Init) !void {
     const xwayland_display = server.startXwayland(init.environ_map);
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.File.stdout().writer(init.io, &buffer);
-    try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{socket_name});
-    if (wayring_host) |host|
+    try writer.interface.print("WAYLAND_DISPLAY={s}\n", .{canonical_display_name});
+    if (wayland_server_mode == .dual) if (wayring_host) |host|
         try writer.interface.print("KEYWORK_WAYRING_DISPLAY={s}\n", .{host.displayName()});
     if (xwayland_display) |display_name|
         try writer.interface.print("DISPLAY={s}\n", .{display_name});
     try writer.interface.flush();
-    systemd.ready(socket_name, init.environ_map.get("XCURSOR_SIZE").?) catch |err| {
+    systemd.ready(canonical_display_name, init.environ_map.get("XCURSOR_SIZE").?) catch |err| {
         systemd.shutdown() catch |shutdown_err| {
             log.warn("failed to roll back graphical session startup: {t}", .{shutdown_err});
         };
@@ -778,9 +800,14 @@ fn parseArguments(arguments: anytype) !StartupOptions {
             const value = arguments.next() orelse return error.MissingArgument;
             if (value.len == 0) return error.InvalidDrmDevice;
             options.drm_device = value;
+        } else if (std.mem.eql(u8, argument, "--wayland-server")) {
+            if (options.wayland_server != null) return error.DuplicateArgument;
+            const value = arguments.next() orelse return error.MissingArgument;
+            options.wayland_server = std.meta.stringToEnum(WaylandServerMode, value) orelse
+                return error.InvalidWaylandServer;
         } else if (std.mem.eql(u8, argument, "--experimental-wayring")) {
-            if (options.experimental_wayring) return error.DuplicateArgument;
-            options.experimental_wayring = true;
+            if (options.wayland_server != null) return error.DuplicateArgument;
+            options.wayland_server = .dual;
         } else if (std.mem.eql(u8, argument, "--log-level")) {
             if (options.log_level != null) return error.DuplicateArgument;
             const value = arguments.next() orelse return error.MissingArgument;
@@ -802,6 +829,9 @@ fn parseArguments(arguments: anytype) !StartupOptions {
     }
     if (output != .drm and options.drm_device != null) {
         return error.DrmDeviceRequiresDrmOutput;
+    }
+    if (options.waylandServerMode() == .wayring and output != .headless) {
+        return error.WayringRequiresHeadlessOutput;
     }
     return options;
 }
@@ -908,6 +938,7 @@ test "startup options replace environment backend controls" {
     const default_options = try parseArguments(&defaults);
     try std.testing.expectEqual(OutputBackend.Kind.drm, default_options.outputKind());
     try std.testing.expectEqual(Renderer.Kind.vulkan, default_options.rendererKind());
+    try std.testing.expectEqual(WaylandServerMode.libwayland, default_options.waylandServerMode());
 
     var configured: TestArguments = .{ .values = &.{
         "--config",
@@ -933,7 +964,7 @@ test "startup options replace environment backend controls" {
     try std.testing.expectEqual(render.Size{ .width = 2880, .height = 1800 }, options.headless_size.?);
     try std.testing.expectEqual(@as(u32, 180), options.headless_scale.?.numerator);
     try std.testing.expectEqual(@as(i32, 120_000), options.headless_refresh_millihertz.?);
-    try std.testing.expect(options.experimental_wayring);
+    try std.testing.expectEqual(WaylandServerMode.dual, options.waylandServerMode());
     try std.testing.expectEqual(ControlProtocol.LogLevel.debug, options.log_level.?);
 
     var drm: TestArguments = .{ .values = &.{ "--drm-device", "/dev/dri/card1" } };
@@ -957,6 +988,18 @@ test "startup options reject duplicates and backend-specific misuse" {
     var duplicate_wayring: TestArguments = .{ .values = &.{ "--experimental-wayring", "--experimental-wayring" } };
     try std.testing.expectError(error.DuplicateArgument, parseArguments(&duplicate_wayring));
 
+    var missing_wayland_server: TestArguments = .{ .values = &.{"--wayland-server"} };
+    try std.testing.expectError(error.MissingArgument, parseArguments(&missing_wayland_server));
+
+    var invalid_wayland_server: TestArguments = .{ .values = &.{ "--wayland-server", "generated" } };
+    try std.testing.expectError(error.InvalidWaylandServer, parseArguments(&invalid_wayland_server));
+
+    var selector_then_alias: TestArguments = .{ .values = &.{ "--wayland-server", "dual", "--experimental-wayring" } };
+    try std.testing.expectError(error.DuplicateArgument, parseArguments(&selector_then_alias));
+
+    var alias_then_selector: TestArguments = .{ .values = &.{ "--experimental-wayring", "--wayland-server", "dual" } };
+    try std.testing.expectError(error.DuplicateArgument, parseArguments(&alias_then_selector));
+
     var invalid_output: TestArguments = .{ .values = &.{ "--output", "windowed" } };
     try std.testing.expectError(error.InvalidOutputBackend, parseArguments(&invalid_output));
 
@@ -978,6 +1021,34 @@ test "startup options reject duplicates and backend-specific misuse" {
     try std.testing.expectError(
         error.DrmDeviceRequiresDrmOutput,
         parseArguments(&misplaced_drm),
+    );
+
+    var canonical_wayring_drm: TestArguments = .{ .values = &.{ "--wayland-server", "wayring" } };
+    try std.testing.expectError(
+        error.WayringRequiresHeadlessOutput,
+        parseArguments(&canonical_wayring_drm),
+    );
+
+    var canonical_wayring_nested: TestArguments = .{ .values = &.{
+        "--output",
+        "nested",
+        "--wayland-server",
+        "wayring",
+    } };
+    try std.testing.expectError(
+        error.WayringRequiresHeadlessOutput,
+        parseArguments(&canonical_wayring_nested),
+    );
+
+    var canonical_wayring_headless: TestArguments = .{ .values = &.{
+        "--output",
+        "headless",
+        "--wayland-server",
+        "wayring",
+    } };
+    try std.testing.expectEqual(
+        WaylandServerMode.wayring,
+        (try parseArguments(&canonical_wayring_headless)).waylandServerMode(),
     );
 }
 

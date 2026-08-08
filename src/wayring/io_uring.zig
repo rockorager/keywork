@@ -322,12 +322,15 @@ pub const CompleteResult = union(enum) {
 };
 
 pub const Server = struct {
-    const max_auto_socket_number = 31;
+    const max_auto_socket_number = 32;
 
     allocator: std.mem.Allocator,
     sans_io: *server.Server,
     listener_fd: linux.fd_t,
+    owned_lock_fd: ?linux.fd_t = null,
     owned_socket_path: ?[:0]u8 = null,
+    owned_socket_identity: ?PathIdentity = null,
+    owned_lock_path: ?[:0]u8 = null,
     owned_socket_name: ?[]const u8 = null,
     operations: OperationTable,
     connections: std.ArrayList(*Connection) = .empty,
@@ -359,7 +362,8 @@ pub const Server = struct {
     }
 
     /// Creates and owns the first available `wayland-N` listener in an
-    /// explicit runtime directory. Existing paths are never removed.
+    /// explicit runtime directory. A writable stale socket is removed only
+    /// while holding its companion lock.
     pub fn listenAuto(allocator: std.mem.Allocator, sans_io: *server.Server, runtime_directory: []const u8) !Server {
         return listenAutoWithOptions(allocator, sans_io, runtime_directory, .{});
     }
@@ -370,7 +374,12 @@ pub const Server = struct {
         for (0..max_auto_socket_number + 1) |number| {
             const name = std.fmt.bufPrint(&name_buffer, "wayland-{d}", .{number}) catch unreachable;
             const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ runtime_directory, name }, 0);
-            const listener_fd = openListener(path) catch |err| {
+            const lock_path = std.fmt.allocPrintSentinel(allocator, "{s}.lock", .{path}, 0) catch |err| {
+                allocator.free(path);
+                return err;
+            };
+            const owned = acquireListener(path, lock_path) catch |err| {
+                allocator.free(lock_path);
                 allocator.free(path);
                 if (err == error.AddressInUse) continue;
                 return err;
@@ -378,8 +387,11 @@ pub const Server = struct {
             return .{
                 .allocator = allocator,
                 .sans_io = sans_io,
-                .listener_fd = listener_fd,
+                .listener_fd = owned.listener_fd,
+                .owned_lock_fd = owned.lock_fd,
                 .owned_socket_path = path,
+                .owned_socket_identity = owned.socket_identity,
+                .owned_lock_path = lock_path,
                 .owned_socket_name = path[path.len - name.len ..],
                 .operations = .init(allocator),
                 .transport_provenance = options.transport_provenance,
@@ -398,11 +410,29 @@ pub const Server = struct {
         _ = linux.close(self.listener_fd);
         var socket_cleanup_failed = false;
         if (self.owned_socket_path) |path| {
-            removeSocketPath(path) catch {
+            const owns_lock_path = if (self.owned_lock_fd) |fd|
+                if (self.owned_lock_path) |lock_path| lockPathMatchesFd(fd, lock_path) else false
+            else
+                false;
+            if (!owns_lock_path or !socketPathMatchesIdentity(path, self.owned_socket_identity.?)) {
+                socket_cleanup_failed = true;
+            } else removeSocketPath(path, self.owned_socket_identity.?) catch {
                 socket_cleanup_failed = true;
             };
             self.allocator.free(path);
         }
+        if (self.owned_lock_path) |path| {
+            if (self.owned_lock_fd) |fd| {
+                if (lockPathMatchesFd(fd, path)) {
+                    switch (linux.errno(linux.unlink(path.ptr))) {
+                        .SUCCESS, .NOENT => {},
+                        else => socket_cleanup_failed = true,
+                    }
+                }
+            }
+            self.allocator.free(path);
+        }
+        if (self.owned_lock_fd) |fd| _ = linux.close(fd);
         self.connections.deinit(self.allocator);
         self.operations.deinit();
         self.* = undefined;
@@ -760,7 +790,122 @@ fn socketAddress(path: []const u8) !struct { linux.sockaddr.un, linux.socklen_t 
     return .{ address, @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1) };
 }
 
+const OwnedListener = struct {
+    listener_fd: linux.fd_t,
+    lock_fd: linux.fd_t,
+    socket_identity: PathIdentity,
+};
+
+const OpenedListener = struct {
+    fd: linux.fd_t,
+    identity: PathIdentity,
+};
+
+const PathIdentity = struct {
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
+};
+
+fn acquireListener(path: [:0]const u8, lock_path: [:0]const u8) !OwnedListener {
+    const raw_lock_fd = linux.openat(linux.AT.FDCWD, lock_path.ptr, .{
+        .ACCMODE = .RDWR,
+        .CREAT = true,
+        .CLOEXEC = true,
+    }, 0o660);
+    if (linux.errno(raw_lock_fd) != .SUCCESS) return error.LockOpenFailed;
+    const lock_fd: linux.fd_t = @intCast(raw_lock_fd);
+    var handed_off = false;
+    defer if (!handed_off) {
+        _ = linux.close(lock_fd);
+    };
+
+    // Linux LOCK_EX | LOCK_NB. std.os.linux exposes flock but not its flags.
+    switch (linux.errno(linux.flock(lock_fd, 2 | 4))) {
+        .SUCCESS => {},
+        .AGAIN => return error.AddressInUse,
+        else => return error.LockFailed,
+    }
+    // A waiter may have opened an inode that the previous owner subsequently
+    // unlinked. Never treat that detached lock as ownership of the current
+    // pathname; another process may already own a replacement inode.
+    if (!lockPathMatchesFd(lock_fd, lock_path)) return error.AddressInUse;
+    errdefer {
+        if (lockPathMatchesFd(lock_fd, lock_path)) _ = linux.unlink(lock_path.ptr);
+    }
+
+    const listener = openOwnedListener(path) catch |err| switch (err) {
+        error.AddressInUse => blk: {
+            const stale_identity = writableStaleSocketIdentity(path) orelse return error.AddressInUse;
+            if (!lockPathMatchesFd(lock_fd, lock_path) or !socketPathMatchesIdentity(path, stale_identity))
+                return error.AddressInUse;
+            switch (linux.errno(linux.unlink(path.ptr))) {
+                .SUCCESS => {},
+                else => return error.AddressInUse,
+            }
+            break :blk try openOwnedListener(path);
+        },
+        else => return err,
+    };
+    errdefer {
+        _ = linux.close(listener.fd);
+        if (lockPathMatchesFd(lock_fd, lock_path)) removeSocketPath(path, listener.identity) catch {};
+    }
+    if (!lockPathMatchesFd(lock_fd, lock_path) or !socketPathMatchesIdentity(path, listener.identity))
+        return error.AddressInUse;
+    handed_off = true;
+    return .{ .listener_fd = listener.fd, .lock_fd = lock_fd, .socket_identity = listener.identity };
+}
+
+fn lockPathMatchesFd(fd: linux.fd_t, path: [:0]const u8) bool {
+    var descriptor_status: linux.Statx = undefined;
+    var path_status: linux.Statx = undefined;
+    const mask: linux.STATX = .{ .INO = true };
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, mask, &descriptor_status)) != .SUCCESS)
+        return false;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path.ptr, linux.AT.SYMLINK_NOFOLLOW, mask, &path_status)) != .SUCCESS)
+        return false;
+    return descriptor_status.ino == path_status.ino and
+        descriptor_status.dev_major == path_status.dev_major and
+        descriptor_status.dev_minor == path_status.dev_minor;
+}
+
+fn socketPathIdentity(path: [:0]const u8) ?PathIdentity {
+    var status: linux.Statx = undefined;
+    const mask: linux.STATX = .{ .TYPE = true, .INO = true };
+    if (linux.errno(linux.statx(linux.AT.FDCWD, path.ptr, linux.AT.SYMLINK_NOFOLLOW, mask, &status)) != .SUCCESS or
+        status.mode & linux.S.IFMT != linux.S.IFSOCK)
+        return null;
+    return .{ .device_major = status.dev_major, .device_minor = status.dev_minor, .inode = status.ino };
+}
+
+fn socketPathMatchesIdentity(path: [:0]const u8, identity: PathIdentity) bool {
+    const current = socketPathIdentity(path) orelse return false;
+    return current.device_major == identity.device_major and
+        current.device_minor == identity.device_minor and
+        current.inode == identity.inode;
+}
+
+fn writableStaleSocketIdentity(path: [:0]const u8) ?PathIdentity {
+    const identity = socketPathIdentity(path) orelse return null;
+    if (linux.errno(linux.access(path.ptr, linux.W_OK)) != .SUCCESS) return null;
+
+    const address, const address_len = socketAddress(path) catch return null;
+    const raw_fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(raw_fd) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(raw_fd);
+    defer _ = linux.close(fd);
+    if (linux.errno(linux.connect(fd, @ptrCast(&address), address_len)) != .CONNREFUSED or
+        !socketPathMatchesIdentity(path, identity))
+        return null;
+    return identity;
+}
+
 fn openListener(path: [:0]const u8) !linux.fd_t {
+    return (try openOwnedListener(path)).fd;
+}
+
+fn openOwnedListener(path: [:0]const u8) !OpenedListener {
     const address, const address_len = try socketAddress(path);
     const raw_fd = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(raw_fd) != .SUCCESS) return error.SocketFailed;
@@ -772,19 +917,15 @@ fn openListener(path: [:0]const u8) !linux.fd_t {
         .ADDRINUSE => return error.AddressInUse,
         else => return error.BindFailed,
     }
-    errdefer _ = linux.unlink(path.ptr);
+    const identity = socketPathIdentity(path) orelse return error.SocketPathInspectionFailed;
+    errdefer removeSocketPath(path, identity) catch {};
     if (linux.errno(linux.listen(fd, linux.SOMAXCONN)) != .SUCCESS) return error.ListenFailed;
-    return fd;
+    if (!socketPathMatchesIdentity(path, identity)) return error.SocketPathReplaced;
+    return .{ .fd = fd, .identity = identity };
 }
 
-fn removeSocketPath(path: [:0]const u8) !void {
-    var status: linux.Statx = undefined;
-    const stat_result = linux.statx(linux.AT.FDCWD, path.ptr, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &status);
-    switch (linux.errno(stat_result)) {
-        .NOENT => return,
-        .SUCCESS => if (status.mode & linux.S.IFMT != linux.S.IFSOCK) return error.SocketPathOccupied,
-        else => return error.SocketPathInspectionFailed,
-    }
+fn removeSocketPath(path: [:0]const u8, identity: PathIdentity) !void {
+    if (!socketPathMatchesIdentity(path, identity)) return error.SocketPathReplaced;
     switch (linux.errno(linux.unlink(path.ptr))) {
         .SUCCESS, .NOENT => {},
         else => return error.UnlinkFailed,
@@ -895,13 +1036,156 @@ test "automatic listener chooses the next name and removes owned socket paths" {
     defer host.deinit();
     var transport = try Server.listenAuto(std.testing.allocator, &host, directory);
     try std.testing.expectEqualStrings("wayland-1", transport.socketName().?);
+    const listener_descriptor_flags = linux.fcntl(transport.listener_fd, linux.F.GETFD, 0);
+    const listener_status_flags = linux.fcntl(transport.listener_fd, linux.F.GETFL, 0);
+    const lock_descriptor_flags = linux.fcntl(transport.owned_lock_fd.?, linux.F.GETFD, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(listener_descriptor_flags));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(listener_status_flags));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(lock_descriptor_flags));
+    try std.testing.expect(listener_descriptor_flags & linux.FD_CLOEXEC != 0);
+    try std.testing.expect(listener_status_flags & (1 << @bitOffsetOf(linux.O, "NONBLOCK")) != 0);
+    try std.testing.expect(lock_descriptor_flags & linux.FD_CLOEXEC != 0);
+    const abandoned_lock = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}.lock", .{occupied}, 0);
+    defer std.testing.allocator.free(abandoned_lock);
+    try std.testing.expectEqual(linux.E.NOENT, linux.errno(linux.access(abandoned_lock.ptr, 0)));
     const owned_path = try std.testing.allocator.dupeZ(u8, transport.owned_socket_path.?);
     defer std.testing.allocator.free(owned_path);
+    const owned_lock_path = try std.testing.allocator.dupeZ(u8, transport.owned_lock_path.?);
+    defer std.testing.allocator.free(owned_lock_path);
     try transport.deinit();
 
     var status: linux.Statx = undefined;
     const stat_result = linux.statx(linux.AT.FDCWD, owned_path.ptr, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &status);
     try std.testing.expectEqual(linux.E.NOENT, linux.errno(stat_result));
+    try std.testing.expectEqual(
+        linux.E.NOENT,
+        linux.errno(linux.statx(linux.AT.FDCWD, owned_lock_path.ptr, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &status)),
+    );
+}
+
+test "automatic listener replaces a writable stale socket while owning its lock" {
+    var unique_marker: u8 = 0;
+    const directory = try std.fmt.allocPrintSentinel(std.testing.allocator, "/tmp/keywork-wayring-stale-{d}-{x}", .{ linux.getpid(), @intFromPtr(&unique_marker) }, 0);
+    defer std.testing.allocator.free(directory);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(directory.ptr, 0o700)));
+    defer _ = linux.rmdir(directory.ptr);
+
+    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/wayland-0", .{directory}, 0);
+    defer std.testing.allocator.free(path);
+    const stale_fd = try openListener(path);
+    _ = linux.close(stale_fd);
+    defer _ = linux.unlink(path.ptr);
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var transport = try Server.listenAuto(std.testing.allocator, &host, directory);
+    defer transport.deinit() catch {};
+    try std.testing.expectEqualStrings("wayland-0", transport.socketName().?);
+    const contender_raw = linux.openat(linux.AT.FDCWD, transport.owned_lock_path.?.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(contender_raw));
+    const contender: linux.fd_t = @intCast(contender_raw);
+    defer _ = linux.close(contender);
+    try std.testing.expectEqual(linux.E.AGAIN, linux.errno(linux.flock(contender, 2 | 4)));
+}
+
+test "automatic listener never removes a replacement lock pathname" {
+    var unique_marker: u8 = 0;
+    const directory = try std.fmt.allocPrintSentinel(std.testing.allocator, "/tmp/keywork-wayring-replaced-lock-{d}-{x}", .{ linux.getpid(), @intFromPtr(&unique_marker) }, 0);
+    defer std.testing.allocator.free(directory);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(directory.ptr, 0o700)));
+    defer _ = linux.rmdir(directory.ptr);
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var transport = try Server.listenAuto(std.testing.allocator, &host, directory);
+    const socket_path = try std.testing.allocator.dupeZ(u8, transport.owned_socket_path.?);
+    defer std.testing.allocator.free(socket_path);
+    const lock_path = try std.testing.allocator.dupeZ(u8, transport.owned_lock_path.?);
+    defer std.testing.allocator.free(lock_path);
+    const detached_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}.detached", .{lock_path}, 0);
+    defer std.testing.allocator.free(detached_path);
+    defer _ = linux.unlink(detached_path.ptr);
+    defer _ = linux.unlink(lock_path.ptr);
+    defer _ = linux.unlink(socket_path.ptr);
+
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.renameat(linux.AT.FDCWD, lock_path.ptr, linux.AT.FDCWD, detached_path.ptr)),
+    );
+    const replacement_raw = linux.openat(linux.AT.FDCWD, lock_path.ptr, .{
+        .ACCMODE = .RDWR,
+        .CREAT = true,
+        .CLOEXEC = true,
+    }, 0o660);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(replacement_raw));
+    _ = linux.close(@intCast(replacement_raw));
+
+    try std.testing.expectError(error.SocketCleanupFailed, transport.deinit());
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.access(socket_path.ptr, 0)));
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.access(lock_path.ptr, 0)));
+}
+
+test "automatic listener never removes a replacement socket pathname" {
+    var unique_marker: u8 = 0;
+    const directory = try std.fmt.allocPrintSentinel(std.testing.allocator, "/tmp/keywork-wayring-replaced-socket-{d}-{x}", .{ linux.getpid(), @intFromPtr(&unique_marker) }, 0);
+    defer std.testing.allocator.free(directory);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(directory.ptr, 0o700)));
+    defer _ = linux.rmdir(directory.ptr);
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var transport = try Server.listenAuto(std.testing.allocator, &host, directory);
+    const socket_path = try std.testing.allocator.dupeZ(u8, transport.owned_socket_path.?);
+    defer std.testing.allocator.free(socket_path);
+    const lock_path = try std.testing.allocator.dupeZ(u8, transport.owned_lock_path.?);
+    defer std.testing.allocator.free(lock_path);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(socket_path.ptr)));
+    const replacement_fd = try openListener(socket_path);
+    defer _ = linux.close(replacement_fd);
+    defer _ = linux.unlink(socket_path.ptr);
+
+    try std.testing.expectError(error.SocketCleanupFailed, transport.deinit());
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.access(socket_path.ptr, 0)));
+    try std.testing.expectEqual(linux.E.NOENT, linux.errno(linux.access(lock_path.ptr, 0)));
+}
+
+test "automatic listener leaves contended locks and sockets and exhausts all 33 names" {
+    var unique_marker: u8 = 0;
+    const directory = try std.fmt.allocPrintSentinel(std.testing.allocator, "/tmp/keywork-wayring-locks-{d}-{x}", .{ linux.getpid(), @intFromPtr(&unique_marker) }, 0);
+    defer std.testing.allocator.free(directory);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(directory.ptr, 0o700)));
+    defer _ = linux.rmdir(directory.ptr);
+
+    var lock_fds: [33]linux.fd_t = undefined;
+    var lock_paths: [33][:0]u8 = undefined;
+    var count: usize = 0;
+    defer for (0..count) |index| {
+        _ = linux.close(lock_fds[index]);
+        _ = linux.unlink(lock_paths[index].ptr);
+        std.testing.allocator.free(lock_paths[index]);
+    };
+    for (0..33) |number| {
+        const lock_path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/wayland-{d}.lock", .{ directory, number }, 0);
+        lock_paths[count] = lock_path;
+        const raw_fd = linux.openat(linux.AT.FDCWD, lock_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .CLOEXEC = true }, 0o660);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(raw_fd));
+        lock_fds[count] = @intCast(raw_fd);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.flock(lock_fds[count], 2 | 4)));
+        count += 1;
+    }
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    try std.testing.expectError(error.NoAvailableSocketName, Server.listenAuto(std.testing.allocator, &host, directory));
+    for (lock_paths[0..count]) |path|
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.access(path.ptr, 0)));
+}
+
+test "automatic listener rejects invalid runtime paths without ownership" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    try std.testing.expectError(error.InvalidRuntimeDirectory, Server.listenAuto(std.testing.allocator, &host, "relative"));
+    try std.testing.expectError(error.LockOpenFailed, Server.listenAuto(std.testing.allocator, &host, "/definitely-missing-keywork-runtime"));
 }
 
 test "SCM_RIGHTS encoder emits one ordered descriptor message" {
