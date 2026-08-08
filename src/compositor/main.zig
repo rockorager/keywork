@@ -23,6 +23,7 @@ const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
 const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
 const WayringIdleNotification = @import("wayland/WayringIdleNotification.zig");
 const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
+const WayringProfile = @import("wayland/WayringProfile.zig");
 const WayringSessionLock = @import("wayland/WayringSessionLock.zig");
 const WayringWorkspace = @import("wayland/WayringWorkspace.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
@@ -275,9 +276,10 @@ pub fn main(init: std.process.Init) !void {
         layer_shell: ?*WayringLayerShell,
         session_lock: ?*WayringSessionLock,
         workspace: ?*WayringWorkspace,
+        authorized_uid: std.os.linux.uid_t,
 
         fn globalVisible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
-            return if (self.workspace) |workspace| workspace.globalFilter(client, global) else if (self.data_control) |data_control| data_control.globalFilter(client, global) else global.visibility() != .restricted;
+            return WayringProfile.securityVisible(self.authorized_uid, client, global);
         }
 
         fn accepted(erased: *anyopaque, client: *wayring.server.Client) !void {
@@ -666,7 +668,18 @@ pub fn main(init: std.process.Init) !void {
             .layer_shell = if (wayring_layer_shell_initialized) &wayring_layer_shell else null,
             .session_lock = if (wayring_session_lock_initialized) &wayring_session_lock else null,
             .workspace = if (wayring_workspace_initialized) &wayring_workspace else null,
+            .authorized_uid = std.os.linux.getuid(),
         };
+        if (WayringProfile.validate(
+            &wayring_protocol_server.?,
+            if (wayring_outputs_initialized) .presenting_headless else .sidecar,
+        )) |diagnostic| {
+            var diagnostic_buffer: [512]u8 = undefined;
+            var diagnostic_writer: std.Io.Writer = .fixed(&diagnostic_buffer);
+            diagnostic.format(&diagnostic_writer) catch {};
+            log.err("generated Wayland profile mismatch: {s}", .{diagnostic_writer.buffered()});
+            return error.WayringProfileMismatch;
+        }
         wayring_protocol_server.?.setGlobalFilter(
             WayringLifecycle,
             &wayring_lifecycle,

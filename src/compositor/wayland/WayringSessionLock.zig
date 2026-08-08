@@ -9,6 +9,7 @@ const SessionLock = @import("../SessionLock.zig");
 const WayringClients = @import("WayringClients.zig");
 const WayringCompositor = @import("WayringCompositor.zig");
 const WayringOutput = @import("WayringOutput.zig");
+const WayringProfile = @import("WayringProfile.zig");
 
 const server = wayring.server;
 
@@ -93,7 +94,7 @@ pub fn deinit(self: *WayringSessionLock) void {
 }
 /// Suitable for the server-wide restricted-global filter.
 pub fn globalFilter(self: *const WayringSessionLock, client: *const server.Client, global: *const server.Server.Global) bool {
-    return global.visibility() != .restricted or client.isAuthorizedDirectPeer(self.authorized_uid);
+    return WayringProfile.securityVisible(self.authorized_uid, client, global);
 }
 fn generation(self: *WayringSessionLock) !u64 {
     const result = self.next_generation orelse return error.GenerationExhausted;

@@ -17,6 +17,7 @@ const GtkShell = @import("wayland/gtk_shell.zig");
 const XdgForeign = @import("wayland/xdg_foreign.zig");
 const LayerShell = @import("wayland/layer_shell.zig");
 const NeutralLayerShell = @import("LayerShell.zig");
+const WayringProfile = @import("wayland/WayringProfile.zig");
 
 fn layerOutputValid(context: *anyopaque, id: @import("output_layout.zig").Id) bool {
     const outputs: *OutputLayout = @ptrCast(@alignCast(context));
@@ -18583,30 +18584,8 @@ const WayringXdgClient = struct {
     activated_surface_sequence: u8 = 0,
     activated_ack_sequence: u8 = 0,
 
-    const ExpectedGlobal = struct { name: []const u8, version: u32 };
-    const expected_globals = [_]ExpectedGlobal{
-        .{ .name = "wl_compositor", .version = 6 },
-        .{ .name = "wl_shm", .version = 1 },
-        .{ .name = "wl_subcompositor", .version = 1 },
-        .{ .name = "wl_seat", .version = 11 },
-        .{ .name = "wl_output", .version = 4 },
-        .{ .name = "xdg_wm_base", .version = 7 },
-        .{ .name = "wp_viewporter", .version = 1 },
-        .{ .name = "wp_fractional_scale_manager_v1", .version = 1 },
-        .{ .name = "wp_cursor_shape_manager_v1", .version = 2 },
-        .{ .name = "zxdg_decoration_manager_v1", .version = 2 },
-        .{ .name = "xdg_activation_v1", .version = 1 },
-        .{ .name = "wl_data_device_manager", .version = 4 },
-        .{ .name = "zwp_primary_selection_device_manager_v1", .version = 1 },
-        .{ .name = "zwp_text_input_manager_v3", .version = 2 },
-        .{ .name = "ext_data_control_manager_v1", .version = 1 },
-        .{ .name = "zwp_input_method_manager_v2", .version = 1 },
-        .{ .name = "zwp_virtual_keyboard_manager_v1", .version = 1 },
-        .{ .name = "zwlr_layer_shell_v1", .version = 5 },
-        .{ .name = "ext_session_lock_manager_v1", .version = 1 },
-        .{ .name = "ext_idle_notifier_v1", .version = 2 },
-        .{ .name = "ext_workspace_manager_v1", .version = 1 },
-    };
+    const ExpectedGlobal = WayringProfile.Entry;
+    const expected_globals = WayringProfile.entries;
 
     fn expectedGlobalCount(self: *const @This()) usize {
         return expected_globals.len - @intFromBool(!self.expect_text_input) -
@@ -18622,21 +18601,21 @@ const WayringXdgClient = struct {
     fn expectedGlobal(self: *const @This(), visible_index: usize) ?ExpectedGlobal {
         var index: usize = 0;
         for (expected_globals) |global| {
-            const present = if (std.mem.eql(u8, global.name, "zwp_text_input_manager_v3"))
+            const present = if (std.mem.eql(u8, global.interface, "zwp_text_input_manager_v3"))
                 self.expect_text_input
-            else if (std.mem.eql(u8, global.name, "ext_data_control_manager_v1"))
+            else if (std.mem.eql(u8, global.interface, "ext_data_control_manager_v1"))
                 self.expect_data_control
-            else if (std.mem.eql(u8, global.name, "zwp_input_method_manager_v2"))
+            else if (std.mem.eql(u8, global.interface, "zwp_input_method_manager_v2"))
                 self.expect_input_method
-            else if (std.mem.eql(u8, global.name, "zwp_virtual_keyboard_manager_v1"))
+            else if (std.mem.eql(u8, global.interface, "zwp_virtual_keyboard_manager_v1"))
                 self.expect_virtual_keyboard
-            else if (std.mem.eql(u8, global.name, "zwlr_layer_shell_v1"))
+            else if (std.mem.eql(u8, global.interface, "zwlr_layer_shell_v1"))
                 self.expect_layer_shell
-            else if (std.mem.eql(u8, global.name, "ext_idle_notifier_v1"))
+            else if (std.mem.eql(u8, global.interface, "ext_idle_notifier_v1"))
                 self.expect_idle_notify
-            else if (std.mem.eql(u8, global.name, "ext_session_lock_manager_v1"))
+            else if (std.mem.eql(u8, global.interface, "ext_session_lock_manager_v1"))
                 self.expect_session_lock
-            else if (std.mem.eql(u8, global.name, "ext_workspace_manager_v1"))
+            else if (std.mem.eql(u8, global.interface, "ext_workspace_manager_v1"))
                 self.expect_workspace
             else
                 true;
@@ -19059,7 +19038,7 @@ const WayringXdgClient = struct {
                 const index = self.global_count;
                 self.global_count += 1;
                 const expected = self.expectedGlobal(index);
-                if (expected == null or !std.mem.eql(u8, interface, expected.?.name) or
+                if (expected == null or !std.mem.eql(u8, interface, expected.?.interface) or
                     global.version != expected.?.version) self.globals_exact = false;
                 if (std.mem.eql(u8, interface, "wl_compositor")) self.compositor = registry.bind(global.name, client_wl.Compositor, 6) catch null else if (std.mem.eql(u8, interface, "wl_shm")) self.shm = registry.bind(global.name, client_wl.Shm, 1) catch null else if (std.mem.eql(u8, interface, "wl_output")) self.output = registry.bind(global.name, client_wl.Output, 4) catch null else if (std.mem.eql(u8, interface, "wl_seat")) self.seat = registry.bind(global.name, client_wl.Seat, 11) catch null else if (std.mem.eql(u8, interface, "xdg_wm_base")) self.wm_base = registry.bind(global.name, client_xdg.WmBase, 7) catch null else if (std.mem.eql(u8, interface, "zxdg_decoration_manager_v1")) self.decoration_manager = registry.bind(global.name, client_zxdg.DecorationManagerV1, 2) catch null else if (std.mem.eql(u8, interface, "xdg_activation_v1")) self.activation = registry.bind(global.name, client_xdg.ActivationV1, 1) catch null;
             },
@@ -26285,7 +26264,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, host, &peer, .registry_ready);
     try std.testing.expect(peer.globals_exact);
-    try std.testing.expectEqual(@as(usize, 16), peer.global_count);
+    try std.testing.expectEqual(peer.expectedGlobalCount(), peer.global_count);
     try std.testing.expectEqual(@as(usize, 1), peer.data_device_manager_count);
     try std.testing.expectEqual(@as(u32, 4), peer.data_device_manager_version);
     try std.testing.expectEqual(@as(usize, 1), peer.primary_selection_manager_count);
@@ -26314,7 +26293,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(@as(usize, 1), peer.virtual_keyboard_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.virtual_keyboard_manager_version);
-    try std.testing.expectEqual(@as(usize, 21), peer.global_count);
+    try std.testing.expectEqual(WayringProfile.expectedCount(.presenting_headless, .direct), peer.global_count);
     try std.testing.expectEqual(@as(usize, 1), peer.layer_shell_count);
     try std.testing.expectEqual(@as(u32, 5), peer.layer_shell_version);
     try std.testing.expectEqual(@as(usize, 1), peer.idle_notifier_count);
@@ -26323,6 +26302,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(u32, 1), peer.session_lock_manager_version);
     try std.testing.expectEqual(@as(usize, 1), peer.workspace_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.workspace_manager_version);
+    try std.testing.expect(WayringProfile.validate(&protocol_server, .presenting_headless) == null);
 
     // Drive the scanner-generated manager with the same real libwayland
     // client fixture used for the mature frontend. Keep the registry peer
@@ -26476,7 +26456,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, host, &profile, .registry_ready);
     try std.testing.expect(profile.globals_exact);
-    try std.testing.expectEqual(@as(usize, 21), profile.global_count);
+    try std.testing.expectEqual(WayringProfile.expectedCount(.presenting_headless, .direct), profile.global_count);
     try std.testing.expectEqual(@as(usize, 1), profile.idle_notifier_count);
     try std.testing.expectEqual(@as(u32, 2), profile.idle_notifier_version);
     try std.testing.expectEqual(@as(usize, 1), profile.session_lock_manager_count);
@@ -26524,7 +26504,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, denied_host, &denied, .registry_ready);
     try std.testing.expect(denied.globals_exact);
-    try std.testing.expectEqual(@as(usize, 16), denied.global_count);
+    try std.testing.expectEqual(WayringProfile.expectedCount(.presenting_headless, .security_context), denied.global_count);
     try std.testing.expectEqual(@as(usize, 1), denied.layer_shell_count);
     try std.testing.expectEqual(@as(u32, 5), denied.layer_shell_version);
     try std.testing.expectEqual(@as(usize, 0), denied.data_control_manager_count);
@@ -26532,13 +26512,11 @@ test "production generated data device completes the exact profile and supports 
     const before_denied_bind = server.dataDeviceResourceSnapshot();
     data_control.unpublish();
     try data_control.publish();
-    // Global names are allocated monotonically by the protocol server. No
-    // other publication occurs after workspace and before this re-publication.
-    denied.guessed_data_control_name = profile.workspace_manager_name + 1;
+    denied.guessed_data_control_name = data_control.global.?.name();
     try signalWayringCommand(denied_command);
     try waitForWayringXdgStage(server, denied_host, &denied, .manager_added);
     try std.testing.expect(denied.globals_exact);
-    try std.testing.expectEqual(@as(usize, 16), denied.global_count);
+    try std.testing.expectEqual(WayringProfile.expectedCount(.presenting_headless, .security_context), denied.global_count);
     try std.testing.expectEqual(@as(usize, 0), denied.data_control_manager_count);
     try std.testing.expect(denied.data_control_manager == null);
     const managers_before_denied_bind = data_control.managers.items.len;
@@ -26588,7 +26566,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, denied_host, &denied_method, .registry_ready);
     try std.testing.expect(denied_method.globals_exact);
-    try std.testing.expectEqual(@as(usize, 16), denied_method.global_count);
+    try std.testing.expectEqual(WayringProfile.expectedCount(.presenting_headless, .security_context), denied_method.global_count);
     try std.testing.expectEqual(@as(usize, 0), denied_method.input_method_manager_count);
     const method_managers_before_denied_bind = input_method.managers.items.len;
     try signalWayringCommand(denied_method_command);
@@ -26629,7 +26607,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, denied_host, &denied_virtual, .registry_ready);
     try std.testing.expect(denied_virtual.globals_exact);
-    try std.testing.expectEqual(@as(usize, 16), denied_virtual.global_count);
+    try std.testing.expectEqual(WayringProfile.expectedCount(.presenting_headless, .security_context), denied_virtual.global_count);
     try std.testing.expectEqual(@as(usize, 0), denied_virtual.virtual_keyboard_manager_count);
     try signalWayringCommand(denied_virtual_command);
     try waitForWayringXdgStage(server, denied_host, &denied_virtual, .manager_added);
@@ -26675,7 +26653,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, denied_host, &denied_lock, .registry_ready);
     try std.testing.expect(denied_lock.globals_exact);
-    try std.testing.expectEqual(@as(usize, 16), denied_lock.global_count);
+    try std.testing.expectEqual(WayringProfile.expectedCount(.presenting_headless, .security_context), denied_lock.global_count);
     try std.testing.expectEqual(@as(usize, 0), denied_lock.session_lock_manager_count);
     try signalWayringCommand(denied_lock_command);
     try waitForWayringXdgStage(server, denied_host, &denied_lock, .manager_added);
@@ -26782,6 +26760,8 @@ test "production generated data device completes the exact profile and supports 
     try layer_shell.publish();
     try session_lock.publish();
     try idle_notify.publish();
+    try generated_workspace.publish();
+    try std.testing.expect(WayringProfile.validate(&protocol_server, .presenting_headless) == null);
 
     const raw_layer_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_layer_command) != .SUCCESS) return error.EventFdFailed;
@@ -27216,6 +27196,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_layer_shell = true,
         .expect_idle_notify = true,
         .expect_session_lock = true,
+        .expect_workspace = true,
     };
     const primary_watch_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_watch});
     var primary_watch_joined = false;
@@ -27226,6 +27207,7 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringXdgStage(server, host, &primary_watch, .registry_ready);
     try std.testing.expect(primary_watch.globals_exact);
     try std.testing.expectEqual(@as(usize, 1), primary_watch.primary_selection_manager_count);
+    generated_workspace.unpublish();
     idle_notify.unpublish();
     session_lock.unpublish();
     layer_shell.unpublish();
@@ -27255,6 +27237,8 @@ test "production generated data device completes the exact profile and supports 
     try layer_shell.publish();
     try session_lock.publish();
     try idle_notify.publish();
+    try generated_workspace.publish();
+    try std.testing.expect(WayringProfile.validate(&protocol_server, .presenting_headless) == null);
     const raw_primary_rebind_command = linux.eventfd(0, linux.EFD.CLOEXEC);
     if (linux.errno(raw_primary_rebind_command) != .SUCCESS) return error.EventFdFailed;
     const primary_rebind_command: std.posix.fd_t = @intCast(raw_primary_rebind_command);
@@ -27271,6 +27255,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_layer_shell = true,
         .expect_idle_notify = true,
         .expect_session_lock = true,
+        .expect_workspace = true,
     };
     const primary_rebind_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_rebind});
     var primary_rebind_joined = false;
@@ -27280,7 +27265,7 @@ test "production generated data device completes the exact profile and supports 
     };
     try waitForWayringXdgStage(server, host, &primary_rebind, .registry_ready);
     try std.testing.expect(primary_rebind.globals_exact);
-    try std.testing.expectEqual(@as(usize, 20), primary_rebind.global_count);
+    try std.testing.expectEqual(WayringProfile.expectedCount(.presenting_headless, .direct), primary_rebind.global_count);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.primary_selection_manager_count);
     try std.testing.expectEqual(@as(u32, 1), primary_rebind.primary_selection_manager_version);
     try std.testing.expectEqual(@as(usize, 1), primary_rebind.input_method_manager_count);

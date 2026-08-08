@@ -26,6 +26,24 @@ pub const TransportProvenance = enum {
     security_context,
 };
 
+/// Immutable accept-time identity used by compositor authorization policy.
+/// Missing credentials deliberately preserve provenance for diagnostics while
+/// failing every trust predicate.
+pub const SecurityIdentity = struct {
+    credentials: ?Credentials,
+    provenance: TransportProvenance,
+
+    pub fn classification(self: SecurityIdentity) TransportProvenance {
+        if (self.credentials == null) return .unknown;
+        return self.provenance;
+    }
+
+    pub fn isTrustedDirectUid(self: SecurityIdentity, authorized_uid: std.os.linux.uid_t) bool {
+        const peer = self.credentials orelse return false;
+        return peer.uid == authorized_uid and self.provenance == .direct;
+    }
+};
+
 pub const ProtocolDirection = enum { request, event };
 
 pub const ProtocolMessage = struct {
@@ -173,12 +191,18 @@ pub fn transportProvenance(self: *const Client) TransportProvenance {
     return self.transport_provenance_value;
 }
 
+pub fn securityIdentity(self: *const Client) SecurityIdentity {
+    return .{
+        .credentials = self.credentials_value,
+        .provenance = self.transport_provenance_value,
+    };
+}
+
 /// Authorizes a privileged compositor-local client from immutable transport
 /// metadata. Same-UID clients accepted through a security context are not
 /// equivalent to a client accepted directly by the compositor socket.
 pub fn isAuthorizedDirectPeer(self: *const Client, authorized_uid: std.os.linux.uid_t) bool {
-    const peer = self.credentials_value orelse return false;
-    return peer.uid == authorized_uid and self.transport_provenance_value == .direct;
+    return self.securityIdentity().isTrustedDirectUid(authorized_uid);
 }
 
 pub fn addDestroyObserver(
@@ -1308,6 +1332,7 @@ test "privileged UID authorization requires immutable direct provenance" {
     defer direct.deinit();
     try std.testing.expect(direct.isAuthorizedDirectPeer(42));
     try std.testing.expect(!direct.isAuthorizedDirectPeer(41));
+    try std.testing.expectEqual(TransportProvenance.direct, direct.securityIdentity().classification());
 
     inline for (.{ TransportProvenance.unknown, .security_context }) |provenance| {
         var derived: Client = .init(std.testing.allocator, .{
@@ -1316,8 +1341,12 @@ test "privileged UID authorization requires immutable direct provenance" {
         });
         defer derived.deinit();
         try std.testing.expect(!derived.isAuthorizedDirectPeer(42));
+        try std.testing.expectEqual(provenance, derived.securityIdentity().classification());
     }
     var missing: Client = .init(std.testing.allocator, .{ .transport_provenance = .direct });
     defer missing.deinit();
     try std.testing.expect(!missing.isAuthorizedDirectPeer(42));
+    try std.testing.expectEqual(TransportProvenance.direct, missing.securityIdentity().provenance);
+    try std.testing.expectEqual(TransportProvenance.unknown, missing.securityIdentity().classification());
+    try std.testing.expect(missing.securityIdentity().credentials == null);
 }
