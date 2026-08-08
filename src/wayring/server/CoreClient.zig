@@ -66,6 +66,7 @@ pub fn create(allocator: std.mem.Allocator, server: *Server, options: Options) !
             .credentials = options.credentials,
             .transport_provenance = options.transport_provenance,
             .protocol_log_sink = server.protocolLogSink(),
+            .registry_lifecycle = .{ .context = self, .destroy = destroyRegistry },
         }),
         .display = undefined,
         .publication_observer = undefined,
@@ -86,12 +87,7 @@ pub fn create(allocator: std.mem.Allocator, server: *Server, options: Options) !
 /// Every application-owned resource must already have been destroyed.
 pub fn destroy(self: *CoreClient) void {
     self.server.removePublicationObserver(self.publication_observer);
-    for (self.registries.items) |registry| {
-        registry.advertised_globals.deinit(self.allocator);
-        registry.resource.destroy();
-        registry.resource.deinit();
-        self.allocator.destroy(registry);
-    }
+    while (self.registries.items.len != 0) self.reclaimRegistry(self.registries.items.len - 1);
     self.registries.deinit(self.allocator);
     self.display.destroy();
     self.display.deinit();
@@ -125,6 +121,28 @@ pub fn client(self: *CoreClient) *Client {
 /// retire their resources before the transport releases this client.
 pub fn canDestroy(self: *const CoreClient) bool {
     return self.connection.objectCount() == 1 + self.registries.items.len;
+}
+
+fn destroyRegistry(erased: *anyopaque, client_value: *Client, object_id: u32) Client.DestroyRegistryError!void {
+    const self: *CoreClient = @ptrCast(@alignCast(erased));
+    if (client_value != &self.connection) return error.InvalidRegistry;
+    for (self.registries.items, 0..) |registry, index| {
+        if (registry.resource.id() != object_id) continue;
+        if (registry.resource.state() != .live or
+            client_value.lookup(object_id) != &registry.resource or
+            !registry.resource.ownedBy(client_value.ownerHooks())) return error.InvalidRegistry;
+        self.reclaimRegistry(index);
+        return;
+    }
+    return error.InvalidRegistry;
+}
+
+fn reclaimRegistry(self: *CoreClient, index: usize) void {
+    const registry = self.registries.swapRemove(index);
+    registry.resource.destroy();
+    registry.advertised_globals.deinit(self.allocator);
+    registry.resource.deinit();
+    self.allocator.destroy(registry);
 }
 
 fn handleDisplay(self: *CoreClient, _: *Resource, opcode: u16, message: *wire.DecodedMessage) !void {
@@ -232,6 +250,27 @@ test "display sync emits callback done before delete_id and tears down cleanly" 
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[12..16], .little));
     try std.testing.expectEqual(@as(u16, 1), @as(u16, @truncate(std.mem.readInt(u32, bytes[16..20], .little))));
     try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, bytes[20..24], .little));
+}
+
+test "registry lifecycle destroys exact core registry immediately" {
+    var host: Server = .init(std.testing.allocator);
+    defer host.deinit();
+    const managed = try CoreClient.create(std.testing.allocator, &host, .{});
+    defer managed.destroy();
+    const client_value = managed.client();
+    try testSend(client_value, 1, 1, &display_get_registry, &.{.{ .new_id = .{ .typed = 2 } }});
+    while (try client_value.beginSend()) |batch| try client_value.completeSend(batch.token, batch.bytes.len);
+
+    try client_value.destroyRegistry(2);
+    try std.testing.expect(client_value.lookup(2) == null);
+    try std.testing.expect(managed.canDestroy());
+    const deleted = (try client_value.beginSend()).?;
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, deleted.bytes[0..4], .native));
+    try std.testing.expectEqual(@as(u16, 1), @as(u16, @truncate(std.mem.readInt(u32, deleted.bytes[4..8], .native))));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, deleted.bytes[8..12], .native));
+    try client_value.completeSend(deleted.token, deleted.bytes.len);
+    try std.testing.expectError(error.InvalidRegistry, client_value.destroyRegistry(2));
+    try std.testing.expectError(error.InvalidRegistry, client_value.destroyRegistry(1));
 }
 
 test "repeated multi-client sync returns zero without consuming display serials" {

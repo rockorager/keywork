@@ -66,11 +66,22 @@ pub const ProtocolLogSink = struct {
     notify: *const fn (*anyopaque, *Client, ProtocolMessage) void,
 };
 
+pub const DestroyRegistryError = error{
+    RegistryLifecycleUnavailable,
+    InvalidRegistry,
+};
+
+pub const RegistryLifecycle = struct {
+    context: *anyopaque,
+    destroy: *const fn (*anyopaque, *Client, u32) DestroyRegistryError!void,
+};
+
 pub const Options = struct {
     max_objects: usize = 4096,
     credentials: ?Credentials = null,
     transport_provenance: TransportProvenance = .unknown,
     protocol_log_sink: ?ProtocolLogSink = null,
+    registry_lifecycle: ?RegistryLifecycle = null,
 };
 
 /// Opaque, runtime-owned destruction registration handle.
@@ -128,6 +139,7 @@ objects: ObjectMap,
 credentials_value: ?Credentials,
 transport_provenance_value: TransportProvenance,
 protocol_log_sink: ?ProtocolLogSink,
+registry_lifecycle: ?RegistryLifecycle,
 fatal_state: Fatal = .{},
 dispatching: bool = false,
 active_new_ids: ?[]NewIdExpectation = null,
@@ -149,6 +161,7 @@ pub fn init(allocator: std.mem.Allocator, options: Options) Client {
         .credentials_value = options.credentials,
         .transport_provenance_value = options.transport_provenance,
         .protocol_log_sink = options.protocol_log_sink,
+        .registry_lifecycle = options.registry_lifecycle,
     };
 }
 
@@ -196,6 +209,12 @@ pub fn securityIdentity(self: *const Client) SecurityIdentity {
         .credentials = self.credentials_value,
         .provenance = self.transport_provenance_value,
     };
+}
+
+/// Destroys one exact live wl_registry through its core owner.
+pub fn destroyRegistry(self: *Client, object_id: u32) DestroyRegistryError!void {
+    const lifecycle = self.registry_lifecycle orelse return error.RegistryLifecycleUnavailable;
+    try lifecycle.destroy(lifecycle.context, self, object_id);
 }
 
 /// Authorizes a privileged compositor-local client from immutable transport
