@@ -297,6 +297,113 @@ test "typed bind requires direct exact UID and accepts both manager versions" {
     try std.testing.expectEqual(@as(usize, 0), adapter.devices.items.len);
 }
 
+const BindFixture = struct {
+    protocol_server: wayring.server.Server,
+    output_layout: @import("output_layout.zig") = undefined,
+    context: u8 = 0,
+    neutral: VirtualPointer = undefined,
+    seat_adapter: WayringSeatAdapter = undefined,
+    outputs: WayringOutput = undefined,
+    seat: Seat = undefined,
+    adapter: WayringVirtualPointer = undefined,
+
+    fn event(_: *anyopaque, _: *Seat, _: ?@import("output_layout.zig").Id, _: u64, _: VirtualPointer.Event) void {}
+
+    fn init(self: *BindFixture, allocator: std.mem.Allocator) !void {
+        self.* = .{ .protocol_server = .init(std.testing.allocator) };
+        self.neutral = VirtualPointer.init(allocator, &self.output_layout, .{
+            .context = &self.context,
+            .event = event,
+        });
+        errdefer self.neutral.deinit();
+        try self.adapter.init(
+            allocator,
+            &self.protocol_server,
+            &self.seat_adapter,
+            &self.outputs,
+            &self.neutral,
+            &self.seat,
+            42,
+        );
+    }
+
+    fn deinit(self: *BindFixture) void {
+        self.adapter.deinit();
+        self.neutral.deinit();
+        self.protocol_server.deinit();
+        self.* = undefined;
+    }
+
+    fn client(allocator: std.mem.Allocator) wayring.server.Client {
+        return .init(allocator, .{
+            .credentials = .{ .pid = 1, .uid = 42, .gid = 1 },
+            .transport_provenance = .direct,
+        });
+    }
+};
+
+test "every manager bind allocation failure rolls back without half-live state" {
+    var measuring_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var measuring_fixture: BindFixture = undefined;
+    try measuring_fixture.init(measuring_allocator.allocator());
+    var measuring_client = BindFixture.client(std.testing.allocator);
+    const allocation_start = measuring_allocator.alloc_index;
+    try measuring_fixture.adapter.bind(&measuring_client, 2, 2);
+    const allocation_end = measuring_allocator.alloc_index;
+    try std.testing.expect(allocation_end > allocation_start);
+    measuring_fixture.adapter.destroyClientResources(&measuring_client);
+    measuring_client.deinit();
+    measuring_fixture.deinit();
+    try std.testing.expectEqual(measuring_allocator.allocated_bytes, measuring_allocator.freed_bytes);
+
+    for (allocation_start..allocation_end) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var fixture: BindFixture = undefined;
+        try fixture.init(failing.allocator());
+        var client = BindFixture.client(std.testing.allocator);
+        failing.fail_index = fail_index;
+        try std.testing.expectError(error.OutOfMemory, fixture.adapter.bind(&client, 2, 2));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), fixture.adapter.managers.items.len);
+        try std.testing.expect(client.lookup(2) == null);
+        client.deinit();
+        failing.fail_index = std.math.maxInt(usize);
+        fixture.deinit();
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "every client materialization failure rolls back manager storage" {
+    var measuring_fixture: BindFixture = undefined;
+    try measuring_fixture.init(std.testing.allocator);
+    var measuring_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var measuring_client = BindFixture.client(measuring_allocator.allocator());
+    const allocation_start = measuring_allocator.alloc_index;
+    try measuring_fixture.adapter.bind(&measuring_client, 2, 2);
+    const allocation_end = measuring_allocator.alloc_index;
+    try std.testing.expect(allocation_end > allocation_start);
+    measuring_fixture.adapter.destroyClientResources(&measuring_client);
+    measuring_client.deinit();
+    measuring_fixture.deinit();
+    try std.testing.expectEqual(measuring_allocator.allocated_bytes, measuring_allocator.freed_bytes);
+
+    for (allocation_start..allocation_end) |fail_index| {
+        var fixture: BindFixture = undefined;
+        try fixture.init(std.testing.allocator);
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var client = BindFixture.client(failing.allocator());
+        failing.fail_index = fail_index;
+        try std.testing.expectError(error.OutOfMemory, fixture.adapter.bind(&client, 2, 2));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), fixture.adapter.managers.items.len);
+        try std.testing.expect(client.lookup(2) == null);
+        failing.fail_index = std.math.maxInt(usize);
+        client.deinit();
+        fixture.deinit();
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
 fn expectNames(messages: anytype, expected: []const []const u8) !void {
     try std.testing.expectEqual(expected.len, messages.len);
     for (messages, expected) |message, name| try std.testing.expectEqualStrings(name, message.name);
