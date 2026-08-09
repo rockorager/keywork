@@ -197,6 +197,11 @@ pub fn identityIsCurrent(self: *WayringXdgShell, identity: ToplevelIdentity) boo
     return current.generation == identity.generation and std.meta.eql(current.core_id, identity.core_id);
 }
 
+pub fn setPendingToplevelIcon(self: *WayringXdgShell, identity: ToplevelIdentity, icon: ?XdgShell.ToplevelIcon) void {
+    std.debug.assert(self.identityIsCurrent(identity));
+    self.core_shell.setPendingToplevelIcon(identity.core_id, icon);
+}
+
 pub fn toplevelIdentityForSurface(self: *WayringXdgShell, client: *server.Client, surface_object_id: u32) ?ToplevelIdentity {
     const surface_id = self.compositor.surfaceId(client, surface_object_id) orelse return null;
     for (self.toplevels.items) |value| if (value.surface.client == client and std.meta.eql(value.surface.surface_id, surface_id)) {

@@ -46,6 +46,7 @@ pub const entries = [_]Entry{
     .{ .interface = "xdg_wm_dialog_v1", .version = 1, .gate = .presenting_headless },
     .{ .interface = "xdg_system_bell_v1", .version = 1, .gate = .presenting_headless },
     .{ .interface = "xdg_toplevel_tag_manager_v1", .version = 1, .gate = .presenting_headless },
+    .{ .interface = "xdg_toplevel_icon_manager_v1", .version = 1, .gate = .presenting_headless },
     .{ .interface = "wl_data_device_manager", .version = 4, .gate = .presenting_headless },
     .{ .interface = "zwp_primary_selection_device_manager_v1", .version = 1, .gate = .presenting_headless },
     .{ .interface = "zwp_text_input_manager_v3", .version = 2, .gate = .presenting_headless },
@@ -159,12 +160,12 @@ fn enabled(entry: Entry, gate: Gate) bool {
 test "manifest pins exact direct and security-context profiles" {
     try std.testing.expectEqual(@as(usize, 4), expectedCount(.sidecar, .direct));
     try std.testing.expectEqual(@as(usize, 4), expectedCount(.sidecar, .security_context));
-    try std.testing.expectEqual(@as(usize, 38), expectedCount(.presenting_headless, .direct));
-    try std.testing.expectEqual(@as(usize, 29), expectedCount(.presenting_headless, .security_context));
-    try std.testing.expectEqual(@as(usize, 29), expectedCount(.presenting_headless, .unknown));
+    try std.testing.expectEqual(@as(usize, 39), expectedCount(.presenting_headless, .direct));
+    try std.testing.expectEqual(@as(usize, 30), expectedCount(.presenting_headless, .security_context));
+    try std.testing.expectEqual(@as(usize, 30), expectedCount(.presenting_headless, .unknown));
     try std.testing.expectEqualStrings("wp_security_context_manager_v1", expectedAt(.presenting_headless, .direct, 33).?.interface);
-    try std.testing.expectEqualStrings("zwp_linux_dmabuf_v1", expectedAt(.presenting_headless, .security_context, 28).?.interface);
-    try std.testing.expect(expectedAt(.presenting_headless, .security_context, 29) == null);
+    try std.testing.expectEqualStrings("zwp_linux_dmabuf_v1", expectedAt(.presenting_headless, .security_context, 29).?.interface);
+    try std.testing.expect(expectedAt(.presenting_headless, .security_context, 30) == null);
 }
 
 test "security visibility requires trusted direct UID and keeps public open" {
