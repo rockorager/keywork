@@ -33,6 +33,12 @@ terminal_clients: std.ArrayList(TerminalClient) = .empty,
 next_keyboard_resource_generation: ?SeatDelivery.ResourceGeneration = 1,
 next_pointer_resource_generation: ?SeatDelivery.ResourceGeneration = 1,
 next_touch_resource_generation: ?SeatDelivery.ResourceGeneration = 1,
+pointer_resource_listener: ?PointerResourceListener = null,
+
+pub const PointerResourceListener = struct {
+    context: *anyopaque,
+    changed: *const fn (*anyopaque) void,
+};
 
 const TerminalClient = struct {
     client: *wayring.server.Client,
@@ -192,6 +198,17 @@ pub fn installCursorListener(self: *WayringSeatAdapter) void {
 
 pub fn clearCursorListener(self: *WayringSeatAdapter) void {
     self.compositor.clearCursorListener(self);
+}
+
+pub fn setPointerResourceListener(self: *WayringSeatAdapter, listener: PointerResourceListener) void {
+    std.debug.assert(self.pointer_resource_listener == null);
+    self.pointer_resource_listener = listener;
+}
+
+pub fn clearPointerResourceListener(self: *WayringSeatAdapter, context: *anyopaque) void {
+    std.debug.assert(self.pointer_resource_listener != null and
+        self.pointer_resource_listener.?.context == context);
+    self.pointer_resource_listener = null;
 }
 
 /// Direct typed bind seam shared by production publication and fault fixtures.
@@ -635,6 +652,7 @@ fn destroyPointer(pointer_resource: *PointerResource) void {
         pointer_resource.resource.destroy();
         pointer_resource.resource.deinit();
         self.allocator.destroy(pointer_resource);
+        if (self.pointer_resource_listener) |listener| listener.changed(listener.context);
         return;
     };
 }
@@ -827,6 +845,7 @@ fn touchTarget(context: *anyopaque, surface: SurfaceRegistry.Id) ?SeatDelivery.T
 
 fn capabilities(context: *anyopaque, snapshot: SeatDelivery.CapabilitySnapshot) void {
     const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
+    const pointer_changed = !std.meta.eql(self.snapshot.pointer, snapshot.pointer);
     if (self.snapshot.touch.available and !snapshot.touch.available)
         self.flushPendingTouchFrames(null);
     self.snapshot = snapshot;
@@ -840,6 +859,8 @@ fn capabilities(context: *anyopaque, snapshot: SeatDelivery.CapabilitySnapshot) 
         }
     }
     for (self.seats.items) |seat| sendCapabilities(seat) catch |err| self.eventFailure(seat.client, &seat.resource.runtime, err);
+    if (pointer_changed) if (self.pointer_resource_listener) |listener|
+        listener.changed(listener.context);
 }
 fn keyboardState(context: *anyopaque, event: SeatDelivery.KeyboardStateEvent) void {
     const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));

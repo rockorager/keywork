@@ -21,6 +21,7 @@ const WayringZwlrDataControl = @import("wayland/WayringZwlrDataControl.zig");
 const WayringDataControlFanout = @import("wayland/WayringDataControlFanout.zig");
 const WayringForeignToplevelList = @import("wayland/WayringForeignToplevelList.zig");
 const WayringImageCaptureSource = @import("wayland/WayringImageCaptureSource.zig");
+const WayringImageCopyCapture = @import("wayland/WayringImageCopyCapture.zig");
 const WayringDataDevice = @import("wayland/WayringDataDevice.zig");
 const WayringXdgToplevelDrag = @import("wayland/WayringXdgToplevelDrag.zig");
 const WayringPrimarySelection = @import("wayland/WayringPrimarySelection.zig");
@@ -80,6 +81,7 @@ const WayringProductionAdapters = struct {
     server: *Server,
     output_management: *WayringOutputManagement,
     screencopy: *WayringScreencopy,
+    image_copy_capture: *WayringImageCopyCapture,
     security_context: *WayringSecurityContext,
     direct_host: ?*WayringHost = null,
 
@@ -102,6 +104,7 @@ const WayringProductionAdapters = struct {
         }};
         const output_id = self.server.wayringDefaultOutputId().?;
         self.screencopy.invalidateOutput(output_id);
+        self.image_copy_capture.refreshCursors();
         self.output_management.syncOutput(self.server.generatedOutputSnapshot(&modes)) catch
             self.server.terminate();
         self.flush();
@@ -110,6 +113,14 @@ const WayringProductionAdapters = struct {
     fn capture(context: *anyopaque, output: @import("wayland/output_layout.zig").Id) void {
         const self: *@This() = @ptrCast(@alignCast(context));
         self.screencopy.captureOutput(output);
+        self.image_copy_capture.captureOutput(output);
+        self.image_copy_capture.refreshCursors();
+        self.flush();
+    }
+
+    fn refreshCursors(context: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.image_copy_capture.refreshCursors();
         self.flush();
     }
 };
@@ -145,7 +156,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 56/42 profile is not default eligible
+    \\                            its limited 57/42 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -416,6 +427,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_image_capture_source: WayringImageCaptureSource = undefined;
     var wayring_image_capture_source_initialized = false;
     var wayring_image_capture_source_published = false;
+    var wayring_image_copy_capture: WayringImageCopyCapture = undefined;
+    var wayring_image_copy_capture_initialized = false;
+    var wayring_image_copy_capture_published = false;
     var wayring_foreign_toplevel_adapters: WayringForeignToplevelAdapters = undefined;
     var wayring_input_method: WayringInputMethod = undefined;
     var wayring_input_method_initialized = false;
@@ -494,6 +508,7 @@ pub fn main(init: std.process.Init) !void {
         zwlr_data_control: ?*WayringZwlrDataControl,
         foreign_toplevel: ?*WayringForeignToplevelList,
         image_capture_source: ?*WayringImageCaptureSource,
+        image_copy_capture: ?*WayringImageCopyCapture,
         input_method: ?*WayringInputMethod,
         virtual_keyboard: ?*WayringVirtualKeyboard,
         idle_notification: ?*WayringIdleNotification,
@@ -527,6 +542,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.pointer_constraints) |adapter| adapter.destroyClientResources(client);
             if (self.virtual_pointer) |adapter| adapter.destroyClientResources(client);
             if (self.screencopy) |adapter| adapter.destroyClientResources(client);
+            if (self.image_copy_capture) |adapter| adapter.destroyClientResources(client);
             if (self.output_management) |adapter| adapter.destroyClientResources(client);
             if (self.linux_dmabuf) |adapter| adapter.destroyClientResources(client);
             if (self.security_context) |adapter| adapter.destroyClientResources(client);
@@ -601,6 +617,10 @@ pub fn main(init: std.process.Init) !void {
             server.setGeneratedCaptureObserver(null);
             if (wayring_screencopy_published) wayring_screencopy.unpublish();
             wayring_screencopy.deinit();
+        }
+        if (wayring_image_copy_capture_initialized) {
+            if (wayring_image_copy_capture_published) wayring_image_copy_capture.unpublish();
+            wayring_image_copy_capture.deinit();
         }
         if (wayring_output_management_initialized) {
             server.setGeneratedOutputObserver(null);
@@ -1022,6 +1042,8 @@ pub fn main(init: std.process.Init) !void {
                 std.os.linux.getuid(),
             );
             wayring_image_capture_source_initialized = true;
+            wayring_image_copy_capture.init(init.gpa, &wayring_protocol_server.?, server.eventLoop(), &wayring_image_capture_source, &wayring_compositor, &wayring_linux_dmabuf, &wayring_seat_adapter, server.canonicalSeat(), server.generatedImageCopyDmabufDevice(), std.os.linux.getuid(), .{ .context = server, .constraints = Server.generatedImageCopyConstraints, .schedule = Server.scheduleGeneratedImageCopy, .capture_shm = Server.captureGeneratedImageCopy, .capture_dmabuf = Server.captureGeneratedImageCopyDmabuf, .complete = Server.completeGeneratedImageCopy, .cursor_info = Server.generatedImageCopyCursorInfo });
+            wayring_image_copy_capture_initialized = true;
         }
         wayring_foreign_toplevel_adapters = .{
             .foreign_toplevel = &wayring_foreign_toplevel,
@@ -1188,6 +1210,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_foreign_toplevel_published = true;
             try wayring_image_capture_source.publish();
             wayring_image_capture_source_published = true;
+            try wayring_image_copy_capture.publish();
+            wayring_image_copy_capture_published = true;
             try wayring_input_method.publish();
             wayring_input_method_published = true;
             // Virtual keyboard is the most privileged generated input global
@@ -1252,6 +1276,7 @@ pub fn main(init: std.process.Init) !void {
             .zwlr_data_control = if (wayring_zwlr_data_control_initialized) &wayring_zwlr_data_control else null,
             .foreign_toplevel = if (wayring_foreign_toplevel_initialized) &wayring_foreign_toplevel else null,
             .image_capture_source = if (wayring_image_capture_source_initialized) &wayring_image_capture_source else null,
+            .image_copy_capture = if (wayring_image_copy_capture_initialized) &wayring_image_copy_capture else null,
             .input_method = if (wayring_input_method_initialized) &wayring_input_method else null,
             .virtual_keyboard = if (wayring_virtual_keyboard_initialized) &wayring_virtual_keyboard else null,
             .idle_notification = if (wayring_idle_notification_initialized) &wayring_idle_notification else null,
@@ -1295,10 +1320,15 @@ pub fn main(init: std.process.Init) !void {
                 .server = server,
                 .output_management = &wayring_output_management,
                 .screencopy = &wayring_screencopy,
+                .image_copy_capture = &wayring_image_copy_capture,
                 .security_context = &wayring_security_context,
             };
             server.setGeneratedOutputObserver(.{ .context = &wayring_production_adapters, .changed = WayringProductionAdapters.outputChanged });
-            server.setGeneratedCaptureObserver(.{ .context = &wayring_production_adapters, .capture_output = WayringProductionAdapters.capture });
+            server.setGeneratedCaptureObserver(.{
+                .context = &wayring_production_adapters,
+                .capture_output = WayringProductionAdapters.capture,
+                .refresh_cursors = WayringProductionAdapters.refreshCursors,
+            });
             try wayring_virtual_pointer.init(init.gpa, &wayring_protocol_server.?, &wayring_seat_adapter, &wayring_outputs, server.virtualPointerAuthority(), server.canonicalSeat(), std.os.linux.getuid());
             wayring_virtual_pointer_initialized = true;
             try wayring_virtual_pointer.publish();
@@ -1306,6 +1336,7 @@ pub fn main(init: std.process.Init) !void {
             wayring_lifecycle.linux_dmabuf = &wayring_linux_dmabuf;
             wayring_lifecycle.output_management = &wayring_output_management;
             wayring_lifecycle.screencopy = &wayring_screencopy;
+            wayring_lifecycle.image_copy_capture = &wayring_image_copy_capture;
             wayring_lifecycle.virtual_pointer = &wayring_virtual_pointer;
             wayring_lifecycle.security_context = &wayring_security_context;
         }
@@ -1852,6 +1883,7 @@ test {
     _ = @import("wayland/WayringDataControlFanout.zig");
     _ = @import("wayland/WayringForeignToplevelList.zig");
     _ = @import("wayland/WayringImageCaptureSource.zig");
+    _ = @import("wayland/WayringImageCopyCapture.zig");
     _ = @import("wayland/WayringVirtualKeyboard.zig");
     _ = @import("VirtualPointer.zig");
     _ = @import("wayland/WayringVirtualPointer.zig");

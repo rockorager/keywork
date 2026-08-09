@@ -142,6 +142,10 @@ pub fn captureBuffer(
     return null;
 }
 
+pub fn supportsPair(self: *const WayringLinuxDmabuf, format: u32, modifier: u64) bool {
+    return render.DmabufFormatModifier.contains(self.feedback.pairs, format, modifier);
+}
+
 pub fn deinit(self: *WayringLinuxDmabuf) void {
     std.debug.assert(self.global == null and self.managers.items.len == 0 and
         self.params.items.len == 0 and self.feedback_resources.items.len == 0 and

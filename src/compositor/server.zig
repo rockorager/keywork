@@ -60,6 +60,8 @@ const DataControl = @import("wayland/data_control.zig");
 const ForeignToplevelList = @import("wayland/foreign_toplevel_list.zig");
 const ImageCaptureSource = @import("wayland/image_capture_source.zig");
 const ImageCopyCapture = @import("wayland/image_copy_capture.zig");
+const WayringImageCaptureSource = @import("wayland/WayringImageCaptureSource.zig");
+const WayringImageCopyCapture = @import("wayland/WayringImageCopyCapture.zig");
 const Screencopy = @import("wayland/screencopy.zig");
 const XwaylandKeyboardGrab = @import("wayland/xwayland_keyboard_grab.zig");
 const XwaylandShell = @import("wayland/xwayland_shell.zig");
@@ -216,6 +218,7 @@ pub const GeneratedOutputObserver = struct {
 pub const GeneratedCaptureObserver = struct {
     context: *anyopaque,
     capture_output: *const fn (*anyopaque, OutputLayout.Id) void,
+    refresh_cursors: *const fn (*anyopaque) void,
 };
 const GeneratedInputPopup = struct {
     id: NeutralTextInput.PopupId,
@@ -4608,12 +4611,103 @@ pub fn captureGeneratedScreencopy(context: *anyopaque, target: WayringScreencopy
     return presentation.Info.now(self.io).timestamp;
 }
 
+pub fn generatedImageCopyConstraints(context: *anyopaque, target: WayringImageCopyCapture.Target) ?WayringImageCopyCapture.Constraints {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const constraints = captureConstraints(context, generatedImageTarget(target)) orelse return null;
+    var generated: WayringImageCopyCapture.Constraints = .{ .size = constraints.size };
+    const access = self.renderer.dmabufAccess() orelse return generated;
+    const source_formats = self.renderer.dmabufSourceFormats();
+    for (LinuxDmabuf.capture_formats) |format| {
+        if (!render.DmabufFormatModifier.contains(access.target_formats, format.format, format.modifier) or
+            !render.DmabufFormatModifier.contains(source_formats, format.format, format.modifier) or
+            !access.supports_target(access.context, constraints.size, format.format, format.modifier)) continue;
+        generated.dmabuf_formats[generated.dmabuf_format_count] = .{
+            .format = format.format,
+            .modifier = format.modifier,
+        };
+        generated.dmabuf_format_count += 1;
+    }
+    return generated;
+}
+
+pub fn scheduleGeneratedImageCopy(context: *anyopaque, target: WayringImageCopyCapture.Target, wait_for_damage: bool) ?OutputLayout.Id {
+    return scheduleImageCapture(context, generatedImageTarget(target), wait_for_damage);
+}
+
+pub fn captureGeneratedImageCopy(context: *anyopaque, target: WayringImageCopyCapture.Target, cursors: bool, pixels: render.PixelBuffer) WayringImageCopyCapture.CaptureError!WayringImageCopyCapture.CaptureResult {
+    const result = try captureImage(context, generatedImageTarget(target), cursors, pixels);
+    return .{ .timestamp = result.timestamp, .completion_fd = result.completion_fd };
+}
+
+pub fn captureGeneratedImageCopyDmabuf(context: *anyopaque, target: WayringImageCopyCapture.Target, cursors: bool, buffer: *@import("wayland/linux_dmabuf_buffer.zig").Buffer) WayringImageCopyCapture.CaptureError!presentation.Timestamp {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const access = self.renderer.dmabufAccess() orelse return error.Failed;
+    const capture_target = buffer.captureTarget(access) catch return error.Failed;
+    const completion = switch (generatedImageTarget(target)) {
+        .source => |source| switch (source) {
+            .output => |output| self.captureFullOutputTarget(output, cursors, .{ .dmabuf = capture_target }) catch return error.Failed,
+            .toplevel => |toplevel| self.captureToplevelTarget(toplevel, .{ .dmabuf = capture_target }) catch |err| switch (err) {
+                error.Stopped => return error.Stopped,
+                else => return error.Failed,
+            },
+        },
+        .cursor => |cursor| self.captureCursorTarget(cursor, .{ .dmabuf = capture_target }) catch return error.Failed,
+    };
+    finishGeneratedDmabufCapture(buffer, completion) catch return error.Failed;
+    return presentation.Info.now(self.io).timestamp;
+}
+
+fn finishGeneratedDmabufCapture(buffer: *@import("wayland/linux_dmabuf_buffer.zig").Buffer, completion: Renderer.FrameCompletion) error{CaptureSyncFailed}!void {
+    const sync_file_fd = completion.sync_file_fd orelse return;
+    defer _ = std.c.close(sync_file_fd);
+    if (buffer.importWriteFence(sync_file_fd)) return;
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = sync_file_fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    if ((std.posix.poll(&poll_fds, -1) catch return error.CaptureSyncFailed) != 1 or
+        poll_fds[0].revents & std.posix.POLL.IN == 0 or
+        poll_fds[0].revents &
+            (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0)
+    {
+        return error.CaptureSyncFailed;
+    }
+}
+
+pub fn generatedImageCopyCursorInfo(context: *anyopaque, target: WayringImageCopyCapture.CursorTarget) ?WayringImageCopyCapture.CursorInfo {
+    const info = captureCursorInfo(context, .{ .source = generatedSource(target.source), .seat = target.seat }) orelse return null;
+    return .{ .entered = info.entered, .position = info.position, .hotspot = info.hotspot };
+}
+
+fn generatedSource(target: WayringImageCaptureSource.Target) ImageCaptureSource.Target {
+    return switch (target) {
+        .output => |output| .{ .output = output },
+        .toplevel => |toplevel| .{ .toplevel = toplevel },
+    };
+}
+
+fn generatedImageTarget(target: WayringImageCopyCapture.Target) ImageCopyCapture.Target {
+    return switch (target) {
+        .source => |source| .{ .source = generatedSource(source) },
+        .cursor => |cursor| .{ .cursor = .{ .source = generatedSource(cursor.source), .seat = cursor.seat } },
+    };
+}
+
 pub fn generatedDmabufCapabilities(self: *Self) WayringLinuxDmabuf.Capabilities {
     const device = if (self.renderer.dmabufDeviceId()) |id|
         sysmacros.makedev(id.major, id.minor)
     else
         0;
     return .{ .device = device, .supported_pairs = self.renderer.dmabufSourceFormats(), .source_validator = self.renderer.dmabufSourceValidator() };
+}
+
+pub fn generatedImageCopyDmabufDevice(self: *Self) ?@import("wayland/linux_dmabuf_buffer.zig").Device {
+    return self.linux_dmabuf.allocationDevice();
+}
+
+pub fn completeGeneratedImageCopy(context: *anyopaque, source: render.PixelBuffer, destination: ?render.PixelBuffer) bool {
+    return completeCaptureReadback(context, source, destination);
 }
 
 pub fn setWayringDefaultOutputListener(self: *Self, listener: WayringDefaultOutputListener) void {
@@ -4975,6 +5069,7 @@ noinline fn requestRepaint(context: *anyopaque) void {
     log.debug("full repaint requested by 0x{x}", .{@returnAddress()});
     self.refreshIdleInhibition();
     if (self.image_copy_capture_initialized) self.image_copy_capture.refreshCursors();
+    if (self.generated_capture_observer) |observer| observer.refresh_cursors(observer.context);
     var render_outputs = self.render_outputs.iterator();
     while (render_outputs.next()) |entry| {
         const render_output = entry.value.*;
@@ -4991,6 +5086,7 @@ fn cursorChanged(context: *anyopaque, old: ?Seat.CursorInfo, new: ?Seat.CursorIn
     const self: *Self = @ptrCast(@alignCast(context));
     self.refreshIdleInhibition();
     if (self.image_copy_capture_initialized) self.image_copy_capture.refreshCursors();
+    if (self.generated_capture_observer) |observer| observer.refresh_cursors(observer.context);
     var outputs = self.render_outputs.iterator();
     while (outputs.next()) |entry| {
         const output = entry.value.*;
@@ -5261,6 +5357,7 @@ fn sceneVisibilityChanged(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     self.refreshIdleInhibition();
     if (self.image_copy_capture_initialized) self.image_copy_capture.refreshCursors();
+    if (self.generated_capture_observer) |observer| observer.refresh_cursors(observer.context);
     self.refreshKeyboardFocus();
 }
 
