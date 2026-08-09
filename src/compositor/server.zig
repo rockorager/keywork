@@ -405,6 +405,7 @@ data_control_observer: ?DataControlObserver = null,
 generated_input_method_observer: ?GeneratedInputMethodObserver = null,
 generated_output_observer: ?GeneratedOutputObserver = null,
 generated_capture_observer: ?GeneratedCaptureObserver = null,
+generated_idle_inhibit_provider: ?GeneratedIdleInhibitProvider = null,
 generated_input_popups: std.ArrayList(GeneratedInputPopup) = .empty,
 xdg_toplevel_drag: XdgToplevelDrag,
 xdg_toplevel_icon: XdgToplevelIcon,
@@ -4607,6 +4608,7 @@ fn removeHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
     self.headless_surface_forest.remove(id);
     self.reconcileGeneratedPointerTopology();
     self.repairGeneratedFocus();
+    self.refreshIdleInhibition();
 }
 
 fn detachHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
@@ -4616,6 +4618,7 @@ fn detachHeadlessSurface(self: *Self, id: SurfaceRegistry.Id) void {
     self.headless_surface_forest.detach(id);
     self.reconcileGeneratedPointerTopology();
     self.repairGeneratedFocus();
+    self.refreshIdleInhibition();
 }
 
 fn applyHeadlessBatch(self: *Self, batch: WayringCompositor.AppliedBatch) void {
@@ -4631,6 +4634,7 @@ fn applyHeadlessBatch(self: *Self, batch: WayringCompositor.AppliedBatch) void {
     self.headless_surface_forest.apply(batch);
     self.reconcileGeneratedPointerTopology();
     self.repairGeneratedFocus();
+    self.refreshIdleInhibition();
     self.damageHeadlessBatch(batch);
 }
 
@@ -6740,12 +6744,28 @@ fn idleNotificationSeatDestroyed(context: *anyopaque, seat: *Seat) void {
     idle_notification.seatDestroyed(NeutralIdleNotification.SeatRef.fromPointer(seat));
 }
 
-fn refreshIdleInhibition(self: *Self) void {
+pub const GeneratedIdleInhibitProvider = struct {
+    context: *anyopaque,
+    has_visible: *const fn (*anyopaque, *anyopaque, *const fn (*anyopaque, SurfaceRegistry.Id) bool) bool,
+};
+
+pub fn setGeneratedIdleInhibitProvider(self: *Self, provider: ?GeneratedIdleInhibitProvider) void {
+    std.debug.assert(provider == null or self.generated_idle_inhibit_provider == null);
+    self.generated_idle_inhibit_provider = provider;
+    self.refreshIdleInhibition();
+}
+
+pub fn refreshIdleInhibition(self: *Self) void {
     if (!self.idle_notify_initialized) return;
-    self.setIdleInhibited(self.idle_inhibit.hasVisibleInhibitor(
+    const mature = self.idle_inhibit.hasVisibleInhibitor(
         self,
         idleInhibitorSurfaceVisible,
-    ));
+    );
+    const generated = if (self.generated_idle_inhibit_provider) |provider|
+        provider.has_visible(provider.context, self, idleInhibitorSurfaceVisible)
+    else
+        false;
+    self.setIdleInhibited(mature or generated);
 }
 
 pub fn neutralIdleNotification(self: *Self) *NeutralIdleNotification {
@@ -6816,7 +6836,8 @@ fn setIdleInhibited(self: *Self, inhibited: bool) void {
 
 fn idleInhibitorSurfaceVisible(context: *anyopaque, surface_id: Surface.Id) bool {
     const self: *Self = @ptrCast(@alignCast(context));
-    const root = self.subcompositor.rootSurface(surface_id);
+    const root = self.headless_surface_forest.compoundRoot(surface_id) orelse
+        self.subcompositor.rootSurface(surface_id);
     if (self.session_lock.isLocked()) return self.session_lock.ownsSurface(root);
     return self.scene.surfaceMapped(root);
 }

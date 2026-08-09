@@ -32,6 +32,10 @@ const preferred_buffer_scale_event_opcode = 2;
 const preferred_buffer_transform_event_opcode = 3;
 
 pub const SurfaceId = SurfaceRegistry.Id;
+pub const SurfaceDestructionObservation = struct {
+    id: SurfaceId,
+    observer: *server.Resource.Observer,
+};
 pub const ViewportState = surface_geometry.ViewportState;
 pub const ViewportSource = surface_geometry.ViewportSource;
 pub const ViewportDestination = surface_geometry.ViewportDestination;
@@ -890,6 +894,28 @@ pub fn surfaceId(self: *const WayringCompositor, client: *const server.Client, o
         if (objects.client != client) continue;
         for (objects.surfaces.items) |surface| {
             if (surface.resource.id() == object_id) return surface.id;
+        }
+        return null;
+    }
+    return null;
+}
+
+/// Observes an exact live same-client generated wl_surface without exposing
+/// the resource or its implementation object to protocol adapters.
+pub fn observeSurfaceDestruction(
+    self: *const WayringCompositor,
+    client: *const server.Client,
+    object_id: u32,
+    comptime Context: type,
+    context: *Context,
+    comptime callback: *const fn (*Context, *server.Resource, *server.Resource.Observer) void,
+) !?SurfaceDestructionObservation {
+    for (self.clients.items) |objects| {
+        if (objects.client != client) continue;
+        for (objects.surfaces.items) |surface| {
+            if (surface.resource.id() != object_id) continue;
+            const observer = try surface.resource.runtime.addDestroyObserver(Context, context, callback);
+            return .{ .id = surface.id, .observer = observer };
         }
         return null;
     }

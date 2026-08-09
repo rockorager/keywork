@@ -23,6 +23,7 @@ const WayringTextInput = @import("wayland/WayringTextInput.zig");
 const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
 const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
 const WayringIdleNotification = @import("wayland/WayringIdleNotification.zig");
+const WayringIdleInhibit = @import("wayland/WayringIdleInhibit.zig");
 const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
 const WayringProfile = @import("wayland/WayringProfile.zig");
 const WayringSessionLock = @import("wayland/WayringSessionLock.zig");
@@ -117,7 +118,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 39/30 profile is not default eligible
+    \\                            its limited 40/31 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -354,6 +355,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_idle_notification: WayringIdleNotification = undefined;
     var wayring_idle_notification_initialized = false;
     var wayring_idle_notification_published = false;
+    var wayring_idle_inhibit: WayringIdleInhibit = undefined;
+    var wayring_idle_inhibit_initialized = false;
+    var wayring_idle_inhibit_published = false;
     var wayring_layer_shell: WayringLayerShell = undefined;
     var wayring_layer_shell_initialized = false;
     var wayring_layer_shell_published = false;
@@ -409,6 +413,7 @@ pub fn main(init: std.process.Init) !void {
         input_method: ?*WayringInputMethod,
         virtual_keyboard: ?*WayringVirtualKeyboard,
         idle_notification: ?*WayringIdleNotification,
+        idle_inhibit: ?*WayringIdleInhibit,
         layer_shell: ?*WayringLayerShell,
         session_lock: ?*WayringSessionLock,
         workspace: ?*WayringWorkspace,
@@ -439,6 +444,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.security_context) |adapter| adapter.destroyClientResources(client);
             if (self.workspace) |workspace| workspace.destroyClientResources(client);
             if (self.idle_notification) |idle_notification| idle_notification.destroyClientResources(client);
+            if (self.idle_inhibit) |idle_inhibit| idle_inhibit.destroyClientResources(client);
             if (self.session_lock) |generated_session_lock| generated_session_lock.destroyClientResources(client);
             if (self.layer_shell) |layer_shell| layer_shell.destroyClientResources(client);
             if (self.virtual_keyboard) |keyboard| keyboard.destroyClientResources(client);
@@ -517,6 +523,11 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_idle_notification_initialized) {
             if (wayring_idle_notification_published) wayring_idle_notification.unpublish();
             wayring_idle_notification.deinit();
+        }
+        if (wayring_idle_inhibit_initialized) {
+            server.setGeneratedIdleInhibitProvider(null);
+            if (wayring_idle_inhibit_published) wayring_idle_inhibit.unpublish();
+            wayring_idle_inhibit.deinit();
         }
         if (wayring_session_lock_initialized) {
             if (wayring_session_lock_published) wayring_session_lock.unpublish();
@@ -707,6 +718,9 @@ pub fn main(init: std.process.Init) !void {
             .{ .context = server, .failed = Server.idleNotificationFrontendFailed },
         );
         wayring_idle_notification_initialized = true;
+        wayring_idle_inhibit.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor, server);
+        wayring_idle_inhibit_initialized = true;
+        server.setGeneratedIdleInhibitProvider(wayring_idle_inhibit.provider());
         server.setGeneratedInputMethodObserver(.{
             .context = &wayring_input_method,
             .set_inhibited = WayringInputMethod.observerSetInhibited,
@@ -929,6 +943,8 @@ pub fn main(init: std.process.Init) !void {
             // follows lock ownership in the deterministic composed profile.
             try wayring_idle_notification.publish();
             wayring_idle_notification_published = true;
+            try wayring_idle_inhibit.publish();
+            wayring_idle_inhibit_published = true;
             // Restricted workspace control is last so profile ordering is
             // deterministic and all canonical shell/output owners are live.
             try wayring_workspace.publish();
@@ -964,6 +980,7 @@ pub fn main(init: std.process.Init) !void {
             .input_method = if (wayring_input_method_initialized) &wayring_input_method else null,
             .virtual_keyboard = if (wayring_virtual_keyboard_initialized) &wayring_virtual_keyboard else null,
             .idle_notification = if (wayring_idle_notification_initialized) &wayring_idle_notification else null,
+            .idle_inhibit = if (wayring_idle_inhibit_initialized) &wayring_idle_inhibit else null,
             .layer_shell = if (wayring_layer_shell_initialized) &wayring_layer_shell else null,
             .session_lock = if (wayring_session_lock_initialized) &wayring_session_lock else null,
             .workspace = if (wayring_workspace_initialized) &wayring_workspace else null,
@@ -1594,6 +1611,7 @@ test {
     _ = @import("wayland/pointer_constraints.zig");
     _ = @import("wayland/pointer_warp.zig");
     _ = @import("wayland/idle_inhibit.zig");
+    _ = @import("wayland/WayringIdleInhibit.zig");
     _ = @import("wayland/keyboard_shortcuts_inhibit.zig");
     _ = @import("IdleNotification.zig");
     _ = @import("wayland/idle_notify.zig");
