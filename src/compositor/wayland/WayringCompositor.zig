@@ -88,6 +88,55 @@ pub const AlphaModifierAttachResult = union(enum) {
     not_live,
     wrong_client,
 };
+pub const ColorRepresentationState = struct {
+    pub const AlphaMode = enum(u32) { premultiplied_electrical, premultiplied_optical, straight, _ };
+    pub const Coefficients = enum(u32) { identity = 1, bt709, fcc, bt601, smpte240, bt2020, bt2020_cl, ictcp, _ };
+    pub const Range = enum(u32) { full = 1, limited, _ };
+    pub const ChromaLocation = enum(u32) { type_0 = 1, type_1, type_2, type_3, type_4, type_5, _ };
+
+    alpha_mode: ?AlphaMode = null,
+    coefficients: ?Coefficients = null,
+    range: ?Range = null,
+    chroma_location: ?ChromaLocation = null,
+
+    pub fn toRender(self: ColorRepresentationState, format: render.DmabufFormat) render.ColorRepresentation {
+        if (format.isPackedRgb()) return .{};
+        return .{
+            .coefficients = switch (self.coefficients orelse .bt709) {
+                .identity => .identity,
+                .bt601 => .bt601,
+                .bt709 => .bt709,
+                .bt2020 => .bt2020,
+                else => unreachable,
+            },
+            .range = switch (self.range orelse .limited) {
+                .full => .full,
+                .limited => .limited,
+                else => unreachable,
+            },
+            .chroma_location = switch (self.chroma_location orelse .type_0) {
+                .type_0 => .type_0,
+                .type_1 => .type_1,
+                .type_2 => .type_2,
+                .type_3 => .type_3,
+                .type_4 => .type_4,
+                .type_5 => .type_5,
+                else => unreachable,
+            },
+        };
+    }
+};
+pub const ColorRepresentationHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+    validate_commit: *const fn (*anyopaque, ColorRepresentationState, ?render.DmabufFormat) bool,
+};
+pub const ColorRepresentationAttachResult = union(enum) {
+    attached: SurfaceId,
+    surface_exists,
+    not_live,
+    wrong_client,
+};
 
 /// Frontend-local delivery endpoint borrowed for one synchronous event fanout.
 /// Callers must not retain either pointer or use it after returning to the
@@ -355,6 +404,9 @@ const Surface = struct {
     content_type_handler: ?ContentTypeHandler = null,
     pending_content_type: ContentType = .none,
     current_content_type: ContentType = .none,
+    color_representation_handler: ?ColorRepresentationHandler = null,
+    pending_color_representation: ColorRepresentationState = .{},
+    current_color_representation: ColorRepresentationState = .{},
     alpha_modifier_handler: ?AlphaModifierHandler = null,
     pending_alpha_multiplier: u32 = std.math.maxInt(u32),
     current_alpha_multiplier: u32 = std.math.maxInt(u32),
@@ -524,6 +576,7 @@ const PreparedCommit = struct {
     logical_size: ?render.Size,
     viewport: ViewportState,
     content_type: ContentType,
+    color_representation: ColorRepresentationState,
     alpha_multiplier: u32,
     source: ?render.SourceRect = null,
     scale: i32,
@@ -540,6 +593,7 @@ const PreparedCommit = struct {
             .logical_size = surface.current_logical_size,
             .viewport = surface.pending_viewport,
             .content_type = surface.pending_content_type,
+            .color_representation = surface.pending_color_representation,
             .alpha_multiplier = surface.pending_alpha_multiplier,
             .scale = surface.pending_scale,
             .transform = surface.pending_transform,
@@ -633,6 +687,16 @@ const BufferSnapshot = union(enum) {
         return switch (self.*) {
             .copied => |*snapshot| snapshot.pixelBuffer(.{}, .{}),
             .dmabuf => |*snapshot| snapshot.pixelBuffer(),
+        };
+    }
+
+    fn format(self: *const BufferSnapshot) render.DmabufFormat {
+        return switch (self.*) {
+            .copied => |snapshot| switch (snapshot.format) {
+                .argb8888 => .argb8888,
+                .xrgb8888 => .xrgb8888,
+            },
+            .dmabuf => |snapshot| render.DmabufFormat.fromFourcc(snapshot.buffer.descriptor.format).?,
         };
     }
 
@@ -1014,6 +1078,46 @@ pub fn setPendingContentType(self: *WayringCompositor, id: SurfaceId, handler_co
 
 pub fn currentContentType(self: *const WayringCompositor, id: SurfaceId) ?ContentType {
     return (self.surfaceForId(id) orelse return null).current_content_type;
+}
+
+pub fn attachColorRepresentation(
+    self: *WayringCompositor,
+    client: *server.Client,
+    object_id: u32,
+    handler: ColorRepresentationHandler,
+) ColorRepresentationAttachResult {
+    const objects = self.findClient(client) orelse return .not_live;
+    for (objects.surfaces.items) |surface| if (surface.resource.id() == object_id and !surface.destroying) {
+        if (surface.color_representation_handler != null) return .surface_exists;
+        surface.color_representation_handler = handler;
+        return .{ .attached = surface.id };
+    };
+    if (client.lookup(object_id)) |resource| if (resource.interface() == &core.wl_surface.interface) return .wrong_client;
+    return .not_live;
+}
+
+pub fn detachColorRepresentation(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque) void {
+    const surface = self.surfaceForId(id) orelse return;
+    const handler = surface.color_representation_handler orelse return;
+    if (handler.context != handler_context) return;
+    surface.color_representation_handler = null;
+    surface.pending_color_representation = .{};
+}
+
+pub fn setPendingColorRepresentation(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque, value: ColorRepresentationState) bool {
+    const surface = self.surfaceForId(id) orelse return false;
+    const handler = surface.color_representation_handler orelse return false;
+    if (handler.context != handler_context) return false;
+    surface.pending_color_representation = value;
+    return true;
+}
+
+pub fn pendingColorRepresentation(self: *const WayringCompositor, id: SurfaceId) ?ColorRepresentationState {
+    return (self.surfaceForId(id) orelse return null).pending_color_representation;
+}
+
+pub fn currentColorRepresentation(self: *const WayringCompositor, id: SurfaceId) ?ColorRepresentationState {
+    return (self.surfaceForId(id) orelse return null).current_color_representation;
 }
 
 pub fn attachAlphaModifier(self: *WayringCompositor, client: *server.Client, object_id: u32, handler: AlphaModifierHandler) AlphaModifierAttachResult {
@@ -2105,8 +2209,10 @@ fn createRegion(self: *WayringCompositor, compositor: *core.wl_compositor.Resour
 fn surfaceRenderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
     const surface: *Surface = @ptrCast(@alignCast(context));
     const current = if (surface.current) |*snapshot| snapshot else return null;
+    var buffer = current.pixelBuffer();
+    buffer.color_representation = surface.current_color_representation.toRender(current.format());
     return .{
-        .buffer = current.pixelBuffer(),
+        .buffer = buffer,
         .logical_size = surface.current_logical_size.?,
         .source = surface.current_source,
         .transform = surface.current_transform,
@@ -2391,6 +2497,7 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
                 &surface.resource.runtime,
                 "preparing wl_surface commit",
             ),
+            error.InvalidColorRepresentation => {},
             error.BadViewportSize, error.ViewportOutOfBuffer => if (surface.viewport_handler) |handler|
                 handler.post_error(handler.context, if (err == error.BadViewportSize) .bad_size else .out_of_buffer)
             else
@@ -2559,6 +2666,18 @@ fn projectedPhysicalSize(self: *WayringCompositor, surface: *const Surface) ?ren
         return prepared.physical_size;
     }
     return if (surface.current) |*current| current.size() else null;
+}
+
+fn projectedFormat(self: *WayringCompositor, surface: *const Surface) ?render.DmabufFormat {
+    _ = self;
+    var index = surface.content_updates.items.len;
+    while (index > 0) {
+        index -= 1;
+        const prepared = &surface.content_updates.items[index].prepared;
+        if (!prepared.attachment_changed) continue;
+        return if (prepared.buffer) |*buffer| buffer.format() else null;
+    }
+    return if (surface.current) |*current| current.format() else null;
 }
 
 fn updateForToken(self: *WayringCompositor, token: UpdateToken) ?*ContentUpdate {
@@ -2840,6 +2959,7 @@ fn prepareCommit(self: *WayringCompositor, surface: *Surface) !PreparedCommit {
         prepared.transform == surface.current_transform and
         std.meta.eql(prepared.viewport, surface.current_viewport) and
         prepared.content_type == surface.current_content_type and
+        std.meta.eql(prepared.color_representation, surface.current_color_representation) and
         prepared.alpha_multiplier == surface.current_alpha_multiplier and
         prepared.offset_x == 0 and prepared.offset_y == 0 and
         !surface.topology_dirty;
@@ -2857,6 +2977,16 @@ fn prepareCommit(self: *WayringCompositor, surface: *Surface) !PreparedCommit {
         prepared.source = geometry.source;
     } else {
         prepared.logical_size = null;
+    }
+    if (surface.color_representation_handler) |handler| {
+        const format = if (prepared.buffer) |*buffer|
+            buffer.format()
+        else if (!prepared.attachment_changed)
+            self.projectedFormat(surface)
+        else
+            null;
+        if (!handler.validate_commit(handler.context, prepared.color_representation, format))
+            return error.InvalidColorRepresentation;
     }
     return prepared;
 }
@@ -2985,6 +3115,7 @@ fn publishPreparedCommit(
     surface.current_logical_size = prepared.logical_size;
     surface.current_viewport = prepared.viewport;
     surface.current_content_type = prepared.content_type;
+    surface.current_color_representation = prepared.color_representation;
     surface.current_alpha_multiplier = prepared.alpha_multiplier;
     surface.current_source = prepared.source;
     surface.current_scale = prepared.scale;
@@ -3226,6 +3357,10 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     }
     if (surface.content_type_handler) |handler| {
         surface.content_type_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (surface.color_representation_handler) |handler| {
+        surface.color_representation_handler = null;
         handler.surface_destroyed(handler.context);
     }
     if (surface.alpha_modifier_handler) |handler| {

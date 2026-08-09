@@ -26506,6 +26506,7 @@ test "production generated data device completes the exact profile and supports 
     const WayringZwlrDataControl = @import("wayland/WayringZwlrDataControl.zig");
     const WayringDataControlFanout = @import("wayland/WayringDataControlFanout.zig");
     const WayringForeignToplevelList = @import("wayland/WayringForeignToplevelList.zig");
+    const WayringColorRepresentation = @import("wayland/WayringColorRepresentation.zig");
     const WayringTextInput = @import("wayland/WayringTextInput.zig");
     const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
     const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
@@ -26629,6 +26630,13 @@ test "production generated data device completes the exact profile and supports 
     defer fractional_scale.deinit();
     try fractional_scale.publish();
     defer fractional_scale.unpublish();
+    var color_representation: WayringColorRepresentation = undefined;
+    color_representation.init(std.testing.allocator, &protocol_server, &compositor);
+    defer {
+        if (color_representation.global != null) color_representation.unpublish();
+        color_representation.deinit();
+    }
+    try color_representation.publish();
     var cursor_shape: WayringCursorShape = undefined;
     cursor_shape.init(
         std.testing.allocator,
@@ -26911,6 +26919,7 @@ test "production generated data device completes the exact profile and supports 
         xdg: *WayringXdgShell,
         viewporter: *WayringViewporter,
         fractional_scale: *WayringFractionalScale,
+        color_representation: *WayringColorRepresentation,
         cursor_shape: *WayringCursorShape,
         decoration: *WayringXdgDecoration,
         activation: *WayringXdgActivation,
@@ -27003,6 +27012,7 @@ test "production generated data device completes the exact profile and supports 
             self.xdg.destroyClientResources(client);
             self.seat.destroyClientResources(client);
             self.outputs.destroyClientResources(client);
+            self.color_representation.destroyClientResources(client);
             self.compositor.destroyClientResources(client);
             if (self.generated_raw == client) self.generated_raw = null;
             if (self.clients.id(client) != null) self.clients.unregister(client);
@@ -27016,6 +27026,7 @@ test "production generated data device completes the exact profile and supports 
         .xdg = &xdg,
         .viewporter = &viewporter,
         .fractional_scale = &fractional_scale,
+        .color_representation = &color_representation,
         .cursor_shape = &cursor_shape,
         .decoration = &decoration,
         .activation = &activation,
