@@ -10,7 +10,7 @@ const protocol = @import("wayring-protocol");
 const wayland = @import("wayland");
 const wayring = @import("wayring");
 const Seat = @import("seat.zig");
-const WayringSeatAdapter = @import("WayringSeatAdapter.zig");
+const WayringTransientSeat = @import("WayringTransientSeat.zig");
 
 const wl = wayland.server.wl;
 
@@ -24,12 +24,12 @@ const Device = struct {
     owner: *WayringVirtualKeyboard,
     client: *wayring.server.Client,
     resource: protocol.zwp_virtual_keyboard_v1.Resource,
+    selection: ?WayringTransientSeat.Selection,
 };
 
 allocator: std.mem.Allocator,
 protocol_server: *wayring.server.Server,
-seat_adapter: *WayringSeatAdapter,
-seat: *Seat,
+seats: *WayringTransientSeat,
 authorized_uid: std.os.linux.uid_t,
 global: ?*const wayring.server.Server.Global = null,
 managers: std.ArrayList(*Manager) = .empty,
@@ -39,21 +39,21 @@ pub fn init(
     self: *WayringVirtualKeyboard,
     allocator: std.mem.Allocator,
     protocol_server: *wayring.server.Server,
-    seat_adapter: *WayringSeatAdapter,
-    seat: *Seat,
+    seats: *WayringTransientSeat,
     authorized_uid: std.os.linux.uid_t,
-) void {
+) !void {
     self.* = .{
         .allocator = allocator,
         .protocol_server = protocol_server,
-        .seat_adapter = seat_adapter,
-        .seat = seat,
+        .seats = seats,
         .authorized_uid = authorized_uid,
     };
+    try seats.addSeatListener(.{ .context = self, .removed = transientSeatRemoved });
 }
 
 pub fn deinit(self: *WayringVirtualKeyboard) void {
     std.debug.assert(self.global == null and self.managers.items.len == 0 and self.devices.items.len == 0);
+    self.seats.removeSeatListener(self);
     self.devices.deinit(self.allocator);
     self.managers.deinit(self.allocator);
     self.* = undefined;
@@ -120,19 +120,12 @@ fn managerRequest(
                 );
                 return;
             }
-            if (value.owner.seat_adapter.seatClientIdentity(value.client, args.seat) == null) {
-                value.client.postImplementationError(
-                    &value.resource.runtime,
-                    "virtual keyboard requires the exact live same-client wl_seat",
-                );
-                return;
-            }
-            try value.owner.createDevice(value, args.id);
+            try value.owner.createDevice(value, args.seat, args.id);
         },
     }
 }
 
-fn createDevice(self: *WayringVirtualKeyboard, manager: *Manager, id: u32) !void {
+fn createDevice(self: *WayringVirtualKeyboard, manager: *Manager, seat_object: u32, id: u32) !void {
     try self.devices.ensureUnusedCapacity(self.allocator, 1);
     const value = try self.allocator.create(Device);
     errdefer self.allocator.destroy(value);
@@ -140,14 +133,16 @@ fn createDevice(self: *WayringVirtualKeyboard, manager: *Manager, id: u32) !void
         .owner = self,
         .client = manager.client,
         .resource = .init(self.allocator, id, 1, .client, manager.client.ownerHooks()),
+        .selection = self.seats.acquireSeat(manager.client, seat_object),
     };
+    errdefer if (value.selection) |selection| self.seats.releaseSeat(selection);
     errdefer {
         value.resource.destroy();
         value.resource.deinit();
     }
     try value.resource.setHandler(Device, value, deviceRequest, null);
-    try self.seat.createVirtualKeyboard(value);
-    errdefer self.seat.destroyVirtualKeyboard(value);
+    if (value.selection) |selection| try selection.seat.createVirtualKeyboard(value);
+    errdefer if (value.selection) |selection| selection.seat.destroyVirtualKeyboard(value);
     try manager.client.materialize(&value.resource.runtime);
     self.devices.appendAssumeCapacity(value);
 }
@@ -157,12 +152,20 @@ fn deviceRequest(
     request: protocol.zwp_virtual_keyboard_v1.Request,
     value: *Device,
 ) !void {
+    if (value.selection == null) {
+        switch (request) {
+            .keymap => |args| _ = std.c.close(args.fd),
+            .destroy => value.owner.destroyDevice(value),
+            .key, .modifiers => {},
+        }
+        return;
+    }
     switch (request) {
         .keymap => |args| value.owner.setKeymap(value, args.format, args.fd, args.size),
         .key => |args| value.owner.sendKey(value, args.time, args.key, args.state),
         .modifiers => |args| {
             if (!value.owner.requireKeymap(value)) return;
-            value.owner.seat.setVirtualModifiers(
+            value.selection.?.seat.setVirtualModifiers(
                 value,
                 args.mods_depressed,
                 args.mods_latched,
@@ -181,6 +184,7 @@ fn setKeymap(
     fd: std.posix.fd_t,
     size: u32,
 ) void {
+    _ = self;
     if (format != @intFromEnum(wl.Keyboard.KeymapFormat.xkb_v1)) {
         _ = std.c.close(fd);
         value.client.postProtocolError(
@@ -190,7 +194,7 @@ fn setKeymap(
         );
         return;
     }
-    self.seat.setVirtualKeyboardKeymap(value, fd, size) catch {
+    value.selection.?.seat.setVirtualKeyboardKeymap(value, fd, size) catch {
         value.client.postImplementationError(&value.resource.runtime, "invalid virtual keyboard keymap");
     };
 }
@@ -211,12 +215,13 @@ fn sendKey(
             return;
         },
     };
-    self.seat.virtualKey(value, time, key, state) catch
+    value.selection.?.seat.virtualKey(value, time, key, state) catch
         value.client.postOutOfMemory(&value.resource.runtime, "recording virtual keyboard key");
 }
 
 fn requireKeymap(self: *WayringVirtualKeyboard, value: *Device) bool {
-    if (self.seat.virtualKeyboardHasKeymap(value)) return true;
+    _ = self;
+    if (value.selection.?.seat.virtualKeyboardHasKeymap(value)) return true;
     value.client.postProtocolError(
         &value.resource.runtime,
         @intCast(protocol.zwp_virtual_keyboard_v1.@"error".no_keymap),
@@ -239,10 +244,24 @@ fn destroyDevice(self: *WayringVirtualKeyboard, value: *Device) void {
         _ = self.devices.swapRemove(index);
         break;
     };
-    self.seat.destroyVirtualKeyboard(value);
+    self.deactivateDevice(value);
     value.resource.destroy();
     value.resource.deinit();
     self.allocator.destroy(value);
+}
+
+fn transientSeatRemoved(context: *anyopaque, seat: *Seat) void {
+    const self: *WayringVirtualKeyboard = @ptrCast(@alignCast(context));
+    for (self.devices.items) |device| if (device.selection) |selection| {
+        if (selection.seat == seat) self.deactivateDevice(device);
+    };
+}
+
+fn deactivateDevice(self: *WayringVirtualKeyboard, value: *Device) void {
+    const selection = value.selection orelse return;
+    selection.seat.destroyVirtualKeyboard(value);
+    value.selection = null;
+    self.seats.releaseSeat(selection);
 }
 
 fn destroyManager(self: *WayringVirtualKeyboard, value: *Manager) void {

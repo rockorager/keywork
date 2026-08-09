@@ -70,6 +70,7 @@ pub const entries = [_]Entry{
     .{ .interface = "ext_foreign_toplevel_image_capture_source_manager_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "ext_image_copy_capture_manager_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "zwp_input_method_manager_v2", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
+    .{ .interface = "ext_transient_seat_manager_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "zwp_virtual_keyboard_manager_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "zwlr_layer_shell_v1", .version = 5, .gate = .presenting_headless },
     .{ .interface = "ext_session_lock_manager_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },

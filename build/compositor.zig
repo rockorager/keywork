@@ -251,6 +251,23 @@ pub fn add(
     const run_security_context_tests = b.addRunArtifact(b.addTest(.{ .root_module = security_context_tests }));
     test_step.dependOn(&run_security_context_tests.step);
     test_wayring_step.dependOn(&run_security_context_tests.step);
+    const transient_seat_tests = b.createModule(.{
+        .root_source_file = b.path("src/compositor/wayring_transient_seat_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "wayring", .module = wayring },
+            .{ .name = "wayring-protocol", .module = wayring_protocol },
+            .{ .name = "wayland", .module = wayland },
+        },
+    });
+    transient_seat_tests.linkSystemLibrary("pixman-1", .{});
+    transient_seat_tests.linkSystemLibrary("ffi", .{});
+    wayland_libraries.linkClientAndServer(transient_seat_tests);
+    const run_transient_seat_tests = b.addRunArtifact(b.addTest(.{ .root_module = transient_seat_tests }));
+    test_step.dependOn(&run_transient_seat_tests.step);
+    test_wayring_step.dependOn(&run_transient_seat_tests.step);
     const keyworkctl_tests = b.addTest(.{ .root_module = keyworkctl_adapter });
     const run_keyworkctl_tests = b.addRunArtifact(keyworkctl_tests);
     test_step.dependOn(&run_keyworkctl_tests.step);

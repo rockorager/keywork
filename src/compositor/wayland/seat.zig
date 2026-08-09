@@ -19,7 +19,7 @@ const wl = wayland.server.wl;
 allocator: std.mem.Allocator,
 io: std.Io,
 display: *wl.Server,
-global: *wl.Global,
+global: ?*wl.Global,
 global_removed: bool,
 name_value: [:0]const u8,
 surface_store: *Surface.Store,
@@ -308,11 +308,41 @@ pub fn init(
     mature_clients: *MatureClients,
     surface_registry: *SurfaceRegistry,
 ) !void {
+    return self.initWithPublication(allocator, io, display, seat_name, surface_store, clients, mature_clients, surface_registry, true);
+}
+
+/// Initializes semantic seat authority without publishing a mature wl_seat.
+pub fn initAuthorityOnly(
+    self: *Self,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    display: *wl.Server,
+    seat_name: [:0]const u8,
+    surface_store: *Surface.Store,
+    clients: *ClientRegistry,
+    mature_clients: *MatureClients,
+    surface_registry: *SurfaceRegistry,
+) !void {
+    return self.initWithPublication(allocator, io, display, seat_name, surface_store, clients, mature_clients, surface_registry, false);
+}
+
+fn initWithPublication(
+    self: *Self,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    display: *wl.Server,
+    seat_name: [:0]const u8,
+    surface_store: *Surface.Store,
+    clients: *ClientRegistry,
+    mature_clients: *MatureClients,
+    surface_registry: *SurfaceRegistry,
+    publish_global: bool,
+) !void {
     self.* = .{
         .allocator = allocator,
         .io = io,
         .display = display,
-        .global = undefined,
+        .global = null,
         .global_removed = false,
         .name_value = seat_name,
         .surface_store = surface_store,
@@ -369,7 +399,7 @@ pub fn init(
     try clients.addDisconnectListener(.{ .context = self, .notify = clientDisconnected });
     errdefer clients.removeDisconnectListener(self);
     errdefer self.authority.deinit();
-    self.global = try wl.Global.create(display, wl.Seat, 10, *Self, self, bind);
+    if (publish_global) self.global = try wl.Global.create(display, wl.Seat, 10, *Self, self, bind);
 }
 
 pub fn deinit(self: *Self) void {
@@ -390,7 +420,7 @@ pub fn deinit(self: *Self) void {
     self.clients.removeDisconnectListener(self);
     self.authority.deinit();
     self.delivery.deinit();
-    self.global.destroy();
+    if (self.global) |global| global.destroy();
     if (self.keymap) |keymap| keymap.file.close(self.io);
     self.keyboard_focus_listeners.deinit(self.allocator);
     self.grabbed_keys.deinit(self.allocator);
@@ -406,13 +436,13 @@ pub fn deinit(self: *Self) void {
 
 pub fn globalName(self: *const Self, client: *const wl.Client) u32 {
     std.debug.assert(!self.global_removed);
-    return self.global.getName(client);
+    return (self.global orelse unreachable).getName(client);
 }
 
 /// Stop advertising this seat while keeping existing client resources alive.
 pub fn removeGlobal(self: *Self) void {
     std.debug.assert(!self.global_removed);
-    self.global.remove();
+    (self.global orelse unreachable).remove();
     self.global_removed = true;
 }
 

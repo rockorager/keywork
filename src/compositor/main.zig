@@ -3,7 +3,6 @@
 const std = @import("std");
 const build_options = @import("build-options");
 const ControlProtocol = @import("keywork-control");
-const IdleNotification = @import("IdleNotification.zig");
 const OutputBackend = @import("backend/output.zig");
 const Config = @import("config.zig");
 const Launcher = @import("launcher.zig");
@@ -28,6 +27,7 @@ const WayringPrimarySelection = @import("wayland/WayringPrimarySelection.zig");
 const WayringTextInput = @import("wayland/WayringTextInput.zig");
 const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
 const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
+const WayringTransientSeat = @import("wayland/WayringTransientSeat.zig");
 const WayringIdleNotification = @import("wayland/WayringIdleNotification.zig");
 const WayringIdleInhibit = @import("wayland/WayringIdleInhibit.zig");
 const WayringKeyboardShortcutsInhibit = @import("wayland/WayringKeyboardShortcutsInhibit.zig");
@@ -441,6 +441,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_virtual_keyboard: WayringVirtualKeyboard = undefined;
     var wayring_virtual_keyboard_initialized = false;
     var wayring_virtual_keyboard_published = false;
+    var wayring_transient_seat: WayringTransientSeat = undefined;
+    var wayring_transient_seat_initialized = false;
+    var wayring_transient_seat_published = false;
     var wayring_idle_notification: WayringIdleNotification = undefined;
     var wayring_idle_notification_initialized = false;
     var wayring_idle_notification_published = false;
@@ -516,6 +519,7 @@ pub fn main(init: std.process.Init) !void {
         image_copy_capture: ?*WayringImageCopyCapture,
         input_method: ?*WayringInputMethod,
         virtual_keyboard: ?*WayringVirtualKeyboard,
+        transient_seat: ?*WayringTransientSeat,
         idle_notification: ?*WayringIdleNotification,
         idle_inhibit: ?*WayringIdleInhibit,
         keyboard_shortcuts_inhibit: ?*WayringKeyboardShortcutsInhibit,
@@ -538,6 +542,8 @@ pub fn main(init: std.process.Init) !void {
             _ = try self.clients.register(client);
             errdefer self.clients.unregister(client);
             try self.seat.trackClient(client);
+            errdefer self.seat.destroyClientResources(client);
+            if (self.transient_seat) |transient| try transient.trackClient(client);
         }
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
@@ -558,6 +564,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.session_lock) |generated_session_lock| generated_session_lock.destroyClientResources(client);
             if (self.layer_shell) |layer_shell| layer_shell.destroyClientResources(client);
             if (self.virtual_keyboard) |keyboard| keyboard.destroyClientResources(client);
+            if (self.transient_seat) |transient| transient.destroyClientResources(client);
             if (self.input_method) |input_method| input_method.destroyClientResources(client);
             if (self.image_capture_source) |source| source.destroyClientResources(client);
             if (self.foreign_toplevel) |foreign_toplevel| foreign_toplevel.destroyClientResources(client);
@@ -665,6 +672,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_virtual_keyboard_initialized) {
             if (wayring_virtual_keyboard_published) wayring_virtual_keyboard.unpublish();
             wayring_virtual_keyboard.deinit();
+        }
+        if (wayring_transient_seat_initialized) {
+            if (wayring_transient_seat_published) wayring_transient_seat.unpublish();
+            wayring_transient_seat.deinit();
         }
         if (wayring_input_method_initialized) {
             server.setGeneratedInputMethodObserver(null);
@@ -833,7 +844,6 @@ pub fn main(init: std.process.Init) !void {
             }
             if (wayring_seat_published) wayring_seat_adapter.unpublish();
             server.clearGeneratedSeatDeliverySink(&wayring_seat_adapter);
-            wayring_seat_adapter.clearCursorListener();
             wayring_seat_adapter.deinit();
             wayring_seat_adapter_initialized = false;
         }
@@ -905,20 +915,29 @@ pub fn main(init: std.process.Init) !void {
             server.generatedInputMethodLayout(),
         );
         wayring_input_method_initialized = true;
-        wayring_virtual_keyboard.init(
-            init.gpa,
-            &wayring_protocol_server.?,
-            &wayring_seat_adapter,
-            server.canonicalSeat(),
-            std.os.linux.getuid(),
-        );
-        wayring_virtual_keyboard_initialized = true;
-        wayring_idle_notification.init(
+        wayring_transient_seat.init(
             init.gpa,
             &wayring_protocol_server.?,
             &wayring_clients,
+            &wayring_compositor,
+            server.canonicalSeat(),
             &wayring_seat_adapter,
-            IdleNotification.SeatRef.fromPointer(server.canonicalSeat()),
+            .{ .context = server, .init_seat = Server.initGeneratedTransientSeat },
+            std.os.linux.getuid(),
+        );
+        wayring_transient_seat_initialized = true;
+        try wayring_virtual_keyboard.init(
+            init.gpa,
+            &wayring_protocol_server.?,
+            &wayring_transient_seat,
+            std.os.linux.getuid(),
+        );
+        wayring_virtual_keyboard_initialized = true;
+        try wayring_idle_notification.init(
+            init.gpa,
+            &wayring_protocol_server.?,
+            &wayring_clients,
+            &wayring_transient_seat,
             server.neutralIdleNotification(),
             .{ .context = server, .failed = Server.idleNotificationFrontendFailed },
         );
@@ -979,7 +998,6 @@ pub fn main(init: std.process.Init) !void {
             .{ .context = server, .warp = Server.generatedPointerWarp },
         );
         wayring_pointer_warp_initialized = true;
-        wayring_seat_adapter.installCursorListener();
         server.setGeneratedSeatDeliverySink(wayring_seat_adapter.sink());
         try wayring_seat_adapter.publish();
         wayring_seat_published = true;
@@ -1228,6 +1246,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_image_copy_capture_published = true;
             try wayring_input_method.publish();
             wayring_input_method_published = true;
+            try wayring_transient_seat.publish();
+            wayring_transient_seat_published = true;
             // Virtual keyboard is the most privileged generated input global
             // and is published last under the same immutable restricted gate.
             try wayring_virtual_keyboard.publish();
@@ -1294,6 +1314,7 @@ pub fn main(init: std.process.Init) !void {
             .image_copy_capture = if (wayring_image_copy_capture_initialized) &wayring_image_copy_capture else null,
             .input_method = if (wayring_input_method_initialized) &wayring_input_method else null,
             .virtual_keyboard = if (wayring_virtual_keyboard_initialized) &wayring_virtual_keyboard else null,
+            .transient_seat = if (wayring_transient_seat_initialized) &wayring_transient_seat else null,
             .idle_notification = if (wayring_idle_notification_initialized) &wayring_idle_notification else null,
             .idle_inhibit = if (wayring_idle_inhibit_initialized) &wayring_idle_inhibit else null,
             .keyboard_shortcuts_inhibit = if (wayring_keyboard_shortcuts_inhibit_initialized) &wayring_keyboard_shortcuts_inhibit else null,
@@ -1344,7 +1365,7 @@ pub fn main(init: std.process.Init) !void {
                 .capture_output = WayringProductionAdapters.capture,
                 .refresh_cursors = WayringProductionAdapters.refreshCursors,
             });
-            try wayring_virtual_pointer.init(init.gpa, &wayring_protocol_server.?, &wayring_seat_adapter, &wayring_outputs, server.virtualPointerAuthority(), server.canonicalSeat(), std.os.linux.getuid());
+            try wayring_virtual_pointer.init(init.gpa, &wayring_protocol_server.?, &wayring_transient_seat, &wayring_outputs, server.virtualPointerAuthority(), std.os.linux.getuid());
             wayring_virtual_pointer_initialized = true;
             try wayring_virtual_pointer.publish();
             wayring_virtual_pointer_published = true;
@@ -1901,6 +1922,7 @@ test {
     _ = @import("wayland/WayringImageCaptureSource.zig");
     _ = @import("wayland/WayringImageCopyCapture.zig");
     _ = @import("wayland/WayringVirtualKeyboard.zig");
+    _ = @import("wayland/WayringTransientSeat.zig");
     _ = @import("VirtualPointer.zig");
     _ = @import("wayland/WayringVirtualPointer.zig");
     _ = @import("wayland/surface.zig");

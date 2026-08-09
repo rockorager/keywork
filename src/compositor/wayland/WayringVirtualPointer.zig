@@ -10,9 +10,13 @@ const protocol = @import("wayring-protocol");
 const wayland = @import("wayland");
 const wayring = @import("wayring");
 const VirtualPointer = @import("../VirtualPointer.zig");
+const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const Seat = @import("seat.zig");
+const WayringClients = @import("WayringClients.zig");
+const WayringCompositor = @import("WayringCompositor.zig");
 const WayringOutput = @import("WayringOutput.zig");
 const WayringSeatAdapter = @import("WayringSeatAdapter.zig");
+const WayringTransientSeat = @import("WayringTransientSeat.zig");
 
 const wl = wayland.server.wl;
 const ManagerResource = protocol.zwlr_virtual_pointer_manager_v1.Resource;
@@ -28,16 +32,15 @@ const Device = struct {
     owner: *WayringVirtualPointer,
     client: *wayring.server.Client,
     resource: DeviceResource,
-    neutral: *VirtualPointer.Device,
+    neutral: ?*VirtualPointer.Device,
 };
 
 allocator: std.mem.Allocator,
 protocol_server: *wayring.server.Server,
-seat_adapter: *WayringSeatAdapter,
+seats: *WayringTransientSeat,
 outputs: *WayringOutput,
 neutral: *VirtualPointer,
 provider: *VirtualPointer.Provider,
-default_seat: *Seat,
 authorized_uid: std.os.linux.uid_t,
 global: ?*const wayring.server.Server.Global = null,
 managers: std.ArrayList(*Manager) = .empty,
@@ -47,28 +50,29 @@ pub fn init(
     self: *WayringVirtualPointer,
     allocator: std.mem.Allocator,
     protocol_server: *wayring.server.Server,
-    seat_adapter: *WayringSeatAdapter,
+    seats: *WayringTransientSeat,
     outputs: *WayringOutput,
     neutral: *VirtualPointer,
-    default_seat: *Seat,
     authorized_uid: std.os.linux.uid_t,
 ) !void {
     self.* = .{
         .allocator = allocator,
         .protocol_server = protocol_server,
-        .seat_adapter = seat_adapter,
+        .seats = seats,
         .outputs = outputs,
         .neutral = neutral,
         .provider = try neutral.createProvider(),
-        .default_seat = default_seat,
         .authorized_uid = authorized_uid,
     };
+    errdefer neutral.destroyProvider(self.provider);
+    try seats.addSeatListener(.{ .context = self, .removed = transientSeatRemoved });
 }
 
 pub fn deinit(self: *WayringVirtualPointer) void {
     std.debug.assert(self.global == null and self.managers.items.len == 0 and self.devices.items.len == 0);
     self.devices.deinit(self.allocator);
     self.managers.deinit(self.allocator);
+    self.seats.removeSeatListener(self);
     self.neutral.destroyProvider(self.provider);
     self.* = undefined;
 }
@@ -134,10 +138,6 @@ fn managerRequest(_: *ManagerResource, request: protocol.zwlr_virtual_pointer_ma
 
 fn createDevice(self: *WayringVirtualPointer, manager: *Manager, seat_object: ?u32, output_object: ?u32, id: u32) !void {
     if (!self.authorized(manager.client, &manager.resource.runtime)) return;
-    if (seat_object) |seat_id| if (self.seat_adapter.seatClientIdentity(manager.client, seat_id) == null) {
-        manager.client.postImplementationError(&manager.resource.runtime, "virtual pointer requires the exact live same-client wl_seat");
-        return;
-    };
     const output = if (output_object) |output_id| switch (self.outputs.identifyResource(manager.client, output_id)) {
         .live => |identity| identity.output,
         .retired, .invalid => {
@@ -148,8 +148,17 @@ fn createDevice(self: *WayringVirtualPointer, manager: *Manager, seat_object: ?u
     try self.devices.ensureUnusedCapacity(self.allocator, 1);
     const value = try self.allocator.create(Device);
     errdefer self.allocator.destroy(value);
-    const neutral = try self.neutral.createDevice(self.provider, .{ .seat = self.default_seat, .output = output });
-    errdefer self.neutral.destroyDevice(neutral);
+    const selection = if (seat_object) |seat_id|
+        self.seats.acquireSeat(manager.client, seat_id)
+    else
+        self.seats.canonicalSelection(manager.client);
+    const neutral = if (selection) |selected| try self.neutral.createDevice(self.provider, .{
+        .seat = selected.seat,
+        .output = output,
+        .release_context = if (selected.entry) |entry| entry else null,
+        .release = if (selected.entry != null) releaseTransientSeat else null,
+    }) else null;
+    errdefer if (neutral) |device| self.neutral.destroyDevice(device);
     value.* = .{
         .owner = self,
         .client = manager.client,
@@ -167,18 +176,23 @@ fn createDevice(self: *WayringVirtualPointer, manager: *Manager, seat_object: ?u
 
 fn deviceRequest(_: *DeviceResource, request: protocol.zwlr_virtual_pointer_v1.Request, device: *Device) !void {
     if (!device.owner.authorized(device.client, &device.resource.runtime)) return;
+    const neutral = device.neutral orelse {
+        if (request == .destroy) device.owner.destroyDevice(device);
+        return;
+    };
+    if (!neutral.active and request != .destroy) return;
     switch (request) {
-        .motion => |args| device.neutral.motion(args.time, fixedDouble(args.dx), fixedDouble(args.dy)),
-        .motion_absolute => |args| device.neutral.motionAbsolute(args.time, args.x, args.y, args.x_extent, args.y_extent),
-        .button => |args| device.neutral.button(args.time, args.button, args.state) catch |err| switch (err) {
+        .motion => |args| neutral.motion(args.time, fixedDouble(args.dx), fixedDouble(args.dy)),
+        .motion_absolute => |args| neutral.motionAbsolute(args.time, args.x, args.y, args.x_extent, args.y_extent),
+        .button => |args| neutral.button(args.time, args.button, args.state) catch |err| switch (err) {
             error.OutOfMemory => device.client.postOutOfMemory(&device.resource.runtime, "recording virtual pointer button"),
             error.InvalidButtonState => device.client.postImplementationError(&device.resource.runtime, "invalid virtual pointer button state"),
         },
-        .axis => |args| device.neutral.axis(args.time, args.axis, fixed(args.value)) catch invalidAxis(device),
-        .frame => device.neutral.frame(),
-        .axis_source => |args| device.neutral.axisSource(args.axis_source) catch invalidAxisSource(device),
-        .axis_stop => |args| device.neutral.axisStop(args.time, args.axis) catch invalidAxis(device),
-        .axis_discrete => |args| device.neutral.axisDiscrete(args.time, args.axis, fixed(args.value), args.discrete) catch invalidAxis(device),
+        .axis => |args| neutral.axis(args.time, args.axis, fixed(args.value)) catch invalidAxis(device),
+        .frame => neutral.frame(),
+        .axis_source => |args| neutral.axisSource(args.axis_source) catch invalidAxisSource(device),
+        .axis_stop => |args| neutral.axisStop(args.time, args.axis) catch invalidAxis(device),
+        .axis_discrete => |args| neutral.axisDiscrete(args.time, args.axis, fixed(args.value), args.discrete) catch invalidAxis(device),
         .destroy => device.owner.destroyDevice(device),
     }
 }
@@ -217,10 +231,20 @@ fn destroyDevice(self: *WayringVirtualPointer, value: *Device) void {
         _ = self.devices.swapRemove(index);
         break;
     };
-    self.neutral.destroyDevice(value.neutral);
+    if (value.neutral) |neutral| self.neutral.destroyDevice(neutral);
     value.resource.destroy();
     value.resource.deinit();
     self.allocator.destroy(value);
+}
+
+fn transientSeatRemoved(context: *anyopaque, seat: *Seat) void {
+    const self: *WayringVirtualPointer = @ptrCast(@alignCast(context));
+    self.neutral.deactivateSeat(seat);
+}
+
+fn releaseTransientSeat(context: *anyopaque, _: *Seat) void {
+    const entry: *WayringTransientSeat.Entry = @ptrCast(@alignCast(context));
+    entry.owner.releaseEntry(entry);
 }
 
 fn destroyManager(self: *WayringVirtualPointer, value: *Manager) void {
@@ -247,34 +271,11 @@ test "virtual-pointer v2 descriptors versions and errors are exact" {
 }
 
 test "typed bind requires direct exact UID and accepts both manager versions" {
-    const Context = struct {
-        fn event(_: *anyopaque, _: *Seat, _: ?@import("output_layout.zig").Id, _: u64, _: VirtualPointer.Event) void {}
-    };
-    var protocol_server: wayring.server.Server = .init(std.testing.allocator);
-    defer protocol_server.deinit();
-    var output_layout: @import("output_layout.zig") = undefined;
-    var context: u8 = 0;
-    var neutral = VirtualPointer.init(std.testing.allocator, &output_layout, .{ .context = &context, .event = Context.event });
-    defer neutral.deinit();
-    var seat_adapter: WayringSeatAdapter = undefined;
-    var outputs: WayringOutput = undefined;
-    var seat: Seat = undefined;
-    var adapter: WayringVirtualPointer = undefined;
-    try adapter.init(
-        std.testing.allocator,
-        &protocol_server,
-        &seat_adapter,
-        &outputs,
-        &neutral,
-        &seat,
-        42,
-    );
-    defer adapter.deinit();
-
-    try adapter.publish();
-    defer adapter.unpublish();
-    protocol_server.setGlobalFilter(WayringVirtualPointer, &adapter, globalFilter);
-    defer protocol_server.clearGlobalFilter();
+    var fixture: BindFixture = undefined;
+    try fixture.init(std.testing.allocator);
+    defer fixture.deinit();
+    const protocol_server = &fixture.protocol_server;
+    const adapter = &fixture.adapter;
 
     const credentials: wayring.server.Client.Credentials = .{ .pid = 1, .uid = 42, .gid = 1 };
     var direct: wayring.server.Client = .init(std.testing.allocator, .{
@@ -297,16 +298,16 @@ test "typed bind requires direct exact UID and accepts both manager versions" {
     try std.testing.expectError(error.InvalidVersion, adapter.bind(&direct, 2, 3));
     try std.testing.expectError(error.AccessDenied, adapter.bind(&wrong_uid, 2, 1));
     try std.testing.expectError(error.AccessDenied, adapter.bind(&derived, 2, 2));
-    const managed = try wayring.server.CoreClient.create(std.testing.allocator, &protocol_server, .{
+    const managed = try wayring.server.CoreClient.create(std.testing.allocator, protocol_server, .{
         .credentials = credentials,
         .transport_provenance = .direct,
     });
     defer managed.destroy();
     try prepareRegistry(managed.client());
-    try registryBind(&adapter, managed.client(), 3, 1);
-    try registryBind(&adapter, managed.client(), 4, 2);
+    try registryBind(adapter, managed.client(), 3, 1);
+    try registryBind(adapter, managed.client(), 4, 2);
     try std.testing.expectEqual(@as(usize, 2), adapter.managers.items.len);
-    try std.testing.expectEqual(@as(usize, 1), neutral.providers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fixture.neutral.providers.items.len);
     adapter.destroyClientResources(managed.client());
     try std.testing.expectEqual(@as(usize, 0), adapter.managers.items.len);
     try std.testing.expectEqual(@as(usize, 0), adapter.devices.items.len);
@@ -314,19 +315,33 @@ test "typed bind requires direct exact UID and accepts both manager versions" {
 
 const BindFixture = struct {
     protocol_server: wayring.server.Server,
+    surface_registry: SurfaceRegistry = undefined,
+    clients: WayringClients = undefined,
+    compositor: WayringCompositor = undefined,
     output_layout: @import("output_layout.zig") = undefined,
     context: u8 = 0,
     neutral: VirtualPointer = undefined,
     seat_adapter: WayringSeatAdapter = undefined,
+    transient_seat: WayringTransientSeat = undefined,
     outputs: WayringOutput = undefined,
     seat: Seat = undefined,
     adapter: WayringVirtualPointer = undefined,
 
     fn event(_: *anyopaque, _: *Seat, _: ?@import("output_layout.zig").Id, _: u64, _: VirtualPointer.Event) void {}
+    fn initSeat(_: *anyopaque, _: *Seat, _: std.mem.Allocator, _: [:0]const u8) !void {}
 
     fn init(self: *BindFixture, allocator: std.mem.Allocator) !void {
         self.* = .{ .protocol_server = .init(std.testing.allocator) };
         errdefer self.protocol_server.deinit();
+        self.surface_registry = .init(allocator);
+        errdefer self.surface_registry.deinit();
+        try self.compositor.init(allocator, &self.protocol_server, &self.surface_registry, null);
+        errdefer self.compositor.deinit();
+        self.clients = undefined;
+        self.seat_adapter = .init(allocator, &self.protocol_server, &self.clients, &self.compositor, undefined, "test");
+        errdefer self.seat_adapter.deinit();
+        self.transient_seat.init(allocator, &self.protocol_server, &self.clients, &self.compositor, &self.seat, &self.seat_adapter, .{ .context = self, .init_seat = initSeat }, 42);
+        errdefer self.transient_seat.deinit();
         self.neutral = VirtualPointer.init(allocator, &self.output_layout, .{
             .context = &self.context,
             .event = event,
@@ -335,10 +350,9 @@ const BindFixture = struct {
         try self.adapter.init(
             allocator,
             &self.protocol_server,
-            &self.seat_adapter,
+            &self.transient_seat,
             &self.outputs,
             &self.neutral,
-            &self.seat,
             42,
         );
         errdefer self.adapter.deinit();
@@ -351,6 +365,10 @@ const BindFixture = struct {
         self.adapter.unpublish();
         self.adapter.deinit();
         self.neutral.deinit();
+        self.transient_seat.deinit();
+        self.seat_adapter.deinit();
+        self.compositor.deinit();
+        self.surface_registry.deinit();
         self.protocol_server.deinit();
         self.* = undefined;
     }

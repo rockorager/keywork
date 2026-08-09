@@ -124,6 +124,7 @@ const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
 const WayringGtkShell = @import("wayland/WayringGtkShell.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
+const WayringTransientSeat = @import("wayland/WayringTransientSeat.zig");
 const WayringPointerConstraints = @import("wayland/WayringPointerConstraints.zig");
 const IdleAlarmHost = @import("wayland/WayringHost.zig");
 const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
@@ -4165,6 +4166,27 @@ pub fn neutralPointerConstraints(self: *Self) *NeutralPointerConstraints {
 /// Canonical seat authority used by protocol adapters that implement grabs.
 pub fn canonicalSeat(self: *Self) *Seat {
     return &self.seat;
+}
+
+/// Initializes a generated transient seat's semantic authority without
+/// publishing it on the mature libwayland display.
+pub fn initGeneratedTransientSeat(
+    context: *anyopaque,
+    seat: *Seat,
+    allocator: std.mem.Allocator,
+    name: [:0]const u8,
+) !void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    try seat.initAuthorityOnly(
+        allocator,
+        self.io,
+        self.display,
+        name,
+        self.compositor.surfaceStore(),
+        &self.client_registry,
+        &self.mature_clients,
+        &self.surface_registry,
+    );
 }
 
 pub fn virtualPointerAuthority(self: *Self) *@import("VirtualPointer.zig") {
@@ -8217,7 +8239,7 @@ fn pointerMotionGlobalForSeat(
     }
     if (seat != &self.seat) {
         const route = self.pointerRoute(x, y);
-        seat.pointerMotion(time, x, y, maturePointerFocus(route.focus));
+        seat.pointerMotion(time, x, y, selectedSeatPointerFocus(seat, route.focus));
         return;
     }
     const motion = self.constrainPointerMotion(.{ .x = x, .y = y });
@@ -8922,7 +8944,7 @@ fn restoreSeatPointerFocus(self: *Self, seat: *Seat) void {
     seat.pointerEnter(
         position.x,
         position.y,
-        if (seat == &self.seat) route.focus else maturePointerFocus(route.focus),
+        if (seat == &self.seat) route.focus else selectedSeatPointerFocus(seat, route.focus),
     );
     if (seat != &self.seat or self.session_lock.isLocked()) return;
     if (!self.xdg_shell_core.hasPopupGrab()) {
@@ -9112,6 +9134,13 @@ fn pointerFocus(self: *Self, x: f64, y: f64) ?Seat.PointerFocus {
 fn maturePointerFocus(focus: ?Seat.PointerFocus) ?Seat.PointerFocus {
     const value = focus orelse return null;
     return if (value.generated == null) value else null;
+}
+
+fn selectedSeatPointerFocus(seat: *const Seat, focus: ?Seat.PointerFocus) ?Seat.PointerFocus {
+    const value = focus orelse return null;
+    const generated = value.generated orelse return value;
+    const owner = seat.generatedSurfaceOwner(generated.root) orelse return null;
+    return if (std.meta.eql(owner, generated.client)) value else null;
 }
 
 fn neutralPointerFocus(focus: ?NeutralDataDevice.Target) ?Seat.PointerFocus {
@@ -18999,6 +19028,7 @@ const WayringXdgClient = struct {
     expect_output_management: bool = false,
     expect_screencopy: bool = false,
     expect_virtual_pointer: bool = false,
+    expect_transient_seat: bool = false,
     guessed_data_control_name: ?u32 = null,
     guessed_virtual_keyboard_name: ?u32 = null,
     guessed_data_control_bind_issued: bool = false,
@@ -19121,7 +19151,8 @@ const WayringXdgClient = struct {
             @intFromBool(!self.expect_linux_dmabuf) -
             @intFromBool(!self.expect_output_management) -
             @intFromBool(!self.expect_screencopy) -
-            @intFromBool(!self.expect_virtual_pointer);
+            @intFromBool(!self.expect_virtual_pointer) -
+            @intFromBool(!self.expect_transient_seat);
     }
 
     fn expectedGlobal(self: *const @This(), visible_index: usize) ?ExpectedGlobal {
@@ -19158,6 +19189,8 @@ const WayringXdgClient = struct {
                 self.expect_screencopy
             else if (std.mem.eql(u8, global.interface, "zwlr_virtual_pointer_manager_v1"))
                 self.expect_virtual_pointer
+            else if (std.mem.eql(u8, global.interface, "ext_transient_seat_manager_v1"))
+                self.expect_transient_seat
             else
                 true;
             if (!present) continue;
@@ -27125,12 +27158,26 @@ test "production generated data device completes the exact profile and supports 
         .refresh_popups = WayringInputMethod.observerRefreshPopups,
     });
     try input_method.publish();
-    var virtual_keyboard: WayringVirtualKeyboard = undefined;
-    virtual_keyboard.init(
+    var transient_seat: WayringTransientSeat = undefined;
+    transient_seat.init(
         std.testing.allocator,
         &protocol_server,
-        &seat,
+        &clients,
+        &compositor,
         server.canonicalSeat(),
+        &seat,
+        .{ .context = server, .init_seat = Self.initGeneratedTransientSeat },
+        linux.getuid(),
+    );
+    defer {
+        if (transient_seat.global != null) transient_seat.unpublish();
+        transient_seat.deinit();
+    }
+    var virtual_keyboard: WayringVirtualKeyboard = undefined;
+    try virtual_keyboard.init(
+        std.testing.allocator,
+        &protocol_server,
+        &transient_seat,
         linux.getuid(),
     );
     defer {
@@ -27141,10 +27188,9 @@ test "production generated data device completes the exact profile and supports 
     try generated_virtual_pointer.init(
         std.testing.allocator,
         &protocol_server,
-        &seat,
+        &transient_seat,
         &outputs,
         server.virtual_pointer.authority(),
-        server.canonicalSeat(),
         linux.getuid(),
     );
     defer {
@@ -27179,12 +27225,11 @@ test "production generated data device completes the exact profile and supports 
         session_lock.deinit();
     }
     var idle_notify: WayringIdleNotification = undefined;
-    idle_notify.init(
+    try idle_notify.init(
         std.testing.allocator,
         &protocol_server,
         &clients,
-        &seat,
-        NeutralIdleNotification.SeatRef.fromPointer(server.canonicalSeat()),
+        &transient_seat,
         server.neutralIdleNotification(),
         .{ .context = server, .failed = Self.idleNotificationFrontendFailed },
     );
@@ -27251,6 +27296,7 @@ test "production generated data device completes the exact profile and supports 
         zwlr_data_control: *WayringZwlrDataControl,
         foreign_toplevel: *WayringForeignToplevelList,
         input_method: *WayringInputMethod,
+        transient_seat: *WayringTransientSeat,
         virtual_keyboard: *WayringVirtualKeyboard,
         virtual_pointer: *WayringVirtualPointer,
         pointer_constraints: *WayringPointerConstraints,
@@ -27279,6 +27325,8 @@ test "production generated data device completes the exact profile and supports 
                 self.generated_client = id;
             }
             try self.seat.trackClient(client);
+            errdefer self.seat.retireClient(client);
+            try self.transient_seat.trackClient(client);
         }
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -27320,6 +27368,7 @@ test "production generated data device completes the exact profile and supports 
             // Synthetic devices must release canonical input state before
             // their seat/output resources lose identity.
             self.virtual_keyboard.destroyClientResources(client);
+            self.transient_seat.destroyClientResources(client);
             self.input_method.destroyClientResources(client);
             self.foreign_toplevel.destroyClientResources(client);
             self.data_control.destroyClientResources(client);
@@ -27372,6 +27421,7 @@ test "production generated data device completes the exact profile and supports 
         .zwlr_data_control = &zwlr_data_control,
         .foreign_toplevel = &foreign_toplevel,
         .input_method = &input_method,
+        .transient_seat = &transient_seat,
         .virtual_keyboard = &virtual_keyboard,
         .virtual_pointer = &generated_virtual_pointer,
         .pointer_constraints = &generated_pointer_constraints,
@@ -27555,6 +27605,8 @@ test "production generated data device completes the exact profile and supports 
     peer.expect_output_management = true;
     peer.expect_screencopy = true;
     peer.expect_virtual_pointer = true;
+    peer.expect_transient_seat = true;
+    try transient_seat.publish();
     try virtual_keyboard.publish();
     try layer_shell.publish();
     try session_lock.publish();
@@ -27732,6 +27784,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_output_management = true,
         .expect_screencopy = true,
         .expect_virtual_pointer = true,
+        .expect_transient_seat = true,
     };
     const profile_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&profile});
     var profile_joined = false;
@@ -28516,6 +28569,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_output_management = true,
         .expect_screencopy = true,
         .expect_virtual_pointer = true,
+        .expect_transient_seat = true,
     };
     const primary_watch_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_watch});
     var primary_watch_joined = false;
@@ -28597,6 +28651,7 @@ test "production generated data device completes the exact profile and supports 
         .expect_output_management = true,
         .expect_screencopy = true,
         .expect_virtual_pointer = true,
+        .expect_transient_seat = true,
     };
     const primary_rebind_thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&primary_rebind});
     var primary_rebind_joined = false;

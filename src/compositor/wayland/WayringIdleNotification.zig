@@ -6,8 +6,9 @@ const std = @import("std");
 const protocol = @import("wayring-protocol");
 const wayring = @import("wayring");
 const IdleNotification = @import("../IdleNotification.zig");
+const Seat = @import("seat.zig");
 const WayringClients = @import("WayringClients.zig");
-const WayringSeatAdapter = @import("WayringSeatAdapter.zig");
+const WayringTransientSeat = @import("WayringTransientSeat.zig");
 
 pub const Failure = struct {
     context: *anyopaque,
@@ -32,8 +33,7 @@ const Notification = struct {
 allocator: std.mem.Allocator,
 protocol_server: *wayring.server.Server,
 clients: *WayringClients,
-seat: *WayringSeatAdapter,
-seat_ref: IdleNotification.SeatRef,
+seats: *WayringTransientSeat,
 core: *IdleNotification,
 failure: Failure,
 global: ?*const wayring.server.Server.Global = null,
@@ -41,12 +41,14 @@ managers: std.ArrayList(*Manager) = .empty,
 notifications: std.ArrayList(*Notification) = .empty,
 next_generation: u64 = 1,
 
-pub fn init(self: *WayringIdleNotification, allocator: std.mem.Allocator, protocol_server: *wayring.server.Server, clients: *WayringClients, seat: *WayringSeatAdapter, seat_ref: IdleNotification.SeatRef, core: *IdleNotification, failure: Failure) void {
-    self.* = .{ .allocator = allocator, .protocol_server = protocol_server, .clients = clients, .seat = seat, .seat_ref = seat_ref, .core = core, .failure = failure };
+pub fn init(self: *WayringIdleNotification, allocator: std.mem.Allocator, protocol_server: *wayring.server.Server, clients: *WayringClients, seats: *WayringTransientSeat, core: *IdleNotification, failure: Failure) !void {
+    self.* = .{ .allocator = allocator, .protocol_server = protocol_server, .clients = clients, .seats = seats, .core = core, .failure = failure };
+    try seats.addSeatListener(.{ .context = self, .removed = transientSeatRemoved });
 }
 
 pub fn deinit(self: *WayringIdleNotification) void {
     std.debug.assert(self.global == null and self.managers.items.len == 0 and self.notifications.items.len == 0);
+    self.seats.removeSeatListener(self);
     self.notifications.deinit(self.allocator);
     self.managers.deinit(self.allocator);
     self.* = undefined;
@@ -96,10 +98,11 @@ fn managerRequest(_: *protocol.ext_idle_notifier_v1.Resource, request: protocol.
 }
 
 fn createNotification(self: *WayringIdleNotification, manager: *Manager, id: u32, timeout_ms: u32, seat_object: u32, obey_inhibitors: bool) !void {
-    const client_id = self.seat.seatClientIdentity(manager.client, seat_object) orelse {
+    const selection = self.seats.resolveSeat(manager.client, seat_object) orelse {
         manager.client.postImplementationError(&manager.resource.runtime, "idle notification requires the exact live same-client wl_seat");
         return;
     };
+    const client_id = selection.client;
     if (self.clients.id(manager.client)) |registered| {
         if (!std.meta.eql(registered, client_id)) {
             manager.client.postImplementationError(&manager.resource.runtime, "idle notification seat has a stale client identity");
@@ -121,7 +124,7 @@ fn createNotification(self: *WayringIdleNotification, manager: *Manager, id: u32
     }
     try value.resource.setHandler(Notification, value, notificationRequest, null);
     try manager.client.materialize(&value.resource.runtime);
-    value.core_id = self.core.create(client_id, self.seat_ref, timeout_ms, obey_inhibitors, endpoint(value)) catch |err| switch (err) {
+    value.core_id = self.core.create(client_id, IdleNotification.SeatRef.fromPointer(selection.seat), timeout_ms, obey_inhibitors, endpoint(value)) catch |err| switch (err) {
         error.ScheduleFailed, error.TimerGenerationExhausted => {
             // Keep the already materialized child valid until orderly server
             // teardown. Transport failure is compositor-fatal, not a client
@@ -133,6 +136,11 @@ fn createNotification(self: *WayringIdleNotification, manager: *Manager, id: u32
         else => return err,
     };
     self.notifications.appendAssumeCapacity(value);
+}
+
+fn transientSeatRemoved(context: *anyopaque, seat: *Seat) void {
+    const self: *WayringIdleNotification = @ptrCast(@alignCast(context));
+    self.core.seatDestroyed(IdleNotification.SeatRef.fromPointer(seat));
 }
 
 fn notificationRequest(_: *protocol.ext_idle_notification_v1.Resource, request: protocol.ext_idle_notification_v1.Request, value: *Notification) !void {

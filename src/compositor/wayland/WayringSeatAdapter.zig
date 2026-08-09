@@ -34,10 +34,16 @@ next_keyboard_resource_generation: ?SeatDelivery.ResourceGeneration = 1,
 next_pointer_resource_generation: ?SeatDelivery.ResourceGeneration = 1,
 next_touch_resource_generation: ?SeatDelivery.ResourceGeneration = 1,
 pointer_resource_listener: ?PointerResourceListener = null,
+resource_count_listener: ?ResourceCountListener = null,
 
 pub const PointerResourceListener = struct {
     context: *anyopaque,
     changed: *const fn (*anyopaque) void,
+};
+
+pub const ResourceCountListener = struct {
+    context: *anyopaque,
+    changed: *const fn (*anyopaque, usize) void,
 };
 
 const TerminalClient = struct {
@@ -129,6 +135,7 @@ pub fn deinit(self: *WayringSeatAdapter) void {
     std.debug.assert(self.seats.items.len == 0 and self.keyboards.items.len == 0 and
         self.pointers.items.len == 0 and self.touches.items.len == 0 and
         self.terminal_clients.items.len == 0);
+    std.debug.assert(self.pointer_resource_listener == null and self.resource_count_listener == null);
     self.seats.deinit(self.allocator);
     self.keyboards.deinit(self.allocator);
     self.pointers.deinit(self.allocator);
@@ -160,6 +167,28 @@ pub fn unpublish(self: *WayringSeatAdapter) void {
         error.ForeignGlobal => unreachable,
     };
     self.global = null;
+}
+
+pub fn globalName(self: *const WayringSeatAdapter) u32 {
+    return (self.global orelse unreachable).name();
+}
+
+pub fn resourceCount(self: *const WayringSeatAdapter) usize {
+    return self.seats.items.len + self.keyboards.items.len + self.pointers.items.len + self.touches.items.len;
+}
+
+pub fn setResourceCountListener(self: *WayringSeatAdapter, listener: ResourceCountListener) void {
+    std.debug.assert(self.resource_count_listener == null);
+    self.resource_count_listener = listener;
+}
+
+pub fn clearResourceCountListener(self: *WayringSeatAdapter, context: *anyopaque) void {
+    std.debug.assert(self.resource_count_listener != null and self.resource_count_listener.?.context == context);
+    self.resource_count_listener = null;
+}
+
+fn notifyResourceCount(self: *WayringSeatAdapter) void {
+    if (self.resource_count_listener) |listener| listener.changed(listener.context, self.resourceCount());
 }
 
 fn bindGlobal(
@@ -200,6 +229,14 @@ pub fn clearCursorListener(self: *WayringSeatAdapter) void {
     self.compositor.clearCursorListener(self);
 }
 
+pub fn processCursorCommitted(self: *WayringSeatAdapter, id: SurfaceRegistry.Id, x: i32, y: i32) void {
+    self.request_sink.cursor_committed(self.request_sink.context, id, x, y);
+}
+
+pub fn processCursorRemoved(self: *WayringSeatAdapter, id: SurfaceRegistry.Id) void {
+    self.request_sink.cursor_removed(self.request_sink.context, id);
+}
+
 pub fn setPointerResourceListener(self: *WayringSeatAdapter, listener: PointerResourceListener) void {
     std.debug.assert(self.pointer_resource_listener == null);
     self.pointer_resource_listener = listener;
@@ -226,6 +263,7 @@ pub fn bind(self: *WayringSeatAdapter, client: *wayring.server.Client, id: u32, 
     try seat.resource.setHandler(SeatResource, seat, seatRequest, null);
     try client.materialize(&seat.resource.runtime);
     self.seats.appendAssumeCapacity(seat);
+    self.notifyResourceCount();
     if (version >= 2) core.wl_seat.@"send:name"(&seat.resource, self.seat_name) catch |err| self.eventFailure(client, &seat.resource.runtime, err);
     sendCapabilities(seat) catch |err| self.eventFailure(client, &seat.resource.runtime, err);
 }
@@ -484,6 +522,7 @@ fn createKeyboard(seat: *SeatResource, id: u32) !void {
     try keyboard_resource.resource.setHandler(KeyboardResource, keyboard_resource, keyboardRequest, null);
     try seat.client.materialize(&keyboard_resource.resource.runtime);
     self.keyboards.appendAssumeCapacity(keyboard_resource);
+    self.notifyResourceCount();
     if (!self.snapshot.keyboard.resourceActive(keyboard_resource.generation)) return;
     const client_id = self.clients.id(seat.client) orelse {
         self.retireClient(seat.client);
@@ -538,6 +577,7 @@ fn createPointer(seat: *SeatResource, id: u32) !void {
     try pointer_resource.resource.setHandler(PointerResource, pointer_resource, pointerRequest, null);
     try seat.client.materialize(&pointer_resource.resource.runtime);
     self.pointers.appendAssumeCapacity(pointer_resource);
+    self.notifyResourceCount();
     const client_id = self.clients.id(seat.client) orelse return;
     const snapshot = self.request_sink.pointer_enter_snapshot(
         self.request_sink.context,
@@ -617,6 +657,7 @@ fn createTouch(seat: *SeatResource, id: u32) !void {
     try touch_resource.resource.setHandler(TouchResource, touch_resource, touchRequest, null);
     try seat.client.materialize(&touch_resource.resource.runtime);
     self.touches.appendAssumeCapacity(touch_resource);
+    self.notifyResourceCount();
 }
 
 fn touchRequest(_: *core.wl_touch.Resource, request: core.wl_touch.Request, touch_resource: *TouchResource) !void {
@@ -632,6 +673,7 @@ fn destroySeat(seat: *SeatResource) void {
         seat.resource.destroy();
         seat.resource.deinit();
         self.allocator.destroy(seat);
+        self.notifyResourceCount();
         return;
     };
 }
@@ -642,6 +684,7 @@ fn destroyKeyboard(keyboard_resource: *KeyboardResource) void {
         keyboard_resource.resource.destroy();
         keyboard_resource.resource.deinit();
         self.allocator.destroy(keyboard_resource);
+        self.notifyResourceCount();
         return;
     };
 }
@@ -653,6 +696,7 @@ fn destroyPointer(pointer_resource: *PointerResource) void {
         pointer_resource.resource.deinit();
         self.allocator.destroy(pointer_resource);
         if (self.pointer_resource_listener) |listener| listener.changed(listener.context);
+        self.notifyResourceCount();
         return;
     };
 }
@@ -663,6 +707,7 @@ fn destroyTouch(touch_resource: *TouchResource) void {
         touch_resource.resource.destroy();
         touch_resource.resource.deinit();
         self.allocator.destroy(touch_resource);
+        self.notifyResourceCount();
         return;
     };
 }
@@ -720,11 +765,11 @@ fn assignCursorRole(context: *anyopaque, client_id: ClientRegistry.Id, surface: 
 
 fn cursorCommitted(context: *anyopaque, id: SurfaceRegistry.Id, x: i32, y: i32) void {
     const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
-    self.request_sink.cursor_committed(self.request_sink.context, id, x, y);
+    self.processCursorCommitted(id, x, y);
 }
 fn cursorRemoved(context: *anyopaque, id: SurfaceRegistry.Id) void {
     const self: *WayringSeatAdapter = @ptrCast(@alignCast(context));
-    self.request_sink.cursor_removed(self.request_sink.context, id);
+    self.processCursorRemoved(id);
 }
 
 fn terminalize(context: *anyopaque, client_id: ClientRegistry.Id, _: SeatDelivery.TerminalReason) void {
@@ -1204,7 +1249,9 @@ fn sendTouchOrientation(
     touch_resource.frame_pending = true;
 }
 
-fn retireClient(self: *WayringSeatAdapter, client: *wayring.server.Client) void {
+/// Retires authority associated with a terminal raw client without destroying
+/// resources; lifecycle teardown performs the latter after callbacks drain.
+pub fn retireClient(self: *WayringSeatAdapter, client: *wayring.server.Client) void {
     const client_id = self.clients.id(client) orelse return;
     self.request_sink.client_retiring(self.request_sink.context, client_id);
 }
