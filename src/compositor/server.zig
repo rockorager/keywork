@@ -11160,10 +11160,10 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     );
     const allow_tearing = if (top_fullscreen) |window_id|
         if (self.scene.windowSurface(window_id)) |surface_id|
-            Surface.currentPresentationHint(
-                self.compositor.surfaceStore(),
-                surface_id,
-            ) == .async and !fifo_barrier
+            if (self.surface_registry.renderState(surface_id)) |state|
+                state.allow_tearing and !fifo_barrier
+            else
+                false
         else
             false
     else
@@ -26507,6 +26507,7 @@ test "production generated data device completes the exact profile and supports 
     const WayringDataControlFanout = @import("wayland/WayringDataControlFanout.zig");
     const WayringForeignToplevelList = @import("wayland/WayringForeignToplevelList.zig");
     const WayringColorRepresentation = @import("wayland/WayringColorRepresentation.zig");
+    const WayringTearingControl = @import("wayland/WayringTearingControl.zig");
     const WayringTextInput = @import("wayland/WayringTextInput.zig");
     const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
     const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
@@ -26637,6 +26638,13 @@ test "production generated data device completes the exact profile and supports 
         color_representation.deinit();
     }
     try color_representation.publish();
+    var tearing_control: WayringTearingControl = undefined;
+    tearing_control.init(std.testing.allocator, &protocol_server, &compositor);
+    defer {
+        if (tearing_control.global != null) tearing_control.unpublish();
+        tearing_control.deinit();
+    }
+    try tearing_control.publish();
     var cursor_shape: WayringCursorShape = undefined;
     cursor_shape.init(
         std.testing.allocator,
@@ -26920,6 +26928,7 @@ test "production generated data device completes the exact profile and supports 
         viewporter: *WayringViewporter,
         fractional_scale: *WayringFractionalScale,
         color_representation: *WayringColorRepresentation,
+        tearing_control: *WayringTearingControl,
         cursor_shape: *WayringCursorShape,
         decoration: *WayringXdgDecoration,
         activation: *WayringXdgActivation,
@@ -27012,6 +27021,7 @@ test "production generated data device completes the exact profile and supports 
             self.xdg.destroyClientResources(client);
             self.seat.destroyClientResources(client);
             self.outputs.destroyClientResources(client);
+            self.tearing_control.destroyClientResources(client);
             self.color_representation.destroyClientResources(client);
             self.compositor.destroyClientResources(client);
             if (self.generated_raw == client) self.generated_raw = null;
@@ -27027,6 +27037,7 @@ test "production generated data device completes the exact profile and supports 
         .viewporter = &viewporter,
         .fractional_scale = &fractional_scale,
         .color_representation = &color_representation,
+        .tearing_control = &tearing_control,
         .cursor_shape = &cursor_shape,
         .decoration = &decoration,
         .activation = &activation,

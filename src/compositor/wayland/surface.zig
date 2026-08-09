@@ -334,6 +334,7 @@ fn providerRenderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
         .transform = renderTransform(buffer.transform) orelse unreachable,
         .force_opaque = buffer.force_opaque,
         .alpha_multiplier = surface_state.current_alpha_multiplier,
+        .allow_tearing = surface_state.current_presentation_hint == .async,
         .opaque_region = &surface_state.current_opaque,
         .blur_region = if (surface_state.current_blur_region.isEmpty())
             null

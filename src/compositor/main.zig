@@ -59,6 +59,7 @@ const WayringSinglePixelBuffer = @import("wayland/WayringSinglePixelBuffer.zig")
 const WayringContentType = @import("wayland/WayringContentType.zig");
 const WayringColorRepresentation = @import("wayland/WayringColorRepresentation.zig");
 const WayringAlphaModifier = @import("wayland/WayringAlphaModifier.zig");
+const WayringTearingControl = @import("wayland/WayringTearingControl.zig");
 const WayringFixes = @import("wayland/WayringFixes.zig");
 const WayringSystemBell = @import("wayland/WayringSystemBell.zig");
 const wayring = @import("wayring");
@@ -316,6 +317,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_alpha_modifier: WayringAlphaModifier = undefined;
     var wayring_alpha_modifier_initialized = false;
     var wayring_alpha_modifier_published = false;
+    var wayring_tearing_control: WayringTearingControl = undefined;
+    var wayring_tearing_control_initialized = false;
+    var wayring_tearing_control_published = false;
     var wayring_fixes: WayringFixes = undefined;
     var wayring_fixes_initialized = false;
     var wayring_fixes_published = false;
@@ -424,6 +428,7 @@ pub fn main(init: std.process.Init) !void {
         content_type: ?*WayringContentType,
         color_representation: ?*WayringColorRepresentation,
         alpha_modifier: ?*WayringAlphaModifier,
+        tearing_control: ?*WayringTearingControl,
         fixes: ?*WayringFixes,
         cursor_shape: ?*WayringCursorShape,
         pointer_warp: ?*WayringPointerWarp,
@@ -506,6 +511,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.fractional_scale) |fractional_scale|
                 fractional_scale.destroyClientResources(client);
             if (self.alpha_modifier) |alpha_modifier| alpha_modifier.destroyClientResources(client);
+            if (self.tearing_control) |adapter| adapter.destroyClientResources(client);
             if (self.color_representation) |adapter| adapter.destroyClientResources(client);
             if (self.content_type) |content_type| content_type.destroyClientResources(client);
             if (self.single_pixel_buffer) |single_pixel_buffer|
@@ -657,6 +663,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_alpha_modifier_initialized) {
             if (wayring_alpha_modifier_published) wayring_alpha_modifier.unpublish();
             wayring_alpha_modifier.deinit();
+        }
+        if (wayring_tearing_control_initialized) {
+            if (wayring_tearing_control_published) wayring_tearing_control.unpublish();
+            wayring_tearing_control.deinit();
         }
         if (wayring_color_representation_initialized) {
             if (wayring_color_representation_published) wayring_color_representation.unpublish();
@@ -960,6 +970,8 @@ pub fn main(init: std.process.Init) !void {
         wayring_color_representation_initialized = true;
         wayring_alpha_modifier.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
         wayring_alpha_modifier_initialized = true;
+        wayring_tearing_control.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
+        wayring_tearing_control_initialized = true;
         wayring_fixes.init(init.gpa, &wayring_protocol_server.?);
         wayring_fixes_initialized = true;
         if (wayring_outputs_initialized) {
@@ -1001,6 +1013,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_color_representation_published = true;
             try wayring_alpha_modifier.publish();
             wayring_alpha_modifier_published = true;
+            try wayring_tearing_control.publish();
+            wayring_tearing_control_published = true;
             try wayring_fixes.publish();
             wayring_fixes_published = true;
             try wayring_cursor_shape.publish();
@@ -1075,6 +1089,7 @@ pub fn main(init: std.process.Init) !void {
             .content_type = if (wayring_content_type_initialized) &wayring_content_type else null,
             .color_representation = if (wayring_color_representation_initialized) &wayring_color_representation else null,
             .alpha_modifier = if (wayring_alpha_modifier_initialized) &wayring_alpha_modifier else null,
+            .tearing_control = if (wayring_tearing_control_initialized) &wayring_tearing_control else null,
             .fixes = if (wayring_fixes_initialized) &wayring_fixes else null,
             .cursor_shape = if (wayring_cursor_shape_initialized) &wayring_cursor_shape else null,
             .pointer_warp = if (wayring_pointer_warp_initialized) &wayring_pointer_warp else null,
@@ -1705,6 +1720,7 @@ test {
     _ = @import("wayland/WayringContentType.zig");
     _ = @import("wayland/WayringColorRepresentation.zig");
     _ = @import("wayland/WayringAlphaModifier.zig");
+    _ = @import("wayland/WayringTearingControl.zig");
     _ = @import("wayland/WayringFixes.zig");
     _ = @import("wayland/WayringSystemBell.zig");
     _ = @import("wayland/fixes.zig");

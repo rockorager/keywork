@@ -88,6 +88,16 @@ pub const AlphaModifierAttachResult = union(enum) {
     not_live,
     wrong_client,
 };
+pub const TearingControlHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+pub const TearingControlAttachResult = union(enum) {
+    attached: SurfaceId,
+    tearing_control_exists,
+    not_live,
+    wrong_client,
+};
 pub const ColorRepresentationState = struct {
     pub const AlphaMode = enum(u32) { premultiplied_electrical, premultiplied_optical, straight, _ };
     pub const Coefficients = enum(u32) { identity = 1, bt709, fcc, bt601, smpte240, bt2020, bt2020_cl, ictcp, _ };
@@ -410,6 +420,9 @@ const Surface = struct {
     alpha_modifier_handler: ?AlphaModifierHandler = null,
     pending_alpha_multiplier: u32 = std.math.maxInt(u32),
     current_alpha_multiplier: u32 = std.math.maxInt(u32),
+    tearing_control_handler: ?TearingControlHandler = null,
+    pending_allow_tearing: bool = false,
+    current_allow_tearing: bool = false,
     current_source: ?render.SourceRect = null,
     source_cache_id: u64,
     next_source_version: u64 = 1,
@@ -578,6 +591,7 @@ const PreparedCommit = struct {
     content_type: ContentType,
     color_representation: ColorRepresentationState,
     alpha_multiplier: u32,
+    allow_tearing: bool,
     source: ?render.SourceRect = null,
     scale: i32,
     transform: render.BufferTransform,
@@ -595,6 +609,7 @@ const PreparedCommit = struct {
             .content_type = surface.pending_content_type,
             .color_representation = surface.pending_color_representation,
             .alpha_multiplier = surface.pending_alpha_multiplier,
+            .allow_tearing = surface.pending_allow_tearing,
             .scale = surface.pending_scale,
             .transform = surface.pending_transform,
             .offset_x = surface.pending_offset_x,
@@ -1078,6 +1093,37 @@ pub fn setPendingContentType(self: *WayringCompositor, id: SurfaceId, handler_co
 
 pub fn currentContentType(self: *const WayringCompositor, id: SurfaceId) ?ContentType {
     return (self.surfaceForId(id) orelse return null).current_content_type;
+}
+
+pub fn attachTearingControl(self: *WayringCompositor, client: *server.Client, object_id: u32, handler: TearingControlHandler) TearingControlAttachResult {
+    const objects = self.findClient(client) orelse return .not_live;
+    for (objects.surfaces.items) |surface| if (surface.resource.id() == object_id and !surface.destroying) {
+        if (surface.tearing_control_handler != null) return .tearing_control_exists;
+        surface.tearing_control_handler = handler;
+        return .{ .attached = surface.id };
+    };
+    if (client.lookup(object_id)) |resource| if (resource.interface() == &core.wl_surface.interface) return .wrong_client;
+    return .not_live;
+}
+
+pub fn detachTearingControl(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque) void {
+    const surface = self.surfaceForId(id) orelse return;
+    const handler = surface.tearing_control_handler orelse return;
+    if (handler.context != handler_context) return;
+    surface.tearing_control_handler = null;
+    surface.pending_allow_tearing = false;
+}
+
+pub fn setPendingAllowTearing(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque, value: bool) bool {
+    const surface = self.surfaceForId(id) orelse return false;
+    const handler = surface.tearing_control_handler orelse return false;
+    if (handler.context != handler_context) return false;
+    surface.pending_allow_tearing = value;
+    return true;
+}
+
+pub fn currentAllowTearing(self: *const WayringCompositor, id: SurfaceId) ?bool {
+    return (self.surfaceForId(id) orelse return null).current_allow_tearing;
 }
 
 pub fn attachColorRepresentation(
@@ -2218,6 +2264,7 @@ fn surfaceRenderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
         .transform = surface.current_transform,
         .force_opaque = current.forceOpaque(),
         .alpha_multiplier = surface.current_alpha_multiplier,
+        .allow_tearing = surface.current_allow_tearing,
         .opaque_region = &surface.current_opaque,
         .blur_region = null,
     };
@@ -2961,6 +3008,7 @@ fn prepareCommit(self: *WayringCompositor, surface: *Surface) !PreparedCommit {
         prepared.content_type == surface.current_content_type and
         std.meta.eql(prepared.color_representation, surface.current_color_representation) and
         prepared.alpha_multiplier == surface.current_alpha_multiplier and
+        prepared.allow_tearing == surface.current_allow_tearing and
         prepared.offset_x == 0 and prepared.offset_y == 0 and
         !surface.topology_dirty;
 
@@ -3117,6 +3165,7 @@ fn publishPreparedCommit(
     surface.current_content_type = prepared.content_type;
     surface.current_color_representation = prepared.color_representation;
     surface.current_alpha_multiplier = prepared.alpha_multiplier;
+    surface.current_allow_tearing = prepared.allow_tearing;
     surface.current_source = prepared.source;
     surface.current_scale = prepared.scale;
     surface.current_transform = prepared.transform;
@@ -3365,6 +3414,10 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     }
     if (surface.alpha_modifier_handler) |handler| {
         surface.alpha_modifier_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (surface.tearing_control_handler) |handler| {
+        surface.tearing_control_handler = null;
         handler.surface_destroyed(handler.context);
     }
     if (surface.xdg_association) |association| {
@@ -8978,6 +9031,55 @@ test "content type attachment is unique double buffered and safe across destruct
     try send(client, 4, 0, &core.wl_surface.request_messages[0], &.{});
     try std.testing.expect(second.destroyed);
     try std.testing.expect(compositor.currentContentType(id) == null);
+}
+
+test "tearing control is unique double buffered and resets pending state on destroy" {
+    const Recorder = struct {
+        destroyed: bool = false,
+
+        fn handler(self: *@This()) TearingControlHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn surfaceDestroyed(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.destroyed = true;
+        }
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try createSurfaceResource(client, 3, 4);
+    const id = compositor.surfaceId(client, 4).?;
+    var first: Recorder = .{};
+    var second: Recorder = .{};
+    try std.testing.expect(compositor.attachTearingControl(client, 4, first.handler()) == .attached);
+    try std.testing.expectEqual(TearingControlAttachResult.tearing_control_exists, compositor.attachTearingControl(client, 4, second.handler()));
+    try std.testing.expect(compositor.setPendingAllowTearing(id, &first, true));
+    try std.testing.expectEqual(false, compositor.currentAllowTearing(id).?);
+    try commitSurfaceResource(client, 4);
+    try std.testing.expectEqual(true, compositor.currentAllowTearing(id).?);
+
+    compositor.detachTearingControl(id, &first);
+    try commitSurfaceResource(client, 4);
+    try std.testing.expectEqual(false, compositor.currentAllowTearing(id).?);
+    try std.testing.expect(compositor.attachTearingControl(client, 4, second.handler()) == .attached);
+    try send(client, 4, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expect(second.destroyed);
+    try std.testing.expect(compositor.currentAllowTearing(id) == null);
 }
 
 test "alpha modifier is unique double buffered and resets pending state on destroy" {

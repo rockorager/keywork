@@ -24,6 +24,7 @@ pub const RenderState = struct {
     transform: render.BufferTransform = .normal,
     force_opaque: bool = false,
     alpha_multiplier: u32 = std.math.maxInt(u32),
+    allow_tearing: bool = false,
     opaque_region: ?*const Region = null,
     blur_region: ?*const Region = null,
 };
