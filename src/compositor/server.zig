@@ -417,6 +417,7 @@ generated_idle_inhibit_provider: ?GeneratedIdleInhibitProvider = null,
 generated_keyboard_shortcuts_inhibit_provider: ?GeneratedKeyboardShortcutsInhibitProvider = null,
 generated_relative_pointer_observer: ?GeneratedRelativePointerObserver = null,
 generated_pointer_gesture_observer: ?GeneratedPointerGestureObserver = null,
+generated_xdg_toplevel_drag: ?GeneratedXdgToplevelDrag = null,
 generated_input_popups: std.ArrayList(GeneratedInputPopup) = .empty,
 xdg_toplevel_drag: XdgToplevelDrag,
 xdg_toplevel_icon: XdgToplevelIcon,
@@ -7985,6 +7986,7 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
             neutralPointerFocus(self.data_device.externalDragPointerFocus(point.x, point.y)),
         );
         self.xdg_toplevel_drag.pointerMotion(point.x, point.y);
+        if (self.generated_xdg_toplevel_drag) |endpoint| endpoint.pointer_motion(endpoint.context, point.x, point.y);
         self.routeActiveDrag(0, self.dragPointerRoute(point.x, point.y), point.x, point.y, false);
         return;
     }
@@ -8055,6 +8057,7 @@ fn pointerMotionGlobalForSeat(
             neutralPointerFocus(self.data_device.externalDragPointerFocus(x, y)),
         );
         self.xdg_toplevel_drag.pointerMotion(x, y);
+        if (self.generated_xdg_toplevel_drag) |endpoint| endpoint.pointer_motion(endpoint.context, x, y);
         self.routeActiveDrag(
             time,
             self.dragPointerRoute(x, y),
@@ -8707,7 +8710,7 @@ fn xdgToplevelDragBegin(
     use_offset_hint: bool,
 ) bool {
     const self: *Self = @ptrCast(@alignCast(context));
-    return self.window_manager.beginToplevelDrag(
+    return self.beginToplevelDrag(
         window_id,
         pointer_x,
         pointer_y,
@@ -8719,11 +8722,43 @@ fn xdgToplevelDragBegin(
 
 fn xdgToplevelDragMotion(context: *anyopaque, x: f64, y: f64) void {
     const self: *Self = @ptrCast(@alignCast(context));
-    self.window_manager.updateToplevelDrag(x, y);
+    self.updateToplevelDrag(x, y);
 }
 
 fn xdgToplevelDragEnd(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    self.endToplevelDrag();
+}
+
+pub const GeneratedXdgToplevelDrag = struct {
+    context: *anyopaque,
+    pointer_motion: *const fn (*anyopaque, f64, f64) void,
+    attached_scene: *const fn (*anyopaque) ?Scene.Id,
+};
+
+pub fn setGeneratedXdgToplevelDrag(self: *Self, endpoint: GeneratedXdgToplevelDrag) void {
+    std.debug.assert(self.generated_xdg_toplevel_drag == null);
+    self.generated_xdg_toplevel_drag = endpoint;
+}
+
+pub fn clearGeneratedXdgToplevelDrag(self: *Self, context: *anyopaque) void {
+    const endpoint = self.generated_xdg_toplevel_drag orelse unreachable;
+    std.debug.assert(endpoint.context == context);
+    self.generated_xdg_toplevel_drag = null;
+}
+
+pub fn currentPointerPosition(self: *Self) ?struct { x: f64, y: f64 } {
+    const point = self.seat.pointerPosition() orelse return null;
+    return .{ .x = point.x, .y = point.y };
+}
+
+pub fn beginToplevelDrag(self: *Self, window: NeutralXdgShell.WindowId, x: f64, y: f64, x_offset: i32, y_offset: i32, use_offset_hint: bool) bool {
+    return self.window_manager.beginToplevelDrag(window, x, y, x_offset, y_offset, use_offset_hint);
+}
+pub fn updateToplevelDrag(self: *Self, x: f64, y: f64) void {
+    self.window_manager.updateToplevelDrag(x, y);
+}
+pub fn endToplevelDrag(self: *Self) void {
     self.window_manager.endToplevelDrag();
 }
 
@@ -8951,7 +8986,10 @@ fn pointerRoute(self: *Self, x: f64, y: f64) PointerRoute {
 }
 
 fn dragPointerRoute(self: *Self, x: f64, y: f64) PointerRoute {
-    return self.pointerRouteExcluding(x, y, self.xdg_toplevel_drag.attachedScene());
+    const mature = self.xdg_toplevel_drag.attachedScene();
+    const generated = if (self.generated_xdg_toplevel_drag) |endpoint| endpoint.attached_scene(endpoint.context) else null;
+    std.debug.assert(mature == null or generated == null);
+    return self.pointerRouteExcluding(x, y, mature orelse generated);
 }
 
 fn pointerRouteExcluding(
@@ -26536,6 +26574,7 @@ test "production generated data device completes the exact profile and supports 
     const WayringZwlrDataControl = @import("wayland/WayringZwlrDataControl.zig");
     const WayringDataControlFanout = @import("wayland/WayringDataControlFanout.zig");
     const WayringForeignToplevelList = @import("wayland/WayringForeignToplevelList.zig");
+    const WayringXdgToplevelDrag = @import("wayland/WayringXdgToplevelDrag.zig");
     const WayringColorRepresentation = @import("wayland/WayringColorRepresentation.zig");
     const WayringTearingControl = @import("wayland/WayringTearingControl.zig");
     const WayringFifo = @import("wayland/WayringFifo.zig");
@@ -26765,6 +26804,52 @@ test "production generated data device completes the exact profile and supports 
 
     // Production publishes stateful data-device after its dependencies.
     try data_device.publish();
+    const GeneratedToplevelDragCallbacks = struct {
+        fn pointerPosition(context: *anyopaque) ?WayringXdgToplevelDrag.Point {
+            const owner: *Self = @ptrCast(@alignCast(context));
+            const point = owner.currentPointerPosition() orelse return null;
+            return .{ .x = point.x, .y = point.y };
+        }
+        fn begin(context: *anyopaque, window: NeutralXdgShell.WindowId, x: f64, y: f64, x_offset: i32, y_offset: i32, use_offset_hint: bool) bool {
+            const owner: *Self = @ptrCast(@alignCast(context));
+            return owner.beginToplevelDrag(window, x, y, x_offset, y_offset, use_offset_hint);
+        }
+        fn motion(context: *anyopaque, x: f64, y: f64) void {
+            const owner: *Self = @ptrCast(@alignCast(context));
+            owner.updateToplevelDrag(x, y);
+        }
+        fn end(context: *anyopaque) void {
+            const owner: *Self = @ptrCast(@alignCast(context));
+            owner.endToplevelDrag();
+        }
+        fn pointerMotion(context: *anyopaque, x: f64, y: f64) void {
+            const adapter: *WayringXdgToplevelDrag = @ptrCast(@alignCast(context));
+            adapter.pointerMotion(x, y);
+        }
+        fn attachedScene(context: *anyopaque) ?Scene.Id {
+            const adapter: *WayringXdgToplevelDrag = @ptrCast(@alignCast(context));
+            return adapter.attachedScene();
+        }
+    };
+    var generated_toplevel_drag: WayringXdgToplevelDrag = undefined;
+    try generated_toplevel_drag.init(std.testing.allocator, &protocol_server, &data_device, &xdg, server.neutralXdgShell(), .{
+        .context = server,
+        .pointer_position = GeneratedToplevelDragCallbacks.pointerPosition,
+        .begin = GeneratedToplevelDragCallbacks.begin,
+        .motion = GeneratedToplevelDragCallbacks.motion,
+        .end = GeneratedToplevelDragCallbacks.end,
+    });
+    server.setGeneratedXdgToplevelDrag(.{
+        .context = &generated_toplevel_drag,
+        .pointer_motion = GeneratedToplevelDragCallbacks.pointerMotion,
+        .attached_scene = GeneratedToplevelDragCallbacks.attachedScene,
+    });
+    defer {
+        server.clearGeneratedXdgToplevelDrag(&generated_toplevel_drag);
+        if (generated_toplevel_drag.global != null) generated_toplevel_drag.unpublish();
+        generated_toplevel_drag.deinit();
+    }
+    try generated_toplevel_drag.publish();
     var primary_selection: WayringPrimarySelection = undefined;
     primary_selection.init(
         std.testing.allocator,
@@ -27005,6 +27090,7 @@ test "production generated data device completes the exact profile and supports 
         cursor_shape: *WayringCursorShape,
         decoration: *WayringXdgDecoration,
         activation: *WayringXdgActivation,
+        xdg_toplevel_drag: *WayringXdgToplevelDrag,
         data_device: *WayringDataDevice,
         primary_selection: *WayringPrimarySelection,
         text_input: *WayringTextInput,
@@ -27084,6 +27170,7 @@ test "production generated data device completes the exact profile and supports 
             self.data_control.destroyClientResources(client);
             self.zwlr_data_control.destroyClientResources(client);
             self.text_input.destroyClientResources(client);
+            self.xdg_toplevel_drag.destroyClientResources(client);
             self.data_device.destroyClientResources(client);
             self.primary_selection.destroyClientResources(client);
             self.activation.destroyClientResources(client);
@@ -27122,6 +27209,7 @@ test "production generated data device completes the exact profile and supports 
         .cursor_shape = &cursor_shape,
         .decoration = &decoration,
         .activation = &activation,
+        .xdg_toplevel_drag = &generated_toplevel_drag,
         .data_device = &data_device,
         .primary_selection = &primary_selection,
         .text_input = &text_input,

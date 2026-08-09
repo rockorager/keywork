@@ -380,6 +380,18 @@ fn sourceForObject(self: *WayringDataDevice, client: *wayring.server.Client, obj
     return null;
 }
 
+/// Atomically resolves an exact live same-client wire source and reserves its
+/// canonical toplevel-drag handler.
+pub fn reserveToplevelDragSource(self: *WayringDataDevice, client: *wayring.server.Client, object_id: u32, handler: DataDevice.ToplevelDragHandler) error{InvalidSource}!DataDevice.SourceId {
+    const source = self.sourceForObject(client, object_id) orelse return error.InvalidSource;
+    self.canonical.setToplevelDragHandler(source.id, handler) catch return error.InvalidSource;
+    return source.id;
+}
+
+pub fn releaseToplevelDragSource(self: *WayringDataDevice, id: DataDevice.SourceId, context: *anyopaque) void {
+    self.canonical.clearToplevelDragHandler(id, context);
+}
+
 fn deviceSelectionPrepare(context: *anyopaque, offer_id: ?DataDevice.OfferId) error{OutOfMemory}!void {
     const device: *Device = @ptrCast(@alignCast(context));
     const canonical_id = offer_id orelse {

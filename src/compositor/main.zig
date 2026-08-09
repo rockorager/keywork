@@ -21,6 +21,7 @@ const WayringZwlrDataControl = @import("wayland/WayringZwlrDataControl.zig");
 const WayringDataControlFanout = @import("wayland/WayringDataControlFanout.zig");
 const WayringForeignToplevelList = @import("wayland/WayringForeignToplevelList.zig");
 const WayringDataDevice = @import("wayland/WayringDataDevice.zig");
+const WayringXdgToplevelDrag = @import("wayland/WayringXdgToplevelDrag.zig");
 const WayringPrimarySelection = @import("wayland/WayringPrimarySelection.zig");
 const WayringTextInput = @import("wayland/WayringTextInput.zig");
 const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
@@ -137,7 +138,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 52/40 profile is not default eligible
+    \\                            its limited 53/41 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -383,6 +384,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_data_device: WayringDataDevice = undefined;
     var wayring_data_device_initialized = false;
     var wayring_data_device_published = false;
+    var wayring_xdg_toplevel_drag: WayringXdgToplevelDrag = undefined;
+    var wayring_xdg_toplevel_drag_initialized = false;
+    var wayring_xdg_toplevel_drag_published = false;
     var wayring_primary_selection: WayringPrimarySelection = undefined;
     var wayring_primary_selection_initialized = false;
     var wayring_primary_selection_published = false;
@@ -468,6 +472,7 @@ pub fn main(init: std.process.Init) !void {
         relative_pointer: ?*WayringRelativePointer,
         pointer_gestures: ?*WayringPointerGestures,
         data_device: ?*WayringDataDevice,
+        xdg_toplevel_drag: ?*WayringXdgToplevelDrag,
         primary_selection: ?*WayringPrimarySelection,
         text_input: ?*WayringTextInput,
         data_control: ?*WayringDataControl,
@@ -521,6 +526,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.data_control) |data_control| data_control.destroyClientResources(client);
             if (self.text_input) |text_input| text_input.destroyClientResources(client);
             if (self.primary_selection) |primary| primary.destroyClientResources(client);
+            if (self.xdg_toplevel_drag) |drag| drag.destroyClientResources(client);
             if (self.data_device) |data_device| data_device.destroyClientResources(client);
             if (self.xdg_toplevel_tag) |tag| tag.destroyClientResources(client);
             if (self.xdg_toplevel_icon) |icon| icon.destroyClientResources(client);
@@ -643,6 +649,11 @@ pub fn main(init: std.process.Init) !void {
             server.setPrimarySelectionObserver(null);
             if (wayring_primary_selection_published) wayring_primary_selection.unpublish();
             wayring_primary_selection.deinit();
+        }
+        if (wayring_xdg_toplevel_drag_initialized) {
+            server.clearGeneratedXdgToplevelDrag(&wayring_xdg_toplevel_drag);
+            if (wayring_xdg_toplevel_drag_published) wayring_xdg_toplevel_drag.unpublish();
+            wayring_xdg_toplevel_drag.deinit();
         }
         if (wayring_data_device_initialized) {
             server.setDataDeviceObserver(null);
@@ -947,6 +958,15 @@ pub fn main(init: std.process.Init) !void {
         );
         wayring_xdg_shell.setSeatAdapter(&wayring_seat_adapter);
         wayring_xdg_shell_initialized = true;
+        try wayring_xdg_toplevel_drag.init(init.gpa, &wayring_protocol_server.?, &wayring_data_device, &wayring_xdg_shell, server.neutralXdgShell(), .{
+            .context = server,
+            .pointer_position = generatedToplevelDragPointerPosition,
+            .begin = generatedToplevelDragBegin,
+            .motion = generatedToplevelDragMotion,
+            .end = generatedToplevelDragEnd,
+        });
+        wayring_xdg_toplevel_drag_initialized = true;
+        server.setGeneratedXdgToplevelDrag(.{ .context = &wayring_xdg_toplevel_drag, .pointer_motion = generatedToplevelDragPointerMotion, .attached_scene = generatedToplevelDragAttachedScene });
         wayring_gtk_shell.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor, &wayring_xdg_shell, &wayring_seat_adapter);
         wayring_gtk_shell_initialized = true;
         try wayring_foreign_toplevel.init(
@@ -1098,6 +1118,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_xdg_toplevel_tag_published = true;
             try wayring_xdg_toplevel_icon.publish();
             wayring_xdg_toplevel_icon_published = true;
+            try wayring_xdg_toplevel_drag.publish();
+            wayring_xdg_toplevel_drag_published = true;
             // Publish stateful transfer globals only after the headless shell
             // and activation are ready. Privileged data control follows
             // primary selection and remains registry-filtered by credentials.
@@ -1173,6 +1195,7 @@ pub fn main(init: std.process.Init) !void {
             .relative_pointer = if (wayring_relative_pointer_initialized) &wayring_relative_pointer else null,
             .pointer_gestures = if (wayring_pointer_gestures_initialized) &wayring_pointer_gestures else null,
             .data_device = if (wayring_data_device_initialized) &wayring_data_device else null,
+            .xdg_toplevel_drag = if (wayring_xdg_toplevel_drag_initialized) &wayring_xdg_toplevel_drag else null,
             .primary_selection = if (wayring_primary_selection_initialized) &wayring_primary_selection else null,
             .text_input = if (wayring_text_input_initialized) &wayring_text_input else null,
             .data_control = if (wayring_data_control_initialized) &wayring_data_control else null,
@@ -1306,6 +1329,37 @@ pub fn main(init: std.process.Init) !void {
 fn generatedForeignToplevelSyncOutput(context: *anyopaque, id: OutputLayout.Id) void {
     const adapter: *WayringForeignToplevelList = @ptrCast(@alignCast(context));
     adapter.syncOutput(id);
+}
+
+fn generatedToplevelDragPointerPosition(context: *anyopaque) ?WayringXdgToplevelDrag.Point {
+    const server: *Server = @ptrCast(@alignCast(context));
+    const point = server.currentPointerPosition() orelse return null;
+    return .{ .x = point.x, .y = point.y };
+}
+
+fn generatedToplevelDragBegin(context: *anyopaque, window: @import("XdgShell.zig").WindowId, x: f64, y: f64, x_offset: i32, y_offset: i32, use_offset_hint: bool) bool {
+    const server: *Server = @ptrCast(@alignCast(context));
+    return server.beginToplevelDrag(window, x, y, x_offset, y_offset, use_offset_hint);
+}
+
+fn generatedToplevelDragMotion(context: *anyopaque, x: f64, y: f64) void {
+    const server: *Server = @ptrCast(@alignCast(context));
+    server.updateToplevelDrag(x, y);
+}
+
+fn generatedToplevelDragEnd(context: *anyopaque) void {
+    const server: *Server = @ptrCast(@alignCast(context));
+    server.endToplevelDrag();
+}
+
+fn generatedToplevelDragPointerMotion(context: *anyopaque, x: f64, y: f64) void {
+    const adapter: *WayringXdgToplevelDrag = @ptrCast(@alignCast(context));
+    adapter.pointerMotion(x, y);
+}
+
+fn generatedToplevelDragAttachedScene(context: *anyopaque) ?@import("scene.zig").Id {
+    const adapter: *WayringXdgToplevelDrag = @ptrCast(@alignCast(context));
+    return adapter.attachedScene();
 }
 
 fn generatedForeignToplevelRemoveOutput(context: *anyopaque, id: OutputLayout.Id) void {
@@ -1737,6 +1791,7 @@ test {
     _ = @import("wayland/WayringXdgOutput.zig");
     _ = @import("wayland/WayringSeatAdapter.zig");
     _ = @import("wayland/WayringDataDevice.zig");
+    _ = @import("wayland/WayringXdgToplevelDrag.zig");
     _ = @import("wayland/WayringPrimarySelection.zig");
     _ = @import("wayland/WayringTextInput.zig");
     _ = @import("wayland/WayringDataControl.zig");
