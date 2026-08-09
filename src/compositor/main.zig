@@ -62,10 +62,16 @@ const WayringColorRepresentation = @import("wayland/WayringColorRepresentation.z
 const WayringAlphaModifier = @import("wayland/WayringAlphaModifier.zig");
 const WayringTearingControl = @import("wayland/WayringTearingControl.zig");
 const WayringFifo = @import("wayland/WayringFifo.zig");
+const WayringCommitTiming = @import("wayland/WayringCommitTiming.zig");
 const WayringBackgroundEffect = @import("wayland/WayringBackgroundEffect.zig");
 const WayringFixes = @import("wayland/WayringFixes.zig");
 const WayringSystemBell = @import("wayland/WayringSystemBell.zig");
 const wayring = @import("wayring");
+
+fn generatedCommitTimingFailed(context: *anyopaque) void {
+    const server: *Server = @ptrCast(@alignCast(context));
+    server.terminate();
+}
 
 const WayringProductionAdapters = struct {
     server: *Server,
@@ -131,7 +137,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 51/39 profile is not default eligible
+    \\                            its limited 52/40 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -329,6 +335,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_fifo: WayringFifo = undefined;
     var wayring_fifo_initialized = false;
     var wayring_fifo_published = false;
+    var wayring_commit_timing: WayringCommitTiming = undefined;
+    var wayring_commit_timing_initialized = false;
+    var wayring_commit_timing_published = false;
     var wayring_background_effect: WayringBackgroundEffect = undefined;
     var wayring_background_effect_initialized = false;
     var wayring_background_effect_published = false;
@@ -443,6 +452,7 @@ pub fn main(init: std.process.Init) !void {
         alpha_modifier: ?*WayringAlphaModifier,
         tearing_control: ?*WayringTearingControl,
         fifo: ?*WayringFifo,
+        commit_timing: ?*WayringCommitTiming,
         background_effect: ?*WayringBackgroundEffect,
         fixes: ?*WayringFixes,
         cursor_shape: ?*WayringCursorShape,
@@ -528,6 +538,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.alpha_modifier) |alpha_modifier| alpha_modifier.destroyClientResources(client);
             if (self.tearing_control) |adapter| adapter.destroyClientResources(client);
             if (self.fifo) |adapter| adapter.destroyClientResources(client);
+            if (self.commit_timing) |adapter| adapter.destroyClientResources(client);
             if (self.background_effect) |adapter| adapter.destroyClientResources(client);
             if (self.color_representation) |adapter| adapter.destroyClientResources(client);
             if (self.content_type) |content_type| content_type.destroyClientResources(client);
@@ -685,6 +696,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_background_effect_initialized) {
             if (wayring_background_effect_published) wayring_background_effect.unpublish();
             wayring_background_effect.deinit();
+        }
+        if (wayring_commit_timing_initialized) {
+            if (wayring_commit_timing_published) wayring_commit_timing.unpublish();
+            wayring_commit_timing.deinit();
         }
         if (wayring_fifo_initialized) {
             if (wayring_fifo_published) wayring_fifo.unpublish();
@@ -1010,6 +1025,8 @@ pub fn main(init: std.process.Init) !void {
         wayring_tearing_control_initialized = true;
         wayring_fifo.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
         wayring_fifo_initialized = true;
+        try wayring_commit_timing.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor, server.eventLoop(), server.presentationClockId(), .{ .context = server, .failed = generatedCommitTimingFailed });
+        wayring_commit_timing_initialized = true;
         wayring_background_effect.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
         wayring_background_effect_initialized = true;
         wayring_fixes.init(init.gpa, &wayring_protocol_server.?);
@@ -1059,6 +1076,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_tearing_control_published = true;
             try wayring_fifo.publish();
             wayring_fifo_published = true;
+            try wayring_commit_timing.publish();
+            wayring_commit_timing_published = true;
             try wayring_background_effect.publish();
             wayring_background_effect_published = true;
             try wayring_fixes.publish();
@@ -1138,6 +1157,7 @@ pub fn main(init: std.process.Init) !void {
             .alpha_modifier = if (wayring_alpha_modifier_initialized) &wayring_alpha_modifier else null,
             .tearing_control = if (wayring_tearing_control_initialized) &wayring_tearing_control else null,
             .fifo = if (wayring_fifo_initialized) &wayring_fifo else null,
+            .commit_timing = if (wayring_commit_timing_initialized) &wayring_commit_timing else null,
             .background_effect = if (wayring_background_effect_initialized) &wayring_background_effect else null,
             .fixes = if (wayring_fixes_initialized) &wayring_fixes else null,
             .cursor_shape = if (wayring_cursor_shape_initialized) &wayring_cursor_shape else null,
@@ -1771,6 +1791,7 @@ test {
     _ = @import("wayland/WayringAlphaModifier.zig");
     _ = @import("wayland/WayringTearingControl.zig");
     _ = @import("wayland/WayringFifo.zig");
+    _ = @import("wayland/WayringCommitTiming.zig");
     _ = @import("wayland/WayringBackgroundEffect.zig");
     _ = @import("wayland/WayringFixes.zig");
     _ = @import("wayland/WayringSystemBell.zig");

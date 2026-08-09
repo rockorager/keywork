@@ -4098,6 +4098,10 @@ pub fn eventLoop(self: *Self) *wl.EventLoop {
     return self.display.getEventLoop();
 }
 
+pub fn presentationClockId(self: *Self) u32 {
+    return self.primaryRenderOutput().backend.presentationClockId();
+}
+
 pub fn clientRegistry(self: *Self) *ClientRegistry {
     return &self.client_registry;
 }
@@ -26535,6 +26539,7 @@ test "production generated data device completes the exact profile and supports 
     const WayringColorRepresentation = @import("wayland/WayringColorRepresentation.zig");
     const WayringTearingControl = @import("wayland/WayringTearingControl.zig");
     const WayringFifo = @import("wayland/WayringFifo.zig");
+    const WayringCommitTiming = @import("wayland/WayringCommitTiming.zig");
     const WayringBackgroundEffect = @import("wayland/WayringBackgroundEffect.zig");
     const WayringTextInput = @import("wayland/WayringTextInput.zig");
     const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
@@ -26687,6 +26692,21 @@ test "production generated data device completes the exact profile and supports 
         fifo.deinit();
     }
     try fifo.publish();
+    var commit_timing: WayringCommitTiming = undefined;
+    try commit_timing.init(std.testing.allocator, &protocol_server, &compositor, server.eventLoop(), server.presentationClockId(), .{
+        .context = server,
+        .failed = struct {
+            fn failed(context: *anyopaque) void {
+                const owner: *Self = @ptrCast(@alignCast(context));
+                owner.terminate();
+            }
+        }.failed,
+    });
+    defer {
+        if (commit_timing.global != null) commit_timing.unpublish();
+        commit_timing.deinit();
+    }
+    try commit_timing.publish();
     var background_effect: WayringBackgroundEffect = undefined;
     background_effect.init(std.testing.allocator, &protocol_server, &compositor);
     defer {
@@ -26980,6 +27000,7 @@ test "production generated data device completes the exact profile and supports 
         color_representation: *WayringColorRepresentation,
         tearing_control: *WayringTearingControl,
         fifo: *WayringFifo,
+        commit_timing: *WayringCommitTiming,
         background_effect: *WayringBackgroundEffect,
         cursor_shape: *WayringCursorShape,
         decoration: *WayringXdgDecoration,
@@ -27075,6 +27096,7 @@ test "production generated data device completes the exact profile and supports 
             self.seat.destroyClientResources(client);
             self.outputs.destroyClientResources(client);
             self.background_effect.destroyClientResources(client);
+            self.commit_timing.destroyClientResources(client);
             self.fifo.destroyClientResources(client);
             self.tearing_control.destroyClientResources(client);
             self.color_representation.destroyClientResources(client);
@@ -27095,6 +27117,7 @@ test "production generated data device completes the exact profile and supports 
         .color_representation = &color_representation,
         .tearing_control = &tearing_control,
         .fifo = &fifo,
+        .commit_timing = &commit_timing,
         .background_effect = &background_effect,
         .cursor_shape = &cursor_shape,
         .decoration = &decoration,

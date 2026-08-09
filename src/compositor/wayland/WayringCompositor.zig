@@ -108,6 +108,16 @@ pub const FifoAttachResult = union(enum) {
     not_live,
     wrong_client,
 };
+pub const CommitTimingHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+pub const CommitTimingAttachResult = union(enum) {
+    attached: SurfaceId,
+    already_exists,
+    not_live,
+    wrong_client,
+};
 pub const BackgroundEffectHandler = struct {
     context: *anyopaque,
     surface_destroyed: *const fn (*anyopaque) void,
@@ -451,6 +461,9 @@ const Surface = struct {
     pending_fifo_wait: bool = false,
     current_fifo_barrier: bool = false,
     fifo_barrier_output: ?OutputLayout.Id = null,
+    commit_timing_handler: ?CommitTimingHandler = null,
+    pending_commit_target: ?i96 = null,
+    pending_timing_ready: bool = true,
     background_effect_handler: ?BackgroundEffectHandler = null,
     pending_blur_region: Region,
     pending_blur_region_dirty: bool = false,
@@ -552,7 +565,7 @@ const ApplyScratch = struct {
     surfaces: std.ArrayList(AppliedSurfaceState) = .empty,
     parents: std.ArrayList(AppliedParentState) = .empty,
     stack_entries: std.ArrayList(AppliedStackEntry) = .empty,
-    fifo_ready_prefix_proven: bool = false,
+    constraints_ready_prefix_proven: bool = false,
 
     fn deinit(self: *ApplyScratch, allocator: std.mem.Allocator) void {
         self.stack_entries.deinit(allocator);
@@ -627,6 +640,8 @@ const PreparedCommit = struct {
     allow_tearing: bool,
     fifo_barrier: bool,
     fifo_wait: bool,
+    commit_target: ?i96,
+    timing_ready: bool,
     blur_region: ?Region = null,
     source: ?render.SourceRect = null,
     scale: i32,
@@ -648,6 +663,8 @@ const PreparedCommit = struct {
             .allow_tearing = surface.pending_allow_tearing,
             .fifo_barrier = surface.pending_fifo_barrier,
             .fifo_wait = surface.pending_fifo_wait,
+            .commit_target = surface.pending_commit_target,
+            .timing_ready = surface.pending_timing_ready,
             .scale = surface.pending_scale,
             .transform = surface.pending_transform,
             .offset_x = surface.pending_offset_x,
@@ -1197,6 +1214,73 @@ pub fn setPendingFifoWait(self: *WayringCompositor, id: SurfaceId, handler_conte
     if (handler.context != handler_context) return false;
     surface.pending_fifo_wait = true;
     return true;
+}
+
+pub fn attachCommitTiming(self: *WayringCompositor, client: *server.Client, object_id: u32, handler: CommitTimingHandler) CommitTimingAttachResult {
+    const objects = self.findClient(client) orelse return .not_live;
+    for (objects.surfaces.items) |surface| if (surface.resource.id() == object_id and !surface.destroying) {
+        if (surface.commit_timing_handler != null) return .already_exists;
+        surface.commit_timing_handler = handler;
+        return .{ .attached = surface.id };
+    };
+    if (client.lookup(object_id)) |resource| if (resource.interface() == &core.wl_surface.interface) return .wrong_client;
+    return .not_live;
+}
+
+pub fn detachCommitTiming(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque) void {
+    const surface = self.surfaceForId(id) orelse return;
+    const handler = surface.commit_timing_handler orelse return;
+    if (handler.context == handler_context) surface.commit_timing_handler = null;
+}
+
+pub fn setPendingCommitTimestamp(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque, target: i96, ready: bool) enum { set, timestamp_exists, surface_destroyed } {
+    const surface = self.surfaceForId(id) orelse return .surface_destroyed;
+    const handler = surface.commit_timing_handler orelse return .surface_destroyed;
+    if (handler.context != handler_context) return .surface_destroyed;
+    if (surface.pending_commit_target != null) return .timestamp_exists;
+    surface.pending_commit_target = target;
+    surface.pending_timing_ready = ready;
+    return .set;
+}
+
+pub fn releaseTimedCommits(self: *WayringCompositor, now: i96) !void {
+    for (self.clients.items) |objects| for (objects.surfaces.items) |surface| {
+        if (surface.pending_commit_target) |target| {
+            if (!surface.pending_timing_ready and target <= now) surface.pending_timing_ready = true;
+        }
+        for (surface.content_updates.items) |*update| if (update.prepared.commit_target) |target| {
+            if (!update.prepared.timing_ready and target <= now) update.prepared.timing_ready = true;
+        };
+    };
+    var progressed = true;
+    while (progressed) {
+        progressed = false;
+        for (self.clients.items) |objects| for (objects.surfaces.items) |surface| {
+            if (surface.content_updates.items.len == 0) continue;
+            const update = &surface.content_updates.items[0];
+            if (update.kind != .dcu or update.claimed_by != null) continue;
+            var scratch = self.prepareApplyScratch(&.{update.token}, null) catch |err| switch (err) {
+                error.ConstraintBlocked => continue,
+                else => return err,
+            };
+            defer scratch.deinit(self.allocator);
+            self.applyScratch(&scratch);
+            progressed = true;
+        };
+    }
+}
+
+pub fn earliestCommitTimestamp(self: *const WayringCompositor) ?i96 {
+    var earliest: ?i96 = null;
+    for (self.clients.items) |objects| for (objects.surfaces.items) |surface| {
+        if (!surface.pending_timing_ready) if (surface.pending_commit_target) |target| {
+            earliest = if (earliest) |value| @min(value, target) else target;
+        };
+        for (surface.content_updates.items) |update| if (!update.prepared.timing_ready) if (update.prepared.commit_target) |target| {
+            earliest = if (earliest) |value| @min(value, target) else target;
+        };
+    };
+    return earliest;
 }
 
 /// Associates a committed barrier only with an output where the generated
@@ -1904,7 +1988,7 @@ fn prepareDesyncTransition(
         const surface = self.surfaceForId(transition.affected.items[index]) orelse continue;
         var ready_tail: ?UpdateToken = null;
         for (surface.content_updates.items) |update| {
-            if (!fifoTokenInReadyPrefix(surface, update.token, null, true)) break;
+            if (!tokenInConstraintsReadyPrefix(surface, update.token, null, true)) break;
             ready_tail = update.token;
         }
         if (ready_tail) |token| roots.appendAssumeCapacity(token);
@@ -2470,7 +2554,7 @@ fn handleSurface(
 ) !void {
     switch (request) {
         .destroy => {
-            const surface: *Surface = @fieldParentPtr("resource", resource);
+            const surface: *Surface = @alignCast(@fieldParentPtr("resource", resource));
             const live_xdg_role = if (surface.xdg_association) |association|
                 association.live_role != null
             else
@@ -2485,7 +2569,7 @@ fn handleSurface(
         .attach => |attach| try self.attachSurface(resource, attach.buffer, attach.x, attach.y),
         .damage => |damage| {
             if (damage.width > 0 and damage.height > 0) {
-                const surface: *Surface = @fieldParentPtr("resource", resource);
+                const surface: *Surface = @alignCast(@fieldParentPtr("resource", resource));
                 surface.pending_damage.add(damage.x, damage.y, damage.width, damage.height) catch {
                     const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
                     client.postOutOfMemory(&resource.runtime, "adding wl_surface damage");
@@ -2495,7 +2579,7 @@ fn handleSurface(
         .frame => |frame| try self.frameSurface(resource, frame.callback),
         .set_opaque_region => |set| self.setOpaqueRegion(resource, set.region),
         .set_input_region => |set| self.setInputRegion(resource, set.region),
-        .commit => try self.commitSurface(@fieldParentPtr("resource", resource)),
+        .commit => try self.commitSurface(@alignCast(@fieldParentPtr("resource", resource))),
         .set_buffer_transform => |set| {
             const transform = bufferTransform(set.transform) orelse {
                 const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
@@ -2506,7 +2590,7 @@ fn handleSurface(
                 );
                 return;
             };
-            const surface: *Surface = @fieldParentPtr("resource", resource);
+            const surface: *Surface = @alignCast(@fieldParentPtr("resource", resource));
             surface.pending_transform = transform;
         },
         .set_buffer_scale => |set| {
@@ -2519,7 +2603,7 @@ fn handleSurface(
                 );
                 return;
             }
-            const surface: *Surface = @fieldParentPtr("resource", resource);
+            const surface: *Surface = @alignCast(@fieldParentPtr("resource", resource));
             surface.pending_scale = set.scale;
         },
         .damage_buffer => |damage| {
@@ -2531,7 +2615,7 @@ fn handleSurface(
             // this advisory rectangle has no incremental consumer yet.
         },
         .offset => |offset| {
-            const surface: *Surface = @fieldParentPtr("resource", resource);
+            const surface: *Surface = @alignCast(@fieldParentPtr("resource", resource));
             surface.pending_offset_x = offset.x;
             surface.pending_offset_y = offset.y;
         },
@@ -2562,7 +2646,7 @@ fn frameSurface(
     callback_id: u32,
 ) !void {
     const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
-    const surface: *Surface = @fieldParentPtr("resource", resource);
+    const surface: *Surface = @alignCast(@fieldParentPtr("resource", resource));
     const had_callback_storage = surface.frame_callbacks.capacity != 0;
     try surface.frame_callbacks.ensureUnusedCapacity(self.allocator, 1);
     errdefer if (!had_callback_storage and surface.frame_callbacks.items.len == 0) {
@@ -2608,7 +2692,7 @@ fn handleRegion(
 }
 
 fn setOpaqueRegion(self: *WayringCompositor, resource: *core.wl_surface.Resource, region_id: ?u32) void {
-    const surface: *Surface = @fieldParentPtr("resource", resource);
+    const surface: *Surface = @alignCast(@fieldParentPtr("resource", resource));
     const id = region_id orelse {
         surface.pending_opaque.clear();
         surface.pending_opaque_dirty = true;
@@ -2628,7 +2712,7 @@ fn setOpaqueRegion(self: *WayringCompositor, resource: *core.wl_surface.Resource
 }
 
 fn setInputRegion(self: *WayringCompositor, resource: *core.wl_surface.Resource, region_id: ?u32) void {
-    const surface: *Surface = @fieldParentPtr("resource", resource);
+    const surface: *Surface = @alignCast(@fieldParentPtr("resource", resource));
     const id = region_id orelse {
         surface.pending_input.setInfinite();
         surface.pending_input_dirty = true;
@@ -2670,7 +2754,7 @@ fn attachSurface(
     y: i32,
 ) !void {
     const client = self.clientForResource(&resource.runtime) orelse return error.UntrackedClient;
-    const surface: *Surface = @fieldParentPtr("resource", resource);
+    const surface: *Surface = @alignCast(@fieldParentPtr("resource", resource));
     if (resource.version() >= 5 and (x != 0 or y != 0)) {
         client.postProtocolError(&resource.runtime, core.wl_surface.@"error".invalid_offset, "attach offset requires wl_surface.offset");
         return;
@@ -2891,6 +2975,8 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     surface.pending_blur_region_dirty = false;
     surface.pending_fifo_barrier = false;
     surface.pending_fifo_wait = false;
+    surface.pending_commit_target = null;
+    surface.pending_timing_ready = true;
     clearPendingAttachment(surface);
     clearPendingOffset(surface);
     surface.topology_dirty = false;
@@ -2907,8 +2993,9 @@ fn projectedLogicalSize(surface: *const Surface) ?render.Size {
 }
 
 /// Returns whether one exact queued token, or the proposed queue-tail token,
-/// belongs to this surface's maximal FIFO-ready prefix.
-fn fifoTokenInReadyPrefix(
+/// belongs to this surface's maximal timing-and-FIFO-ready prefix. Claim
+/// projection can suppress FIFO waits, but never presentation timing.
+fn tokenInConstraintsReadyPrefix(
     surface: *const Surface,
     token: UpdateToken,
     proposed: ?*const ContentUpdate,
@@ -2917,13 +3004,14 @@ fn fifoTokenInReadyPrefix(
     var barrier = surface.current_fifo_barrier;
     const ignored_through = fifoWaitIgnoredThrough(surface, proposed, ignore_live_claims);
     for (surface.content_updates.items, 0..) |update, index| {
+        if (!update.prepared.timing_ready) return false;
         const ignore_wait = if (ignored_through) |last| index <= last else false;
         if (update.prepared.fifo_wait and barrier and !ignore_wait) return false;
         if (std.meta.eql(update.token, token)) return true;
         if (update.prepared.fifo_barrier) barrier = true;
     }
     if (proposed) |candidate| {
-        if (!std.meta.eql(candidate.token, token) or
+        if (!std.meta.eql(candidate.token, token) or !candidate.prepared.timing_ready or
             candidate.prepared.fifo_wait and barrier) return false;
         return true;
     }
@@ -3111,7 +3199,7 @@ fn prepareApplyScratchProjected(
             const update = self.updateForPlan(visit.token, proposed) orelse return error.InvalidDependencyToken;
             const surface = self.surfaceForId(visit.token.surface) orelse return error.InvalidDependencyToken;
             const incoming_claim_removed = surfaceIdIn(removing_incoming_claims, surface.id);
-            if (!fifoTokenInReadyPrefix(surface, visit.token, proposed, incoming_claim_removed)) return error.ConstraintBlocked;
+            if (!tokenInConstraintsReadyPrefix(surface, visit.token, proposed, incoming_claim_removed)) return error.ConstraintBlocked;
             if (!incoming_claim_removed) if (update.claimed_by) |owner| {
                 if (!tokenIn(scratch.active.items, owner) and !tokenIn(scratch.plan.items, owner))
                     return error.ConstraintBlocked;
@@ -3121,6 +3209,7 @@ fn prepareApplyScratchProjected(
             var claim_index = update.claims.items.len;
             while (claim_index > 0) {
                 claim_index -= 1;
+                if (surfaceIdIn(removing_incoming_claims, update.claims.items[claim_index].token.surface)) continue;
                 scratch.visits.appendAssumeCapacity(.{
                     .token = update.claims.items[claim_index].token,
                     .exit = false,
@@ -3133,17 +3222,18 @@ fn prepareApplyScratchProjected(
     std.debug.assert(scratch.active.items.len == 0);
     // This proof is against one pre-application snapshot. Applying an earlier
     // planned barrier may change live state, so applyScratch must not re-test
-    // tokens independently against that evolving state.
+    // tokens independently against that evolving state. Timing remains part
+    // of every token's proof even in a projected removed-claim view.
     for (scratch.plan.items) |token| {
         const surface = self.surfaceForId(token.surface) orelse return error.InvalidDependencyToken;
-        if (!fifoTokenInReadyPrefix(
+        if (!tokenInConstraintsReadyPrefix(
             surface,
             token,
             proposed,
             surfaceIdIn(removing_incoming_claims, surface.id),
         )) return error.ConstraintBlocked;
     }
-    scratch.fifo_ready_prefix_proven = true;
+    scratch.constraints_ready_prefix_proven = true;
     return scratch;
 }
 
@@ -3164,7 +3254,7 @@ fn associationLive(
 }
 
 fn applyScratch(self: *WayringCompositor, scratch: *ApplyScratch) void {
-    std.debug.assert(scratch.fifo_ready_prefix_proven);
+    std.debug.assert(scratch.constraints_ready_prefix_proven);
     for (scratch.plan.items) |token| {
         const update = self.updateForToken(token) orelse unreachable;
         const surface = self.surfaceForId(token.surface) orelse unreachable;
@@ -3745,6 +3835,10 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     }
     if (surface.fifo_handler) |handler| {
         surface.fifo_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (surface.commit_timing_handler) |handler| {
+        surface.commit_timing_handler = null;
         handler.surface_destroyed(handler.context);
     }
     if (surface.background_effect_handler) |handler| {
@@ -9574,6 +9668,211 @@ test "synchronized parent claims ignore FIFO waits in the claimed child prefix" 
     try std.testing.expectEqual(@as(usize, 0), parent.content_updates.items.len);
     try std.testing.expectEqual(@as(usize, 0), child.content_updates.items.len);
     try std.testing.expect(child.current_fifo_barrier);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "commit timing preserves pending state after timer detach and orders successors" {
+    const Recorder = struct {
+        fn handler(self: *@This()) CommitTimingHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn surfaceDestroyed(_: *anyopaque) void {}
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try createSurfaceResource(client, 3, 4);
+    const id = compositor.surfaceId(client, 4).?;
+    const surface = compositor.surfaceForId(id).?;
+    var recorder: Recorder = .{};
+    try std.testing.expect(compositor.attachCommitTiming(client, 4, recorder.handler()) == .attached);
+    try std.testing.expect(compositor.setPendingCommitTimestamp(id, &recorder, 50, false) == .set);
+    compositor.detachCommitTiming(id, &recorder);
+    try std.testing.expectEqual(@as(?i96, 50), surface.pending_commit_target);
+    try std.testing.expect(!surface.pending_timing_ready);
+
+    try setSurfaceOffset(client, 4, 10, 11);
+    try commitSurfaceResource(client, 4);
+    try setSurfaceOffset(client, 4, 20, 21);
+    try commitSurfaceResource(client, 4);
+    try std.testing.expectEqual(@as(usize, 2), surface.content_updates.items.len);
+    try std.testing.expectEqual(Position{}, compositor.currentOffset(id).?);
+    try compositor.releaseTimedCommits(49);
+    try std.testing.expectEqual(@as(usize, 2), surface.content_updates.items.len);
+    try compositor.releaseTimedCommits(50);
+    try std.testing.expectEqual(@as(usize, 0), surface.content_updates.items.len);
+    try std.testing.expectEqual(Position{ .x = 20, .y = 21 }, compositor.currentOffset(id).?);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "timed synchronized child blocks and then joins the parent transaction" {
+    const Recorder = struct {
+        fn handler(self: *@This()) CommitTimingHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn surfaceDestroyed(_: *anyopaque) void {}
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try bindTestSubcompositor(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    try createSurfaceResource(client, 3, 6);
+    try getSubsurface(client, 4, 7, 6, 5);
+    const parent = compositor.surfaceForId(compositor.surfaceId(client, 5).?).?;
+    const child_id = compositor.surfaceId(client, 6).?;
+    const child = compositor.surfaceForId(child_id).?;
+    var recorder: Recorder = .{};
+    try std.testing.expect(compositor.attachCommitTiming(client, 6, recorder.handler()) == .attached);
+    try std.testing.expect(compositor.setPendingCommitTimestamp(child_id, &recorder, 80, false) == .set);
+    try setSurfaceOffset(client, 6, 7, 8);
+    try commitSurfaceResource(client, 6);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(usize, 1), parent.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
+    try std.testing.expectEqual(parent.content_updates.items[0].token, child.content_updates.items[0].claimed_by.?);
+    try compositor.releaseTimedCommits(80);
+    try std.testing.expectEqual(@as(usize, 0), parent.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 0), child.content_updates.items.len);
+    try std.testing.expectEqual(Position{ .x = 7, .y = 8 }, compositor.currentOffset(child_id).?);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "desynchronization applies only the timing-ready child prefix" {
+    const Recorder = struct {
+        fn handler(self: *@This()) CommitTimingHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn surfaceDestroyed(_: *anyopaque) void {}
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try bindTestSubcompositor(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    try createSurfaceResource(client, 3, 6);
+    try getSubsurface(client, 4, 7, 6, 5);
+    const child_id = compositor.surfaceId(client, 6).?;
+    const child = compositor.surfaceForId(child_id).?;
+    var recorder: Recorder = .{};
+    try std.testing.expect(compositor.attachCommitTiming(client, 6, recorder.handler()) == .attached);
+
+    try setSurfaceOffset(client, 6, 1, 2);
+    try commitSurfaceResource(client, 6);
+    try std.testing.expect(compositor.setPendingCommitTimestamp(child_id, &recorder, 90, false) == .set);
+    try setSurfaceOffset(client, 6, 3, 4);
+    try commitSurfaceResource(client, 6);
+    try std.testing.expectEqual(@as(usize, 2), child.content_updates.items.len);
+    try setSubsurfaceMode(client, 7, false);
+    try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
+    try std.testing.expectEqual(UpdateKind.dcu, child.content_updates.items[0].kind);
+    try std.testing.expectEqual(Position{ .x = 1, .y = 2 }, compositor.currentOffset(child_id).?);
+    try compositor.releaseTimedCommits(90);
+    try std.testing.expectEqual(@as(usize, 0), child.content_updates.items.len);
+    try std.testing.expectEqual(Position{ .x = 3, .y = 4 }, compositor.currentOffset(child_id).?);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "timing and FIFO constraints cannot release through each other" {
+    const Recorder = struct {
+        fn fifo(self: *@This()) FifoHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn timing(self: *@This()) CommitTimingHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn surfaceDestroyed(_: *anyopaque) void {}
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try createSurfaceResource(client, 3, 4);
+    const id = compositor.surfaceId(client, 4).?;
+    const surface = compositor.surfaceForId(id).?;
+    const output: OutputLayout.Id = .{ .index = 1, .generation = 1 };
+    var recorder: Recorder = .{};
+    try std.testing.expect(compositor.attachFifo(client, 4, recorder.fifo()) == .attached);
+    try std.testing.expect(compositor.attachCommitTiming(client, 4, recorder.timing()) == .attached);
+
+    try std.testing.expect(compositor.setPendingFifoBarrier(id, &recorder));
+    try commitSurfaceResource(client, 4);
+    try std.testing.expect(surface.current_fifo_barrier);
+    try std.testing.expect(compositor.setPendingFifoWait(id, &recorder));
+    try std.testing.expect(compositor.setPendingCommitTimestamp(id, &recorder, 100, false) == .set);
+    try commitSurfaceResource(client, 4);
+    try compositor.releaseTimedCommits(100);
+    try std.testing.expectEqual(@as(usize, 1), surface.content_updates.items.len);
+    compositor.markFifoBarrierVisible(id, output);
+    try compositor.clearFifoBarriersForOutput(output);
+    try std.testing.expectEqual(@as(usize, 0), surface.content_updates.items.len);
+
+    try std.testing.expect(compositor.setPendingFifoBarrier(id, &recorder));
+    try commitSurfaceResource(client, 4);
+    try std.testing.expect(compositor.setPendingFifoWait(id, &recorder));
+    try std.testing.expect(compositor.setPendingCommitTimestamp(id, &recorder, 200, false) == .set);
+    try commitSurfaceResource(client, 4);
+    compositor.markFifoBarrierVisible(id, output);
+    try compositor.clearFifoBarriersForOutput(output);
+    try std.testing.expectEqual(@as(usize, 1), surface.content_updates.items.len);
+    try compositor.releaseTimedCommits(200);
+    try std.testing.expectEqual(@as(usize, 0), surface.content_updates.items.len);
     try std.testing.expect(client.fatal() == null);
 }
 
