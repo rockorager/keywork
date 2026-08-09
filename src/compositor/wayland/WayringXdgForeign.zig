@@ -149,7 +149,7 @@ fn handleExported(_: *protocol.zxdg_exported_v2.Resource, request: protocol.zxdg
 fn handleImported(_: *protocol.zxdg_imported_v2.Resource, request: protocol.zxdg_imported_v2.Request, value: *Imported) !void {
     switch (request) {
         .destroy => value.owner.destroyImported(value),
-        .set_parent_of => |args| value.setParent(args.surface),
+        .set_parent_of => |args| setParent(value, args.surface),
     }
 }
 fn setParent(value: *Imported, surface: u32) void {

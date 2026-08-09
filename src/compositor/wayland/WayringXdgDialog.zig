@@ -163,8 +163,8 @@ fn handleDialogRequest(
 ) !void {
     switch (request) {
         .destroy => dialog.owner.destroyDialog(dialog),
-        .set_modal => dialog.setModal(true),
-        .unset_modal => dialog.setModal(false),
+        .set_modal => setModal(dialog, true),
+        .unset_modal => setModal(dialog, false),
     }
 }
 

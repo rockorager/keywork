@@ -105,7 +105,9 @@ fn create(self: *WayringContentType, manager: *Manager, id: u32, surface_object:
 fn handleValue(_: *protocol.wp_content_type_v1.Resource, request: protocol.wp_content_type_v1.Request, value: *Value) !void {
     switch (request) {
         .destroy => value.owner.destroyValue(value),
-        .set_content_type => |args| if (value.surface) |surface| _ = value.owner.compositor.setPendingContentType(surface, value, @enumFromInt(args.content_type)),
+        .set_content_type => |args| if (value.surface) |surface| {
+            _ = value.owner.compositor.setPendingContentType(surface, value, @enumFromInt(args.content_type));
+        },
     }
 }
 fn surfaceDestroyed(context: *anyopaque) void {
