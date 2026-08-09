@@ -36,6 +36,7 @@ compositor: *WayringCompositor,
 outputs: ?*WayringOutput,
 seat: ?*WayringSeatAdapter = null,
 decoration_endpoint: ?DecorationEndpoint = null,
+foreign_endpoint: ?ForeignEndpoint = null,
 managers: std.ArrayList(*Manager) = .empty,
 positioners: std.ArrayList(*Positioner) = .empty,
 surfaces: std.ArrayList(*Surface) = .empty,
@@ -123,6 +124,11 @@ pub const DecorationEndpoint = struct {
     destroyed: *const fn (*anyopaque, ToplevelIdentity) void,
 };
 
+pub const ForeignEndpoint = struct {
+    context: *anyopaque,
+    destroyed: *const fn (*anyopaque, ToplevelIdentity) void,
+};
+
 const Popup = struct {
     adapter: *WayringXdgShell,
     surface: *Surface,
@@ -170,6 +176,15 @@ pub fn clearDecorationEndpoint(self: *WayringXdgShell) void {
     self.decoration_endpoint = null;
 }
 
+pub fn setForeignEndpoint(self: *WayringXdgShell, endpoint: ForeignEndpoint) void {
+    std.debug.assert(self.foreign_endpoint == null);
+    self.foreign_endpoint = endpoint;
+}
+
+pub fn clearForeignEndpoint(self: *WayringXdgShell) void {
+    self.foreign_endpoint = null;
+}
+
 pub fn toplevelIdentity(self: *WayringXdgShell, client: *server.Client, object_id: u32) ?ToplevelIdentity {
     for (self.toplevels.items) |value| if (value.surface.client == client and value.resource.runtime.id() == object_id) {
         return .{ .client = client, .object_id = object_id, .generation = value.generation, .core_id = value.core_id };
@@ -180,6 +195,45 @@ pub fn toplevelIdentity(self: *WayringXdgShell, client: *server.Client, object_i
 pub fn identityIsCurrent(self: *WayringXdgShell, identity: ToplevelIdentity) bool {
     const current = self.toplevelIdentity(identity.client, identity.object_id) orelse return false;
     return current.generation == identity.generation and std.meta.eql(current.core_id, identity.core_id);
+}
+
+pub fn toplevelIdentityForSurface(self: *WayringXdgShell, client: *server.Client, surface_object_id: u32) ?ToplevelIdentity {
+    const surface_id = self.compositor.surfaceId(client, surface_object_id) orelse return null;
+    for (self.toplevels.items) |value| if (value.surface.client == client and std.meta.eql(value.surface.surface_id, surface_id)) {
+        return .{
+            .client = client,
+            .object_id = value.resource.runtime.id(),
+            .generation = value.generation,
+            .core_id = value.core_id,
+        };
+    };
+    return null;
+}
+
+/// Applies a foreign parent to an exact live generated toplevel. Parent-cycle
+/// failures belong to the child xdg_toplevel resource, not the importing
+/// extension object.
+pub fn setForeignParent(
+    self: *WayringXdgShell,
+    child: ToplevelIdentity,
+    parent: XdgShell.WindowId,
+    owner: *anyopaque,
+) error{InvalidToplevel}!void {
+    if (!self.identityIsCurrent(child)) return error.InvalidToplevel;
+    for (self.toplevels.items) |value| if (value.generation == child.generation and
+        std.meta.eql(value.core_id, child.core_id))
+    {
+        self.core_shell.setForeignParent(value.surface.surface_id, parent, owner) catch |err| switch (err) {
+            error.InvalidSurface => return error.InvalidToplevel,
+            error.InvalidParent => value.surface.client.postProtocolError(
+                &value.resource.runtime,
+                @intCast(core.xdg_toplevel.@"error".invalid_parent),
+                "xdg-foreign parent cycle",
+            ),
+        };
+        return;
+    };
+    return error.InvalidToplevel;
 }
 
 pub fn setToplevelTag(
@@ -1539,6 +1593,12 @@ fn destroyToplevel(self: *WayringXdgShell, toplevel: *Toplevel, surface_gone: bo
     std.debug.assert(surface.active_role != null and surface.active_role.? == .toplevel and
         surface.active_role.?.toplevel == toplevel);
     if (self.decoration_endpoint) |endpoint| endpoint.destroyed(endpoint.context, .{
+        .client = surface.client,
+        .object_id = toplevel.resource.runtime.id(),
+        .generation = toplevel.generation,
+        .core_id = toplevel.core_id,
+    });
+    if (self.foreign_endpoint) |endpoint| endpoint.destroyed(endpoint.context, .{
         .client = surface.client,
         .object_id = toplevel.resource.runtime.id(),
         .generation = toplevel.generation,

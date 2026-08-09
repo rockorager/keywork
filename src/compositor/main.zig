@@ -43,6 +43,7 @@ const WayringPresentation = @import("wayland/WayringPresentation.zig");
 const WayringXdgOutput = @import("wayland/WayringXdgOutput.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
+const WayringXdgForeign = @import("wayland/WayringXdgForeign.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const WayringSinglePixelBuffer = @import("wayland/WayringSinglePixelBuffer.zig");
 const WayringContentType = @import("wayland/WayringContentType.zig");
@@ -115,7 +116,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 36/27 profile is not default eligible
+    \\                            its limited 38/29 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -283,6 +284,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_xdg_shell: WayringXdgShell = undefined;
     var wayring_xdg_shell_initialized = false;
     var wayring_xdg_shell_published = false;
+    var wayring_xdg_foreign: WayringXdgForeign = undefined;
+    var wayring_xdg_foreign_initialized = false;
+    var wayring_xdg_foreign_published = false;
     var wayring_viewporter: WayringViewporter = undefined;
     var wayring_viewporter_initialized = false;
     var wayring_viewporter_published = false;
@@ -377,6 +381,7 @@ pub fn main(init: std.process.Init) !void {
         presentation: ?*WayringPresentation,
         xdg_output: ?*WayringXdgOutput,
         xdg_shell: *WayringXdgShell,
+        xdg_foreign: ?*WayringXdgForeign,
         viewporter: *WayringViewporter,
         fractional_scale: ?*WayringFractionalScale,
         single_pixel_buffer: ?*WayringSinglePixelBuffer,
@@ -442,6 +447,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.xdg_dialog) |dialog| dialog.destroyClientResources(client);
             if (self.xdg_activation) |activation| activation.destroyClientResources(client);
             if (self.xdg_decoration) |decoration| decoration.destroyClientResources(client);
+            if (self.xdg_foreign) |foreign| foreign.destroyClientResources(client);
             if (self.pointer_warp) |pointer_warp| pointer_warp.destroyClientResources(client);
             if (self.cursor_shape) |cursor_shape| cursor_shape.destroyClientResources(client);
             if (self.fixes) |fixes| fixes.destroyClientResources(client);
@@ -561,6 +567,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_xdg_decoration_initialized) {
             if (wayring_xdg_decoration_published) wayring_xdg_decoration.unpublish();
             wayring_xdg_decoration.deinit();
+        }
+        if (wayring_xdg_foreign_initialized) {
+            if (wayring_xdg_foreign_published) wayring_xdg_foreign.unpublish();
+            wayring_xdg_foreign.deinit();
         }
         if (wayring_pointer_warp_initialized) {
             if (wayring_pointer_warp_published) wayring_pointer_warp.unpublish();
@@ -766,6 +776,8 @@ pub fn main(init: std.process.Init) !void {
         );
         wayring_xdg_shell.setSeatAdapter(&wayring_seat_adapter);
         wayring_xdg_shell_initialized = true;
+        wayring_xdg_foreign.init(init.gpa, init.io, &wayring_protocol_server.?, &wayring_xdg_shell, server.neutralXdgShell());
+        wayring_xdg_foreign_initialized = true;
         if (wayring_outputs_initialized) {
             wayring_layer_shell.init(
                 init.gpa,
@@ -843,6 +855,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_presentation_published = true;
             try wayring_xdg_shell.publish();
             wayring_xdg_shell_published = true;
+            try wayring_xdg_foreign.publish();
+            wayring_xdg_foreign_published = true;
             try wayring_viewporter.publish();
             wayring_viewporter_published = true;
             try wayring_fractional_scale.publish();
@@ -912,6 +926,7 @@ pub fn main(init: std.process.Init) !void {
             .presentation = if (wayring_presentation_initialized) &wayring_presentation else null,
             .xdg_output = if (wayring_xdg_output_initialized) &wayring_xdg_output else null,
             .xdg_shell = &wayring_xdg_shell,
+            .xdg_foreign = if (wayring_xdg_foreign_initialized) &wayring_xdg_foreign else null,
             .viewporter = &wayring_viewporter,
             .fractional_scale = if (wayring_fractional_scale_initialized) &wayring_fractional_scale else null,
             .single_pixel_buffer = if (wayring_single_pixel_buffer_initialized) &wayring_single_pixel_buffer else null,
