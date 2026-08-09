@@ -4892,6 +4892,10 @@ pub fn generatedDmabufCapabilities(self: *Self) WayringLinuxDmabuf.Capabilities 
     return .{ .device = device, .supported_pairs = self.renderer.dmabufSourceFormats(), .source_validator = self.renderer.dmabufSourceValidator() };
 }
 
+pub fn generatedDmabufDeviceId(self: *Self) ?render.DrmDeviceId {
+    return self.renderer.dmabufDeviceId();
+}
+
 pub fn generatedImageCopyDmabufDevice(self: *Self) ?@import("wayland/linux_dmabuf_buffer.zig").Device {
     return self.linux_dmabuf.allocationDevice();
 }

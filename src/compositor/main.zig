@@ -40,6 +40,7 @@ const WayringSessionLock = @import("wayland/WayringSessionLock.zig");
 const WayringWorkspace = @import("wayland/WayringWorkspace.zig");
 const WayringSecurityContext = @import("wayland/WayringSecurityContext.zig");
 const WayringLinuxDmabuf = @import("wayland/WayringLinuxDmabuf.zig");
+const WayringLinuxDrmSyncobj = @import("wayland/WayringLinuxDrmSyncobj.zig");
 const WayringOutputManagement = @import("wayland/WayringOutputManagement.zig");
 const WayringScreencopy = @import("wayland/WayringScreencopy.zig");
 const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
@@ -137,6 +138,7 @@ const WayringForeignToplevelAdapters = struct {
 comptime {
     _ = @import("DataDevice.zig");
     _ = @import("TextInput.zig");
+    _ = @import("wayland/WayringLinuxDrmSyncobj.zig");
 }
 
 pub const std_options: std.Options = .{
@@ -468,6 +470,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_linux_dmabuf: WayringLinuxDmabuf = undefined;
     var wayring_linux_dmabuf_initialized = false;
     var wayring_linux_dmabuf_published = false;
+    var wayring_linux_drm_syncobj: WayringLinuxDrmSyncobj = undefined;
+    var wayring_linux_drm_syncobj_initialized = false;
+    var wayring_linux_drm_syncobj_published = false;
     var wayring_output_management: WayringOutputManagement = undefined;
     var wayring_output_management_initialized = false;
     var wayring_output_management_published = false;
@@ -542,6 +547,7 @@ pub fn main(init: std.process.Init) !void {
         session_lock: ?*WayringSessionLock,
         workspace: ?*WayringWorkspace,
         linux_dmabuf: ?*WayringLinuxDmabuf,
+        linux_drm_syncobj: ?*WayringLinuxDrmSyncobj,
         output_management: ?*WayringOutputManagement,
         screencopy: ?*WayringScreencopy,
         virtual_pointer: ?*WayringVirtualPointer,
@@ -576,6 +582,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.screencopy) |adapter| adapter.destroyClientResources(client);
             if (self.image_copy_capture) |adapter| adapter.destroyClientResources(client);
             if (self.output_management) |adapter| adapter.destroyClientResources(client);
+            if (self.linux_drm_syncobj) |adapter| adapter.destroyClientResources(client);
             if (self.linux_dmabuf) |adapter| adapter.destroyClientResources(client);
             if (self.security_context) |adapter| adapter.destroyClientResources(client);
             if (self.workspace) |workspace| workspace.destroyClientResources(client);
@@ -675,6 +682,10 @@ pub fn main(init: std.process.Init) !void {
             server.setGeneratedOutputObserver(null);
             if (wayring_output_management_published) wayring_output_management.unpublish();
             wayring_output_management.deinit();
+        }
+        if (wayring_linux_drm_syncobj_initialized) {
+            if (wayring_linux_drm_syncobj_published) wayring_linux_drm_syncobj.unpublish();
+            wayring_linux_drm_syncobj.deinit();
         }
         if (wayring_linux_dmabuf_initialized) {
             if (wayring_linux_dmabuf_published) wayring_linux_dmabuf.unpublish();
@@ -1389,6 +1400,7 @@ pub fn main(init: std.process.Init) !void {
             .session_lock = if (wayring_session_lock_initialized) &wayring_session_lock else null,
             .workspace = if (wayring_workspace_initialized) &wayring_workspace else null,
             .linux_dmabuf = null,
+            .linux_drm_syncobj = null,
             .output_management = null,
             .screencopy = null,
             .virtual_pointer = null,
@@ -1411,6 +1423,18 @@ pub fn main(init: std.process.Init) !void {
             wayring_linux_dmabuf_initialized = true;
             try wayring_linux_dmabuf.publish();
             wayring_linux_dmabuf_published = true;
+            wayring_linux_drm_syncobj.init(
+                init.gpa,
+                init.io,
+                &wayring_protocol_server.?,
+                &wayring_compositor,
+                .{ .context = server, .failed = generatedCommitTimingFailed },
+                server.eventLoop(),
+                server.generatedDmabufDeviceId(),
+            );
+            wayring_linux_drm_syncobj_initialized = true;
+            try wayring_linux_drm_syncobj.publish();
+            wayring_linux_drm_syncobj_published = wayring_linux_drm_syncobj.available();
             wayring_output_management.init(init.gpa, &wayring_protocol_server.?, server.generatedOutputManagement(), std.os.linux.getuid(), server.generatedOutputManagementListener());
             wayring_output_management_initialized = true;
             const size = server.primaryOutputModeSize();
@@ -1440,6 +1464,7 @@ pub fn main(init: std.process.Init) !void {
             try wayring_virtual_pointer.publish();
             wayring_virtual_pointer_published = true;
             wayring_lifecycle.linux_dmabuf = &wayring_linux_dmabuf;
+            wayring_lifecycle.linux_drm_syncobj = if (wayring_linux_drm_syncobj.available()) &wayring_linux_drm_syncobj else null;
             wayring_lifecycle.output_management = &wayring_output_management;
             wayring_lifecycle.screencopy = &wayring_screencopy;
             wayring_lifecycle.image_copy_capture = &wayring_image_copy_capture;
@@ -1449,7 +1474,7 @@ pub fn main(init: std.process.Init) !void {
         if (WayringProfile.validate(
             &wayring_protocol_server.?,
             if (wayring_presenting_headless)
-                .presenting_headless
+                if (wayring_linux_drm_syncobj.available()) .presenting_headless_syncobj else .presenting_headless
             else if (output_kind == .drm)
                 .drm
             else

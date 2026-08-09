@@ -145,6 +145,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-background-effect/ext-background-effect-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/pointer-warp/pointer-warp-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));
+    generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"));
     // Cursor shape refers to the tablet-tool interface in its manager request;
     // tablet is scanner input only and is not published by the generated host.
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/tablet/tablet-v2.xml"));

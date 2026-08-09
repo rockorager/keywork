@@ -13,6 +13,7 @@ const linux = @cImport({
     @cInclude("libdrm/drm_fourcc.h");
     @cInclude("linux/dma-buf.h");
     @cInclude("linux/memfd.h");
+    @cInclude("linux/sync_file.h");
     @cInclude("sys/ioctl.h");
     @cInclude("sys/types.h");
 });
@@ -438,6 +439,35 @@ pub const Buffer = struct {
         return true;
     }
 
+    /// Exports one sync file which waits for every reader and writer of every
+    /// plane. The caller owns the returned descriptor.
+    pub fn exportCompletionFence(self: *const Buffer) ?std.posix.fd_t {
+        var merged: ?std.posix.fd_t = null;
+        defer {
+            if (merged) |fd| _ = std.c.close(fd);
+        }
+        for (self.descriptor.planes[0..self.descriptor.plane_count]) |plane| {
+            const fd = exportFence(plane.plane.fd, linux.DMA_BUF_SYNC_WRITE) orelse return null;
+            if (merged == null) {
+                merged = fd;
+                continue;
+            }
+            var merge: linux.sync_merge_data = std.mem.zeroes(linux.sync_merge_data);
+            merge.fd2 = fd;
+            const result = while (true) {
+                const value = linux.ioctl(merged.?, linux.SYNC_IOC_MERGE, &merge);
+                if (value >= 0 or std.posix.errno(value) != .INTR) break value;
+            };
+            _ = std.c.close(fd);
+            if (result < 0) return null;
+            _ = std.c.close(merged.?);
+            merged = merge.fence;
+        }
+        const result = merged;
+        merged = null;
+        return result;
+    }
+
     pub fn captureTarget(
         self: *Buffer,
         renderer: render.DmabufRenderer,
@@ -509,13 +539,17 @@ pub const Buffer = struct {
     fn exportReadFence(context: *anyopaque, plane_index: u8) ?std.posix.fd_t {
         const self: *Buffer = @ptrCast(@alignCast(context));
         if (plane_index >= self.descriptor.plane_count) return null;
+        return exportFence(self.descriptor.planes[plane_index].plane.fd, linux.DMA_BUF_SYNC_READ);
+    }
+
+    fn exportFence(fd: std.posix.fd_t, flags: u32) ?std.posix.fd_t {
         var value: linux.dma_buf_export_sync_file = .{
-            .flags = linux.DMA_BUF_SYNC_READ,
+            .flags = flags,
             .fd = -1,
         };
         while (true) {
             const result = linux.ioctl(
-                self.descriptor.planes[plane_index].plane.fd,
+                fd,
                 linux.DMA_BUF_IOCTL_EXPORT_SYNC_FILE,
                 &value,
             );

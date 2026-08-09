@@ -4301,7 +4301,7 @@ fn renderFrameWithCompletion(
     ) catch return error.OutOfMemory;
     for (self.prepared_images.items, 0..) |prepared, index| {
         if (!prepared.texture.imported or
-            !isFirstImportedTexture(self.prepared_images.items, index)) continue;
+            !isFirstImportedSource(self.prepared_images.items, index)) continue;
         const source = prepared.buffer.dmabuf.?;
         plane_waits: for (source.planeSlice(), 0..) |_, plane_index| {
             const sync_fd = (source.export_read_fence)(source.context, @intCast(plane_index)) orelse {
@@ -4334,16 +4334,27 @@ fn renderFrameWithCompletion(
         }
     }
 
-    const export_completion = submission.scanout_semaphore != .null_handle and switch (completion_mode) {
+    var sampled_imported_dmabuf = false;
+    for (self.prepared_images.items) |prepared| {
+        if (prepared.texture.imported) {
+            sampled_imported_dmabuf = true;
+            break;
+        }
+    }
+    const return_completion = switch (completion_mode) {
         .wait => false,
         .sync_fd => output.kind == .dmabuf,
         .readback => output.kind == .pixels,
     };
-    // A GPU-resident offscreen output has no external consumer to synchronize.
-    // Keep its work in flight and drain before the target is reused instead of
-    // delaying headless presentation and frame callbacks on GPU completion.
+    // Imported sources are external consumers of an offscreen submission: its
+    // completion fence must enter their DMA-BUF reservations before the
+    // frontend can publish explicit release points. With no export semaphore,
+    // drain instead of ending the source borrow while reads remain in flight.
+    const export_completion = submission.scanout_semaphore != .null_handle and
+        (return_completion or output.kind == .offscreen and sampled_imported_dmabuf);
     const async_submission = completion_mode != .wait and
-        (output.kind == .offscreen or export_completion);
+        (return_completion and export_completion or
+            output.kind == .offscreen and (!sampled_imported_dmabuf or export_completion));
     // Queue submission makes prior coherent mapped writes visible to every
     // device access in the submission; no host pipeline barrier is needed.
     const submit_info: vk.SubmitInfo = .{
@@ -4457,8 +4468,10 @@ fn renderFrameWithCompletion(
             }
         }
         frame_succeeded = true;
-        completion_fd_owned = false;
-        completion.sync_file_fd = completion_fd;
+        if (return_completion) {
+            completion_fd_owned = false;
+            completion.sync_file_fd = completion_fd;
+        }
         return completion;
     }
 
@@ -4511,6 +4524,14 @@ fn isFirstImportedTexture(prepared_images: []const PreparedImage, index: usize) 
     const image = prepared_images[index].texture.image;
     for (prepared_images[0..index]) |prepared| {
         if (prepared.texture.imported and prepared.texture.image == image) return false;
+    }
+    return true;
+}
+
+fn isFirstImportedSource(prepared_images: []const PreparedImage, index: usize) bool {
+    const context = prepared_images[index].buffer.dmabuf.?.context;
+    for (prepared_images[0..index]) |prepared| {
+        if (prepared.texture.imported and prepared.buffer.dmabuf.?.context == context) return false;
     }
     return true;
 }

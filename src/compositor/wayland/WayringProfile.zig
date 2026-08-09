@@ -15,6 +15,7 @@ pub const Gate = enum {
     drm,
     scanner_output,
     presenting_headless,
+    presenting_headless_syncobj,
 };
 
 pub const Entry = struct {
@@ -85,6 +86,7 @@ pub const entries = [_]Entry{
     .{ .interface = "ext_workspace_manager_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "wp_security_context_manager_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "zwp_linux_dmabuf_v1", .version = 6, .gate = .presenting_headless },
+    .{ .interface = "wp_linux_drm_syncobj_manager_v1", .version = 1, .gate = .presenting_headless_syncobj },
     .{ .interface = "zwlr_output_manager_v1", .version = 4, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "zwlr_screencopy_manager_v1", .version = 3, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "zwlr_virtual_pointer_manager_v1", .version = 2, .visibility = .restricted, .gate = .presenting_headless },
@@ -228,7 +230,8 @@ pub fn securityVisible(
 
 fn enabled(entry: Entry, gate: Gate) bool {
     return entry.gate == .sidecar or entry.gate == gate or
-        (entry.gate == .scanner_output and (gate == .drm or gate == .presenting_headless));
+        (entry.gate == .scanner_output and (gate == .drm or gate == .presenting_headless or gate == .presenting_headless_syncobj)) or
+        (entry.gate == .presenting_headless and gate == .presenting_headless_syncobj);
 }
 
 test "manifest pins exact direct and security-context profiles" {
@@ -249,6 +252,13 @@ test "manifest pins exact direct and security-context profiles" {
     try std.testing.expectEqualStrings("wp_security_context_manager_v1", expectedAt(.presenting_headless, .direct, 53).?.interface);
     try std.testing.expectEqualStrings("zwp_linux_dmabuf_v1", expectedAt(.presenting_headless, .security_context, 42).?.interface);
     try std.testing.expect(expectedAt(.presenting_headless, .security_context, 43) == null);
+    try std.testing.expectEqual(@as(usize, 59), expectedCount(.presenting_headless_syncobj, .direct));
+    try std.testing.expectEqual(@as(usize, 44), expectedCount(.presenting_headless_syncobj, .security_context));
+    try std.testing.expectEqual(@as(usize, 44), expectedCount(.presenting_headless_syncobj, .unknown));
+    try std.testing.expectEqualStrings("wp_linux_drm_syncobj_manager_v1", expectedAt(.presenting_headless_syncobj, .direct, 55).?.interface);
+    try std.testing.expectEqualStrings("wp_linux_drm_syncobj_manager_v1", expectedAt(.presenting_headless_syncobj, .security_context, 43).?.interface);
+    try std.testing.expectEqualStrings("zwlr_output_manager_v1", expectedAt(.presenting_headless_syncobj, .direct, 56).?.interface);
+    try std.testing.expect(expectedAt(.presenting_headless_syncobj, .security_context, 44) == null);
 }
 
 test "DRM profile accepts contiguous output globals for every monitor" {

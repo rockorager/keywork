@@ -27,6 +27,7 @@ const surface_geometry = @import("surface_geometry.zig");
 const server = wayring.server;
 const wire = wayring.wire;
 const Shm = server.shm.Protocol(core);
+const log = std.log.scoped(.wayring_compositor);
 const compositor_version = 6;
 const preferred_buffer_scale_event_opcode = 2;
 const preferred_buffer_transform_event_opcode = 3;
@@ -40,6 +41,38 @@ pub const ViewportState = surface_geometry.ViewportState;
 pub const ViewportSource = surface_geometry.ViewportSource;
 pub const ViewportDestination = surface_geometry.ViewportDestination;
 pub const ViewportError = enum { bad_size, out_of_buffer };
+pub const ExplicitSyncAttachment = enum { none, null_buffer, unsupported, dmabuf };
+pub const ExplicitSyncReadyListener = struct {
+    context: *anyopaque,
+    ready: *const fn (*anyopaque, *anyopaque, bool) void,
+};
+pub const ExplicitSyncUse = struct {
+    context: *anyopaque,
+    is_ready: *const fn (*anyopaque) bool,
+    retain: *const fn (*anyopaque) void,
+    release: *const fn (*anyopaque) void,
+    render_source: *const fn (*anyopaque) render.DmabufSource,
+};
+pub const ExplicitSyncHandler = struct {
+    context: *anyopaque,
+    /// Must only inspect pending point state. A false result means the
+    /// protocol adapter has already reported the commit error.
+    validate_commit: *const fn (*anyopaque, ExplicitSyncAttachment) bool,
+    /// Transfers both pending points and one retained snapshot of `buffer` to
+    /// an opaque use. The adapter must store `listener` in stable use-owned
+    /// memory. It consumes and cleans up pending state even when this fails.
+    /// The use's final release signals release and releases the snapshot.
+    take_pending: *const fn (*anyopaque, *linux_dmabuf.Buffer, ExplicitSyncReadyListener) error{OutOfMemory}!ExplicitSyncUse,
+    /// The association is invalid before this callback. The adapter must
+    /// discard any still-pending points.
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+pub const ExplicitSyncAttachResult = union(enum) {
+    attached: SurfaceId,
+    already_exists,
+    not_live,
+    wrong_client,
+};
 pub const ViewportHandler = struct {
     context: *anyopaque,
     post_error: *const fn (*anyopaque, ViewportError) void,
@@ -455,6 +488,7 @@ const Surface = struct {
     pending_viewport: ViewportState = .{},
     current_viewport: ViewportState = .{},
     viewport_handler: ?ViewportHandler = null,
+    explicit_sync_handler: ?ExplicitSyncHandler = null,
     fractional_scale_handler: ?FractionalScaleHandler = null,
     content_type_handler: ?ContentTypeHandler = null,
     pending_content_type: ContentType = .none,
@@ -731,6 +765,7 @@ const PendingAttachment = struct {
 const DmabufSnapshot = struct {
     buffer: *linux_dmabuf.Buffer,
     source_cache: render.SourceCache,
+    explicit_use: ?ExplicitSyncUse = null,
 
     fn init(buffer: *linux_dmabuf.Buffer) DmabufSnapshot {
         buffer.retainSnapshot();
@@ -738,7 +773,7 @@ const DmabufSnapshot = struct {
     }
 
     fn deinit(self: *DmabufSnapshot) void {
-        self.buffer.releaseSnapshot();
+        if (self.explicit_use) |use| use.release(use.context) else self.buffer.releaseSnapshot();
         self.* = undefined;
     }
 
@@ -748,7 +783,7 @@ const DmabufSnapshot = struct {
         return .{
             .size = descriptor.size,
             .stride_pixels = if (format.isPackedRgb()) descriptor.planes[0].plane.stride / @sizeOf(u32) else 0,
-            .dmabuf = self.buffer.renderSource(),
+            .dmabuf = if (self.explicit_use) |use| use.render_source(use.context) else self.buffer.renderSource(),
             .source_cache = self.source_cache,
         };
     }
@@ -1167,6 +1202,30 @@ pub fn attachViewport(self: *WayringCompositor, client: *server.Client, object_i
     return .not_live;
 }
 
+pub fn attachExplicitSync(
+    self: *WayringCompositor,
+    client: *server.Client,
+    object_id: u32,
+    handler: ExplicitSyncHandler,
+) ExplicitSyncAttachResult {
+    const objects = self.findClient(client) orelse return .not_live;
+    for (objects.surfaces.items) |surface| if (surface.resource.id() == object_id and !surface.destroying) {
+        if (surface.explicit_sync_handler != null) return .already_exists;
+        surface.explicit_sync_handler = handler;
+        return .{ .attached = surface.id };
+    };
+    if (client.lookup(object_id)) |resource| if (resource.interface() == &core.wl_surface.interface) return .wrong_client;
+    return .not_live;
+}
+
+/// Detaching leaves already transferred commits owned by their snapshots.
+/// Pending points remain adapter-owned and must be cleared by the adapter.
+pub fn detachExplicitSync(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque) void {
+    const surface = self.surfaceForId(id) orelse return;
+    const handler = surface.explicit_sync_handler orelse return;
+    if (handler.context == handler_context) surface.explicit_sync_handler = null;
+}
+
 pub fn attachFractionalScale(
     self: *WayringCompositor,
     client: *server.Client,
@@ -1322,22 +1381,7 @@ pub fn releaseTimedCommits(self: *WayringCompositor, now: i96) !void {
             if (!update.prepared.timing_ready and target <= now) update.prepared.timing_ready = true;
         };
     };
-    var progressed = true;
-    while (progressed) {
-        progressed = false;
-        for (self.clients.items) |objects| for (objects.surfaces.items) |surface| {
-            if (surface.content_updates.items.len == 0) continue;
-            const update = &surface.content_updates.items[0];
-            if (update.kind != .dcu or update.claimed_by != null) continue;
-            var scratch = self.prepareApplyScratch(&.{update.token}, null) catch |err| switch (err) {
-                error.ConstraintBlocked => continue,
-                else => return err,
-            };
-            defer scratch.deinit(self.allocator);
-            self.applyScratch(&scratch);
-            progressed = true;
-        };
-    }
+    self.retryReadyDirectUpdates();
 }
 
 pub fn earliestCommitTimestamp(self: *const WayringCompositor) ?i96 {
@@ -1384,22 +1428,7 @@ pub fn clearFifoBarriersForOutput(self: *WayringCompositor, output: OutputLayout
             surface.fifo_barrier_output = null;
         }
     };
-    var progressed = true;
-    while (progressed) {
-        progressed = false;
-        for (self.clients.items) |objects| for (objects.surfaces.items) |surface| {
-            if (surface.content_updates.items.len == 0) continue;
-            const update = &surface.content_updates.items[0];
-            if (update.kind != .dcu or update.claimed_by != null) continue;
-            var scratch = self.prepareApplyScratch(&.{update.token}, null) catch |err| switch (err) {
-                error.ConstraintBlocked => continue,
-                else => return err,
-            };
-            defer scratch.deinit(self.allocator);
-            self.applyScratch(&scratch);
-            progressed = true;
-        };
-    }
+    self.retryReadyDirectUpdates();
 }
 
 pub fn attachBackgroundEffect(
@@ -2018,6 +2047,7 @@ fn setRelationshipDesync(self: *WayringCompositor, child: *Surface, identity: As
     defer transition.deinit(self.allocator);
     relationship.local_sync = false;
     self.applyDesyncTransition(&transition);
+    self.retryReadyDirectUpdates();
 }
 
 /// Prebuilds every allocation needed to convert one newly desynchronized
@@ -2101,6 +2131,7 @@ fn testDissociate(self: *WayringCompositor, child_id: SurfaceId) !void {
     defer transition.deinit(self.allocator);
     if (!self.dissociate(child, identity)) return error.BadRelationship;
     self.applyDesyncTransition(&transition);
+    self.retryReadyDirectUpdates();
 }
 
 /// Completes every callback committed for the canonical surface ID. Event
@@ -2405,6 +2436,8 @@ fn destroySubsurfaceRequest(self: *WayringCompositor, value: *Subsurface) !void 
     defer transition.deinit(self.allocator);
     self.destroySubsurface(value);
     self.applyDesyncTransition(&transition);
+    // Dropping the child's claimed SCUs can make their direct owner ready.
+    self.retryReadyDirectUpdates();
 }
 
 fn setRelationshipPosition(
@@ -2875,6 +2908,16 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     // state remains unchanged, matching the existing terminal policy.
     defer if (!published and had_pending_attachment) clearPendingAttachment(surface);
 
+    const explicit_attachment: ExplicitSyncAttachment = if (!surface.has_pending_attachment)
+        .none
+    else if (surface.pending_attachment) |pending| switch (pending.pin) {
+        .dmabuf => .dmabuf,
+        .shm, .single_pixel => .unsupported,
+    } else .null_buffer;
+    if (surface.explicit_sync_handler) |handler| {
+        if (!handler.validate_commit(handler.context, explicit_attachment)) return;
+    }
+
     const sequence = surface.next_content_sequence orelse {
         const client = self.clientForResource(&surface.resource.runtime) orelse return error.UntrackedClient;
         client.postImplementationError(&surface.resource.runtime, "wl_surface content-update sequence exhausted");
@@ -3087,6 +3130,7 @@ fn tokenInConstraintsReadyPrefix(
     const ignored_through = fifoWaitIgnoredThrough(surface, proposed, ignore_live_claims);
     for (surface.content_updates.items, 0..) |update, index| {
         if (!update.prepared.timing_ready) return false;
+        if (!explicitReady(&update.prepared)) return false;
         const ignore_wait = if (ignored_through) |last| index <= last else false;
         if (update.prepared.fifo_wait and barrier and !ignore_wait) return false;
         if (std.meta.eql(update.token, token)) return true;
@@ -3094,10 +3138,48 @@ fn tokenInConstraintsReadyPrefix(
     }
     if (proposed) |candidate| {
         if (!std.meta.eql(candidate.token, token) or !candidate.prepared.timing_ready or
+            !explicitReady(&candidate.prepared) or
             candidate.prepared.fifo_wait and barrier) return false;
         return true;
     }
     return false;
+}
+
+fn explicitReady(prepared: *const PreparedCommit) bool {
+    const buffer = prepared.buffer orelse return true;
+    return switch (buffer) {
+        .copied => true,
+        .dmabuf => |snapshot| explicitUseReady(snapshot.explicit_use),
+    };
+}
+
+fn explicitUseReady(use: ?ExplicitSyncUse) bool {
+    const value = use orelse return true;
+    return value.is_ready(value.context);
+}
+
+test "explicit readiness blocks a constraint prefix until signaled without reordering" {
+    const Fake = struct {
+        fn isReady(context: *anyopaque) bool {
+            const ready: *bool = @ptrCast(@alignCast(context));
+            return ready.*;
+        }
+        fn unused(_: *anyopaque) void {}
+        fn source(_: *anyopaque) render.DmabufSource {
+            unreachable;
+        }
+    };
+    var ready = false;
+    const use: ExplicitSyncUse = .{
+        .context = &ready,
+        .is_ready = Fake.isReady,
+        .retain = Fake.unused,
+        .release = Fake.unused,
+        .render_source = Fake.source,
+    };
+    try std.testing.expect(!explicitUseReady(use));
+    ready = true;
+    try std.testing.expect(explicitUseReady(use));
 }
 
 /// A synchronized parent's claim applies the claimed SCU and every same-
@@ -3226,6 +3308,59 @@ fn prepareApplyScratch(
     proposed: ?*const ContentUpdate,
 ) !ApplyScratch {
     return self.prepareApplyScratchProjected(roots, proposed, &.{});
+}
+
+fn explicitSyncReady(context: *anyopaque, use_context: *anyopaque, ready: bool) void {
+    const self: *WayringCompositor = @ptrCast(@alignCast(context));
+    if (!ready) {
+        self.failExplicitSyncUse(use_context);
+        return;
+    }
+    self.retryReadyDirectUpdates();
+}
+
+fn failExplicitSyncUse(self: *WayringCompositor, use_context: *anyopaque) void {
+    for (self.clients.items) |objects| for (objects.surfaces.items) |surface| {
+        for (surface.content_updates.items) |update| {
+            const buffer = update.prepared.buffer orelse continue;
+            const use = switch (buffer) {
+                .copied => continue,
+                .dmabuf => |snapshot| snapshot.explicit_use orelse continue,
+            };
+            if (use.context != use_context) continue;
+            objects.client.postImplementationError(&surface.resource.runtime, "DRM syncobj acquire wait failed");
+            return;
+        }
+    };
+}
+
+/// Applies every unclaimed direct head that became ready after an external
+/// constraint or queue transition. Iterate to a fixed point because applying
+/// one owner can expose another surface's successor.
+fn retryReadyDirectUpdates(self: *WayringCompositor) void {
+    var progressed = true;
+    while (progressed) {
+        progressed = false;
+        for (self.clients.items) |objects| for (objects.surfaces.items) |surface| {
+            if (surface.destroying or surface.content_updates.items.len == 0) continue;
+            const update = &surface.content_updates.items[0];
+            if (update.kind != .dcu or update.claimed_by != null) continue;
+            var scratch = self.prepareApplyScratch(&.{update.token}, null) catch |err| switch (err) {
+                error.ConstraintBlocked => continue,
+                error.OutOfMemory => {
+                    objects.client.postOutOfMemory(&surface.resource.runtime, "retrying ready surface commit");
+                    return;
+                },
+                else => {
+                    objects.client.postImplementationError(&surface.resource.runtime, @errorName(err));
+                    return;
+                },
+            };
+            defer scratch.deinit(self.allocator);
+            self.applyScratch(&scratch);
+            progressed = true;
+        };
+    }
 }
 
 /// Plans against live queues while treating incoming claims on the listed
@@ -3593,7 +3728,19 @@ fn preparePendingBuffer(
             const geometry = try surface_geometry.calculate(physical_size, prepared.scale, prepared.transform, prepared.viewport, surface.role == .cursor);
             prepared.logical_size = geometry.logical_size;
             prepared.source = geometry.source;
-            prepared.buffer = .{ .dmabuf = .init(buffer) };
+            if (surface.explicit_sync_handler) |handler| {
+                const use = try handler.take_pending(handler.context, buffer, .{
+                    .context = self,
+                    .ready = explicitSyncReady,
+                });
+                prepared.buffer = .{ .dmabuf = .{
+                    .buffer = buffer,
+                    .source_cache = buffer.acquireSourceCache(),
+                    .explicit_use = use,
+                } };
+            } else {
+                prepared.buffer = .{ .dmabuf = .init(buffer) };
+            }
             prepared.publishes_snapshot = true;
         },
         .single_pixel => |pixel| {
@@ -3888,6 +4035,10 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     const objects = self.findClient(client) orelse unreachable;
     std.debug.assert(!surface.destroying);
     surface.destroying = true;
+    if (surface.explicit_sync_handler) |handler| {
+        surface.explicit_sync_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
     if (surface.pointer_constraint) |association| {
         surface.pointer_constraint = null;
         for (surface.content_updates.items) |*update| update.pointer_constraint = null;
@@ -9854,6 +10005,51 @@ test "timed synchronized child blocks and then joins the parent transaction" {
     try std.testing.expectEqual(@as(usize, 0), parent.content_updates.items.len);
     try std.testing.expectEqual(@as(usize, 0), child.content_updates.items.len);
     try std.testing.expectEqual(Position{ .x = 7, .y = 8 }, compositor.currentOffset(child_id).?);
+    try std.testing.expect(client.fatal() == null);
+}
+
+test "discarding a blocked claimed child immediately retries its parent" {
+    const Recorder = struct {
+        fn handler(self: *@This()) CommitTimingHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn surfaceDestroyed(_: *anyopaque) void {}
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try bindTestSubcompositor(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    try createSurfaceResource(client, 3, 6);
+    try getSubsurface(client, 4, 7, 6, 5);
+    const parent = compositor.surfaceForId(compositor.surfaceId(client, 5).?).?;
+    const child_id = compositor.surfaceId(client, 6).?;
+    const child = compositor.surfaceForId(child_id).?;
+    var recorder: Recorder = .{};
+    try std.testing.expect(compositor.attachCommitTiming(client, 6, recorder.handler()) == .attached);
+    try std.testing.expect(compositor.setPendingCommitTimestamp(child_id, &recorder, 80, false) == .set);
+    try commitSurfaceResource(client, 6);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(usize, 1), parent.content_updates.items.len);
+    try std.testing.expectEqual(parent.content_updates.items[0].token, child.content_updates.items[0].claimed_by.?);
+
+    try destroySubsurfaceResource(client, 7);
+    try std.testing.expectEqual(@as(usize, 0), parent.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 0), child.content_updates.items.len);
     try std.testing.expect(client.fatal() == null);
 }
 
