@@ -74,6 +74,16 @@ pub const ContentTypeAttachResult = union(enum) {
     not_live,
     wrong_client,
 };
+pub const AlphaModifierHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+pub const AlphaModifierAttachResult = union(enum) {
+    attached: SurfaceId,
+    already_constructed,
+    not_live,
+    wrong_client,
+};
 
 /// Frontend-local delivery endpoint borrowed for one synchronous event fanout.
 /// Callers must not retain either pointer or use it after returning to the
@@ -337,6 +347,9 @@ const Surface = struct {
     content_type_handler: ?ContentTypeHandler = null,
     pending_content_type: ContentType = .none,
     current_content_type: ContentType = .none,
+    alpha_modifier_handler: ?AlphaModifierHandler = null,
+    pending_alpha_multiplier: u32 = std.math.maxInt(u32),
+    current_alpha_multiplier: u32 = std.math.maxInt(u32),
     current_source: ?render.SourceRect = null,
     source_cache_id: u64,
     next_source_version: u64 = 1,
@@ -503,6 +516,7 @@ const PreparedCommit = struct {
     logical_size: ?render.Size,
     viewport: ViewportState,
     content_type: ContentType,
+    alpha_multiplier: u32,
     source: ?render.SourceRect = null,
     scale: i32,
     transform: render.BufferTransform,
@@ -518,6 +532,7 @@ const PreparedCommit = struct {
             .logical_size = surface.current_logical_size,
             .viewport = surface.pending_viewport,
             .content_type = surface.pending_content_type,
+            .alpha_multiplier = surface.pending_alpha_multiplier,
             .scale = surface.pending_scale,
             .transform = surface.pending_transform,
             .offset_x = surface.pending_offset_x,
@@ -954,6 +969,37 @@ pub fn setPendingContentType(self: *WayringCompositor, id: SurfaceId, handler_co
 
 pub fn currentContentType(self: *const WayringCompositor, id: SurfaceId) ?ContentType {
     return (self.surfaceForId(id) orelse return null).current_content_type;
+}
+
+pub fn attachAlphaModifier(self: *WayringCompositor, client: *server.Client, object_id: u32, handler: AlphaModifierHandler) AlphaModifierAttachResult {
+    const objects = self.findClient(client) orelse return .not_live;
+    for (objects.surfaces.items) |surface| if (surface.resource.id() == object_id and !surface.destroying) {
+        if (surface.alpha_modifier_handler != null) return .already_constructed;
+        surface.alpha_modifier_handler = handler;
+        return .{ .attached = surface.id };
+    };
+    if (client.lookup(object_id)) |resource| if (resource.interface() == &core.wl_surface.interface) return .wrong_client;
+    return .not_live;
+}
+
+pub fn detachAlphaModifier(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque) void {
+    const surface = self.surfaceForId(id) orelse return;
+    const handler = surface.alpha_modifier_handler orelse return;
+    if (handler.context != handler_context) return;
+    surface.alpha_modifier_handler = null;
+    surface.pending_alpha_multiplier = std.math.maxInt(u32);
+}
+
+pub fn setPendingAlphaMultiplier(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque, factor: u32) bool {
+    const surface = self.surfaceForId(id) orelse return false;
+    const handler = surface.alpha_modifier_handler orelse return false;
+    if (handler.context != handler_context) return false;
+    surface.pending_alpha_multiplier = factor;
+    return true;
+}
+
+pub fn currentAlphaMultiplier(self: *const WayringCompositor, id: SurfaceId) ?u32 {
+    return (self.surfaceForId(id) orelse return null).current_alpha_multiplier;
 }
 
 pub fn setViewportSource(
@@ -2020,7 +2066,7 @@ fn surfaceRenderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
         .source = surface.current_source,
         .transform = surface.current_transform,
         .force_opaque = current.forceOpaque(),
-        .alpha_multiplier = std.math.maxInt(u32),
+        .alpha_multiplier = surface.current_alpha_multiplier,
         .opaque_region = &surface.current_opaque,
         .blur_region = null,
     };
@@ -2749,6 +2795,7 @@ fn prepareCommit(self: *WayringCompositor, surface: *Surface) !PreparedCommit {
         prepared.transform == surface.current_transform and
         std.meta.eql(prepared.viewport, surface.current_viewport) and
         prepared.content_type == surface.current_content_type and
+        prepared.alpha_multiplier == surface.current_alpha_multiplier and
         prepared.offset_x == 0 and prepared.offset_y == 0 and
         !surface.topology_dirty;
 
@@ -2866,6 +2913,7 @@ fn publishPreparedCommit(
     surface.current_logical_size = prepared.logical_size;
     surface.current_viewport = prepared.viewport;
     surface.current_content_type = prepared.content_type;
+    surface.current_alpha_multiplier = prepared.alpha_multiplier;
     surface.current_source = prepared.source;
     surface.current_scale = prepared.scale;
     surface.current_transform = prepared.transform;
@@ -3106,6 +3154,10 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     }
     if (surface.content_type_handler) |handler| {
         surface.content_type_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
+    if (surface.alpha_modifier_handler) |handler| {
+        surface.alpha_modifier_handler = null;
         handler.surface_destroyed(handler.context);
     }
     if (surface.xdg_association) |association| {
@@ -8666,6 +8718,66 @@ test "content type attachment is unique double buffered and safe across destruct
     try send(client, 4, 0, &core.wl_surface.request_messages[0], &.{});
     try std.testing.expect(second.destroyed);
     try std.testing.expect(compositor.currentContentType(id) == null);
+}
+
+test "alpha modifier is unique double buffered and resets pending state on destroy" {
+    const Recorder = struct {
+        destroyed: bool = false,
+
+        fn handler(self: *@This()) AlphaModifierHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn surfaceDestroyed(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.destroyed = true;
+        }
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try bindShm(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    const id = compositor.surfaceId(client, 5).?;
+    const pixels = [_]u32{0xff12_3456};
+    const fd = try memfdWithPixels(&pixels);
+    defer _ = std.c.close(fd);
+    try createShmPool(client, 4, 6, fd, @sizeOf(@TypeOf(pixels)));
+    try createShmBuffer(client, 6, 7, 0, .{ .width = 1, .height = 1 }, @sizeOf(u32), .argb8888);
+    try attachBuffer(client, 5, 7);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(std.math.maxInt(u32), registry.renderState(id).?.alpha_multiplier);
+    var first: Recorder = .{};
+    var second: Recorder = .{};
+    try std.testing.expect(compositor.attachAlphaModifier(client, 5, first.handler()) == .attached);
+    try std.testing.expectEqual(AlphaModifierAttachResult.already_constructed, compositor.attachAlphaModifier(client, 5, second.handler()));
+    try std.testing.expect(compositor.setPendingAlphaMultiplier(id, &first, 0x8000_0000));
+    try std.testing.expectEqual(std.math.maxInt(u32), compositor.currentAlphaMultiplier(id).?);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(u32, 0x8000_0000), compositor.currentAlphaMultiplier(id).?);
+    try std.testing.expectEqual(@as(u32, 0x8000_0000), registry.renderState(id).?.alpha_multiplier);
+
+    compositor.detachAlphaModifier(id, &first);
+    try std.testing.expectEqual(@as(u32, 0x8000_0000), compositor.currentAlphaMultiplier(id).?);
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(std.math.maxInt(u32), compositor.currentAlphaMultiplier(id).?);
+    try std.testing.expect(compositor.attachAlphaModifier(client, 5, second.handler()) == .attached);
+    try send(client, 5, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expect(second.destroyed);
+    try std.testing.expect(compositor.currentAlphaMultiplier(id) == null);
 }
 
 test "layer root reservation is permanent after release and abort is reversible" {
