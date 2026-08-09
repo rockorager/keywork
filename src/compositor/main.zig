@@ -53,6 +53,7 @@ const WayringXdgOutput = @import("wayland/WayringXdgOutput.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
+const WayringGtkShell = @import("wayland/WayringGtkShell.zig");
 const WayringXdgForeign = @import("wayland/WayringXdgForeign.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const WayringSinglePixelBuffer = @import("wayland/WayringSinglePixelBuffer.zig");
@@ -129,7 +130,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 49/37 profile is not default eligible
+    \\                            its limited 50/38 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -297,6 +298,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_xdg_shell: WayringXdgShell = undefined;
     var wayring_xdg_shell_initialized = false;
     var wayring_xdg_shell_published = false;
+    var wayring_gtk_shell: WayringGtkShell = undefined;
+    var wayring_gtk_shell_initialized = false;
+    var wayring_gtk_shell_published = false;
     var wayring_xdg_foreign: WayringXdgForeign = undefined;
     var wayring_xdg_foreign_initialized = false;
     var wayring_xdg_foreign_published = false;
@@ -425,6 +429,7 @@ pub fn main(init: std.process.Init) !void {
         presentation: ?*WayringPresentation,
         xdg_output: ?*WayringXdgOutput,
         xdg_shell: *WayringXdgShell,
+        gtk_shell: ?*WayringGtkShell,
         xdg_foreign: ?*WayringXdgForeign,
         viewporter: *WayringViewporter,
         fractional_scale: ?*WayringFractionalScale,
@@ -523,6 +528,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.single_pixel_buffer) |single_pixel_buffer|
                 single_pixel_buffer.destroyClientResources(client);
             self.viewporter.destroyClientResources(client);
+            if (self.gtk_shell) |gtk_shell| gtk_shell.destroyClientResources(client);
             self.xdg_shell.destroyClientResources(client);
             if (self.xdg_output) |adapter| adapter.destroyClientResources(client);
             if (self.outputs) |outputs| outputs.destroyClientResources(client);
@@ -700,6 +706,10 @@ pub fn main(init: std.process.Init) !void {
             wayring_viewporter.deinit();
         }
         if (wayring_xdg_shell_initialized) {
+            if (wayring_gtk_shell_initialized) {
+                if (wayring_gtk_shell_published) wayring_gtk_shell.unpublish();
+                wayring_gtk_shell.deinit();
+            }
             if (wayring_xdg_shell_published) wayring_xdg_shell.unpublish();
             wayring_xdg_shell.deinit();
         }
@@ -908,6 +918,8 @@ pub fn main(init: std.process.Init) !void {
         );
         wayring_xdg_shell.setSeatAdapter(&wayring_seat_adapter);
         wayring_xdg_shell_initialized = true;
+        wayring_gtk_shell.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor, &wayring_xdg_shell, &wayring_seat_adapter);
+        wayring_gtk_shell_initialized = true;
         try wayring_foreign_toplevel.init(
             init.gpa,
             &wayring_protocol_server.?,
@@ -1011,6 +1023,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_presentation_published = true;
             try wayring_xdg_shell.publish();
             wayring_xdg_shell_published = true;
+            try wayring_gtk_shell.publish();
+            wayring_gtk_shell_published = true;
             try wayring_xdg_foreign.publish();
             wayring_xdg_foreign_published = true;
             try wayring_viewporter.publish();
@@ -1096,6 +1110,7 @@ pub fn main(init: std.process.Init) !void {
             .presentation = if (wayring_presentation_initialized) &wayring_presentation else null,
             .xdg_output = if (wayring_xdg_output_initialized) &wayring_xdg_output else null,
             .xdg_shell = &wayring_xdg_shell,
+            .gtk_shell = if (wayring_gtk_shell_initialized) &wayring_gtk_shell else null,
             .xdg_foreign = if (wayring_xdg_foreign_initialized) &wayring_xdg_foreign else null,
             .viewporter = &wayring_viewporter,
             .fractional_scale = if (wayring_fractional_scale_initialized) &wayring_fractional_scale else null,

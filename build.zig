@@ -126,6 +126,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/xdg-system-bell/xdg-system-bell-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/xdg-toplevel-tag/xdg-toplevel-tag-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml"));
+    generate_xdg_protocol.addFileArg(b.path("protocols/wayland/gtk-shell.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/viewporter/viewporter.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/presentation-time/presentation-time.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/fractional-scale/fractional-scale-v1.xml"));

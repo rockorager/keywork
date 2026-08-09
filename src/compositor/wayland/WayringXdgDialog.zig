@@ -6,6 +6,7 @@ const std = @import("std");
 const protocol = @import("wayring-protocol");
 const wayring = @import("wayring");
 const XdgShell = @import("../XdgShell.zig");
+const WayringCompositor = @import("WayringCompositor.zig");
 const WayringXdgShell = @import("WayringXdgShell.zig");
 
 const server = wayring.server;
@@ -153,7 +154,7 @@ fn createDialog(self: *WayringXdgDialog, manager: *Manager, id: u32, toplevel_id
         return;
     }
     self.dialogs.appendAssumeCapacity(dialog);
-    self.core_shell.setDialogState(identity.core_id, true, false);
+    self.xdg_shell.setXdgDialogState(identity, true, false);
 }
 
 fn handleDialogRequest(
@@ -170,13 +171,13 @@ fn handleDialogRequest(
 
 fn setModal(dialog: *Dialog, modal: bool) void {
     if (!dialog.owner.xdg_shell.identityIsCurrent(dialog.identity)) return;
-    dialog.owner.core_shell.setDialogState(dialog.identity.core_id, true, modal);
+    dialog.owner.xdg_shell.setXdgDialogState(dialog.identity, true, modal);
 }
 
 fn destroyDialog(self: *WayringXdgDialog, dialog: *Dialog) void {
     remove(Dialog, &self.dialogs, dialog);
     if (self.xdg_shell.identityIsCurrent(dialog.identity)) {
-        self.core_shell.setDialogState(dialog.identity.core_id, false, false);
+        self.xdg_shell.setXdgDialogState(dialog.identity, false, false);
     }
     dialog.resource.destroy();
     dialog.resource.deinit();
@@ -202,6 +203,29 @@ fn remove(comptime T: type, list: *std.ArrayList(*T), value: *T) void {
     unreachable;
 }
 
+const TestGtkModal = struct {
+    modal: bool = false,
+
+    fn eventCount(_: *anyopaque, _: *server.Client, _: WayringCompositor.SurfaceId) usize {
+        return 0;
+    }
+
+    fn fillEvents(
+        _: *anyopaque,
+        _: *server.Client,
+        _: WayringCompositor.SurfaceId,
+        _: XdgShell.TiledEdges,
+        _: []server.Client.PreparedEvent,
+    ) usize {
+        return 0;
+    }
+
+    fn isModal(context: *anyopaque, _: *server.Client, _: WayringCompositor.SurfaceId) bool {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        return self.modal;
+    }
+};
+
 test "generated XDG dialog applies and removes canonical modal state" {
     var harness: WayringXdgShell.TestHarness = undefined;
     try harness.init();
@@ -214,6 +238,14 @@ test "generated XDG dialog applies and removes canonical modal state" {
         adapter.unpublish();
         adapter.deinit();
     }
+    var gtk: TestGtkModal = .{};
+    harness.adapter.setGtkEndpoint(.{
+        .context = &gtk,
+        .event_count = TestGtkModal.eventCount,
+        .fill_events = TestGtkModal.fillEvents,
+        .modal = TestGtkModal.isModal,
+    });
+    defer harness.adapter.clearGtkEndpoint();
     try harness.createSurface();
     try harness.installManager(2);
     try harness.createToplevel();
@@ -229,7 +261,13 @@ test "generated XDG dialog applies and removes canonical modal state" {
     try harness.send(9, 1, &protocol.xdg_dialog_v1.request_messages[1], &.{});
     info = harness.core_shell.windowInfo(window_id).?;
     try std.testing.expect(info.dialog and info.modal);
+    gtk.modal = true;
+    harness.adapter.setGtkModal(harness.client(), harness.adapter.surfaceIdentity(harness.client(), 4).?, true);
     try harness.send(9, 2, &protocol.xdg_dialog_v1.request_messages[2], &.{});
+    info = harness.core_shell.windowInfo(window_id).?;
+    try std.testing.expect(info.dialog and info.modal);
+    gtk.modal = false;
+    harness.adapter.setGtkModal(harness.client(), harness.adapter.surfaceIdentity(harness.client(), 4).?, false);
     info = harness.core_shell.windowInfo(window_id).?;
     try std.testing.expect(info.dialog and !info.modal);
     try harness.send(9, 0, &protocol.xdg_dialog_v1.request_messages[0], &.{});

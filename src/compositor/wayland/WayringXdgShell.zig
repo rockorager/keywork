@@ -37,6 +37,7 @@ outputs: ?*WayringOutput,
 seat: ?*WayringSeatAdapter = null,
 decoration_endpoint: ?DecorationEndpoint = null,
 foreign_endpoint: ?ForeignEndpoint = null,
+gtk_endpoint: ?GtkEndpoint = null,
 managers: std.ArrayList(*Manager) = .empty,
 positioners: std.ArrayList(*Positioner) = .empty,
 surfaces: std.ArrayList(*Surface) = .empty,
@@ -106,6 +107,8 @@ const Toplevel = struct {
     /// The generated role gains input capability only once. A later policy
     /// disable is therefore persistent across unmap/remap.
     interaction_activated: bool = false,
+    xdg_dialog: bool = false,
+    xdg_dialog_modal: bool = false,
 };
 
 pub const ToplevelIdentity = struct {
@@ -127,6 +130,13 @@ pub const DecorationEndpoint = struct {
 pub const ForeignEndpoint = struct {
     context: *anyopaque,
     destroyed: *const fn (*anyopaque, ToplevelIdentity) void,
+};
+
+pub const GtkEndpoint = struct {
+    context: *anyopaque,
+    event_count: *const fn (*anyopaque, *server.Client, WayringCompositor.SurfaceId) usize,
+    fill_events: *const fn (*anyopaque, *server.Client, WayringCompositor.SurfaceId, XdgShell.TiledEdges, []server.Client.PreparedEvent) usize,
+    modal: *const fn (*anyopaque, *server.Client, WayringCompositor.SurfaceId) bool,
 };
 
 const Popup = struct {
@@ -183,6 +193,42 @@ pub fn setForeignEndpoint(self: *WayringXdgShell, endpoint: ForeignEndpoint) voi
 
 pub fn clearForeignEndpoint(self: *WayringXdgShell) void {
     self.foreign_endpoint = null;
+}
+
+pub fn setGtkEndpoint(self: *WayringXdgShell, endpoint: GtkEndpoint) void {
+    std.debug.assert(self.gtk_endpoint == null);
+    self.gtk_endpoint = endpoint;
+}
+
+pub fn clearGtkEndpoint(self: *WayringXdgShell) void {
+    self.gtk_endpoint = null;
+}
+
+pub fn setGtkModal(self: *WayringXdgShell, client: *server.Client, surface_id: WayringCompositor.SurfaceId, modal: bool) void {
+    for (self.toplevels.items) |value| if (value.surface.client == client and std.meta.eql(value.surface.surface_id, surface_id)) {
+        applyDialogState(value, modal);
+        return;
+    };
+}
+
+pub fn setXdgDialogState(self: *WayringXdgShell, identity: ToplevelIdentity, dialog: bool, modal: bool) void {
+    for (self.toplevels.items) |value| if (value.generation == identity.generation and
+        std.meta.eql(value.core_id, identity.core_id))
+    {
+        value.xdg_dialog = dialog;
+        value.xdg_dialog_modal = modal;
+        const gtk_modal = if (self.gtk_endpoint) |endpoint|
+            endpoint.modal(endpoint.context, value.surface.client, value.surface.surface_id)
+        else
+            false;
+        applyDialogState(value, gtk_modal);
+        return;
+    };
+}
+
+fn applyDialogState(toplevel: *Toplevel, gtk_modal: bool) void {
+    const modal = toplevel.xdg_dialog_modal or gtk_modal;
+    toplevel.adapter.core_shell.setDialogState(toplevel.core_id, toplevel.xdg_dialog or modal, modal);
 }
 
 pub fn toplevelIdentity(self: *WayringXdgShell, client: *server.Client, object_id: u32) ?ToplevelIdentity {
@@ -744,6 +790,10 @@ fn createToplevel(
 
     surface.active_role = .{ .toplevel = toplevel };
     self.toplevels.appendAssumeCapacity(toplevel);
+    if (self.gtk_endpoint) |endpoint| {
+        const modal = endpoint.modal(endpoint.context, surface.client, surface.surface_id);
+        applyDialogState(toplevel, modal);
+    }
     core_owned = false;
     resource_owned = false;
 }
@@ -1124,7 +1174,17 @@ fn prepareCommit(
         surface.client.postOutOfMemory(&surface.resource.runtime, "reserving XDG configure snapshot");
         return .reject;
     };
-    surface.prepared_events = surface.client.prepareEvents(prepared_configure_bytes) catch |err| {
+    const extra_bytes = gtkConfigureBytes(surface) catch {
+        surface.prepared_commit = null;
+        surface.client.postOutOfMemory(&surface.resource.runtime, "reserving GTK configure events");
+        return .reject;
+    };
+    const total_bytes = std.math.add(usize, prepared_configure_bytes, extra_bytes) catch {
+        surface.prepared_commit = null;
+        surface.client.postOutOfMemory(&surface.resource.runtime, "reserving XDG configure events");
+        return .reject;
+    };
+    surface.prepared_events = surface.client.prepareEvents(total_bytes) catch |err| {
         surface.prepared_commit = null;
         eventFailure(surface.client, &surface.resource.runtime, err, "reserving XDG configure events");
         return .reject;
@@ -1336,7 +1396,24 @@ fn configureToplevel(
         .toplevel => |value| value,
         .popup => return error.OutOfMemory,
     };
-    try prepareEndpointConfigure(surface);
+    const gtk_count = if (surface.adapter.gtk_endpoint) |endpoint|
+        endpoint.event_count(endpoint.context, surface.client, surface.surface_id)
+    else
+        0;
+    const descriptor_count = std.math.add(usize, 4, gtk_count) catch {
+        surface.client.postOutOfMemory(&surface.resource.runtime, "reserving XDG configure descriptors");
+        return error.OutOfMemory;
+    };
+    var events = surface.adapter.allocator.alloc(server.Client.PreparedEvent, descriptor_count) catch {
+        surface.client.postOutOfMemory(&surface.resource.runtime, "reserving XDG configure descriptors");
+        return error.OutOfMemory;
+    };
+    defer surface.adapter.allocator.free(events);
+    const gtk_bytes = std.math.mul(usize, gtk_count, 128) catch {
+        surface.client.postOutOfMemory(&surface.resource.runtime, "reserving GTK configure events");
+        return error.OutOfMemory;
+    };
+    try prepareEndpointConfigure(surface, gtk_bytes);
     const serial = surface.adapter.protocol_server.nextSerial() catch {
         failPreparedConfigure(surface, "generated XDG wire serial exhausted");
         return error.OutOfMemory;
@@ -1361,7 +1438,6 @@ fn configureToplevel(
     const capabilities = [_]wire.Value{.{
         .array = std.mem.sliceAsBytes(&capability_values),
     }};
-    var events: [4]server.Client.PreparedEvent = undefined;
     var event_count: usize = 0;
     if (toplevel.resource.version() >= 5 and !surface.sent_capabilities) {
         events[event_count] = .{
@@ -1385,6 +1461,9 @@ fn configureToplevel(
             event_count += 1;
             decoration_configured = true;
         }
+    }
+    if (surface.adapter.gtk_endpoint) |endpoint| {
+        event_count += endpoint.fill_events(endpoint.context, surface.client, surface.surface_id, configuration.tiled, events[event_count..]);
     }
     events[event_count] = .{
         .resource = &toplevel.resource.runtime,
@@ -1421,7 +1500,7 @@ fn configurePopup(
         .popup => |value| value,
         .toplevel => return error.OutOfMemory,
     };
-    try prepareEndpointConfigure(surface);
+    try prepareEndpointConfigure(surface, 0);
     const serial = surface.adapter.protocol_server.nextSerial() catch {
         failPreparedConfigure(surface, "generated XDG wire serial exhausted");
         return error.OutOfMemory;
@@ -1467,7 +1546,7 @@ fn configurePopup(
     popup.reposition = null;
 }
 
-fn prepareEndpointConfigure(surface: *Surface) error{OutOfMemory}!void {
+fn prepareEndpointConfigure(surface: *Surface, extra_bytes: usize) error{OutOfMemory}!void {
     if (surface.prepared_events != null) {
         std.debug.assert(surface.configures.capacity - surface.configures.items.len >= 1);
         return;
@@ -1476,10 +1555,20 @@ fn prepareEndpointConfigure(surface: *Surface) error{OutOfMemory}!void {
         surface.client.postOutOfMemory(&surface.resource.runtime, "reserving XDG configure snapshot");
         return error.OutOfMemory;
     };
-    surface.prepared_events = surface.client.prepareEvents(prepared_configure_bytes) catch |err| {
+    const total_bytes = std.math.add(usize, prepared_configure_bytes, extra_bytes) catch {
+        surface.client.postOutOfMemory(&surface.resource.runtime, "reserving XDG configure events");
+        return error.OutOfMemory;
+    };
+    surface.prepared_events = surface.client.prepareEvents(total_bytes) catch |err| {
         eventFailure(surface.client, &surface.resource.runtime, err, "reserving XDG configure events");
         return error.OutOfMemory;
     };
+}
+
+fn gtkConfigureBytes(surface: *Surface) error{OutOfMemory}!usize {
+    const endpoint = surface.adapter.gtk_endpoint orelse return 0;
+    const count = endpoint.event_count(endpoint.context, surface.client, surface.surface_id);
+    return std.math.mul(usize, count, 128) catch error.OutOfMemory;
 }
 
 fn emitConfigure(

@@ -117,6 +117,7 @@ const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
 const WayringOutput = @import("wayland/WayringOutput.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
+const WayringGtkShell = @import("wayland/WayringGtkShell.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const IdleAlarmHost = @import("wayland/WayringHost.zig");
@@ -26615,6 +26616,13 @@ test "production generated data device completes the exact profile and supports 
     xdg.setSeatAdapter(&seat);
     try xdg.publish();
     defer xdg.unpublish();
+    var gtk: WayringGtkShell = undefined;
+    gtk.init(std.testing.allocator, &protocol_server, &compositor, &xdg, &seat);
+    defer {
+        if (gtk.global != null) gtk.unpublish();
+        gtk.deinit();
+    }
+    try gtk.publish();
     var viewporter: WayringViewporter = undefined;
     viewporter.init(std.testing.allocator, &protocol_server, &compositor);
     defer viewporter.deinit();
@@ -26933,6 +26941,7 @@ test "production generated data device completes the exact profile and supports 
         outputs: *WayringOutput,
         seat: *WayringSeatAdapter,
         xdg: *WayringXdgShell,
+        gtk: *WayringGtkShell,
         viewporter: *WayringViewporter,
         fractional_scale: *WayringFractionalScale,
         color_representation: *WayringColorRepresentation,
@@ -27027,6 +27036,7 @@ test "production generated data device completes the exact profile and supports 
             self.cursor_shape.destroyClientResources(client);
             self.fractional_scale.destroyClientResources(client);
             self.viewporter.destroyClientResources(client);
+            self.gtk.destroyClientResources(client);
             self.xdg.destroyClientResources(client);
             self.seat.destroyClientResources(client);
             self.outputs.destroyClientResources(client);
@@ -27044,6 +27054,7 @@ test "production generated data device completes the exact profile and supports 
         .outputs = &outputs,
         .seat = &seat,
         .xdg = &xdg,
+        .gtk = &gtk,
         .viewporter = &viewporter,
         .fractional_scale = &fractional_scale,
         .color_representation = &color_representation,
