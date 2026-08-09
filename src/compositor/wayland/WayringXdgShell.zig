@@ -182,6 +182,18 @@ pub fn identityIsCurrent(self: *WayringXdgShell, identity: ToplevelIdentity) boo
     return current.generation == identity.generation and std.meta.eql(current.core_id, identity.core_id);
 }
 
+pub fn setToplevelTag(
+    self: *WayringXdgShell,
+    client: *server.Client,
+    object_id: u32,
+    field: XdgShell.ToplevelTagField,
+    value: []const u8,
+) error{ InvalidToplevel, InvalidUtf8, OutOfMemory }!void {
+    const identity = self.toplevelIdentity(client, object_id) orelse return error.InvalidToplevel;
+    if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+    try self.core_shell.setToplevelTag(identity.core_id, field, value);
+}
+
 /// Resolves an exact live same-client generated wl_surface to its canonical,
 /// generation-checked compositor identity.
 pub fn surfaceIdentity(self: *WayringXdgShell, client: *server.Client, surface_object_id: u32) ?SurfaceRegistry.Id {
@@ -2135,6 +2147,24 @@ test "stable global publishes in order at scanner version and supports multiple 
     try std.testing.expectEqual(@as(usize, 2), harness.adapter.managers.items.len);
     try std.testing.expectEqual(core.xdg_wm_base.interface.version, harness.adapter.managers.items[0].resource.version());
     try std.testing.expectEqual(core.xdg_wm_base.interface.version, harness.adapter.managers.items[1].resource.version());
+}
+
+test "generated toplevel tag metadata resolves exact live resources" {
+    var harness: TestHarness = undefined;
+    try harness.init();
+    defer harness.deinit();
+    try harness.createSurface();
+    try harness.installManager(7);
+    try harness.createToplevel();
+
+    const window_id = harness.adapter.toplevels.items[0].core_id;
+    try harness.adapter.setToplevelTag(harness.client(), 7, .tag, "stable-id");
+    try harness.adapter.setToplevelTag(harness.client(), 7, .description, "Readable description");
+    const info = harness.core_shell.windowInfo(window_id).?;
+    try std.testing.expectEqualStrings("stable-id", info.tag.?);
+    try std.testing.expectEqualStrings("Readable description", info.description.?);
+    try std.testing.expectError(error.InvalidToplevel, harness.adapter.setToplevelTag(harness.client(), 99, .tag, "invalid"));
+    try std.testing.expectError(error.InvalidUtf8, harness.adapter.setToplevelTag(harness.client(), 7, .tag, "\xff"));
 }
 
 test "stable global publication allocation failure leaves no half-installed global" {

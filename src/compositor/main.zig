@@ -33,6 +33,7 @@ const WayringOutputManagement = @import("wayland/WayringOutputManagement.zig");
 const WayringScreencopy = @import("wayland/WayringScreencopy.zig");
 const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
+const WayringXdgToplevelTag = @import("wayland/WayringXdgToplevelTag.zig");
 const WayringXdgActivation = @import("wayland/WayringXdgActivation.zig");
 const WayringFractionalScale = @import("wayland/WayringFractionalScale.zig");
 const WayringHost = @import("wayland/WayringHost.zig");
@@ -113,7 +114,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 34/25 profile is not default eligible
+    \\                            its limited 35/26 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -314,6 +315,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_system_bell: WayringSystemBell = undefined;
     var wayring_system_bell_initialized = false;
     var wayring_system_bell_published = false;
+    var wayring_xdg_toplevel_tag: WayringXdgToplevelTag = undefined;
+    var wayring_xdg_toplevel_tag_initialized = false;
+    var wayring_xdg_toplevel_tag_published = false;
     var wayring_seat_adapter: WayringSeatAdapter = undefined;
     var wayring_seat_adapter_initialized = false;
     var wayring_seat_published = false;
@@ -380,6 +384,7 @@ pub fn main(init: std.process.Init) !void {
         xdg_decoration: ?*WayringXdgDecoration,
         xdg_activation: ?*WayringXdgActivation,
         system_bell: ?*WayringSystemBell,
+        xdg_toplevel_tag: ?*WayringXdgToplevelTag,
         compositor: *WayringCompositor,
         seat: *WayringSeatAdapter,
         data_device: ?*WayringDataDevice,
@@ -427,6 +432,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.text_input) |text_input| text_input.destroyClientResources(client);
             if (self.primary_selection) |primary| primary.destroyClientResources(client);
             if (self.data_device) |data_device| data_device.destroyClientResources(client);
+            if (self.xdg_toplevel_tag) |tag| tag.destroyClientResources(client);
             if (self.system_bell) |system_bell| system_bell.destroyClientResources(client);
             if (self.xdg_activation) |activation| activation.destroyClientResources(client);
             if (self.xdg_decoration) |decoration| decoration.destroyClientResources(client);
@@ -529,6 +535,10 @@ pub fn main(init: std.process.Init) !void {
             server.setDataDeviceObserver(null);
             if (wayring_data_device_published) wayring_data_device.unpublish();
             wayring_data_device.deinit();
+        }
+        if (wayring_xdg_toplevel_tag_initialized) {
+            if (wayring_xdg_toplevel_tag_published) wayring_xdg_toplevel_tag.unpublish();
+            wayring_xdg_toplevel_tag.deinit();
         }
         if (wayring_system_bell_initialized) {
             if (wayring_system_bell_published) wayring_system_bell.unpublish();
@@ -784,6 +794,8 @@ pub fn main(init: std.process.Init) !void {
         wayring_xdg_activation_initialized = true;
         wayring_system_bell.init(init.gpa, &wayring_protocol_server.?);
         wayring_system_bell_initialized = true;
+        wayring_xdg_toplevel_tag.init(init.gpa, &wayring_protocol_server.?, &wayring_xdg_shell);
+        wayring_xdg_toplevel_tag_initialized = true;
         wayring_viewporter.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
         wayring_viewporter_initialized = true;
         wayring_single_pixel_buffer.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
@@ -841,6 +853,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_xdg_activation_published = true;
             try wayring_system_bell.publish();
             wayring_system_bell_published = true;
+            try wayring_xdg_toplevel_tag.publish();
+            wayring_xdg_toplevel_tag_published = true;
             // Publish stateful transfer globals only after the headless shell
             // and activation are ready. Privileged data control follows
             // primary selection and remains registry-filtered by credentials.
@@ -895,6 +909,7 @@ pub fn main(init: std.process.Init) !void {
             .xdg_decoration = if (wayring_xdg_decoration_initialized) &wayring_xdg_decoration else null,
             .xdg_activation = if (wayring_xdg_activation_initialized) &wayring_xdg_activation else null,
             .system_bell = if (wayring_system_bell_initialized) &wayring_system_bell else null,
+            .xdg_toplevel_tag = if (wayring_xdg_toplevel_tag_initialized) &wayring_xdg_toplevel_tag else null,
             .compositor = &wayring_compositor,
             .seat = &wayring_seat_adapter,
             .data_device = if (wayring_data_device_initialized) &wayring_data_device else null,
@@ -1525,6 +1540,7 @@ test {
     _ = @import("wayland/WayringInputMethod.zig");
     _ = @import("wayland/WayringXdgDecoration.zig");
     _ = @import("wayland/WayringXdgActivation.zig");
+    _ = @import("wayland/WayringXdgToplevelTag.zig");
     _ = @import("wayland/tablet.zig");
     _ = @import("wayland/pointer_gestures.zig");
     _ = @import("wayland/relative_pointer.zig");
