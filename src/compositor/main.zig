@@ -57,6 +57,7 @@ const WayringXdgOutput = @import("wayland/WayringXdgOutput.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const OutputLayout = @import("wayland/output_layout.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
+const WayringXdgSessionManagement = @import("wayland/WayringXdgSessionManagement.zig");
 const WayringGtkShell = @import("wayland/WayringGtkShell.zig");
 const WayringXdgForeign = @import("wayland/WayringXdgForeign.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
@@ -324,6 +325,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_xdg_shell: WayringXdgShell = undefined;
     var wayring_xdg_shell_initialized = false;
     var wayring_xdg_shell_published = false;
+    var wayring_xdg_session_management: WayringXdgSessionManagement = undefined;
+    var wayring_xdg_session_management_initialized = false;
+    var wayring_xdg_session_management_published = false;
     var wayring_gtk_shell: WayringGtkShell = undefined;
     var wayring_gtk_shell_initialized = false;
     var wayring_gtk_shell_published = false;
@@ -474,6 +478,7 @@ pub fn main(init: std.process.Init) !void {
         presentation: ?*WayringPresentation,
         xdg_output: ?*WayringXdgOutput,
         xdg_shell: *WayringXdgShell,
+        xdg_session_management: ?*WayringXdgSessionManagement,
         gtk_shell: ?*WayringGtkShell,
         xdg_foreign: ?*WayringXdgForeign,
         viewporter: *WayringViewporter,
@@ -586,6 +591,7 @@ pub fn main(init: std.process.Init) !void {
                 single_pixel_buffer.destroyClientResources(client);
             self.viewporter.destroyClientResources(client);
             if (self.gtk_shell) |gtk_shell| gtk_shell.destroyClientResources(client);
+            if (self.xdg_session_management) |sessions| sessions.destroyClientResources(client);
             self.xdg_shell.destroyClientResources(client);
             if (self.xdg_output) |adapter| adapter.destroyClientResources(client);
             if (self.outputs) |outputs| outputs.destroyClientResources(client);
@@ -784,6 +790,10 @@ pub fn main(init: std.process.Init) !void {
             wayring_viewporter.deinit();
         }
         if (wayring_xdg_shell_initialized) {
+            if (wayring_xdg_session_management_initialized) {
+                if (wayring_xdg_session_management_published) wayring_xdg_session_management.unpublish();
+                wayring_xdg_session_management.deinit();
+            }
             if (wayring_gtk_shell_initialized) {
                 if (wayring_gtk_shell_published) wayring_gtk_shell.unpublish();
                 wayring_gtk_shell.deinit();
@@ -1010,6 +1020,8 @@ pub fn main(init: std.process.Init) !void {
         );
         wayring_xdg_shell.setSeatAdapter(&wayring_seat_adapter);
         wayring_xdg_shell_initialized = true;
+        wayring_xdg_session_management.init(init.gpa, &wayring_protocol_server.?, &wayring_clients, server.xdgSessionAuthority(), &wayring_xdg_shell);
+        wayring_xdg_session_management_initialized = true;
         try wayring_xdg_toplevel_drag.init(init.gpa, &wayring_protocol_server.?, &wayring_data_device, &wayring_xdg_shell, server.neutralXdgShell(), .{
             .context = server,
             .pointer_position = generatedToplevelDragPointerPosition,
@@ -1145,6 +1157,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_presentation_published = true;
             try wayring_xdg_shell.publish();
             wayring_xdg_shell_published = true;
+            try wayring_xdg_session_management.publish();
+            wayring_xdg_session_management_published = true;
             try wayring_gtk_shell.publish();
             wayring_gtk_shell_published = true;
             try wayring_xdg_foreign.publish();
@@ -1242,6 +1256,7 @@ pub fn main(init: std.process.Init) !void {
             .presentation = if (wayring_presentation_initialized) &wayring_presentation else null,
             .xdg_output = if (wayring_xdg_output_initialized) &wayring_xdg_output else null,
             .xdg_shell = &wayring_xdg_shell,
+            .xdg_session_management = if (wayring_xdg_session_management_initialized) &wayring_xdg_session_management else null,
             .gtk_shell = if (wayring_gtk_shell_initialized) &wayring_gtk_shell else null,
             .xdg_foreign = if (wayring_xdg_foreign_initialized) &wayring_xdg_foreign else null,
             .viewporter = &wayring_viewporter,
@@ -1868,6 +1883,7 @@ test {
     _ = @import("wayland/WayringCompositor.zig");
     _ = @import("PointerConstraints.zig");
     _ = @import("wayland/WayringXdgShell.zig");
+    _ = @import("wayland/WayringXdgSessionManagement.zig");
     _ = @import("wayland/WayringViewporter.zig");
     _ = @import("wayland/WayringClients.zig");
     _ = @import("wayland/WayringHost.zig");

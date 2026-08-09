@@ -35,6 +35,7 @@ pub const entries = [_]Entry{
     .{ .interface = "zxdg_output_manager_v1", .version = 3, .gate = .presenting_headless },
     .{ .interface = "wp_presentation", .version = 2, .gate = .presenting_headless },
     .{ .interface = "xdg_wm_base", .version = 7, .gate = .presenting_headless },
+    .{ .interface = "xdg_session_manager_v1", .version = 1, .gate = .presenting_headless },
     .{ .interface = "gtk_shell1", .version = 5, .gate = .presenting_headless },
     .{ .interface = "zxdg_exporter_v2", .version = 1, .gate = .presenting_headless },
     .{ .interface = "zxdg_importer_v2", .version = 1, .gate = .presenting_headless },
@@ -178,12 +179,12 @@ fn enabled(entry: Entry, gate: Gate) bool {
 test "manifest pins exact direct and security-context profiles" {
     try std.testing.expectEqual(@as(usize, 7), expectedCount(.sidecar, .direct));
     try std.testing.expectEqual(@as(usize, 7), expectedCount(.sidecar, .security_context));
-    try std.testing.expectEqual(@as(usize, 57), expectedCount(.presenting_headless, .direct));
-    try std.testing.expectEqual(@as(usize, 42), expectedCount(.presenting_headless, .security_context));
-    try std.testing.expectEqual(@as(usize, 42), expectedCount(.presenting_headless, .unknown));
-    try std.testing.expectEqualStrings("wp_security_context_manager_v1", expectedAt(.presenting_headless, .direct, 52).?.interface);
-    try std.testing.expectEqualStrings("zwp_linux_dmabuf_v1", expectedAt(.presenting_headless, .security_context, 41).?.interface);
-    try std.testing.expect(expectedAt(.presenting_headless, .security_context, 42) == null);
+    try std.testing.expectEqual(@as(usize, 58), expectedCount(.presenting_headless, .direct));
+    try std.testing.expectEqual(@as(usize, 43), expectedCount(.presenting_headless, .security_context));
+    try std.testing.expectEqual(@as(usize, 43), expectedCount(.presenting_headless, .unknown));
+    try std.testing.expectEqualStrings("wp_security_context_manager_v1", expectedAt(.presenting_headless, .direct, 53).?.interface);
+    try std.testing.expectEqualStrings("zwp_linux_dmabuf_v1", expectedAt(.presenting_headless, .security_context, 42).?.interface);
+    try std.testing.expect(expectedAt(.presenting_headless, .security_context, 43) == null);
 }
 
 test "security visibility requires trusted direct UID and keeps public open" {

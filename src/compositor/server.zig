@@ -54,6 +54,7 @@ const XdgDialog = @import("wayland/xdg_dialog.zig");
 const XdgSystemBell = @import("wayland/xdg_system_bell.zig");
 const XdgToplevelTag = @import("wayland/xdg_toplevel_tag.zig");
 const XdgSessionManagement = @import("wayland/xdg_session_management.zig");
+const XdgSessionAuthority = @import("XdgSessionAuthority.zig");
 const TransientSeat = @import("wayland/transient_seat.zig");
 const PrimarySelection = @import("wayland/primary_selection.zig");
 const DataControl = @import("wayland/data_control.zig");
@@ -430,6 +431,7 @@ xdg_toplevel_icon: XdgToplevelIcon,
 xdg_dialog: XdgDialog,
 xdg_system_bell: XdgSystemBell,
 xdg_toplevel_tag: XdgToplevelTag,
+xdg_session_authority: XdgSessionAuthority,
 xdg_session_management: XdgSessionManagement,
 primary_selection: PrimarySelection,
 data_control: DataControl,
@@ -1271,6 +1273,7 @@ pub fn createWithVirtualOutput(
         .xdg_dialog = undefined,
         .xdg_system_bell = undefined,
         .xdg_toplevel_tag = undefined,
+        .xdg_session_authority = undefined,
         .xdg_session_management = undefined,
         .primary_selection = undefined,
         .data_control = undefined,
@@ -1935,13 +1938,14 @@ pub fn createWithVirtualOutput(
     errdefer self.xdg_system_bell.deinit();
     try self.xdg_toplevel_tag.init(display, &self.xdg_shell, &self.xdg_shell_core);
     errdefer self.xdg_toplevel_tag.deinit();
+    try self.xdg_session_authority.init(allocator, io, &self.xdg_shell_core, &self.window_manager);
+    errdefer self.xdg_session_authority.deinit();
     try self.xdg_session_management.init(
         allocator,
-        io,
         display,
+        &self.xdg_session_authority,
         &self.xdg_shell,
-        &self.xdg_shell_core,
-        &self.window_manager,
+        &self.mature_clients,
     );
     errdefer self.xdg_session_management.deinit();
     self.workspace.setActivationListener(.{
@@ -2148,7 +2152,7 @@ pub fn configureXdgSessionStorage(
     runtime_directory: []const u8,
     instance_name: []const u8,
 ) !void {
-    try self.xdg_session_management.configureStorage(runtime_directory, instance_name);
+    try self.xdg_session_authority.configureStorage(runtime_directory, instance_name);
 }
 
 pub fn destroy(self: *Self) void {
@@ -2228,6 +2232,7 @@ pub fn destroy(self: *Self) void {
     self.foreign_toplevel_list_initialized = false;
     self.workspace.clearActivationListener();
     self.xdg_session_management.deinit();
+    self.xdg_session_authority.deinit();
     self.xdg_toplevel_tag.deinit();
     self.xdg_system_bell.deinit();
     self.xdg_dialog.deinit();
@@ -4321,6 +4326,11 @@ pub fn setGeneratedForeignToplevelObserver(self: *Self, observer: ?GeneratedFore
 /// Neutral XDG semantic owner used by unpublished generated adapters.
 pub fn neutralXdgShell(self: *Self) *NeutralXdgShell {
     return &self.xdg_shell_core;
+}
+
+/// Shared XDG session owner for protocol frontends.
+pub fn xdgSessionAuthority(self: *Self) *XdgSessionAuthority {
+    return &self.xdg_session_authority;
 }
 
 /// Shared canonical state consumed by the generated layer-shell frontend.
