@@ -13,6 +13,7 @@ const Client = wayring.server.Client;
 pub const Gate = enum {
     sidecar,
     drm,
+    scanner_output,
     presenting_headless,
 };
 
@@ -33,7 +34,7 @@ pub const entries = [_]Entry{
     .{ .interface = "zwp_pointer_gestures_v1", .version = 3, .gate = .sidecar },
     .{ .interface = "wp_drm_lease_device_v1", .version = 1, .visibility = .restricted, .gate = .drm },
     .{ .interface = "zwp_pointer_constraints_v1", .version = 1, .gate = .presenting_headless },
-    .{ .interface = "wl_output", .version = 4, .gate = .presenting_headless },
+    .{ .interface = "wl_output", .version = 4, .gate = .scanner_output },
     .{ .interface = "zxdg_output_manager_v1", .version = 3, .gate = .presenting_headless },
     .{ .interface = "wp_presentation", .version = 2, .gate = .presenting_headless },
     .{ .interface = "xdg_wm_base", .version = 7, .gate = .presenting_headless },
@@ -176,17 +177,23 @@ pub fn securityVisible(
 }
 
 fn enabled(entry: Entry, gate: Gate) bool {
-    return entry.gate == .sidecar or entry.gate == gate;
+    return entry.gate == .sidecar or entry.gate == gate or
+        (entry.gate == .scanner_output and (gate == .drm or gate == .presenting_headless));
 }
 
 test "manifest pins exact direct and security-context profiles" {
     try std.testing.expectEqual(@as(usize, 7), expectedCount(.sidecar, .direct));
     try std.testing.expectEqual(@as(usize, 7), expectedCount(.sidecar, .security_context));
-    try std.testing.expectEqual(@as(usize, 8), expectedCount(.drm, .direct));
-    try std.testing.expectEqual(@as(usize, 7), expectedCount(.drm, .security_context));
+    try std.testing.expectEqual(@as(usize, 9), expectedCount(.drm, .direct));
+    try std.testing.expectEqual(@as(usize, 8), expectedCount(.drm, .security_context));
+    try std.testing.expectEqualStrings("wp_drm_lease_device_v1", expectedAt(.drm, .direct, 7).?.interface);
+    try std.testing.expectEqualStrings("wl_output", expectedAt(.drm, .direct, 8).?.interface);
+    try std.testing.expectEqualStrings("wl_output", expectedAt(.drm, .security_context, 7).?.interface);
     try std.testing.expectEqual(@as(usize, 58), expectedCount(.presenting_headless, .direct));
     try std.testing.expectEqual(@as(usize, 43), expectedCount(.presenting_headless, .security_context));
     try std.testing.expectEqual(@as(usize, 43), expectedCount(.presenting_headless, .unknown));
+    try std.testing.expectEqualStrings("zwp_pointer_constraints_v1", expectedAt(.presenting_headless, .direct, 7).?.interface);
+    try std.testing.expectEqualStrings("wl_output", expectedAt(.presenting_headless, .direct, 8).?.interface);
     try std.testing.expectEqualStrings("wp_security_context_manager_v1", expectedAt(.presenting_headless, .direct, 53).?.interface);
     try std.testing.expectEqualStrings("zwp_linux_dmabuf_v1", expectedAt(.presenting_headless, .security_context, 42).?.interface);
     try std.testing.expect(expectedAt(.presenting_headless, .security_context, 43) == null);

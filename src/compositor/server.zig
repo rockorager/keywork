@@ -4539,10 +4539,16 @@ fn wayringSurfacePresentationClass(
     self.damageActiveGeneratedCursor();
 }
 
-/// Output globals use the same presentation gate as scanner-backed surfaces.
-/// Non-presenting DRM and nested sidecars retain their three-global registry.
+/// Presentation consumers receive outputs only on the generated headless path.
 pub fn wayringOutputLayout(self: *Self) ?*OutputLayout {
     if (!wayringPresentationEnabled(self.primaryRenderOutput().backend.backendKind())) return null;
+    return &self.outputs;
+}
+
+/// Scanner-backed wl_output publication is available for presenting headless
+/// output and DRM output identity, without granting DRM presentation policy.
+pub fn wayringScannerOutputLayout(self: *Self) ?*OutputLayout {
+    if (!wayringOutputPublicationEnabled(self.primaryRenderOutput().backend.backendKind())) return null;
     return &self.outputs;
 }
 
@@ -4823,6 +4829,10 @@ pub fn clearWayringDefaultOutputListener(self: *Self, context: *anyopaque) void 
 
 fn wayringPresentationEnabled(output_kind: OutputBackend.Kind) bool {
     return output_kind == .headless;
+}
+
+fn wayringOutputPublicationEnabled(output_kind: OutputBackend.Kind) bool {
+    return output_kind == .headless or output_kind == .drm;
 }
 
 pub fn run(self: *Self) void {
@@ -18062,6 +18072,12 @@ test "Wayring presentation policy excludes DRM and nested sidecars" {
     try std.testing.expect(wayringPresentationEnabled(.headless));
     try std.testing.expect(!wayringPresentationEnabled(.drm));
     try std.testing.expect(!wayringPresentationEnabled(.nested));
+}
+
+test "Wayring output publication includes DRM but excludes nested sidecars" {
+    try std.testing.expect(wayringOutputPublicationEnabled(.headless));
+    try std.testing.expect(wayringOutputPublicationEnabled(.drm));
+    try std.testing.expect(!wayringOutputPublicationEnabled(.nested));
 }
 
 const WayringHeadlessClient = struct {

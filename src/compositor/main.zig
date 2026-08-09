@@ -1040,7 +1040,8 @@ pub fn main(init: std.process.Init) !void {
             try wayring_pointer_constraints.publish();
             wayring_pointer_constraints_published = true;
         }
-        if (server.wayringOutputLayout()) |output_layout| {
+        const wayring_presenting_headless = server.wayringOutputLayout() != null;
+        if (server.wayringScannerOutputLayout()) |output_layout| {
             try wayring_outputs.init(
                 init.gpa,
                 &wayring_protocol_server.?,
@@ -1048,6 +1049,9 @@ pub fn main(init: std.process.Init) !void {
                 &wayring_compositor,
             );
             wayring_outputs_initialized = true;
+        }
+        if (wayring_presenting_headless) {
+            const output_layout = server.wayringOutputLayout().?;
             wayring_xdg_output.init(init.gpa, &wayring_protocol_server.?, &wayring_outputs, output_layout);
             wayring_xdg_output_initialized = true;
             wayring_presentation.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor, &wayring_outputs);
@@ -1059,7 +1063,7 @@ pub fn main(init: std.process.Init) !void {
             server.neutralXdgShell(),
             &wayring_clients,
             &wayring_compositor,
-            if (wayring_outputs_initialized) &wayring_outputs else null,
+            if (wayring_presenting_headless) &wayring_outputs else null,
         );
         wayring_xdg_shell.setSeatAdapter(&wayring_seat_adapter);
         wayring_xdg_shell_initialized = true;
@@ -1081,13 +1085,13 @@ pub fn main(init: std.process.Init) !void {
             &wayring_protocol_server.?,
             server.neutralXdgShell(),
             &wayring_seat_adapter,
-            if (wayring_outputs_initialized) &wayring_outputs else null,
+            if (wayring_presenting_headless) &wayring_outputs else null,
             server.wayringOutputLayout(),
             &wayring_compositor,
             std.os.linux.getuid(),
         );
         wayring_foreign_toplevel_initialized = true;
-        if (wayring_outputs_initialized) {
+        if (wayring_presenting_headless) {
             try wayring_image_capture_source.init(
                 init.gpa,
                 &wayring_protocol_server.?,
@@ -1111,7 +1115,7 @@ pub fn main(init: std.process.Init) !void {
         });
         wayring_xdg_foreign.init(init.gpa, init.io, &wayring_protocol_server.?, &wayring_xdg_shell, server.neutralXdgShell());
         wayring_xdg_foreign_initialized = true;
-        if (wayring_outputs_initialized) {
+        if (wayring_presenting_headless) {
             wayring_layer_shell.init(
                 init.gpa,
                 &wayring_protocol_server.?,
@@ -1175,7 +1179,7 @@ pub fn main(init: std.process.Init) !void {
         wayring_background_effect_initialized = true;
         wayring_fixes.init(init.gpa, &wayring_protocol_server.?);
         wayring_fixes_initialized = true;
-        if (wayring_outputs_initialized) {
+        if (wayring_presenting_headless) {
             try wayring_fractional_scale.init(
                 init.gpa,
                 &wayring_protocol_server.?,
@@ -1193,7 +1197,7 @@ pub fn main(init: std.process.Init) !void {
         // Stable generated XDG is authoritative only on the headless path
         // where generated output/presentation policy is available. Outputs
         // and the seat are deliberately published before this shell global.
-        if (wayring_outputs_initialized) {
+        if (wayring_presenting_headless) {
             try wayring_xdg_output.publish();
             wayring_xdg_output_published = true;
             try wayring_presentation.publish();
@@ -1354,7 +1358,7 @@ pub fn main(init: std.process.Init) !void {
             .security_context = null,
             .authorized_uid = std.os.linux.getuid(),
         };
-        if (wayring_outputs_initialized) {
+        if (wayring_presenting_headless) {
             wayring_security_context.init(init.gpa, server.eventLoop(), &wayring_protocol_server.?, std.os.linux.getuid(), .{
                 .context = &wayring_lifecycle,
                 .accepted = WayringLifecycle.accepted,
@@ -1404,7 +1408,7 @@ pub fn main(init: std.process.Init) !void {
         }
         if (WayringProfile.validate(
             &wayring_protocol_server.?,
-            if (wayring_outputs_initialized)
+            if (wayring_presenting_headless)
                 .presenting_headless
             else if (output_kind == .drm)
                 .drm
@@ -1435,7 +1439,7 @@ pub fn main(init: std.process.Init) !void {
         );
         try server.attachIdleAlarmHost(wayring_host.?);
         wayring_idle_alarm_attached = true;
-        if (wayring_outputs_initialized) wayring_production_adapters.direct_host = wayring_host.?;
+        if (wayring_presenting_headless) wayring_production_adapters.direct_host = wayring_host.?;
         if (wayring_host.?.failure()) |err| return err;
     }
     const canonical_display_name = canonicalDisplayName(
