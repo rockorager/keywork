@@ -18757,6 +18757,7 @@ const WayringXdgClient = struct {
     registry_watch_virtual_keyboard: bool = false,
     expect_text_input: bool = false,
     expect_data_control: bool = false,
+    expect_foreign_toplevel: bool = false,
     expect_virtual_keyboard: bool = false,
     expect_layer_shell: bool = false,
     expect_idle_notify: bool = false,
@@ -18811,6 +18812,10 @@ const WayringXdgClient = struct {
     data_control_manager_removed: bool = false,
     zwlr_data_control_manager_count: usize = 0,
     zwlr_data_control_manager_version: u32 = 0,
+    foreign_toplevel_list_count: usize = 0,
+    foreign_toplevel_list_version: u32 = 0,
+    foreign_toplevel_list_name: u32 = 0,
+    foreign_toplevel_list_removed: bool = false,
     generated_input_method_seen: bool = false,
     input_method_manager_count: usize = 0,
     input_method_manager_version: u32 = 0,
@@ -18870,6 +18875,7 @@ const WayringXdgClient = struct {
     fn expectedGlobalCount(self: *const @This()) usize {
         return expected_globals.len - @intFromBool(!self.expect_text_input) -
             2 * @intFromBool(!self.expect_data_control) -
+            @intFromBool(!self.expect_foreign_toplevel) -
             @intFromBool(!self.expect_input_method) -
             @intFromBool(!self.expect_virtual_keyboard) -
             @intFromBool(!self.expect_layer_shell) -
@@ -18892,6 +18898,8 @@ const WayringXdgClient = struct {
                 self.expect_data_control
             else if (std.mem.eql(u8, global.interface, "zwlr_data_control_manager_v1"))
                 self.expect_data_control
+            else if (std.mem.eql(u8, global.interface, "ext_foreign_toplevel_list_v1"))
+                self.expect_foreign_toplevel
             else if (std.mem.eql(u8, global.interface, "zwp_input_method_manager_v2"))
                 self.expect_input_method
             else if (std.mem.eql(u8, global.interface, "zwp_virtual_keyboard_manager_v1"))
@@ -19308,6 +19316,10 @@ const WayringXdgClient = struct {
                 } else if (std.mem.eql(u8, interface, "zwlr_data_control_manager_v1")) {
                     self.zwlr_data_control_manager_count += 1;
                     self.zwlr_data_control_manager_version = global.version;
+                } else if (std.mem.eql(u8, interface, "ext_foreign_toplevel_list_v1")) {
+                    self.foreign_toplevel_list_count += 1;
+                    self.foreign_toplevel_list_version = global.version;
+                    self.foreign_toplevel_list_name = global.name;
                 } else if (std.mem.eql(u8, interface, "zwp_input_method_manager_v2")) {
                     self.input_method_manager_count += 1;
                     self.input_method_manager_version = global.version;
@@ -19349,6 +19361,8 @@ const WayringXdgClient = struct {
                     self.primary_selection_manager_removed = true;
                 if (removed.name == self.data_control_manager_name)
                     self.data_control_manager_removed = true;
+                if (removed.name == self.foreign_toplevel_list_name)
+                    self.foreign_toplevel_list_removed = true;
                 if (removed.name == self.input_method_manager_name)
                     self.input_method_manager_removed = true;
                 if (removed.name == self.virtual_keyboard_manager_name)
@@ -26464,6 +26478,7 @@ test "production generated data device completes the exact profile and supports 
     const WayringDataControl = @import("wayland/WayringDataControl.zig");
     const WayringZwlrDataControl = @import("wayland/WayringZwlrDataControl.zig");
     const WayringDataControlFanout = @import("wayland/WayringDataControlFanout.zig");
+    const WayringForeignToplevelList = @import("wayland/WayringForeignToplevelList.zig");
     const WayringTextInput = @import("wayland/WayringTextInput.zig");
     const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
     const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
@@ -26696,6 +26711,12 @@ test "production generated data device completes the exact profile and supports 
         zwlr_data_control.deinit();
     }
     var data_control_fanout: WayringDataControlFanout = .{ .ext = &data_control, .wlr = &zwlr_data_control };
+    var foreign_toplevel: WayringForeignToplevelList = undefined;
+    try foreign_toplevel.init(std.testing.allocator, &protocol_server, server.neutralXdgShell(), linux.getuid());
+    defer {
+        if (foreign_toplevel.global != null) foreign_toplevel.unpublish();
+        foreign_toplevel.deinit();
+    }
     defer protocol_server.clearGlobalFilter();
     server.setDataControlObserver(.{
         .context = &data_control_fanout,
@@ -26707,9 +26728,10 @@ test "production generated data device completes the exact profile and supports 
     });
     defer server.setDataControlObserver(null);
     // Restricted globals follow the public profile in deterministic owner
-    // order: data control, then input method.
+    // order: data control, foreign toplevel, then input method.
     try data_control.publish();
     try zwlr_data_control.publish();
+    try foreign_toplevel.publish();
     var input_method: WayringInputMethod = undefined;
     input_method.init(
         std.testing.allocator,
@@ -26845,6 +26867,7 @@ test "production generated data device completes the exact profile and supports 
         text_input: *WayringTextInput,
         data_control: *WayringDataControl,
         zwlr_data_control: *WayringZwlrDataControl,
+        foreign_toplevel: *WayringForeignToplevelList,
         input_method: *WayringInputMethod,
         virtual_keyboard: *WayringVirtualKeyboard,
         virtual_pointer: *WayringVirtualPointer,
@@ -26914,6 +26937,7 @@ test "production generated data device completes the exact profile and supports 
             // their seat/output resources lose identity.
             self.virtual_keyboard.destroyClientResources(client);
             self.input_method.destroyClientResources(client);
+            self.foreign_toplevel.destroyClientResources(client);
             self.data_control.destroyClientResources(client);
             self.zwlr_data_control.destroyClientResources(client);
             self.text_input.destroyClientResources(client);
@@ -26948,6 +26972,7 @@ test "production generated data device completes the exact profile and supports 
         .text_input = &text_input,
         .data_control = &data_control,
         .zwlr_data_control = &zwlr_data_control,
+        .foreign_toplevel = &foreign_toplevel,
         .input_method = &input_method,
         .virtual_keyboard = &virtual_keyboard,
         .virtual_pointer = &generated_virtual_pointer,
@@ -27030,6 +27055,7 @@ test "production generated data device completes the exact profile and supports 
     const GlobalFilter = struct {
         data_control: *WayringDataControl,
         zwlr_data_control: *WayringZwlrDataControl,
+        foreign_toplevel: *WayringForeignToplevelList,
         workspace: *WayringWorkspace,
         security_context: *WayringSecurityContext,
         output_management: *WayringOutputManagement,
@@ -27038,6 +27064,7 @@ test "production generated data device completes the exact profile and supports 
         fn visible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
             return self.data_control.globalFilter(client, global) and
                 self.zwlr_data_control.globalFilter(client, global) and
+                self.foreign_toplevel.globalFilter(client, global) and
                 self.workspace.globalFilter(client, global) and
                 self.security_context.globalFilter(client, global) and
                 self.output_management.globalFilter(client, global) and
@@ -27048,6 +27075,7 @@ test "production generated data device completes the exact profile and supports 
     var global_filter: GlobalFilter = .{
         .data_control = &data_control,
         .zwlr_data_control = &zwlr_data_control,
+        .foreign_toplevel = &foreign_toplevel,
         .workspace = &generated_workspace,
         .security_context = &generated_security_context,
         .output_management = &generated_output_management,
@@ -27086,6 +27114,7 @@ test "production generated data device completes the exact profile and supports 
         .registry_watch_virtual_keyboard = true,
         .expect_text_input = true,
         .expect_data_control = true,
+        .expect_foreign_toplevel = true,
         .expect_input_method = true,
     };
     const thread = try std.Thread.spawn(.{}, WayringXdgClient.run, .{&peer});
@@ -27107,6 +27136,9 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(u32, 1), peer.data_control_manager_version);
     try std.testing.expectEqual(@as(usize, 1), peer.zwlr_data_control_manager_count);
     try std.testing.expectEqual(@as(u32, 2), peer.zwlr_data_control_manager_version);
+    try std.testing.expectEqual(@as(usize, 1), peer.foreign_toplevel_list_count);
+    try std.testing.expectEqual(@as(u32, 1), peer.foreign_toplevel_list_version);
+    try std.testing.expect(peer.foreign_toplevel_list_name != 0);
     try std.testing.expectEqual(@as(usize, 1), peer.input_method_manager_count);
     try std.testing.expect(!peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
@@ -27285,6 +27317,7 @@ test "production generated data device completes the exact profile and supports 
         .registry_only = true,
         .expect_text_input = true,
         .expect_data_control = true,
+        .expect_foreign_toplevel = true,
         .expect_input_method = true,
         .expect_virtual_keyboard = true,
         .expect_layer_shell = true,
@@ -27360,10 +27393,12 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(usize, 0), denied.data_control_manager_count);
     try std.testing.expectEqual(@as(usize, 0), denied.workspace_manager_count);
     const before_denied_bind = server.dataDeviceResourceSnapshot();
+    foreign_toplevel.unpublish();
     zwlr_data_control.unpublish();
     data_control.unpublish();
     try data_control.publish();
     try zwlr_data_control.publish();
+    try foreign_toplevel.publish();
     denied.guessed_data_control_name = data_control.global.?.name();
     try signalWayringCommand(denied_command);
     try waitForWayringXdgStage(server, denied_host, &denied, .manager_added);
@@ -27593,6 +27628,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
 
     input_method.unpublish();
+    foreign_toplevel.unpublish();
     zwlr_data_control.unpublish();
     data_control.unpublish();
     text_input.unpublish();
@@ -27602,6 +27638,7 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringXdgStage(server, host, &peer, .manager_removed);
     try std.testing.expect(peer.data_device_manager_removed);
     try std.testing.expect(peer.data_control_manager_removed);
+    try std.testing.expect(peer.foreign_toplevel_list_removed);
     try std.testing.expect(peer.input_method_manager_removed);
     try std.testing.expect(peer.virtual_keyboard_manager_removed);
     try std.testing.expect(peer.layer_shell_removed);
@@ -27621,6 +27658,7 @@ test "production generated data device completes the exact profile and supports 
     try text_input.publish();
     try data_control.publish();
     try zwlr_data_control.publish();
+    try foreign_toplevel.publish();
     try input_method.publish();
     try virtual_keyboard.publish();
     try layer_shell.publish();
@@ -28062,6 +28100,7 @@ test "production generated data device completes the exact profile and supports 
         .registry_watch_input_method = true,
         .expect_text_input = true,
         .expect_data_control = true,
+        .expect_foreign_toplevel = true,
         .expect_input_method = true,
         .expect_virtual_keyboard = true,
         .expect_layer_shell = true,
@@ -28094,6 +28133,7 @@ test "production generated data device completes the exact profile and supports 
     layer_shell.unpublish();
     virtual_keyboard.unpublish();
     input_method.unpublish();
+    foreign_toplevel.unpublish();
     zwlr_data_control.unpublish();
     data_control.unpublish();
     text_input.unpublish();
@@ -28102,6 +28142,7 @@ test "production generated data device completes the exact profile and supports 
     try waitForWayringXdgStage(server, host, &primary_watch, .manager_removed);
     try std.testing.expect(primary_watch.primary_selection_manager_removed);
     try std.testing.expect(primary_watch.input_method_manager_removed);
+    try std.testing.expect(primary_watch.foreign_toplevel_list_removed);
     try std.testing.expect(primary_watch.layer_shell_removed);
     try std.testing.expect(primary_watch.session_lock_manager_removed);
     try std.testing.expect(primary_watch.idle_notifier_removed);
@@ -28115,6 +28156,7 @@ test "production generated data device completes the exact profile and supports 
     try text_input.publish();
     try data_control.publish();
     try zwlr_data_control.publish();
+    try foreign_toplevel.publish();
     try input_method.publish();
     try virtual_keyboard.publish();
     try layer_shell.publish();
@@ -28138,6 +28180,7 @@ test "production generated data device completes the exact profile and supports 
         .registry_only = true,
         .expect_text_input = true,
         .expect_data_control = true,
+        .expect_foreign_toplevel = true,
         .expect_input_method = true,
         .expect_virtual_keyboard = true,
         .expect_layer_shell = true,

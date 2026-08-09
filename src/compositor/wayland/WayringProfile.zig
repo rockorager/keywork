@@ -55,6 +55,7 @@ pub const entries = [_]Entry{
     .{ .interface = "zwp_text_input_manager_v3", .version = 2, .gate = .presenting_headless },
     .{ .interface = "ext_data_control_manager_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "zwlr_data_control_manager_v1", .version = 2, .visibility = .restricted, .gate = .presenting_headless },
+    .{ .interface = "ext_foreign_toplevel_list_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "zwp_input_method_manager_v2", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "zwp_virtual_keyboard_manager_v1", .version = 1, .visibility = .restricted, .gate = .presenting_headless },
     .{ .interface = "zwlr_layer_shell_v1", .version = 5, .gate = .presenting_headless },
@@ -165,10 +166,10 @@ fn enabled(entry: Entry, gate: Gate) bool {
 test "manifest pins exact direct and security-context profiles" {
     try std.testing.expectEqual(@as(usize, 7), expectedCount(.sidecar, .direct));
     try std.testing.expectEqual(@as(usize, 7), expectedCount(.sidecar, .security_context));
-    try std.testing.expectEqual(@as(usize, 44), expectedCount(.presenting_headless, .direct));
+    try std.testing.expectEqual(@as(usize, 45), expectedCount(.presenting_headless, .direct));
     try std.testing.expectEqual(@as(usize, 34), expectedCount(.presenting_headless, .security_context));
     try std.testing.expectEqual(@as(usize, 34), expectedCount(.presenting_headless, .unknown));
-    try std.testing.expectEqualStrings("wp_security_context_manager_v1", expectedAt(.presenting_headless, .direct, 38).?.interface);
+    try std.testing.expectEqualStrings("wp_security_context_manager_v1", expectedAt(.presenting_headless, .direct, 39).?.interface);
     try std.testing.expectEqualStrings("zwp_linux_dmabuf_v1", expectedAt(.presenting_headless, .security_context, 33).?.interface);
     try std.testing.expect(expectedAt(.presenting_headless, .security_context, 34) == null);
 }
