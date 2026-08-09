@@ -24,6 +24,7 @@ const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
 const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
 const WayringIdleNotification = @import("wayland/WayringIdleNotification.zig");
 const WayringIdleInhibit = @import("wayland/WayringIdleInhibit.zig");
+const WayringKeyboardShortcutsInhibit = @import("wayland/WayringKeyboardShortcutsInhibit.zig");
 const WayringRelativePointer = @import("wayland/WayringRelativePointer.zig");
 const WayringPointerGestures = @import("wayland/WayringPointerGestures.zig");
 const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
@@ -120,7 +121,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 42/33 profile is not default eligible
+    \\                            its limited 43/34 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -336,6 +337,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_seat_adapter: WayringSeatAdapter = undefined;
     var wayring_seat_adapter_initialized = false;
     var wayring_seat_published = false;
+    var wayring_keyboard_shortcuts_inhibit: WayringKeyboardShortcutsInhibit = undefined;
+    var wayring_keyboard_shortcuts_inhibit_initialized = false;
+    var wayring_keyboard_shortcuts_inhibit_published = false;
     var wayring_relative_pointer: WayringRelativePointer = undefined;
     var wayring_relative_pointer_initialized = false;
     var wayring_relative_pointer_published = false;
@@ -424,6 +428,7 @@ pub fn main(init: std.process.Init) !void {
         virtual_keyboard: ?*WayringVirtualKeyboard,
         idle_notification: ?*WayringIdleNotification,
         idle_inhibit: ?*WayringIdleInhibit,
+        keyboard_shortcuts_inhibit: ?*WayringKeyboardShortcutsInhibit,
         layer_shell: ?*WayringLayerShell,
         session_lock: ?*WayringSessionLock,
         workspace: ?*WayringWorkspace,
@@ -457,6 +462,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.workspace) |workspace| workspace.destroyClientResources(client);
             if (self.idle_notification) |idle_notification| idle_notification.destroyClientResources(client);
             if (self.idle_inhibit) |idle_inhibit| idle_inhibit.destroyClientResources(client);
+            if (self.keyboard_shortcuts_inhibit) |adapter| adapter.destroyClientResources(client);
             if (self.session_lock) |generated_session_lock| generated_session_lock.destroyClientResources(client);
             if (self.layer_shell) |layer_shell| layer_shell.destroyClientResources(client);
             if (self.virtual_keyboard) |keyboard| keyboard.destroyClientResources(client);
@@ -652,6 +658,12 @@ pub fn main(init: std.process.Init) !void {
         }
         if (wayring_outputs_initialized) wayring_outputs.deinit();
         if (wayring_seat_adapter_initialized) {
+            if (wayring_keyboard_shortcuts_inhibit_initialized) {
+                server.setGeneratedKeyboardShortcutsInhibitProvider(null);
+                wayring_keyboard_shortcuts_inhibit.clearFocusListener();
+                if (wayring_keyboard_shortcuts_inhibit_published) wayring_keyboard_shortcuts_inhibit.unpublish();
+                wayring_keyboard_shortcuts_inhibit.deinit();
+            }
             if (wayring_relative_pointer_initialized) {
                 server.setGeneratedRelativePointerObserver(null);
                 if (wayring_relative_pointer_published) wayring_relative_pointer.unpublish();
@@ -805,6 +817,12 @@ pub fn main(init: std.process.Init) !void {
         server.setGeneratedSeatDeliverySink(wayring_seat_adapter.sink());
         try wayring_seat_adapter.publish();
         wayring_seat_published = true;
+        wayring_keyboard_shortcuts_inhibit.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor, &wayring_seat_adapter, server.canonicalSeat());
+        wayring_keyboard_shortcuts_inhibit_initialized = true;
+        try wayring_keyboard_shortcuts_inhibit.installFocusListener();
+        server.setGeneratedKeyboardShortcutsInhibitProvider(wayring_keyboard_shortcuts_inhibit.provider());
+        try wayring_keyboard_shortcuts_inhibit.publish();
+        wayring_keyboard_shortcuts_inhibit_published = true;
         try wayring_relative_pointer.publish();
         wayring_relative_pointer_published = true;
         try wayring_pointer_gestures.publish();
@@ -1015,6 +1033,7 @@ pub fn main(init: std.process.Init) !void {
             .virtual_keyboard = if (wayring_virtual_keyboard_initialized) &wayring_virtual_keyboard else null,
             .idle_notification = if (wayring_idle_notification_initialized) &wayring_idle_notification else null,
             .idle_inhibit = if (wayring_idle_inhibit_initialized) &wayring_idle_inhibit else null,
+            .keyboard_shortcuts_inhibit = if (wayring_keyboard_shortcuts_inhibit_initialized) &wayring_keyboard_shortcuts_inhibit else null,
             .layer_shell = if (wayring_layer_shell_initialized) &wayring_layer_shell else null,
             .session_lock = if (wayring_session_lock_initialized) &wayring_session_lock else null,
             .workspace = if (wayring_workspace_initialized) &wayring_workspace else null,
@@ -1646,6 +1665,7 @@ test {
     _ = @import("wayland/pointer_warp.zig");
     _ = @import("wayland/idle_inhibit.zig");
     _ = @import("wayland/WayringIdleInhibit.zig");
+    _ = @import("wayland/WayringKeyboardShortcutsInhibit.zig");
     _ = @import("wayland/WayringRelativePointer.zig");
     _ = @import("wayland/WayringPointerGestures.zig");
     _ = @import("wayland/keyboard_shortcuts_inhibit.zig");

@@ -406,6 +406,7 @@ generated_input_method_observer: ?GeneratedInputMethodObserver = null,
 generated_output_observer: ?GeneratedOutputObserver = null,
 generated_capture_observer: ?GeneratedCaptureObserver = null,
 generated_idle_inhibit_provider: ?GeneratedIdleInhibitProvider = null,
+generated_keyboard_shortcuts_inhibit_provider: ?GeneratedKeyboardShortcutsInhibitProvider = null,
 generated_relative_pointer_observer: ?GeneratedRelativePointerObserver = null,
 generated_pointer_gesture_observer: ?GeneratedPointerGestureObserver = null,
 generated_input_popups: std.ArrayList(GeneratedInputPopup) = .empty,
@@ -2098,6 +2099,7 @@ pub fn createWithVirtualOutput(
         &self.window_manager,
         &self.input_manager,
         &self.keyboard_shortcuts_inhibit,
+        .{ .context = self, .inhibits_seat_named = builtinInhibitsSeatNamed },
         native_input,
     );
     self.builtin_keybindings_initialized = true;
@@ -6757,6 +6759,28 @@ pub fn setGeneratedIdleInhibitProvider(self: *Self, provider: ?GeneratedIdleInhi
     self.refreshIdleInhibition();
 }
 
+pub const GeneratedKeyboardShortcutsInhibitProvider = struct {
+    context: *anyopaque,
+    inhibits_default_seat: *const fn (*anyopaque) bool,
+};
+
+pub fn setGeneratedKeyboardShortcutsInhibitProvider(self: *Self, provider: ?GeneratedKeyboardShortcutsInhibitProvider) void {
+    std.debug.assert(provider == null or self.generated_keyboard_shortcuts_inhibit_provider == null);
+    self.generated_keyboard_shortcuts_inhibit_provider = provider;
+}
+
+fn inhibitsSeatNamed(self: *const Self, name: []const u8) bool {
+    if (self.keyboard_shortcuts_inhibit.inhibitsSeatNamed(name)) return true;
+    if (!std.mem.eql(u8, name, InputManager.default_seat_name)) return false;
+    const provider = self.generated_keyboard_shortcuts_inhibit_provider orelse return false;
+    return provider.inhibits_default_seat(provider.context);
+}
+
+fn builtinInhibitsSeatNamed(context: *anyopaque, name: []const u8) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.inhibitsSeatNamed(name);
+}
+
 pub const GeneratedRelativePointerObserver = struct {
     context: *anyopaque,
     motion: *const fn (*anyopaque, ClientRegistry.Id, u64, f64, f64, f64, f64) void,
@@ -8374,7 +8398,7 @@ fn pointerButtonForSeat(
     {
         if (seat.pointerPosition()) |position| {
             const modifier_move = seat.effectiveModifiers() & Config.super != 0 and
-                !self.keyboard_shortcuts_inhibit.inhibitsSeatNamed(InputManager.default_seat_name);
+                !self.inhibitsSeatNamed(InputManager.default_seat_name);
             const started = if (modifier_move)
                 self.window_manager.beginModifierMove(root, position.x, position.y)
             else

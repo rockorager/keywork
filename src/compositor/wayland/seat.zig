@@ -1101,6 +1101,14 @@ pub fn keyboardFocusedSurface(self: *const Self) ?Surface.Id {
     return focus;
 }
 
+/// Effective scanner-backed focus, subject to the same capability, parent
+/// focus, keymap, and liveness gates as actual keyboard event delivery.
+pub fn effectiveGeneratedKeyboardFocus(self: *const Self) ?GeneratedKeyboardFocus {
+    if (!self.hasKeyboardCapability() or !self.parent_focused or self.keymap == null) return null;
+    if (self.keyboard_grab) |grab| if (grab.surface != null) return null;
+    return self.generatedKeyboardFocus();
+}
+
 pub const TextInputFocus = struct {
     surface: Surface.Id,
     client: ClientRegistry.Id,
@@ -1186,6 +1194,10 @@ pub fn setKeyboardAvailable(self: *Self, available: bool) void {
     const changed = self.delivery.setCapability(.keyboard, self.keyboardCapabilityAvailable());
     std.debug.assert(changed == (old_capability != self.hasKeyboardCapability()));
     if (changed) self.broadcastCapabilities();
+    if (!old_capability and self.hasKeyboardCapability() and self.parent_focused) {
+        self.notifyKeyboardFocus();
+        self.sendEnter();
+    }
 }
 
 pub fn createVirtualKeyboard(self: *Self, owner: *anyopaque) error{OutOfMemory}!void {

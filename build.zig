@@ -138,6 +138,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("unstable/text-input/text-input-unstable-v3.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-idle-notify/ext-idle-notify-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"));
+    generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("unstable/relative-pointer/relative-pointer-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/upstream/input-method-unstable-v2.xml"));

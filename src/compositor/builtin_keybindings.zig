@@ -14,10 +14,16 @@ const WindowManager = @import("window_manager.zig");
 const log = std.log.scoped(.keybindings);
 const wl = wayland.server.wl;
 
+pub const InhibitionProvider = struct {
+    context: *anyopaque,
+    inhibits_seat_named: *const fn (*anyopaque, []const u8) bool,
+};
+
 allocator: std.mem.Allocator,
 manager: *WindowManager,
 input_manager: *InputManager,
 shortcuts_inhibit: *KeyboardShortcutsInhibit,
+inhibition_provider: ?InhibitionProvider,
 native_input: ?*NativeInput,
 launcher: ?*Launcher = null,
 bindings: []const Config.Binding = &.{},
@@ -39,12 +45,13 @@ const RepeatIdentity = struct {
     keysym: u32,
 };
 
-pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server, manager: *WindowManager, input_manager: *InputManager, shortcuts_inhibit: *KeyboardShortcutsInhibit, native_input: ?*NativeInput) !void {
+pub fn init(self: *Self, allocator: std.mem.Allocator, display: *wl.Server, manager: *WindowManager, input_manager: *InputManager, shortcuts_inhibit: *KeyboardShortcutsInhibit, inhibition_provider: ?InhibitionProvider, native_input: ?*NativeInput) !void {
     self.* = .{
         .allocator = allocator,
         .manager = manager,
         .input_manager = input_manager,
         .shortcuts_inhibit = shortcuts_inhibit,
+        .inhibition_provider = inhibition_provider,
         .native_input = native_input,
         .device_listener = .{ .context = self, .added = deviceAdded, .removed = deviceRemoved },
         .repeat_timer = undefined,
@@ -110,7 +117,7 @@ fn keyPressed(self: *Self, event: NativeInput.KeyboardEvent) NativeInput.Keyboar
         }
     }
     self.cancelRepeat();
-    const disposition: NativeInput.KeyboardEventDisposition = if (self.shortcuts_inhibit.inhibitsSeatNamed(device.seat_name))
+    const disposition: NativeInput.KeyboardEventDisposition = if (self.inhibitsSeatNamed(device.seat_name))
         .shortcuts_inhibited
     else if (matchBinding(self.bindings, event.modifiers, event.keysyms)) |binding| blk: {
         self.executeAction(binding.action);
@@ -178,7 +185,7 @@ fn repeatTimer(self: *Self) c_int {
         self.cancelRepeat();
         return 0;
     };
-    if (self.shortcuts_inhibit.inhibitsSeatNamed(device.seat_name)) {
+    if (self.inhibitsSeatNamed(device.seat_name)) {
         self.cancelRepeat();
         return 0;
     }
@@ -193,6 +200,12 @@ fn repeatTimer(self: *Self) c_int {
     self.executeAction(binding.action);
     self.updateRepeatTimer(interval);
     return 0;
+}
+
+fn inhibitsSeatNamed(self: *const Self, name: []const u8) bool {
+    if (self.shortcuts_inhibit.inhibitsSeatNamed(name)) return true;
+    const provider = self.inhibition_provider orelse return false;
+    return provider.inhibits_seat_named(provider.context, name);
 }
 
 fn updateRepeatTimer(self: *Self, milliseconds: i32) void {
