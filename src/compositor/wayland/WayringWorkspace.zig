@@ -99,7 +99,7 @@ pub fn init(
     outputs: *WayringOutput,
     core: *Neutral,
     authorized_uid: std.os.linux.uid_t,
-) void {
+) !void {
     self.* = .{
         .allocator = allocator,
         .protocol_server = protocol_server,
@@ -108,7 +108,7 @@ pub fn init(
         .core = core,
         .authorized_uid = authorized_uid,
     };
-    outputs.setBindListener(.{ .context = self, .bound = outputBound });
+    try outputs.addBindListener(.{ .context = self, .bound = outputBound });
     core.registerFrontend(.{
         .context = self,
         .prepare = secondaryPrepare,
@@ -141,7 +141,7 @@ pub fn unpublish(self: *WayringWorkspace) void {
 pub fn deinit(self: *WayringWorkspace) void {
     std.debug.assert(self.global == null and self.bindings.items.len == 0 and self.pending.items.len == 0);
     self.core.unregisterFrontend(self);
-    self.outputs.clearBindListener(self);
+    self.outputs.removeBindListener(self);
     self.pending.deinit(self.allocator);
     self.bindings.deinit(self.allocator);
     self.* = undefined;

@@ -195,6 +195,11 @@ pub const DataControlObserver = struct {
     offer_rolled_back: *const fn (*anyopaque, NeutralDataDevice.ControlOfferId) void,
     offer_mime_offered: *const fn (*anyopaque, NeutralDataDevice.ControlOfferId, []const u8) void,
 };
+pub const GeneratedForeignToplevelObserver = struct {
+    context: *anyopaque,
+    sync_output: *const fn (*anyopaque, OutputLayout.Id) void,
+    remove_output: *const fn (*anyopaque, OutputLayout.Id) void,
+};
 pub const GeneratedInputMethodObserver = struct {
     context: *anyopaque,
     set_inhibited: *const fn (*anyopaque, bool) void,
@@ -402,6 +407,7 @@ mature_data_device: WaylandDataDevice,
 data_device_observer: ?DataDeviceObserver = null,
 primary_selection_observer: ?PrimarySelectionObserver = null,
 data_control_observer: ?DataControlObserver = null,
+generated_foreign_toplevel_observer: ?GeneratedForeignToplevelObserver = null,
 generated_input_method_observer: ?GeneratedInputMethodObserver = null,
 generated_output_observer: ?GeneratedOutputObserver = null,
 generated_capture_observer: ?GeneratedCaptureObserver = null,
@@ -2608,6 +2614,8 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     if (self.foreign_toplevel_list_initialized) {
         self.foreign_toplevel_list.removeOutput(render_output.protocol_id);
     }
+    if (self.generated_foreign_toplevel_observer) |observer|
+        observer.remove_output(observer.context, render_output.protocol_id);
     if (self.image_capture_source_initialized) {
         self.image_capture_source.removeOutput(render_output.protocol_id);
     }
@@ -4255,6 +4263,10 @@ pub fn setPrimarySelectionObserver(self: *Self, observer: ?PrimarySelectionObser
 
 pub fn setDataControlObserver(self: *Self, observer: ?DataControlObserver) void {
     self.data_control_observer = observer;
+}
+
+pub fn setGeneratedForeignToplevelObserver(self: *Self, observer: ?GeneratedForeignToplevelObserver) void {
+    self.generated_foreign_toplevel_observer = observer;
 }
 
 /// Neutral XDG semantic owner used by unpublished generated adapters.
@@ -11291,6 +11303,8 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     self.scheduleGeneratedCallbackOnlyFrames(render_output);
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(render_output.protocol_id);
+    if (self.generated_foreign_toplevel_observer) |observer|
+        observer.sync_output(observer.context, render_output.protocol_id);
 
     if (!desktop_contents.lower_layers_occluded) {
         self.submitLayerSurfaces(output, .background);
@@ -11594,6 +11608,8 @@ fn presentSessionLockFrame(
     self.scheduleGeneratedCallbackOnlyFrames(frame.render_output);
     self.color_management.refreshPreferred();
     self.foreign_toplevel_list.syncOutput(frame.render_output.protocol_id);
+    if (self.generated_foreign_toplevel_observer) |observer|
+        observer.sync_output(observer.context, frame.render_output.protocol_id);
     if (lock_surface) |info| {
         if (self.headless_surface_forest.presentationClass(info.surface_id) != .session_lock)
             self.submitSurfaceTree(frame.output, info.surface_id);
@@ -18816,6 +18832,10 @@ const WayringXdgClient = struct {
     foreign_toplevel_list_version: u32 = 0,
     foreign_toplevel_list_name: u32 = 0,
     foreign_toplevel_list_removed: bool = false,
+    wlr_foreign_toplevel_manager_count: usize = 0,
+    wlr_foreign_toplevel_manager_version: u32 = 0,
+    wlr_foreign_toplevel_manager_name: u32 = 0,
+    wlr_foreign_toplevel_manager_removed: bool = false,
     generated_input_method_seen: bool = false,
     input_method_manager_count: usize = 0,
     input_method_manager_version: u32 = 0,
@@ -18874,8 +18894,8 @@ const WayringXdgClient = struct {
 
     fn expectedGlobalCount(self: *const @This()) usize {
         return expected_globals.len - @intFromBool(!self.expect_text_input) -
-            2 * @intFromBool(!self.expect_data_control) -
-            @intFromBool(!self.expect_foreign_toplevel) -
+            @as(usize, 2) * @intFromBool(!self.expect_data_control) -
+            @as(usize, 2) * @intFromBool(!self.expect_foreign_toplevel) -
             @intFromBool(!self.expect_input_method) -
             @intFromBool(!self.expect_virtual_keyboard) -
             @intFromBool(!self.expect_layer_shell) -
@@ -18898,7 +18918,8 @@ const WayringXdgClient = struct {
                 self.expect_data_control
             else if (std.mem.eql(u8, global.interface, "zwlr_data_control_manager_v1"))
                 self.expect_data_control
-            else if (std.mem.eql(u8, global.interface, "ext_foreign_toplevel_list_v1"))
+            else if (std.mem.eql(u8, global.interface, "ext_foreign_toplevel_list_v1") or
+                std.mem.eql(u8, global.interface, "zwlr_foreign_toplevel_manager_v1"))
                 self.expect_foreign_toplevel
             else if (std.mem.eql(u8, global.interface, "zwp_input_method_manager_v2"))
                 self.expect_input_method
@@ -19320,6 +19341,10 @@ const WayringXdgClient = struct {
                     self.foreign_toplevel_list_count += 1;
                     self.foreign_toplevel_list_version = global.version;
                     self.foreign_toplevel_list_name = global.name;
+                } else if (std.mem.eql(u8, interface, "zwlr_foreign_toplevel_manager_v1")) {
+                    self.wlr_foreign_toplevel_manager_count += 1;
+                    self.wlr_foreign_toplevel_manager_version = global.version;
+                    self.wlr_foreign_toplevel_manager_name = global.name;
                 } else if (std.mem.eql(u8, interface, "zwp_input_method_manager_v2")) {
                     self.input_method_manager_count += 1;
                     self.input_method_manager_version = global.version;
@@ -19363,6 +19388,8 @@ const WayringXdgClient = struct {
                     self.data_control_manager_removed = true;
                 if (removed.name == self.foreign_toplevel_list_name)
                     self.foreign_toplevel_list_removed = true;
+                if (removed.name == self.wlr_foreign_toplevel_manager_name)
+                    self.wlr_foreign_toplevel_manager_removed = true;
                 if (removed.name == self.input_method_manager_name)
                     self.input_method_manager_removed = true;
                 if (removed.name == self.virtual_keyboard_manager_name)
@@ -26712,11 +26739,36 @@ test "production generated data device completes the exact profile and supports 
     }
     var data_control_fanout: WayringDataControlFanout = .{ .ext = &data_control, .wlr = &zwlr_data_control };
     var foreign_toplevel: WayringForeignToplevelList = undefined;
-    try foreign_toplevel.init(std.testing.allocator, &protocol_server, server.neutralXdgShell(), linux.getuid());
+    try foreign_toplevel.init(
+        std.testing.allocator,
+        &protocol_server,
+        server.neutralXdgShell(),
+        &seat,
+        &outputs,
+        server.wayringOutputLayout(),
+        &compositor,
+        linux.getuid(),
+    );
     defer {
         if (foreign_toplevel.global != null) foreign_toplevel.unpublish();
         foreign_toplevel.deinit();
     }
+    const ForeignToplevelObserver = struct {
+        fn syncOutput(context: *anyopaque, id: OutputLayout.Id) void {
+            const adapter: *WayringForeignToplevelList = @ptrCast(@alignCast(context));
+            adapter.syncOutput(id);
+        }
+        fn removeOutput(context: *anyopaque, id: OutputLayout.Id) void {
+            const adapter: *WayringForeignToplevelList = @ptrCast(@alignCast(context));
+            adapter.removeOutput(id);
+        }
+    };
+    server.setGeneratedForeignToplevelObserver(.{
+        .context = &foreign_toplevel,
+        .sync_output = ForeignToplevelObserver.syncOutput,
+        .remove_output = ForeignToplevelObserver.removeOutput,
+    });
+    defer server.setGeneratedForeignToplevelObserver(null);
     defer protocol_server.clearGlobalFilter();
     server.setDataControlObserver(.{
         .context = &data_control_fanout,
@@ -26818,7 +26870,7 @@ test "production generated data device completes the exact profile and supports 
         idle_notify.deinit();
     }
     var generated_workspace: WayringWorkspace = undefined;
-    generated_workspace.init(
+    try generated_workspace.init(
         std.testing.allocator,
         &protocol_server,
         &clients,
@@ -27139,6 +27191,9 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(usize, 1), peer.foreign_toplevel_list_count);
     try std.testing.expectEqual(@as(u32, 1), peer.foreign_toplevel_list_version);
     try std.testing.expect(peer.foreign_toplevel_list_name != 0);
+    try std.testing.expectEqual(@as(usize, 1), peer.wlr_foreign_toplevel_manager_count);
+    try std.testing.expectEqual(@as(u32, 3), peer.wlr_foreign_toplevel_manager_version);
+    try std.testing.expect(peer.wlr_foreign_toplevel_manager_name != 0);
     try std.testing.expectEqual(@as(usize, 1), peer.input_method_manager_count);
     try std.testing.expect(!peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
@@ -27639,6 +27694,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(peer.data_device_manager_removed);
     try std.testing.expect(peer.data_control_manager_removed);
     try std.testing.expect(peer.foreign_toplevel_list_removed);
+    try std.testing.expect(peer.wlr_foreign_toplevel_manager_removed);
     try std.testing.expect(peer.input_method_manager_removed);
     try std.testing.expect(peer.virtual_keyboard_manager_removed);
     try std.testing.expect(peer.layer_shell_removed);
@@ -28143,6 +28199,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expect(primary_watch.primary_selection_manager_removed);
     try std.testing.expect(primary_watch.input_method_manager_removed);
     try std.testing.expect(primary_watch.foreign_toplevel_list_removed);
+    try std.testing.expect(primary_watch.wlr_foreign_toplevel_manager_removed);
     try std.testing.expect(primary_watch.layer_shell_removed);
     try std.testing.expect(primary_watch.session_lock_manager_removed);
     try std.testing.expect(primary_watch.idle_notifier_removed);

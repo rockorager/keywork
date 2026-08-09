@@ -27,7 +27,8 @@ compositor: *WayringCompositor,
 adapters: std.ArrayList(*Adapter) = .empty,
 scale_listener: ?ScaleListener = null,
 metadata_listener: ?MetadataListener = null,
-bind_listener: ?BindListener = null,
+bind_listeners: std.ArrayList(BindListener) = .empty,
+notifying_bind_listeners: bool = false,
 
 pub const ScaleListener = struct {
     context: *anyopaque,
@@ -99,7 +100,7 @@ fn rollbackInit(self: *WayringOutput) void {
 }
 
 pub fn deinit(self: *WayringOutput) void {
-    std.debug.assert(self.bind_listener == null and self.metadata_listener == null);
+    std.debug.assert(self.bind_listeners.items.len == 0 and self.metadata_listener == null);
     self.layout.clearListener();
     for (self.adapters.items) |adapter| {
         std.debug.assert(adapter.bindings.items.len == 0);
@@ -114,6 +115,7 @@ pub fn deinit(self: *WayringOutput) void {
         self.allocator.destroy(adapter);
     }
     self.adapters.deinit(self.allocator);
+    self.bind_listeners.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -148,14 +150,19 @@ pub fn clearMetadataListener(self: *WayringOutput, context: *anyopaque) void {
     self.metadata_listener = null;
 }
 
-pub fn setBindListener(self: *WayringOutput, listener: BindListener) void {
-    std.debug.assert(self.bind_listener == null);
-    self.bind_listener = listener;
+pub fn addBindListener(self: *WayringOutput, listener: BindListener) !void {
+    std.debug.assert(!self.notifying_bind_listeners);
+    for (self.bind_listeners.items) |current| std.debug.assert(current.context != listener.context);
+    try self.bind_listeners.append(self.allocator, listener);
 }
 
-pub fn clearBindListener(self: *WayringOutput, context: *anyopaque) void {
-    std.debug.assert(self.bind_listener != null and self.bind_listener.?.context == context);
-    self.bind_listener = null;
+pub fn removeBindListener(self: *WayringOutput, context: *anyopaque) void {
+    std.debug.assert(!self.notifying_bind_listeners);
+    for (self.bind_listeners.items, 0..) |listener, index| if (listener.context == context) {
+        _ = self.bind_listeners.orderedRemove(index);
+        return;
+    };
+    unreachable;
 }
 
 /// Visits every currently live generated wl_output for one canonical output
@@ -317,7 +324,9 @@ fn bind(client: *server.Client, id: u32, version: u32, adapter: *Adapter) !void 
     try client.materialize(&binding.resource.runtime);
     adapter.bindings.appendAssumeCapacity(binding);
     sendInitial(binding);
-    if (adapter.manager.bind_listener) |listener|
+    adapter.manager.notifying_bind_listeners = true;
+    defer adapter.manager.notifying_bind_listeners = false;
+    for (adapter.manager.bind_listeners.items) |listener|
         listener.bound(listener.context, adapter.id, client, &binding.resource);
 }
 

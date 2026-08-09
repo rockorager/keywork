@@ -51,6 +51,7 @@ const WayringOutput = @import("wayland/WayringOutput.zig");
 const WayringPresentation = @import("wayland/WayringPresentation.zig");
 const WayringXdgOutput = @import("wayland/WayringXdgOutput.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
+const OutputLayout = @import("wayland/output_layout.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
 const WayringXdgForeign = @import("wayland/WayringXdgForeign.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
@@ -125,7 +126,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 45/34 profile is not default eligible
+    \\                            its limited 46/34 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -580,6 +581,7 @@ pub fn main(init: std.process.Init) !void {
             wayring_input_method.deinit();
         }
         if (wayring_foreign_toplevel_initialized) {
+            server.setGeneratedForeignToplevelObserver(null);
             if (wayring_foreign_toplevel_published) wayring_foreign_toplevel.unpublish();
             wayring_foreign_toplevel.deinit();
         }
@@ -876,8 +878,22 @@ pub fn main(init: std.process.Init) !void {
         );
         wayring_xdg_shell.setSeatAdapter(&wayring_seat_adapter);
         wayring_xdg_shell_initialized = true;
-        try wayring_foreign_toplevel.init(init.gpa, &wayring_protocol_server.?, server.neutralXdgShell(), std.os.linux.getuid());
+        try wayring_foreign_toplevel.init(
+            init.gpa,
+            &wayring_protocol_server.?,
+            server.neutralXdgShell(),
+            &wayring_seat_adapter,
+            if (wayring_outputs_initialized) &wayring_outputs else null,
+            server.wayringOutputLayout(),
+            &wayring_compositor,
+            std.os.linux.getuid(),
+        );
         wayring_foreign_toplevel_initialized = true;
+        server.setGeneratedForeignToplevelObserver(.{
+            .context = &wayring_foreign_toplevel,
+            .sync_output = generatedForeignToplevelSyncOutput,
+            .remove_output = generatedForeignToplevelRemoveOutput,
+        });
         wayring_xdg_foreign.init(init.gpa, init.io, &wayring_protocol_server.?, &wayring_xdg_shell, server.neutralXdgShell());
         wayring_xdg_foreign_initialized = true;
         if (wayring_outputs_initialized) {
@@ -902,7 +918,7 @@ pub fn main(init: std.process.Init) !void {
                 std.os.linux.getuid(),
             );
             wayring_session_lock_initialized = true;
-            wayring_workspace.init(
+            try wayring_workspace.init(
                 init.gpa,
                 &wayring_protocol_server.?,
                 &wayring_clients,
@@ -1186,6 +1202,16 @@ pub fn main(init: std.process.Init) !void {
     systemd.shutdown() catch |err| {
         log.warn("failed to shut down the graphical session targets: {t}", .{err});
     };
+}
+
+fn generatedForeignToplevelSyncOutput(context: *anyopaque, id: OutputLayout.Id) void {
+    const adapter: *WayringForeignToplevelList = @ptrCast(@alignCast(context));
+    adapter.syncOutput(id);
+}
+
+fn generatedForeignToplevelRemoveOutput(context: *anyopaque, id: OutputLayout.Id) void {
+    const adapter: *WayringForeignToplevelList = @ptrCast(@alignCast(context));
+    adapter.removeOutput(id);
 }
 
 fn canonicalDisplayName(
