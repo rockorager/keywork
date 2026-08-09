@@ -406,6 +406,7 @@ generated_input_method_observer: ?GeneratedInputMethodObserver = null,
 generated_output_observer: ?GeneratedOutputObserver = null,
 generated_capture_observer: ?GeneratedCaptureObserver = null,
 generated_idle_inhibit_provider: ?GeneratedIdleInhibitProvider = null,
+generated_relative_pointer_observer: ?GeneratedRelativePointerObserver = null,
 generated_input_popups: std.ArrayList(GeneratedInputPopup) = .empty,
 xdg_toplevel_drag: XdgToplevelDrag,
 xdg_toplevel_icon: XdgToplevelIcon,
@@ -6755,6 +6756,25 @@ pub fn setGeneratedIdleInhibitProvider(self: *Self, provider: ?GeneratedIdleInhi
     self.refreshIdleInhibition();
 }
 
+pub const GeneratedRelativePointerObserver = struct {
+    context: *anyopaque,
+    motion: *const fn (*anyopaque, ClientRegistry.Id, u64, f64, f64, f64, f64) void,
+};
+
+pub fn setGeneratedRelativePointerObserver(self: *Self, observer: ?GeneratedRelativePointerObserver) void {
+    std.debug.assert(observer == null or self.generated_relative_pointer_observer == null);
+    self.generated_relative_pointer_observer = observer;
+}
+
+fn relativePointerMotion(self: *Self, time: u64, dx: f64, dy: f64, dx_unaccelerated: f64, dy_unaccelerated: f64) void {
+    std.debug.assert(std.math.isFinite(dx) and std.math.isFinite(dy));
+    std.debug.assert(std.math.isFinite(dx_unaccelerated) and std.math.isFinite(dy_unaccelerated));
+    self.relative_pointer.motion(time, dx, dy, dx_unaccelerated, dy_unaccelerated);
+    const generated = (self.seat.pointerFocus() orelse return).generated orelse return;
+    if (self.generated_relative_pointer_observer) |observer|
+        observer.motion(observer.context, generated.client, time, dx, dy, dx_unaccelerated, dy_unaccelerated);
+}
+
 pub fn refreshIdleInhibition(self: *Self) void {
     if (!self.idle_notify_initialized) return;
     const mature = self.idle_inhibit.hasVisibleInhibitor(
@@ -7144,7 +7164,7 @@ fn nativePointerRelativeMotion(context: *anyopaque, id: NativeInput.DeviceId, ti
     const self = output.server;
     const seat = self.seatForDevice(id);
     if (seat == &self.seat) {
-        self.relative_pointer.motion(time, dx, dy, dx_unaccelerated, dy_unaccelerated);
+        self.relativePointerMotion(time, dx, dy, dx_unaccelerated, dy_unaccelerated);
     }
     const current: RenderOutput.Point = if (seat.pointerPosition()) |position|
         .{ .x = position.x, .y = position.y }
@@ -8129,7 +8149,7 @@ fn virtualPointerEvent(
         .motion => |motion| {
             const bounds = self.virtualPointerBounds(mapped_output) orelse return;
             if (seat == &self.seat) {
-                self.relative_pointer.motion(
+                self.relativePointerMotion(
                     @as(u64, motion.time) * std.time.us_per_ms,
                     motion.dx,
                     motion.dy,
@@ -8234,7 +8254,7 @@ fn pointerRelativeMotion(
     dy_unaccelerated: f64,
 ) void {
     const self = serverForOutput(context);
-    self.relative_pointer.motion(time_usec, dx, dy, dx_unaccelerated, dy_unaccelerated);
+    self.relativePointerMotion(time_usec, dx, dy, dx_unaccelerated, dy_unaccelerated);
 }
 
 fn pointerButton(

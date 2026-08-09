@@ -245,12 +245,25 @@ pub fn pointerIdentity(
     client: *wayring.server.Client,
     object_id: u32,
 ) ?PointerIdentity {
+    const identity = self.pointerIdentityIncludingInactive(client, object_id) orelse return null;
+    if (!self.snapshot.pointer.resourceActive(identity.capability_generation)) return null;
+    return identity;
+}
+
+/// Resolves exact live identity even while this pointer's capability
+/// generation is inactive. Extension objects may outlive capability loss, but
+/// must use pointerIdentity before delivering events so stale resources never
+/// revive under a later generation.
+pub fn pointerIdentityIncludingInactive(
+    self: *const WayringSeatAdapter,
+    client: *wayring.server.Client,
+    object_id: u32,
+) ?PointerIdentity {
     if (client.fatal() != null) return null;
     const installed = client.lookup(object_id) orelse return null;
     for (self.pointers.items) |pointer_resource| {
         if (pointer_resource.client != client or pointer_resource.resource.id() != object_id or
-            installed != &pointer_resource.resource.runtime or pointer_resource.resource.runtime.state() != .live or
-            !self.snapshot.pointer.resourceActive(pointer_resource.generation)) continue;
+            installed != &pointer_resource.resource.runtime or pointer_resource.resource.runtime.state() != .live) continue;
         return .{
             .client = self.clients.id(client) orelse return null,
             .resource_generation = pointer_resource.resource_generation,
