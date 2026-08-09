@@ -20,6 +20,7 @@ const WayringDataControl = @import("wayland/WayringDataControl.zig");
 const WayringZwlrDataControl = @import("wayland/WayringZwlrDataControl.zig");
 const WayringDataControlFanout = @import("wayland/WayringDataControlFanout.zig");
 const WayringForeignToplevelList = @import("wayland/WayringForeignToplevelList.zig");
+const WayringImageCaptureSource = @import("wayland/WayringImageCaptureSource.zig");
 const WayringDataDevice = @import("wayland/WayringDataDevice.zig");
 const WayringXdgToplevelDrag = @import("wayland/WayringXdgToplevelDrag.zig");
 const WayringPrimarySelection = @import("wayland/WayringPrimarySelection.zig");
@@ -113,6 +114,11 @@ const WayringProductionAdapters = struct {
     }
 };
 
+const WayringForeignToplevelAdapters = struct {
+    foreign_toplevel: *WayringForeignToplevelList,
+    image_capture_source: ?*WayringImageCaptureSource,
+};
+
 comptime {
     _ = @import("DataDevice.zig");
     _ = @import("TextInput.zig");
@@ -139,7 +145,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 54/42 profile is not default eligible
+    \\                            its limited 56/42 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -407,6 +413,10 @@ pub fn main(init: std.process.Init) !void {
     var wayring_foreign_toplevel: WayringForeignToplevelList = undefined;
     var wayring_foreign_toplevel_initialized = false;
     var wayring_foreign_toplevel_published = false;
+    var wayring_image_capture_source: WayringImageCaptureSource = undefined;
+    var wayring_image_capture_source_initialized = false;
+    var wayring_image_capture_source_published = false;
+    var wayring_foreign_toplevel_adapters: WayringForeignToplevelAdapters = undefined;
     var wayring_input_method: WayringInputMethod = undefined;
     var wayring_input_method_initialized = false;
     var wayring_input_method_published = false;
@@ -483,6 +493,7 @@ pub fn main(init: std.process.Init) !void {
         data_control: ?*WayringDataControl,
         zwlr_data_control: ?*WayringZwlrDataControl,
         foreign_toplevel: ?*WayringForeignToplevelList,
+        image_capture_source: ?*WayringImageCaptureSource,
         input_method: ?*WayringInputMethod,
         virtual_keyboard: ?*WayringVirtualKeyboard,
         idle_notification: ?*WayringIdleNotification,
@@ -527,6 +538,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.layer_shell) |layer_shell| layer_shell.destroyClientResources(client);
             if (self.virtual_keyboard) |keyboard| keyboard.destroyClientResources(client);
             if (self.input_method) |input_method| input_method.destroyClientResources(client);
+            if (self.image_capture_source) |source| source.destroyClientResources(client);
             if (self.foreign_toplevel) |foreign_toplevel| foreign_toplevel.destroyClientResources(client);
             if (self.zwlr_data_control) |data_control| data_control.destroyClientResources(client);
             if (self.data_control) |data_control| data_control.destroyClientResources(client);
@@ -633,8 +645,12 @@ pub fn main(init: std.process.Init) !void {
             if (wayring_input_method_published) wayring_input_method.unpublish();
             wayring_input_method.deinit();
         }
+        if (wayring_foreign_toplevel_initialized) server.setGeneratedForeignToplevelObserver(null);
+        if (wayring_image_capture_source_initialized) {
+            if (wayring_image_capture_source_published) wayring_image_capture_source.unpublish();
+            wayring_image_capture_source.deinit();
+        }
         if (wayring_foreign_toplevel_initialized) {
-            server.setGeneratedForeignToplevelObserver(null);
             if (wayring_foreign_toplevel_published) wayring_foreign_toplevel.unpublish();
             wayring_foreign_toplevel.deinit();
         }
@@ -996,8 +1012,23 @@ pub fn main(init: std.process.Init) !void {
             std.os.linux.getuid(),
         );
         wayring_foreign_toplevel_initialized = true;
+        if (wayring_outputs_initialized) {
+            try wayring_image_capture_source.init(
+                init.gpa,
+                &wayring_protocol_server.?,
+                &wayring_outputs,
+                &wayring_foreign_toplevel,
+                server.neutralXdgShell(),
+                std.os.linux.getuid(),
+            );
+            wayring_image_capture_source_initialized = true;
+        }
+        wayring_foreign_toplevel_adapters = .{
+            .foreign_toplevel = &wayring_foreign_toplevel,
+            .image_capture_source = if (wayring_image_capture_source_initialized) &wayring_image_capture_source else null,
+        };
         server.setGeneratedForeignToplevelObserver(.{
-            .context = &wayring_foreign_toplevel,
+            .context = &wayring_foreign_toplevel_adapters,
             .sync_output = generatedForeignToplevelSyncOutput,
             .remove_output = generatedForeignToplevelRemoveOutput,
         });
@@ -1155,6 +1186,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_zwlr_data_control_published = true;
             try wayring_foreign_toplevel.publish();
             wayring_foreign_toplevel_published = true;
+            try wayring_image_capture_source.publish();
+            wayring_image_capture_source_published = true;
             try wayring_input_method.publish();
             wayring_input_method_published = true;
             // Virtual keyboard is the most privileged generated input global
@@ -1218,6 +1251,7 @@ pub fn main(init: std.process.Init) !void {
             .data_control = if (wayring_data_control_initialized) &wayring_data_control else null,
             .zwlr_data_control = if (wayring_zwlr_data_control_initialized) &wayring_zwlr_data_control else null,
             .foreign_toplevel = if (wayring_foreign_toplevel_initialized) &wayring_foreign_toplevel else null,
+            .image_capture_source = if (wayring_image_capture_source_initialized) &wayring_image_capture_source else null,
             .input_method = if (wayring_input_method_initialized) &wayring_input_method else null,
             .virtual_keyboard = if (wayring_virtual_keyboard_initialized) &wayring_virtual_keyboard else null,
             .idle_notification = if (wayring_idle_notification_initialized) &wayring_idle_notification else null,
@@ -1344,8 +1378,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn generatedForeignToplevelSyncOutput(context: *anyopaque, id: OutputLayout.Id) void {
-    const adapter: *WayringForeignToplevelList = @ptrCast(@alignCast(context));
-    adapter.syncOutput(id);
+    const adapters: *WayringForeignToplevelAdapters = @ptrCast(@alignCast(context));
+    adapters.foreign_toplevel.syncOutput(id);
 }
 
 fn generatedToplevelDragPointerPosition(context: *anyopaque) ?WayringXdgToplevelDrag.Point {
@@ -1380,8 +1414,9 @@ fn generatedToplevelDragAttachedScene(context: *anyopaque) ?@import("scene.zig")
 }
 
 fn generatedForeignToplevelRemoveOutput(context: *anyopaque, id: OutputLayout.Id) void {
-    const adapter: *WayringForeignToplevelList = @ptrCast(@alignCast(context));
-    adapter.removeOutput(id);
+    const adapters: *WayringForeignToplevelAdapters = @ptrCast(@alignCast(context));
+    adapters.foreign_toplevel.removeOutput(id);
+    if (adapters.image_capture_source) |source| source.removeOutput(id);
 }
 
 fn canonicalDisplayName(
@@ -1816,6 +1851,7 @@ test {
     _ = @import("wayland/WayringZwlrDataControl.zig");
     _ = @import("wayland/WayringDataControlFanout.zig");
     _ = @import("wayland/WayringForeignToplevelList.zig");
+    _ = @import("wayland/WayringImageCaptureSource.zig");
     _ = @import("wayland/WayringVirtualKeyboard.zig");
     _ = @import("VirtualPointer.zig");
     _ = @import("wayland/WayringVirtualPointer.zig");

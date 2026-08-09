@@ -119,6 +119,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("unstable/primary-selection/primary-selection-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-data-control/ext-data-control-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml"));
+    generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-image-capture-source/ext-image-capture-source-v1.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/upstream/wlr-foreign-toplevel-management-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/upstream/wlr-data-control-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/xdg-activation/xdg-activation-v1.xml"));

@@ -333,6 +333,22 @@ fn wlrHandleRequest(_: *protocol.zwlr_foreign_toplevel_handle_v1.Resource, reque
     }
 }
 
+/// Resolves an exact live same-client EXT handle without exposing adapter
+/// storage to protocols which retain only the canonical window identity.
+pub fn windowForExtHandle(
+    self: *WayringForeignToplevelList,
+    client: *wayring.server.Client,
+    object_id: u32,
+) ?XdgShell.WindowId {
+    const installed = client.lookup(object_id) orelse return null;
+    for (self.handles.items) |handle| {
+        if (handle.client != client or handle.closed or handle.mapping == null or
+            handle.resource.state() != .live or &handle.resource.runtime != installed) continue;
+        return handle.mapping.?.window;
+    }
+    return null;
+}
+
 pub fn globalFilter(self: *WayringForeignToplevelList, client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
     return WayringProfile.securityVisible(self.authorized_uid, client, global);
 }
