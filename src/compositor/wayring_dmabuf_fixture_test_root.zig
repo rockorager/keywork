@@ -7,4 +7,5 @@ test {
     std.testing.refAllDecls(@import("wayland/WayringSystemBell.zig"));
     std.testing.refAllDecls(@import("wayland/WayringAlphaModifier.zig"));
     std.testing.refAllDecls(@import("wayland/WayringSinglePixelBuffer.zig"));
+    std.testing.refAllDecls(@import("wayland/WayringPointerWarp.zig"));
 }

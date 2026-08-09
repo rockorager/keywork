@@ -271,6 +271,18 @@ pub fn acceptsCursorShape(
 ) bool {
     const current = self.pointerIdentity(client, object_id) orelse return false;
     if (!std.meta.eql(current, expected)) return false;
+    return self.acceptsPointerEnterSerial(client, object_id, serial);
+}
+
+/// Proves that an exact live generated pointer received the supplied current
+/// enter serial. The serial remains valid for any focused surface of its client.
+pub fn acceptsPointerEnterSerial(
+    self: *const WayringSeatAdapter,
+    client: *wayring.server.Client,
+    object_id: u32,
+    serial: u32,
+) bool {
+    _ = self.pointerIdentity(client, object_id) orelse return false;
     for (self.pointers.items) |pointer_resource| {
         if (pointer_resource.client == client and pointer_resource.resource.id() == object_id)
             return pointer_resource.last_enter_serial != null and pointer_resource.last_enter_serial.? == serial;

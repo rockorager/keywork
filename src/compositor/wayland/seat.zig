@@ -1858,6 +1858,26 @@ pub fn warpPointer(
     return .{ .x = warped.x, .y = warped.y };
 }
 
+pub fn warpGeneratedPointer(
+    self: *Self,
+    surface_id: SurfaceRegistry.Id,
+    surface_x: f64,
+    surface_y: f64,
+) ?struct { x: f64, y: f64 } {
+    const focus = self.pointer_focus orelse return null;
+    _ = focus.generated orelse return null;
+    if (!std.meta.eql(focus.surface_id, surface_id)) return null;
+    const position = self.pointer_position orelse return null;
+    const warped = PointerPosition{
+        .x = position.x + surface_x - focus.x,
+        .y = position.y + surface_y - focus.y,
+    };
+    self.setPointerPosition(warped.x, warped.y);
+    self.pointer_focus.?.x = surface_x;
+    self.pointer_focus.?.y = surface_y;
+    return .{ .x = warped.x, .y = warped.y };
+}
+
 pub fn pointerLeave(self: *Self) void {
     const old_cursor = self.cursorInfo();
     const fallback_visible = self.active_cursor == null and self.cursorInfo() != null;
@@ -3794,6 +3814,13 @@ test "generated focus cannot prove mature focus for an equal surface id" {
         .y = 6,
         .generated = generated,
     };
+    seat.pointer_position = .{ .x = 100, .y = 200 };
+    seat.compositor_cursor = null;
+    seat.active_cursor = null;
+    seat.cursor_controller = null;
+    seat.drag_cursor_client = null;
+    seat.default_cursor = null;
+    seat.repaint_listener = null;
     seat.focus = null;
     seat.mature_keyboard_focus_client = null;
     seat.generated_keyboard_focus = .{ .surface = surface_id, .client = client };
@@ -3808,6 +3835,12 @@ test "generated focus cannot prove mature focus for an equal surface id" {
     try std.testing.expect(seat.generatedActivationSurfaceFocused(surface_id));
     try std.testing.expect(!seat.generatedActivationSurfaceFocused(.{ .index = 9, .generation = 9 }));
     try std.testing.expect(seat.warpPointer(surface_id, 1, 2) == null);
+    try std.testing.expect(seat.warpGeneratedPointer(.{ .index = 9, .generation = 9 }, 1, 2) == null);
+    const warped = seat.warpGeneratedPointer(surface_id, 9, 11).?;
+    try std.testing.expectEqual(@as(f64, 104), warped.x);
+    try std.testing.expectEqual(@as(f64, 205), warped.y);
+    try std.testing.expectEqual(@as(f64, 9), seat.pointer_focus.?.x);
+    try std.testing.expectEqual(@as(f64, 11), seat.pointer_focus.?.y);
     const unused_handle: PointerHandle = .{ .resource = undefined, .generation = 1 };
     try std.testing.expect(!seat.acceptsPointerEnterSerial(unused_handle, surface_id, 7));
 }

@@ -8194,6 +8194,16 @@ fn pointerWarp(context: *anyopaque, surface_id: Surface.Id, x: f64, y: f64) void
     );
 }
 
+pub fn generatedPointerWarp(context: *anyopaque, surface_id: SurfaceRegistry.Id, x: f64, y: f64) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const position = self.seat.warpGeneratedPointer(surface_id, x, y) orelse return;
+    self.synchronizeBackendPointer(
+        self.renderOutputAt(position.x, position.y),
+        position.x,
+        position.y,
+    );
+}
+
 fn pointerRelativeMotion(
     context: *anyopaque,
     time_usec: u64,

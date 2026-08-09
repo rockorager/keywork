@@ -15,6 +15,7 @@ const Systemd = @import("systemd.zig");
 const WayringCompositor = @import("wayland/WayringCompositor.zig");
 const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCursorShape = @import("wayland/WayringCursorShape.zig");
+const WayringPointerWarp = @import("wayland/WayringPointerWarp.zig");
 const WayringDataControl = @import("wayland/WayringDataControl.zig");
 const WayringDataDevice = @import("wayland/WayringDataDevice.zig");
 const WayringPrimarySelection = @import("wayland/WayringPrimarySelection.zig");
@@ -112,7 +113,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 33/24 profile is not default eligible
+    \\                            its limited 34/25 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -301,6 +302,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_cursor_shape: WayringCursorShape = undefined;
     var wayring_cursor_shape_initialized = false;
     var wayring_cursor_shape_published = false;
+    var wayring_pointer_warp: WayringPointerWarp = undefined;
+    var wayring_pointer_warp_initialized = false;
+    var wayring_pointer_warp_published = false;
     var wayring_xdg_decoration: WayringXdgDecoration = undefined;
     var wayring_xdg_decoration_initialized = false;
     var wayring_xdg_decoration_published = false;
@@ -372,6 +376,7 @@ pub fn main(init: std.process.Init) !void {
         alpha_modifier: ?*WayringAlphaModifier,
         fixes: ?*WayringFixes,
         cursor_shape: ?*WayringCursorShape,
+        pointer_warp: ?*WayringPointerWarp,
         xdg_decoration: ?*WayringXdgDecoration,
         xdg_activation: ?*WayringXdgActivation,
         system_bell: ?*WayringSystemBell,
@@ -425,6 +430,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.system_bell) |system_bell| system_bell.destroyClientResources(client);
             if (self.xdg_activation) |activation| activation.destroyClientResources(client);
             if (self.xdg_decoration) |decoration| decoration.destroyClientResources(client);
+            if (self.pointer_warp) |pointer_warp| pointer_warp.destroyClientResources(client);
             if (self.cursor_shape) |cursor_shape| cursor_shape.destroyClientResources(client);
             if (self.fixes) |fixes| fixes.destroyClientResources(client);
             self.seat.destroyClientResources(client);
@@ -535,6 +541,10 @@ pub fn main(init: std.process.Init) !void {
         if (wayring_xdg_decoration_initialized) {
             if (wayring_xdg_decoration_published) wayring_xdg_decoration.unpublish();
             wayring_xdg_decoration.deinit();
+        }
+        if (wayring_pointer_warp_initialized) {
+            if (wayring_pointer_warp_published) wayring_pointer_warp.unpublish();
+            wayring_pointer_warp.deinit();
         }
         if (wayring_cursor_shape_initialized) {
             if (wayring_cursor_shape_published) wayring_cursor_shape.unpublish();
@@ -701,6 +711,14 @@ pub fn main(init: std.process.Init) !void {
             server.generatedSeatRequestSink(),
         );
         wayring_cursor_shape_initialized = true;
+        wayring_pointer_warp.init(
+            init.gpa,
+            &wayring_protocol_server.?,
+            &wayring_compositor,
+            &wayring_seat_adapter,
+            .{ .context = server, .warp = Server.generatedPointerWarp },
+        );
+        wayring_pointer_warp_initialized = true;
         wayring_seat_adapter.installCursorListener();
         server.setGeneratedSeatDeliverySink(wayring_seat_adapter.sink());
         try wayring_seat_adapter.publish();
@@ -815,6 +833,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_fixes_published = true;
             try wayring_cursor_shape.publish();
             wayring_cursor_shape_published = true;
+            try wayring_pointer_warp.publish();
+            wayring_pointer_warp_published = true;
             try wayring_xdg_decoration.publish();
             wayring_xdg_decoration_published = true;
             try wayring_xdg_activation.publish();
@@ -871,6 +891,7 @@ pub fn main(init: std.process.Init) !void {
             .alpha_modifier = if (wayring_alpha_modifier_initialized) &wayring_alpha_modifier else null,
             .fixes = if (wayring_fixes_initialized) &wayring_fixes else null,
             .cursor_shape = if (wayring_cursor_shape_initialized) &wayring_cursor_shape else null,
+            .pointer_warp = if (wayring_pointer_warp_initialized) &wayring_pointer_warp else null,
             .xdg_decoration = if (wayring_xdg_decoration_initialized) &wayring_xdg_decoration else null,
             .xdg_activation = if (wayring_xdg_activation_initialized) &wayring_xdg_activation else null,
             .system_bell = if (wayring_system_bell_initialized) &wayring_system_bell else null,
@@ -1500,6 +1521,7 @@ test {
     _ = @import("wayland/session_lock.zig");
     _ = @import("wayland/cursor_shape.zig");
     _ = @import("wayland/WayringCursorShape.zig");
+    _ = @import("wayland/WayringPointerWarp.zig");
     _ = @import("wayland/WayringInputMethod.zig");
     _ = @import("wayland/WayringXdgDecoration.zig");
     _ = @import("wayland/WayringXdgActivation.zig");
