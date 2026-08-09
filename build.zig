@@ -167,6 +167,10 @@ pub fn build(b: *std.Build) void {
     // Security-context is generated for the unpublished ingress fixture only;
     // no production profile publishes its manager global.
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/security-context/security-context-v1.xml"));
+    // DRM lease is consumed by the compositor's scanner-backed adapter. Keep
+    // it in the root scanner graph as well as the mature libwayland scanner;
+    // generated protocol types never own lessor policy.
+    generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/drm-lease/drm-lease-v1.xml"));
     const generated_xdg_source = generate_xdg_protocol.captureStdOut(.{ .basename = "wayring_xdg_protocol.zig" });
     const xdg_protocol = b.createModule(.{
         .root_source_file = generated_xdg_source,

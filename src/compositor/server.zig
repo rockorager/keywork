@@ -91,6 +91,7 @@ const NeutralOutputManagement = @import("OutputManagement.zig");
 const WayringOutputManagement = @import("wayland/WayringOutputManagement.zig");
 const WayringScreencopy = @import("wayland/WayringScreencopy.zig");
 const WayringLinuxDmabuf = @import("wayland/WayringLinuxDmabuf.zig");
+const WayringDrmLease = @import("wayland/WayringDrmLease.zig");
 const OutputPower = @import("wayland/output_power.zig");
 const GammaControl = @import("wayland/gamma_control.zig");
 const DrmLease = @import("wayland/drm_lease.zig");
@@ -420,6 +421,7 @@ generated_foreign_toplevel_observer: ?GeneratedForeignToplevelObserver = null,
 generated_input_method_observer: ?GeneratedInputMethodObserver = null,
 generated_output_observer: ?GeneratedOutputObserver = null,
 generated_capture_observer: ?GeneratedCaptureObserver = null,
+generated_drm_lease: ?*WayringDrmLease = null,
 generated_fifo_compositor: ?*WayringCompositor = null,
 generated_idle_inhibit_provider: ?GeneratedIdleInhibitProvider = null,
 generated_keyboard_shortcuts_inhibit_provider: ?GeneratedKeyboardShortcutsInhibitProvider = null,
@@ -2759,6 +2761,12 @@ fn drmOutputAdded(context: *anyopaque, drm_output: *DrmOutput) void {
     if (self.drm_lease_initialized) {
         self.drm_lease.addConnector(drm_output) catch return self.terminate();
     }
+    if (self.generated_drm_lease) |adapter| adapter.addConnector(.{
+        .identity = drm_output.connector_id,
+        .connector_id = drm_output.connector_id,
+        .name = drm_output.name(),
+        .description = drm_output.description(),
+    }) catch return self.terminate();
     requestRepaint(self);
 }
 
@@ -3065,6 +3073,7 @@ fn replacePrimaryRenderOutput(self: *Self, removed_id: RenderOutputId) void {
 
 fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (self.generated_drm_lease) |adapter| adapter.removeConnector(drm_output.connector_id);
     if (self.drm_lease_initialized) self.drm_lease.removeConnector(drm_output);
     if (self.output_management_initialized) self.output_management.removeHead(drm_output);
     const render_output = self.findDrmRenderOutput(drm_output) orelse return;
@@ -3073,7 +3082,7 @@ fn drmOutputRemoving(context: *anyopaque, drm_output: *DrmOutput) void {
         var fallback: ?*DrmOutput = null;
         for (self.drm_device.outputs()) |candidate| {
             if (candidate != drm_output and !candidate.enabled and
-                (!self.drm_lease_initialized or !self.drm_lease.outputLeased(candidate)))
+                !self.drm_device.outputLeased(candidate))
             {
                 fallback = candidate;
                 break;
@@ -3133,12 +3142,12 @@ fn testOutputConfiguration(context: *anyopaque, changes: []const OutputManagemen
 }
 
 fn drmOutputChangesAvailable(self: *Self, changes: []const OutputManagement.Change) bool {
-    if (self.drm_lease_initialized) for (changes) |change| {
+    if (self.drm_device_initialized) for (changes) |change| {
         const output = switch (change.target) {
             .drm => |value| value,
             .virtual => return false,
         };
-        if (self.drm_lease.outputLeased(output)) return false;
+        if (self.drm_device.outputLeased(output)) return false;
     };
     for (changes) |change| {
         const output = switch (change.target) {
@@ -3469,6 +3478,10 @@ fn openDrmLeaseDevice(context: *anyopaque) ?std.posix.fd_t {
 
 fn grantDrmLease(context: *anyopaque, outputs: []const *DrmOutput) ?DrmLease.Grant {
     const self: *Self = @ptrCast(@alignCast(context));
+    return self.createDrmLease(outputs);
+}
+
+fn createDrmLease(self: *Self, outputs: []const *DrmOutput) ?DrmLease.Grant {
     var disabled: std.ArrayList(*DrmOutput) = .empty;
     defer disabled.deinit(self.allocator);
     disabled.ensureUnusedCapacity(self.allocator, outputs.len) catch return null;
@@ -3524,6 +3537,7 @@ fn drmDeviceActivated(context: *anyopaque) void {
     }
     if (self.gamma_control_initialized) self.gamma_control.refreshOutputs();
     if (self.drm_lease_initialized) self.drm_lease.@"resume"();
+    if (self.generated_drm_lease) |adapter| adapter.resumeLeasing() catch self.terminate();
 }
 
 fn refreshRenderOutputColorDescription(
@@ -3567,11 +3581,13 @@ fn calibrationIdentity(calibration: ?render.OutputCalibration) ?u64 {
 
 fn drmDeviceDeactivating(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (self.generated_drm_lease) |adapter| adapter.suspendLeasing();
     if (self.drm_lease_initialized) self.drm_lease.@"suspend"();
 }
 
 fn drmLeaseRevoked(context: *anyopaque, lessee_id: u32) void {
     const self: *Self = @ptrCast(@alignCast(context));
+    if (self.generated_drm_lease) |adapter| adapter.revoke(lessee_id);
     if (self.drm_lease_initialized) self.drm_lease.leaseRevoked(lessee_id);
 }
 
@@ -4545,6 +4561,58 @@ pub fn generatedOutputManagement(self: *Self) *NeutralOutputManagement {
 
 pub fn generatedOutputManagementListener(self: *Self) NeutralOutputManagement.Listener {
     return .{ .context = self, .test_configuration = testOutputConfiguration, .apply = applyOutputConfiguration };
+}
+
+pub fn generatedDrmLeaseAuthority(self: *Self) WayringDrmLease.Authority {
+    std.debug.assert(self.drm_device_initialized);
+    return .{
+        .context = self,
+        .openFd = generatedDrmLeaseOpen,
+        .grant = generatedDrmLeaseGrant,
+        .revoke = generatedDrmLeaseRevoke,
+    };
+}
+
+pub fn attachGeneratedDrmLease(self: *Self, adapter: *WayringDrmLease) !void {
+    std.debug.assert(self.drm_device_initialized and self.generated_drm_lease == null);
+    for (self.drm_device.outputs()) |output| try adapter.addConnector(.{
+        .identity = output.connector_id,
+        .connector_id = output.connector_id,
+        .name = output.name(),
+        .description = output.description(),
+    });
+    self.generated_drm_lease = adapter;
+}
+
+pub fn detachGeneratedDrmLease(self: *Self, adapter: *WayringDrmLease) void {
+    std.debug.assert(self.generated_drm_lease == adapter);
+    self.generated_drm_lease = null;
+}
+
+fn generatedDrmLeaseOpen(context: *anyopaque) !std.posix.fd_t {
+    const self: *Self = @ptrCast(@alignCast(context));
+    return self.drm_device.openNonMasterFd();
+}
+
+fn generatedDrmLeaseGrant(context: *anyopaque, identities: []const u64) !WayringDrmLease.Grant {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const outputs = try self.allocator.alloc(*DrmOutput, identities.len);
+    defer self.allocator.free(outputs);
+    for (identities, 0..) |identity, index| {
+        outputs[index] = blk: {
+            for (self.drm_device.outputs()) |output| {
+                if (output.connector_id == identity) break :blk output;
+            }
+            return error.UnknownConnector;
+        };
+    }
+    const grant = self.createDrmLease(outputs) orelse return error.LeaseDenied;
+    return .{ .identity = grant.lessee_id, .fd = grant.fd };
+}
+
+fn generatedDrmLeaseRevoke(context: *anyopaque, identity: u64) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.drm_device.revokeLease(std.math.cast(u32, identity) orelse return);
 }
 
 pub fn primaryOutputModeSize(self: *Self) render.Size {

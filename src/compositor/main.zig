@@ -43,6 +43,7 @@ const WayringLinuxDmabuf = @import("wayland/WayringLinuxDmabuf.zig");
 const WayringOutputManagement = @import("wayland/WayringOutputManagement.zig");
 const WayringScreencopy = @import("wayland/WayringScreencopy.zig");
 const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
+const WayringDrmLease = @import("wayland/WayringDrmLease.zig");
 
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgDialog = @import("wayland/WayringXdgDialog.zig");
@@ -474,6 +475,10 @@ pub fn main(init: std.process.Init) !void {
     var wayring_virtual_pointer: WayringVirtualPointer = undefined;
     var wayring_virtual_pointer_initialized = false;
     var wayring_virtual_pointer_published = false;
+    var wayring_drm_lease: WayringDrmLease = undefined;
+    var wayring_drm_lease_initialized = false;
+    var wayring_drm_lease_attached = false;
+    var wayring_drm_lease_published = false;
     var wayring_production_adapters: WayringProductionAdapters = undefined;
     const WayringLifecycle = struct {
         clients: *WayringClients,
@@ -530,6 +535,7 @@ pub fn main(init: std.process.Init) !void {
         output_management: ?*WayringOutputManagement,
         screencopy: ?*WayringScreencopy,
         virtual_pointer: ?*WayringVirtualPointer,
+        drm_lease: ?*WayringDrmLease,
         security_context: ?*WayringSecurityContext,
         authorized_uid: std.os.linux.uid_t,
 
@@ -548,6 +554,7 @@ pub fn main(init: std.process.Init) !void {
 
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
+            if (self.drm_lease) |adapter| adapter.destroyClientResources(client);
             if (self.relative_pointer) |adapter| adapter.destroyClientResources(client);
             if (self.pointer_gestures) |adapter| adapter.destroyClientResources(client);
             if (self.pointer_constraints) |adapter| adapter.destroyClientResources(client);
@@ -622,6 +629,11 @@ pub fn main(init: std.process.Init) !void {
             log.warn("failed to shut down Wayring socket: {t}", .{err});
         };
         if (wayring_protocol_server) |*protocol_server| protocol_server.clearGlobalFilter();
+        if (wayring_drm_lease_initialized) {
+            if (wayring_drm_lease_attached) server.detachGeneratedDrmLease(&wayring_drm_lease);
+            if (wayring_drm_lease_published) wayring_drm_lease.unpublish();
+            wayring_drm_lease.deinit();
+        }
         if (wayring_virtual_pointer_initialized) {
             if (wayring_virtual_pointer_published) wayring_virtual_pointer.unpublish();
             wayring_virtual_pointer.deinit();
@@ -1011,6 +1023,19 @@ pub fn main(init: std.process.Init) !void {
         wayring_relative_pointer_published = true;
         try wayring_pointer_gestures.publish();
         wayring_pointer_gestures_published = true;
+        if (output_kind == .drm) {
+            wayring_drm_lease.init(
+                init.gpa,
+                &wayring_protocol_server.?,
+                std.os.linux.getuid(),
+                server.generatedDrmLeaseAuthority(),
+            );
+            wayring_drm_lease_initialized = true;
+            try server.attachGeneratedDrmLease(&wayring_drm_lease);
+            wayring_drm_lease_attached = true;
+            try wayring_drm_lease.publish();
+            wayring_drm_lease_published = true;
+        }
         if (server.wayringOutputLayout() != null) {
             try wayring_pointer_constraints.publish();
             wayring_pointer_constraints_published = true;
@@ -1325,6 +1350,7 @@ pub fn main(init: std.process.Init) !void {
             .output_management = null,
             .screencopy = null,
             .virtual_pointer = null,
+            .drm_lease = if (wayring_drm_lease_initialized) &wayring_drm_lease else null,
             .security_context = null,
             .authorized_uid = std.os.linux.getuid(),
         };
@@ -1378,7 +1404,12 @@ pub fn main(init: std.process.Init) !void {
         }
         if (WayringProfile.validate(
             &wayring_protocol_server.?,
-            if (wayring_outputs_initialized) .presenting_headless else .sidecar,
+            if (wayring_outputs_initialized)
+                .presenting_headless
+            else if (output_kind == .drm)
+                .drm
+            else
+                .sidecar,
         )) |diagnostic| {
             var diagnostic_buffer: [512]u8 = undefined;
             var diagnostic_writer: std.Io.Writer = .fixed(&diagnostic_buffer);
