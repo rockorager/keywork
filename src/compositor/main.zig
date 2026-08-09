@@ -17,6 +17,8 @@ const WayringClients = @import("wayland/WayringClients.zig");
 const WayringCursorShape = @import("wayland/WayringCursorShape.zig");
 const WayringPointerWarp = @import("wayland/WayringPointerWarp.zig");
 const WayringDataControl = @import("wayland/WayringDataControl.zig");
+const WayringZwlrDataControl = @import("wayland/WayringZwlrDataControl.zig");
+const WayringDataControlFanout = @import("wayland/WayringDataControlFanout.zig");
 const WayringDataDevice = @import("wayland/WayringDataDevice.zig");
 const WayringPrimarySelection = @import("wayland/WayringPrimarySelection.zig");
 const WayringTextInput = @import("wayland/WayringTextInput.zig");
@@ -36,6 +38,7 @@ const WayringLinuxDmabuf = @import("wayland/WayringLinuxDmabuf.zig");
 const WayringOutputManagement = @import("wayland/WayringOutputManagement.zig");
 const WayringScreencopy = @import("wayland/WayringScreencopy.zig");
 const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
+
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgDialog = @import("wayland/WayringXdgDialog.zig");
 const WayringXdgToplevelTag = @import("wayland/WayringXdgToplevelTag.zig");
@@ -121,7 +124,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 43/34 profile is not default eligible
+    \\                            its limited 44/34 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -358,6 +361,10 @@ pub fn main(init: std.process.Init) !void {
     var wayring_data_control: WayringDataControl = undefined;
     var wayring_data_control_initialized = false;
     var wayring_data_control_published = false;
+    var wayring_zwlr_data_control: WayringZwlrDataControl = undefined;
+    var wayring_zwlr_data_control_initialized = false;
+    var wayring_zwlr_data_control_published = false;
+    var wayring_data_control_fanout: WayringDataControlFanout = undefined;
     var wayring_input_method: WayringInputMethod = undefined;
     var wayring_input_method_initialized = false;
     var wayring_input_method_published = false;
@@ -424,6 +431,7 @@ pub fn main(init: std.process.Init) !void {
         primary_selection: ?*WayringPrimarySelection,
         text_input: ?*WayringTextInput,
         data_control: ?*WayringDataControl,
+        zwlr_data_control: ?*WayringZwlrDataControl,
         input_method: ?*WayringInputMethod,
         virtual_keyboard: ?*WayringVirtualKeyboard,
         idle_notification: ?*WayringIdleNotification,
@@ -467,6 +475,7 @@ pub fn main(init: std.process.Init) !void {
             if (self.layer_shell) |layer_shell| layer_shell.destroyClientResources(client);
             if (self.virtual_keyboard) |keyboard| keyboard.destroyClientResources(client);
             if (self.input_method) |input_method| input_method.destroyClientResources(client);
+            if (self.zwlr_data_control) |data_control| data_control.destroyClientResources(client);
             if (self.data_control) |data_control| data_control.destroyClientResources(client);
             if (self.text_input) |text_input| text_input.destroyClientResources(client);
             if (self.primary_selection) |primary| primary.destroyClientResources(client);
@@ -564,8 +573,12 @@ pub fn main(init: std.process.Init) !void {
             if (wayring_input_method_published) wayring_input_method.unpublish();
             wayring_input_method.deinit();
         }
+        if (wayring_data_control_initialized or wayring_zwlr_data_control_initialized) server.setDataControlObserver(null);
+        if (wayring_zwlr_data_control_initialized) {
+            if (wayring_zwlr_data_control_published) wayring_zwlr_data_control.unpublish();
+            wayring_zwlr_data_control.deinit();
+        }
         if (wayring_data_control_initialized) {
-            server.setDataControlObserver(null);
             if (wayring_data_control_published) wayring_data_control.unpublish();
             wayring_data_control.deinit();
         }
@@ -728,6 +741,8 @@ pub fn main(init: std.process.Init) !void {
             std.os.linux.getuid(),
         );
         wayring_data_control_initialized = true;
+        wayring_zwlr_data_control.init(init.gpa, &wayring_protocol_server.?, &wayring_clients, &wayring_seat_adapter, server.neutralDataDevice(), std.os.linux.getuid());
+        wayring_zwlr_data_control_initialized = true;
         wayring_input_method.init(
             init.gpa,
             &wayring_protocol_server.?,
@@ -789,13 +804,14 @@ pub fn main(init: std.process.Init) !void {
             .offer_rolled_back = WayringPrimarySelection.offerRolledBack,
             .offer_mime_offered = WayringPrimarySelection.offerMimeOffered,
         });
+        wayring_data_control_fanout = .{ .ext = &wayring_data_control, .wlr = &wayring_zwlr_data_control };
         server.setDataControlObserver(.{
-            .context = &wayring_data_control,
-            .transaction_finalize = WayringDataControl.transactionFinalize,
-            .transaction_commit = WayringDataControl.transactionCommit,
-            .transaction_abort = WayringDataControl.transactionAbort,
-            .offer_rolled_back = WayringDataControl.offerRolledBack,
-            .offer_mime_offered = WayringDataControl.offerMimeOffered,
+            .context = &wayring_data_control_fanout,
+            .transaction_finalize = WayringDataControlFanout.finalize,
+            .transaction_commit = WayringDataControlFanout.commit,
+            .transaction_abort = WayringDataControlFanout.abort,
+            .offer_rolled_back = WayringDataControlFanout.rolledBack,
+            .offer_mime_offered = WayringDataControlFanout.mimeOffered,
         });
         wayring_cursor_shape.init(
             init.gpa,
@@ -976,6 +992,8 @@ pub fn main(init: std.process.Init) !void {
             // registry-filtered by immutable peer credentials.
             try wayring_data_control.publish();
             wayring_data_control_published = true;
+            try wayring_zwlr_data_control.publish();
+            wayring_zwlr_data_control_published = true;
             try wayring_input_method.publish();
             wayring_input_method_published = true;
             // Virtual keyboard is the most privileged generated input global
@@ -1029,6 +1047,7 @@ pub fn main(init: std.process.Init) !void {
             .primary_selection = if (wayring_primary_selection_initialized) &wayring_primary_selection else null,
             .text_input = if (wayring_text_input_initialized) &wayring_text_input else null,
             .data_control = if (wayring_data_control_initialized) &wayring_data_control else null,
+            .zwlr_data_control = if (wayring_zwlr_data_control_initialized) &wayring_zwlr_data_control else null,
             .input_method = if (wayring_input_method_initialized) &wayring_input_method else null,
             .virtual_keyboard = if (wayring_virtual_keyboard_initialized) &wayring_virtual_keyboard else null,
             .idle_notification = if (wayring_idle_notification_initialized) &wayring_idle_notification else null,
@@ -1581,6 +1600,8 @@ test {
     _ = @import("wayland/WayringPrimarySelection.zig");
     _ = @import("wayland/WayringTextInput.zig");
     _ = @import("wayland/WayringDataControl.zig");
+    _ = @import("wayland/WayringZwlrDataControl.zig");
+    _ = @import("wayland/WayringDataControlFanout.zig");
     _ = @import("wayland/WayringVirtualKeyboard.zig");
     _ = @import("VirtualPointer.zig");
     _ = @import("wayland/WayringVirtualPointer.zig");

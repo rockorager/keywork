@@ -18809,6 +18809,8 @@ const WayringXdgClient = struct {
     data_control_manager_version: u32 = 0,
     data_control_manager_name: u32 = 0,
     data_control_manager_removed: bool = false,
+    zwlr_data_control_manager_count: usize = 0,
+    zwlr_data_control_manager_version: u32 = 0,
     generated_input_method_seen: bool = false,
     input_method_manager_count: usize = 0,
     input_method_manager_version: u32 = 0,
@@ -18867,7 +18869,7 @@ const WayringXdgClient = struct {
 
     fn expectedGlobalCount(self: *const @This()) usize {
         return expected_globals.len - @intFromBool(!self.expect_text_input) -
-            @intFromBool(!self.expect_data_control) -
+            2 * @intFromBool(!self.expect_data_control) -
             @intFromBool(!self.expect_input_method) -
             @intFromBool(!self.expect_virtual_keyboard) -
             @intFromBool(!self.expect_layer_shell) -
@@ -18887,6 +18889,8 @@ const WayringXdgClient = struct {
             const present = if (std.mem.eql(u8, global.interface, "zwp_text_input_manager_v3"))
                 self.expect_text_input
             else if (std.mem.eql(u8, global.interface, "ext_data_control_manager_v1"))
+                self.expect_data_control
+            else if (std.mem.eql(u8, global.interface, "zwlr_data_control_manager_v1"))
                 self.expect_data_control
             else if (std.mem.eql(u8, global.interface, "zwp_input_method_manager_v2"))
                 self.expect_input_method
@@ -19301,6 +19305,9 @@ const WayringXdgClient = struct {
                     self.data_control_manager_version = global.version;
                     self.data_control_manager_name = global.name;
                     self.data_control_manager = registry.bind(global.name, client_ext.DataControlManagerV1, 1) catch null;
+                } else if (std.mem.eql(u8, interface, "zwlr_data_control_manager_v1")) {
+                    self.zwlr_data_control_manager_count += 1;
+                    self.zwlr_data_control_manager_version = global.version;
                 } else if (std.mem.eql(u8, interface, "zwp_input_method_manager_v2")) {
                     self.input_method_manager_count += 1;
                     self.input_method_manager_version = global.version;
@@ -26455,6 +26462,8 @@ test "production generated data device completes the exact profile and supports 
     const WayringHost = @import("wayland/WayringHost.zig");
     const WayringIdleNotification = @import("wayland/WayringIdleNotification.zig");
     const WayringDataControl = @import("wayland/WayringDataControl.zig");
+    const WayringZwlrDataControl = @import("wayland/WayringZwlrDataControl.zig");
+    const WayringDataControlFanout = @import("wayland/WayringDataControlFanout.zig");
     const WayringTextInput = @import("wayland/WayringTextInput.zig");
     const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
     const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
@@ -26680,20 +26689,27 @@ test "production generated data device completes the exact profile and supports 
         if (data_control.global != null) data_control.unpublish();
         data_control.deinit();
     }
-    protocol_server.setGlobalFilter(WayringDataControl, &data_control, WayringDataControl.globalFilter);
+    var zwlr_data_control: WayringZwlrDataControl = undefined;
+    zwlr_data_control.init(std.testing.allocator, &protocol_server, &clients, &seat, server.neutralDataDevice(), linux.getuid());
+    defer {
+        if (zwlr_data_control.global != null) zwlr_data_control.unpublish();
+        zwlr_data_control.deinit();
+    }
+    var data_control_fanout: WayringDataControlFanout = .{ .ext = &data_control, .wlr = &zwlr_data_control };
     defer protocol_server.clearGlobalFilter();
     server.setDataControlObserver(.{
-        .context = &data_control,
-        .transaction_finalize = WayringDataControl.transactionFinalize,
-        .transaction_commit = WayringDataControl.transactionCommit,
-        .transaction_abort = WayringDataControl.transactionAbort,
-        .offer_rolled_back = WayringDataControl.offerRolledBack,
-        .offer_mime_offered = WayringDataControl.offerMimeOffered,
+        .context = &data_control_fanout,
+        .transaction_finalize = WayringDataControlFanout.finalize,
+        .transaction_commit = WayringDataControlFanout.commit,
+        .transaction_abort = WayringDataControlFanout.abort,
+        .offer_rolled_back = WayringDataControlFanout.rolledBack,
+        .offer_mime_offered = WayringDataControlFanout.mimeOffered,
     });
     defer server.setDataControlObserver(null);
     // Restricted globals follow the public profile in deterministic owner
     // order: data control, then input method.
     try data_control.publish();
+    try zwlr_data_control.publish();
     var input_method: WayringInputMethod = undefined;
     input_method.init(
         std.testing.allocator,
@@ -26828,6 +26844,7 @@ test "production generated data device completes the exact profile and supports 
         primary_selection: *WayringPrimarySelection,
         text_input: *WayringTextInput,
         data_control: *WayringDataControl,
+        zwlr_data_control: *WayringZwlrDataControl,
         input_method: *WayringInputMethod,
         virtual_keyboard: *WayringVirtualKeyboard,
         virtual_pointer: *WayringVirtualPointer,
@@ -26898,6 +26915,7 @@ test "production generated data device completes the exact profile and supports 
             self.virtual_keyboard.destroyClientResources(client);
             self.input_method.destroyClientResources(client);
             self.data_control.destroyClientResources(client);
+            self.zwlr_data_control.destroyClientResources(client);
             self.text_input.destroyClientResources(client);
             self.data_device.destroyClientResources(client);
             self.primary_selection.destroyClientResources(client);
@@ -26929,6 +26947,7 @@ test "production generated data device completes the exact profile and supports 
         .primary_selection = &primary_selection,
         .text_input = &text_input,
         .data_control = &data_control,
+        .zwlr_data_control = &zwlr_data_control,
         .input_method = &input_method,
         .virtual_keyboard = &virtual_keyboard,
         .virtual_pointer = &generated_virtual_pointer,
@@ -27010,6 +27029,7 @@ test "production generated data device completes the exact profile and supports 
     }
     const GlobalFilter = struct {
         data_control: *WayringDataControl,
+        zwlr_data_control: *WayringZwlrDataControl,
         workspace: *WayringWorkspace,
         security_context: *WayringSecurityContext,
         output_management: *WayringOutputManagement,
@@ -27017,6 +27037,7 @@ test "production generated data device completes the exact profile and supports 
         virtual_pointer: *WayringVirtualPointer,
         fn visible(self: *@This(), client: *const wayring.server.Client, global: *const wayring.server.Server.Global) bool {
             return self.data_control.globalFilter(client, global) and
+                self.zwlr_data_control.globalFilter(client, global) and
                 self.workspace.globalFilter(client, global) and
                 self.security_context.globalFilter(client, global) and
                 self.output_management.globalFilter(client, global) and
@@ -27026,6 +27047,7 @@ test "production generated data device completes the exact profile and supports 
     };
     var global_filter: GlobalFilter = .{
         .data_control = &data_control,
+        .zwlr_data_control = &zwlr_data_control,
         .workspace = &generated_workspace,
         .security_context = &generated_security_context,
         .output_management = &generated_output_management,
@@ -27083,6 +27105,8 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(u32, 2), peer.text_input_manager_version);
     try std.testing.expectEqual(@as(usize, 1), peer.data_control_manager_count);
     try std.testing.expectEqual(@as(u32, 1), peer.data_control_manager_version);
+    try std.testing.expectEqual(@as(usize, 1), peer.zwlr_data_control_manager_count);
+    try std.testing.expectEqual(@as(u32, 2), peer.zwlr_data_control_manager_version);
     try std.testing.expectEqual(@as(usize, 1), peer.input_method_manager_count);
     try std.testing.expect(!peer.generated_virtual_keyboard_seen);
     try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
@@ -27336,8 +27360,10 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(@as(usize, 0), denied.data_control_manager_count);
     try std.testing.expectEqual(@as(usize, 0), denied.workspace_manager_count);
     const before_denied_bind = server.dataDeviceResourceSnapshot();
+    zwlr_data_control.unpublish();
     data_control.unpublish();
     try data_control.publish();
+    try zwlr_data_control.publish();
     denied.guessed_data_control_name = data_control.global.?.name();
     try signalWayringCommand(denied_command);
     try waitForWayringXdgStage(server, denied_host, &denied, .manager_added);
@@ -27567,6 +27593,7 @@ test "production generated data device completes the exact profile and supports 
     try std.testing.expectEqual(client_baseline + 1, server.client_registry.len());
 
     input_method.unpublish();
+    zwlr_data_control.unpublish();
     data_control.unpublish();
     text_input.unpublish();
     primary_selection.unpublish();
@@ -27593,6 +27620,7 @@ test "production generated data device completes the exact profile and supports 
     try primary_selection.publish();
     try text_input.publish();
     try data_control.publish();
+    try zwlr_data_control.publish();
     try input_method.publish();
     try virtual_keyboard.publish();
     try layer_shell.publish();
@@ -28066,6 +28094,7 @@ test "production generated data device completes the exact profile and supports 
     layer_shell.unpublish();
     virtual_keyboard.unpublish();
     input_method.unpublish();
+    zwlr_data_control.unpublish();
     data_control.unpublish();
     text_input.unpublish();
     primary_selection.unpublish();
@@ -28085,6 +28114,7 @@ test "production generated data device completes the exact profile and supports 
     try primary_selection.publish();
     try text_input.publish();
     try data_control.publish();
+    try zwlr_data_control.publish();
     try input_method.publish();
     try virtual_keyboard.publish();
     try layer_shell.publish();

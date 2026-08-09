@@ -148,7 +148,7 @@ pub const ControlDeviceEndpoint = struct {
     regular_prepare: ?*const fn (*anyopaque, ?ControlOfferId) error{OutOfMemory}!void = null,
     regular: *const fn (*anyopaque, ?ControlOfferId) error{OutOfMemory}!void,
     primary_prepare: ?*const fn (*anyopaque, ?ControlOfferId) error{OutOfMemory}!void = null,
-    primary: *const fn (*anyopaque, ?ControlOfferId) error{OutOfMemory}!void,
+    primary: ?*const fn (*anyopaque, ?ControlOfferId) error{OutOfMemory}!void = null,
 };
 const ControlSource = struct { owner: ClientRegistry.Id, regular: SourceId, primary: PrimarySourceId, used: bool = false };
 const ControlDevice = struct { owner: ClientRegistry.Id, endpoint: ControlDeviceEndpoint };
@@ -464,12 +464,15 @@ pub fn createControlDevice(self: *DataDevice, owner: ClientRegistry.Id, endpoint
     const publication = self.issuePublication();
     errdefer self.removeControlPublication(publication);
     const regular = try self.stageControlOffer(id, .regular, publication, self.selection_generation);
-    const primary = try self.stageControlOffer(id, .primary, publication, self.primary_selection_generation);
+    const primary = if (endpoint.primary != null)
+        try self.stageControlOffer(id, .primary, publication, self.primary_selection_generation)
+    else
+        null;
     if (endpoint.regular_prepare) |prepare| prepare(endpoint.context, regular) catch {
         self.abortTransaction();
         return error.OutOfMemory;
     };
-    if (endpoint.primary_prepare) |prepare| prepare(endpoint.context, primary) catch {
+    if (endpoint.primary) |_| if (endpoint.primary_prepare) |prepare| prepare(endpoint.context, primary) catch {
         self.abortTransaction();
         return error.OutOfMemory;
     };
@@ -481,7 +484,7 @@ pub fn createControlDevice(self: *DataDevice, owner: ClientRegistry.Id, endpoint
         self.abortTransaction();
         return error.OutOfMemory;
     };
-    endpoint.primary(endpoint.context, primary) catch {
+    if (endpoint.primary) |primary_callback| primary_callback(endpoint.context, primary) catch {
         self.abortTransaction();
         return error.OutOfMemory;
     };
@@ -1050,6 +1053,7 @@ fn stageControlBatch(self: *DataDevice, channel: ControlChannel, regular: ?Sourc
     var devices = self.control_devices.iterator();
     while (devices.next()) |entry| {
         if (regular == null and primary == null) continue;
+        if (channel == .primary and entry.value.endpoint.primary == null) continue;
         _ = self.control_offers.insert(self.allocator, .{
             .device = entry.id,
             .regular_source = regular,
@@ -1070,6 +1074,7 @@ fn controlOfferForDevice(self: *DataDevice, device: ControlDeviceId, channel: Co
 fn prepareControlBatch(self: *DataDevice, channel: ControlChannel, publication: u64) error{OutOfMemory}!void {
     var devices = self.control_devices.iterator();
     while (devices.next()) |entry| {
+        if (channel == .primary and entry.value.endpoint.primary == null) continue;
         const offer = self.controlOfferForDevice(entry.id, channel, publication);
         const prepare = if (channel == .regular) entry.value.endpoint.regular_prepare else entry.value.endpoint.primary_prepare;
         if (prepare) |callback| try callback(entry.value.endpoint.context, offer);
@@ -1079,11 +1084,12 @@ fn prepareControlBatch(self: *DataDevice, channel: ControlChannel, publication: 
 fn commitControlBatch(self: *DataDevice, channel: ControlChannel, publication: u64) error{OutOfMemory}!void {
     var devices = self.control_devices.iterator();
     while (devices.next()) |entry| {
+        if (channel == .primary and entry.value.endpoint.primary == null) continue;
         const offer = self.controlOfferForDevice(entry.id, channel, publication);
         if (channel == .regular)
             try entry.value.endpoint.regular(entry.value.endpoint.context, offer)
         else
-            try entry.value.endpoint.primary(entry.value.endpoint.context, offer);
+            try entry.value.endpoint.primary.?(entry.value.endpoint.context, offer);
     }
 }
 
@@ -2564,6 +2570,71 @@ test "privileged control shares canonical regular and primary selections without
     data_device.destroyControlSource(regular_source);
     data_device.destroyControlSource(primary_source);
     data_device.destroySource(replacement);
+    data_device.clientDisconnected(client);
+    try std.testing.expectEqual(ResourceCounts{ .sources = 0, .devices = 0, .offers = 0 }, data_device.controlResourceCounts());
+    clients.unregister(client);
+}
+
+test "primary-unsupported control devices never acquire primary offers" {
+    const Endpoint = struct {
+        regular_calls: usize = 0,
+        primary_calls: usize = 0,
+
+        fn regular(context: *anyopaque, _: ?ControlOfferId) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.regular_calls += 1;
+        }
+        fn primary(context: *anyopaque, _: ?ControlOfferId) error{OutOfMemory}!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.primary_calls += 1;
+        }
+        fn send(_: *anyopaque, _: []const u8, _: std.posix.fd_t) void {}
+        fn target(_: *anyopaque, _: ?[]const u8) void {}
+        fn action(_: *anyopaque, _: Actions) void {}
+        fn ignored(_: *anyopaque) void {}
+    };
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    var authority = SeatAuthority.init(std.testing.allocator, &clients, &surfaces);
+    defer authority.deinit();
+    var endpoint: Endpoint = .{};
+    var data_device = DataDevice.init(std.testing.allocator, &clients, &surfaces, &authority, .{
+        .context = &endpoint,
+        .selection_changed = Endpoint.ignored,
+        .drag_changed = Endpoint.ignored,
+    });
+    defer data_device.deinit();
+    const client = try clients.register(.mature_display);
+    const source_endpoint: SourceEndpoint = .{
+        .context = &endpoint,
+        .send = Endpoint.send,
+        .target = Endpoint.target,
+        .action = Endpoint.action,
+        .cancelled = Endpoint.ignored,
+        .drop_performed = Endpoint.ignored,
+        .finished = Endpoint.ignored,
+    };
+    const first = try data_device.createPrimarySource(null, source_endpoint);
+    try data_device.setExternalPrimarySelection(first);
+    const device = try data_device.createControlDevice(client, .{
+        .context = &endpoint,
+        .regular = Endpoint.regular,
+    });
+    try std.testing.expectEqual(@as(usize, 1), endpoint.regular_calls);
+    try std.testing.expectEqual(@as(usize, 0), endpoint.primary_calls);
+    try std.testing.expectEqual(@as(usize, 0), data_device.controlResourceCounts().offers);
+    const second = try data_device.createPrimarySource(null, source_endpoint);
+    try data_device.setExternalPrimarySelection(second);
+    data_device.clearExternalPrimarySelection();
+    try data_device.setExternalPrimarySelection(first);
+    try std.testing.expectEqual(@as(usize, 0), endpoint.primary_calls);
+    try std.testing.expectEqual(@as(usize, 0), data_device.controlResourceCounts().offers);
+    data_device.destroyControlDevice(device);
+    data_device.clearExternalPrimarySelection();
+    data_device.destroyPrimarySource(second);
+    data_device.destroyPrimarySource(first);
     data_device.clientDisconnected(client);
     try std.testing.expectEqual(ResourceCounts{ .sources = 0, .devices = 0, .offers = 0 }, data_device.controlResourceCounts());
     clients.unregister(client);
