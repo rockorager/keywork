@@ -95,7 +95,15 @@ const Surface = struct {
     initial_configure_sent: bool = false,
     sent_capabilities: bool = false,
     prepared_events: ?wire.PreparedBatch = null,
-    prepared_commit: ?WayringCompositor.XdgDirectCommit = null,
+    prepared_commits: std.ArrayList(PreparedDirectCommit) = .empty,
+};
+
+const PreparedDirectCommit = struct {
+    commit: WayringCompositor.XdgDirectCommit,
+    geometry: ?XdgShell.Geometry,
+    geometry_changed: bool,
+    accepted_configure: ?Configure,
+    prepared_events: ?wire.PreparedBatch = null,
 };
 
 const Toplevel = struct {
@@ -1150,6 +1158,7 @@ fn commitHandler(surface: *Surface) WayringCompositor.XdgCommitHandler {
         .prepare = prepareCommit,
         .abort_prepare = abortPreparedCommit,
         .validate = validateCommit,
+        .commit_prepared = commitPrepared,
         .pre_unmap = preUnmap,
         .post_apply = postApply,
         .surface_destroyed = underlyingSurfaceDestroyed,
@@ -1161,42 +1170,43 @@ fn prepareCommit(
     commit: WayringCompositor.XdgDirectCommit,
 ) WayringCompositor.XdgCommitDecision {
     const surface: *Surface = @ptrCast(@alignCast(context));
-    if (surface.prepared_commit != null or surface.prepared_events != null) {
-        surface.client.postImplementationError(&surface.resource.runtime, "nested XDG commit preparation");
+    surface.prepared_commits.ensureUnusedCapacity(surface.adapter.allocator, 1) catch {
+        surface.client.postOutOfMemory(&surface.resource.runtime, "reserving XDG commit ticket");
         return .reject;
-    }
-    surface.prepared_commit = commit;
+    };
+    surface.prepared_commits.appendAssumeCapacity(.{
+        .commit = commit,
+        .geometry = surface.pending_geometry,
+        .geometry_changed = surface.pending_geometry_changed,
+        .accepted_configure = surface.accepted_configure,
+    });
     if (surface.active_role == null or commit.next_size != null or surface.initial_configure_sent) {
         return .accept;
     }
     surface.configures.ensureUnusedCapacity(surface.adapter.allocator, 1) catch {
-        surface.prepared_commit = null;
         surface.client.postOutOfMemory(&surface.resource.runtime, "reserving XDG configure snapshot");
         return .reject;
     };
     const extra_bytes = gtkConfigureBytes(surface) catch {
-        surface.prepared_commit = null;
         surface.client.postOutOfMemory(&surface.resource.runtime, "reserving GTK configure events");
         return .reject;
     };
     const total_bytes = std.math.add(usize, prepared_configure_bytes, extra_bytes) catch {
-        surface.prepared_commit = null;
         surface.client.postOutOfMemory(&surface.resource.runtime, "reserving XDG configure events");
         return .reject;
     };
-    surface.prepared_events = surface.client.prepareEvents(total_bytes) catch |err| {
-        surface.prepared_commit = null;
+    const prepared = &surface.prepared_commits.items[surface.prepared_commits.items.len - 1];
+    prepared.prepared_events = surface.client.prepareEvents(total_bytes) catch |err| {
         eventFailure(surface.client, &surface.resource.runtime, err, "reserving XDG configure events");
         return .reject;
     };
     return .accept;
 }
 
-fn abortPreparedCommit(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
+fn abortPreparedCommit(context: *anyopaque, token: WayringCompositor.UpdateToken) void {
     const surface: *Surface = @ptrCast(@alignCast(context));
-    if (surface.prepared_events) |prepared| surface.client.cancelPreparedEvents(prepared);
-    surface.prepared_events = null;
-    surface.prepared_commit = null;
+    const prepared = takePreparedCommit(surface, token) orelse return;
+    if (prepared.prepared_events) |events| surface.client.cancelPreparedEvents(events);
 }
 
 fn validateCommit(
@@ -1204,7 +1214,7 @@ fn validateCommit(
     commit: WayringCompositor.XdgDirectCommit,
 ) WayringCompositor.XdgCommitDecision {
     const surface: *Surface = @ptrCast(@alignCast(context));
-    std.debug.assert(surface.prepared_commit != null);
+    _ = findPreparedCommit(surface, commit.token) orelse unreachable;
     const role = surface.adapter.core_shell.validateCommit(surface.core_id) catch |err| switch (err) {
         error.InvalidSurface => {
             surface.client.postImplementationError(
@@ -1268,9 +1278,22 @@ fn validateCommit(
     return .accept;
 }
 
-fn preUnmap(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
+fn commitPrepared(context: *anyopaque, token: WayringCompositor.UpdateToken) void {
     const surface: *Surface = @ptrCast(@alignCast(context));
-    const commit = surface.prepared_commit orelse unreachable;
+    const prepared = findPreparedCommit(surface, token) orelse unreachable;
+    const commit = prepared.commit;
+    if (prepared.geometry_changed) surface.pending_geometry_changed = false;
+    const applies_buffer = commit.attachment_changed and commit.next_size != null;
+    const applies_configure = if (surface.active_role) |active| switch (active) {
+        .toplevel => applies_buffer,
+        .popup => commit.next_size != null,
+    } else false;
+    if (applies_configure and prepared.accepted_configure != null) surface.accepted_configure = null;
+}
+
+fn preUnmap(context: *anyopaque, token: WayringCompositor.UpdateToken) void {
+    const surface: *Surface = @ptrCast(@alignCast(context));
+    const commit = (findPreparedCommit(surface, token) orelse unreachable).commit;
     if (commit.current_size != null and commit.next_size == null) if (surface.active_role) |role|
         switch (role) {
             .popup => |popup| surface.adapter.core_shell.setPopupScenePresentationEnabled(popup.core_id, false),
@@ -1283,18 +1306,18 @@ fn preUnmap(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
     );
 }
 
-fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
+fn postApply(context: *anyopaque, token: WayringCompositor.UpdateToken) void {
     const surface: *Surface = @ptrCast(@alignCast(context));
-    const commit = surface.prepared_commit orelse unreachable;
-    if (surface.pending_geometry_changed) {
+    const prepared = findPreparedCommit(surface, token) orelse unreachable;
+    const commit = prepared.commit;
+    if (prepared.geometry_changed) {
         surface.adapter.core_shell.commitGeometry(
             surface.core_id,
-            surface.pending_geometry orelse unreachable,
+            prepared.geometry orelse unreachable,
         );
-        surface.pending_geometry_changed = false;
     }
     const dismissed_popup = switch (surface.active_role orelse {
-        finishPreparedCommit(surface);
+        finishPreparedCommit(surface, token);
         return;
     }) {
         .toplevel => false,
@@ -1306,13 +1329,13 @@ fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
         .popup => commit.next_size != null and !dismissed_popup,
     };
     const accepted: ?XdgShell.AcceptedConfigure = if (applies_configure)
-        if (surface.accepted_configure) |configure| configure.accepted else null
+        if (prepared.accepted_configure) |configure| configure.accepted else null
     else
         null;
     if (commit.next_size != null) switch (surface.active_role.?) {
         .toplevel => |toplevel| {
             const info = surface.adapter.core_shell.windowInfo(toplevel.core_id) orelse {
-                finishPreparedCommit(surface);
+                finishPreparedCommit(surface, token);
                 return;
             };
             const mapping_configured = accepted != null or
@@ -1326,7 +1349,7 @@ fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
                         &surface.resource.runtime,
                         "enabling generated XDG toplevel presentation",
                     );
-                    finishPreparedCommit(surface);
+                    finishPreparedCommit(surface, token);
                     return;
                 };
             }
@@ -1343,7 +1366,7 @@ fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
             error.PopupParentNotMapped => "xdg_popup parent is not mapped",
             error.InvalidPopupParent => "invalid xdg_popup parent",
         });
-        finishPreparedCommit(surface);
+        finishPreparedCommit(surface, token);
         return;
     };
     if (commit.next_size != null) switch (surface.active_role.?) {
@@ -1352,7 +1375,7 @@ fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
             // now completed. Publish interaction only after both succeeded,
             // so OOM can never leave a focusable generated role behind.
             const info = surface.adapter.core_shell.windowInfo(toplevel.core_id) orelse {
-                finishPreparedCommit(surface);
+                finishPreparedCommit(surface, token);
                 return;
             };
             if (info.mapped and info.scene_presentation_enabled) {
@@ -1366,17 +1389,27 @@ fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
                 surface.adapter.core_shell.setPopupScenePresentationEnabled(popup.core_id, true);
         },
     };
-    if (applies_configure) surface.accepted_configure = null;
     if (commit.current_size != null and commit.next_size == null and !dismissed_popup) {
         resetWireState(surface);
     }
-    finishPreparedCommit(surface);
+    finishPreparedCommit(surface, token);
 }
 
-fn finishPreparedCommit(surface: *Surface) void {
-    if (surface.prepared_events) |prepared| surface.client.cancelPreparedEvents(prepared);
-    surface.prepared_events = null;
-    surface.prepared_commit = null;
+fn finishPreparedCommit(surface: *Surface, token: WayringCompositor.UpdateToken) void {
+    const prepared = takePreparedCommit(surface, token) orelse return;
+    if (prepared.prepared_events) |events| surface.client.cancelPreparedEvents(events);
+}
+
+fn findPreparedCommit(surface: *Surface, token: WayringCompositor.UpdateToken) ?*PreparedDirectCommit {
+    for (surface.prepared_commits.items) |*prepared|
+        if (std.meta.eql(prepared.commit.token, token)) return prepared;
+    return null;
+}
+
+fn takePreparedCommit(surface: *Surface, token: WayringCompositor.UpdateToken) ?PreparedDirectCommit {
+    for (surface.prepared_commits.items, 0..) |prepared, index|
+        if (std.meta.eql(prepared.commit.token, token)) return surface.prepared_commits.orderedRemove(index);
+    return null;
 }
 
 fn underlyingSurfaceDestroyed(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
@@ -1547,7 +1580,8 @@ fn configurePopup(
 }
 
 fn prepareEndpointConfigure(surface: *Surface, extra_bytes: usize) error{OutOfMemory}!void {
-    if (surface.prepared_events != null) {
+    const slot = preparedEventSlot(surface);
+    if (slot.* != null) {
         std.debug.assert(surface.configures.capacity - surface.configures.items.len >= 1);
         return;
     }
@@ -1559,7 +1593,7 @@ fn prepareEndpointConfigure(surface: *Surface, extra_bytes: usize) error{OutOfMe
         surface.client.postOutOfMemory(&surface.resource.runtime, "reserving XDG configure events");
         return error.OutOfMemory;
     };
-    surface.prepared_events = surface.client.prepareEvents(total_bytes) catch |err| {
+    slot.* = surface.client.prepareEvents(total_bytes) catch |err| {
         eventFailure(surface.client, &surface.resource.runtime, err, "reserving XDG configure events");
         return error.OutOfMemory;
     };
@@ -1576,22 +1610,35 @@ fn emitConfigure(
     events: []const server.Client.PreparedEvent,
     configure: Configure,
 ) error{OutOfMemory}!void {
-    const prepared = surface.prepared_events.?;
+    const slot = preparedEventSlot(surface);
+    const prepared = slot.*.?;
     surface.client.emitPreparedEvents(prepared, events) catch |err| {
         surface.client.cancelPreparedEvents(prepared);
-        surface.prepared_events = null;
+        slot.* = null;
         eventFailure(surface.client, &surface.resource.runtime, err, "publishing atomic XDG configure");
         return error.OutOfMemory;
     };
-    surface.prepared_events = null;
+    slot.* = null;
     surface.configures.appendAssumeCapacity(configure);
     surface.initial_configure_sent = true;
 }
 
 fn failPreparedConfigure(surface: *Surface, detail: []const u8) void {
-    if (surface.prepared_events) |prepared| surface.client.cancelPreparedEvents(prepared);
-    surface.prepared_events = null;
+    const slot = preparedEventSlot(surface);
+    if (slot.*) |prepared| surface.client.cancelPreparedEvents(prepared);
+    slot.* = null;
     surface.client.postImplementationError(&surface.resource.runtime, detail);
+}
+
+/// Configure callbacks invoked by commit validation use only that exact
+/// newest ticket's reservation. Policy-driven configures outside validation
+/// retain the independent endpoint reservation.
+fn preparedEventSlot(surface: *Surface) *?wire.PreparedBatch {
+    if (surface.prepared_commits.items.len != 0) {
+        const ticket = &surface.prepared_commits.items[surface.prepared_commits.items.len - 1];
+        if (ticket.prepared_events != null) return &ticket.prepared_events;
+    }
+    return &surface.prepared_events;
 }
 
 fn closeToplevel(context: *anyopaque) void {
@@ -1709,9 +1756,12 @@ fn destroyToplevel(self: *WayringXdgShell, toplevel: *Toplevel, surface_gone: bo
 }
 
 fn destroySurface(self: *WayringXdgShell, surface: *Surface, surface_gone: bool) void {
+    if (!surface_gone)
+        self.compositor.detachXdgCommitHandler(surface.reservation, surface) catch unreachable;
     if (surface.prepared_events) |prepared| surface.client.cancelPreparedEvents(prepared);
     surface.prepared_events = null;
-    surface.prepared_commit = null;
+    std.debug.assert(surface.prepared_commits.items.len == 0);
+    surface.prepared_commits.deinit(self.allocator);
     if (surface.active_role) |role| switch (role) {
         .popup => |popup| self.destroyPopup(popup, surface_gone),
         .toplevel => |toplevel| self.destroyToplevel(toplevel, surface_gone),
@@ -2388,7 +2438,7 @@ test "commit before role construction is rejected without configure publication"
         @as(?u32, @intCast(core.xdg_surface.@"error".not_constructed)),
         harness.client().fatal().?.protocol_code,
     );
-    try std.testing.expect(surface.prepared_commit == null);
+    try std.testing.expectEqual(@as(usize, 0), surface.prepared_commits.items.len);
     try std.testing.expect(surface.prepared_events == null);
     try std.testing.expectEqual(@as(usize, 0), surface.configures.items.len);
 }
@@ -2550,7 +2600,7 @@ test "raw configure serial exhaustion publishes no alias and leaves preparation 
     try std.testing.expectEqual(std.math.maxInt(u32), surface.configures.items[0].serial);
     try std.testing.expectEqual(@as(u64, 1), surface.configures.items[0].accepted.token.sequence);
     try std.testing.expect(surface.prepared_events == null);
-    try std.testing.expect(surface.prepared_commit == null);
+    try std.testing.expectEqual(@as(usize, 0), surface.prepared_commits.items.len);
     try std.testing.expectError(error.SerialExhausted, harness.host.nextSerial());
 }
 
@@ -2615,7 +2665,7 @@ test "first-map presentation OOM leaves published Wayring content private" {
     try std.testing.expect(!info.mapped);
     try std.testing.expect(!info.scene_presentation_enabled);
     try std.testing.expect(!info.interaction_enabled);
-    try std.testing.expect(adapter_surface.prepared_commit == null);
+    try std.testing.expectEqual(@as(usize, 0), adapter_surface.prepared_commits.items.len);
     var scene_windows = harness.scene.iterator();
     try std.testing.expect(!scene_windows.next().?.window.mapped);
 }
@@ -2848,7 +2898,7 @@ test "invalid size hints reject after preparation and publish no configure" {
         harness.client().fatal().?.protocol_code,
     );
     try std.testing.expect(surface.prepared_events == null);
-    try std.testing.expect(surface.prepared_commit == null);
+    try std.testing.expectEqual(@as(usize, 0), surface.prepared_commits.items.len);
     try std.testing.expectEqual(@as(usize, 0), surface.configures.items.len);
 }
 

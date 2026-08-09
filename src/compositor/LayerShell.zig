@@ -273,11 +273,11 @@ pub fn prepareCommit(self: *LayerShell, id: LayerSurfaceId, has_buffer: bool) Co
     return .{ .surface = id, .has_buffer = has_buffer, .pending = state.pending };
 }
 
-/// Publishes a prepared commit. The frontend must ensure the surface still
-/// exists and did not receive another pending-state mutation in between.
+/// Publishes the exact prepared snapshot. Pending mutations made after
+/// preparation remain pending for a later commit.
 pub fn finalizeCommit(self: *LayerShell, prepared: PreparedCommit) void {
     const state = self.surfaces.get(prepared.surface) orelse return;
-    std.debug.assert(std.meta.eql(state.pending, prepared.pending));
+    const pending_unchanged = std.meta.eql(state.pending, prepared.pending);
     if (!prepared.has_buffer and state.mapped) {
         const reset: State = .{ .layer = state.initial_layer };
         state.mapped = false;
@@ -285,11 +285,11 @@ pub fn finalizeCommit(self: *LayerShell, prepared: PreparedCommit) void {
         state.acked = false;
         state.awaiting_initial_commit = true;
         state.configure_tokens.clearRetainingCapacity();
-        state.pending = reset;
         state.current = reset;
+        if (pending_unchanged) state.pending = reset;
         if (self.observer) |observer| observer.unmapped(observer.context, prepared.surface);
     } else {
-        state.current = state.pending;
+        state.current = prepared.pending;
         state.awaiting_initial_commit = false;
         if (prepared.has_buffer) state.mapped = true;
     }
@@ -505,6 +505,36 @@ test "transactions own namespace configure acknowledgements and remap state" {
     try std.testing.expectError(error.InvalidLayerSurface, shell.setSize(id, 1, 1));
     try std.testing.expectError(error.ForeignConfigure, shell.ackConfigure(replacement, second));
     shell.destroySurface(replacement);
+}
+
+test "queued prepared commits publish exact snapshots and preserve newer pending state" {
+    var clients = ClientRegistry.init(std.testing.allocator);
+    defer clients.deinit();
+    const client = try clients.register(.wayring_server);
+    defer clients.unregister(client);
+    var surfaces = SurfaceRegistry.init(std.testing.allocator);
+    defer surfaces.deinit();
+    var provider: TestProvider = .{};
+    const surface = try surfaces.add(.{ .context = &provider, .render_state = TestProvider.renderState });
+    defer surfaces.remove(surface);
+    var output: TestOutput = .{};
+    var shell = LayerShell.init(std.testing.allocator, &clients, &surfaces, &output, TestOutput.valid);
+    defer shell.deinit();
+    var endpoint: TestEndpoint = .{};
+    const id = try shell.createSurface(client, surface, output.id, "fifo", .top, endpoint.endpoint());
+    defer shell.destroySurface(id);
+
+    try shell.setLayerRaw(id, @intFromEnum(Layer.bottom));
+    const first = try shell.prepareCommit(id, false);
+    try shell.setLayerRaw(id, @intFromEnum(Layer.overlay));
+    const second = try shell.prepareCommit(id, false);
+
+    shell.finalizeCommit(first);
+    try std.testing.expectEqual(Layer.bottom, shell.snapshot(id).?.current.layer);
+    try std.testing.expectEqual(Layer.overlay, shell.snapshot(id).?.pending.layer);
+    shell.finalizeCommit(second);
+    try std.testing.expectEqual(Layer.overlay, shell.snapshot(id).?.current.layer);
+    try std.testing.expectEqual(Layer.overlay, shell.snapshot(id).?.pending.layer);
 }
 
 test "configure publication rollback and sequence exhaustion are explicit" {

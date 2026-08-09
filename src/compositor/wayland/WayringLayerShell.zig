@@ -263,21 +263,22 @@ fn releaseRole(context: *anyopaque) void {
 }
 
 fn commitHandler(child: *Child) WayringCompositor.LayerCommitHandler {
-    return .{ .context = child, .prepare = prepareCommit, .abort_prepare = abortCommit, .validate = validateCommit, .pre_unmap = preUnmap, .post_apply = finishCommit, .surface_destroyed = surfaceDestroyed };
+    return .{ .context = child, .prepare = prepareCommit, .abort_prepare = abortCommit, .validate = validateCommit, .commit_prepared = commitPrepared, .pre_unmap = preUnmap, .post_apply = finishCommit, .surface_destroyed = surfaceDestroyed };
 }
 fn prepareCommit(context: *anyopaque, commit: WayringCompositor.LayerDirectCommit) WayringCompositor.XdgCommitDecision {
     const child: *Child = @ptrCast(@alignCast(context));
     if (!validate(child, commit.next_size != null)) return .reject;
-    return if (child.owner.policy.prepareDirectCommit(child.policy_id, commit.next_size != null)) .accept else .reject;
+    return if (child.owner.policy.prepareDirectCommit(child.policy_id, commit.token, commit.next_size != null)) .accept else .reject;
 }
-fn abortCommit(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
+fn abortCommit(context: *anyopaque, token: WayringCompositor.UpdateToken) void {
     const child: *Child = @ptrCast(@alignCast(context));
-    child.owner.policy.abortDirectCommit(child.policy_id);
+    child.owner.policy.abortDirectCommit(child.policy_id, token);
 }
 fn validateCommit(context: *anyopaque, commit: WayringCompositor.LayerDirectCommit) WayringCompositor.XdgCommitDecision {
     const child: *Child = @ptrCast(@alignCast(context));
     return if (validate(child, commit.next_size != null)) .accept else .reject;
 }
+fn commitPrepared(_: *anyopaque, _: WayringCompositor.UpdateToken) void {}
 fn validate(child: *Child, has_buffer: bool) bool {
     child.owner.policy.validateDirectCommit(child.policy_id, has_buffer) catch |err| {
         const code: u32 = switch (err) {
@@ -292,10 +293,10 @@ fn validate(child: *Child, has_buffer: bool) bool {
     };
     return true;
 }
-fn preUnmap(_: *anyopaque, _: WayringCompositor.SurfaceId) void {}
-fn finishCommit(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
+fn preUnmap(_: *anyopaque, _: WayringCompositor.UpdateToken) void {}
+fn finishCommit(context: *anyopaque, token: WayringCompositor.UpdateToken) void {
     const child: *Child = @ptrCast(@alignCast(context));
-    child.owner.policy.finishDirectCommit(child.policy_id);
+    child.owner.policy.finishDirectCommit(child.policy_id, token);
 }
 fn surfaceDestroyed(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
     const child: *Child = @ptrCast(@alignCast(context));
@@ -304,6 +305,7 @@ fn surfaceDestroyed(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
 }
 
 fn destroyChild(self: *WayringLayerShell, child: *Child, surface_gone: bool) void {
+    if (child.role_live and !surface_gone) releaseRole(child);
     if (child.policy_live) self.policy.destroyPreparedSurface(child.policy_id);
     if (child.role_live and surface_gone) child.role_live = false;
     remove(Child, &self.children, child);

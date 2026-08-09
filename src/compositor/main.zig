@@ -61,6 +61,7 @@ const WayringContentType = @import("wayland/WayringContentType.zig");
 const WayringColorRepresentation = @import("wayland/WayringColorRepresentation.zig");
 const WayringAlphaModifier = @import("wayland/WayringAlphaModifier.zig");
 const WayringTearingControl = @import("wayland/WayringTearingControl.zig");
+const WayringFifo = @import("wayland/WayringFifo.zig");
 const WayringBackgroundEffect = @import("wayland/WayringBackgroundEffect.zig");
 const WayringFixes = @import("wayland/WayringFixes.zig");
 const WayringSystemBell = @import("wayland/WayringSystemBell.zig");
@@ -130,7 +131,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 50/38 profile is not default eligible
+    \\                            its limited 51/39 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -325,6 +326,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_tearing_control: WayringTearingControl = undefined;
     var wayring_tearing_control_initialized = false;
     var wayring_tearing_control_published = false;
+    var wayring_fifo: WayringFifo = undefined;
+    var wayring_fifo_initialized = false;
+    var wayring_fifo_published = false;
     var wayring_background_effect: WayringBackgroundEffect = undefined;
     var wayring_background_effect_initialized = false;
     var wayring_background_effect_published = false;
@@ -438,6 +442,7 @@ pub fn main(init: std.process.Init) !void {
         color_representation: ?*WayringColorRepresentation,
         alpha_modifier: ?*WayringAlphaModifier,
         tearing_control: ?*WayringTearingControl,
+        fifo: ?*WayringFifo,
         background_effect: ?*WayringBackgroundEffect,
         fixes: ?*WayringFixes,
         cursor_shape: ?*WayringCursorShape,
@@ -522,6 +527,7 @@ pub fn main(init: std.process.Init) !void {
                 fractional_scale.destroyClientResources(client);
             if (self.alpha_modifier) |alpha_modifier| alpha_modifier.destroyClientResources(client);
             if (self.tearing_control) |adapter| adapter.destroyClientResources(client);
+            if (self.fifo) |adapter| adapter.destroyClientResources(client);
             if (self.background_effect) |adapter| adapter.destroyClientResources(client);
             if (self.color_representation) |adapter| adapter.destroyClientResources(client);
             if (self.content_type) |content_type| content_type.destroyClientResources(client);
@@ -680,6 +686,10 @@ pub fn main(init: std.process.Init) !void {
             if (wayring_background_effect_published) wayring_background_effect.unpublish();
             wayring_background_effect.deinit();
         }
+        if (wayring_fifo_initialized) {
+            if (wayring_fifo_published) wayring_fifo.unpublish();
+            wayring_fifo.deinit();
+        }
         if (wayring_tearing_control_initialized) {
             if (wayring_tearing_control_published) wayring_tearing_control.unpublish();
             wayring_tearing_control.deinit();
@@ -746,7 +756,10 @@ pub fn main(init: std.process.Init) !void {
             wayring_seat_adapter_initialized = false;
         }
         if (wayring_clients_initialized) wayring_clients.deinit();
-        if (wayring_compositor_initialized) wayring_compositor.deinit();
+        if (wayring_compositor_initialized) {
+            server.setGeneratedFifoCompositor(null);
+            wayring_compositor.deinit();
+        }
         if (wayring_protocol_server) |*protocol_server| protocol_server.deinit();
     }
     if (wayland_server_mode != .libwayland) {
@@ -763,6 +776,7 @@ pub fn main(init: std.process.Init) !void {
             server.wayringPresentationListener(),
         );
         wayring_compositor_initialized = true;
+        server.setGeneratedFifoCompositor(&wayring_compositor);
         wayring_seat_adapter = .init(
             init.gpa,
             &wayring_protocol_server.?,
@@ -994,6 +1008,8 @@ pub fn main(init: std.process.Init) !void {
         wayring_alpha_modifier_initialized = true;
         wayring_tearing_control.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
         wayring_tearing_control_initialized = true;
+        wayring_fifo.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
+        wayring_fifo_initialized = true;
         wayring_background_effect.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
         wayring_background_effect_initialized = true;
         wayring_fixes.init(init.gpa, &wayring_protocol_server.?);
@@ -1041,6 +1057,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_alpha_modifier_published = true;
             try wayring_tearing_control.publish();
             wayring_tearing_control_published = true;
+            try wayring_fifo.publish();
+            wayring_fifo_published = true;
             try wayring_background_effect.publish();
             wayring_background_effect_published = true;
             try wayring_fixes.publish();
@@ -1119,6 +1137,7 @@ pub fn main(init: std.process.Init) !void {
             .color_representation = if (wayring_color_representation_initialized) &wayring_color_representation else null,
             .alpha_modifier = if (wayring_alpha_modifier_initialized) &wayring_alpha_modifier else null,
             .tearing_control = if (wayring_tearing_control_initialized) &wayring_tearing_control else null,
+            .fifo = if (wayring_fifo_initialized) &wayring_fifo else null,
             .background_effect = if (wayring_background_effect_initialized) &wayring_background_effect else null,
             .fixes = if (wayring_fixes_initialized) &wayring_fixes else null,
             .cursor_shape = if (wayring_cursor_shape_initialized) &wayring_cursor_shape else null,
@@ -1751,6 +1770,7 @@ test {
     _ = @import("wayland/WayringColorRepresentation.zig");
     _ = @import("wayland/WayringAlphaModifier.zig");
     _ = @import("wayland/WayringTearingControl.zig");
+    _ = @import("wayland/WayringFifo.zig");
     _ = @import("wayland/WayringBackgroundEffect.zig");
     _ = @import("wayland/WayringFixes.zig");
     _ = @import("wayland/WayringSystemBell.zig");

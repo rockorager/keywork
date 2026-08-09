@@ -412,6 +412,7 @@ generated_foreign_toplevel_observer: ?GeneratedForeignToplevelObserver = null,
 generated_input_method_observer: ?GeneratedInputMethodObserver = null,
 generated_output_observer: ?GeneratedOutputObserver = null,
 generated_capture_observer: ?GeneratedCaptureObserver = null,
+generated_fifo_compositor: ?*WayringCompositor = null,
 generated_idle_inhibit_provider: ?GeneratedIdleInhibitProvider = null,
 generated_keyboard_shortcuts_inhibit_provider: ?GeneratedKeyboardShortcutsInhibitProvider = null,
 generated_relative_pointer_observer: ?GeneratedRelativePointerObserver = null,
@@ -4481,6 +4482,10 @@ pub fn setGeneratedOutputObserver(self: *Self, observer: ?GeneratedOutputObserve
 
 pub fn setGeneratedCaptureObserver(self: *Self, observer: ?GeneratedCaptureObserver) void {
     self.generated_capture_observer = observer;
+}
+
+pub fn setGeneratedFifoCompositor(self: *Self, compositor: ?*WayringCompositor) void {
+    self.generated_fifo_compositor = compositor;
 }
 
 pub fn generatedOutputTarget(self: *Self) ?NeutralOutputManagement.Target {
@@ -11158,7 +11163,7 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     const fifo_barrier = Surface.hasFifoBarrierForOutput(
         self.compositor.surfaceStore(),
         output,
-    );
+    ) or self.hasGeneratedFifoBarrierCandidate(output);
     const allow_tearing = if (top_fullscreen) |window_id|
         if (self.scene.windowSurface(window_id)) |surface_id|
             if (self.surface_registry.renderState(surface_id)) |state|
@@ -11349,10 +11354,9 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     while (input_popups.next()) |popup| self.submitSurfaceTree(output, popup.surface_id);
     const drag_icon = self.mature_data_device.iconInfo();
     if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
-    const generated_drag_icon = self.generatedDragIconInfo();
-    if (generated_drag_icon) |info| self.submitGeneratedCompound(output, info.surface_id);
     if (paint_primary_cursor) self.submitSeatCursor(output, &self.seat, false);
     self.submitTabletCursors(output, false);
+    self.associateGeneratedFifoBarriers(output, render_output.protocol_id);
     const callback_timestamp = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io));
     try Surface.sendSubmittedFrameCallbacks(
         self.compositor.surfaceStore(),
@@ -11365,6 +11369,8 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
         self.allocator,
         output,
     );
+    if (self.generated_fifo_compositor) |compositor|
+        compositor.clearFifoBarriersForOutput(render_output.protocol_id) catch return error.OutOfMemory;
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
     self.captureOutputFrame(
@@ -11619,6 +11625,7 @@ fn presentSessionLockFrame(
         frame.render_output.cursor_state == .deactivating)
         self.submitSeatCursor(frame.output, &self.seat, true);
     self.submitTabletCursors(frame.output, true);
+    self.associateGeneratedFifoBarriers(frame.output, frame.render_output.protocol_id);
     const callback_timestamp = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io));
     try Surface.sendSubmittedFrameCallbacks(
         self.compositor.surfaceStore(),
@@ -11631,6 +11638,8 @@ fn presentSessionLockFrame(
         self.allocator,
         frame.output,
     );
+    if (self.generated_fifo_compositor) |compositor|
+        compositor.clearFifoBarriersForOutput(frame.render_output.protocol_id) catch return error.OutOfMemory;
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(frame.render_output, info);
     self.captureOutputFrame(frame.render_output.protocol_id, capture_source);
@@ -11837,12 +11846,22 @@ fn renderCursor(
             while (iterator.next()) |entry| {
                 const render_state = self.surface_registry.renderState(entry.id) orelse continue;
                 std.debug.assert(std.meta.eql(entry.mapped_size, render_state.logical_size));
+                const entry_x = generated.x +| entry.position.x;
+                const entry_y = generated.y +| entry.position.y;
+                const bounds: render.Rect = .{
+                    .x = entry_x,
+                    .y = entry_y,
+                    .width = entry.mapped_size.width,
+                    .height = entry.mapped_size.height,
+                };
+                if (bounds.intersection(frame.visible_rect) == null) continue;
+                if (frame.track_visibility) try frame.output.markSurfaceVisible(entry.id);
                 const command = [_]render.Command{.{ .image = imageFromRenderState(
                     render_state,
                     .{
                         .position = .{
-                            .x = generated.x +| entry.position.x,
-                            .y = generated.y +| entry.position.y,
+                            .x = entry_x,
+                            .y = entry_y,
                         },
                         .rounded_clip = null,
                         .clip = null,
@@ -12093,12 +12112,9 @@ fn outputClearColor(palette: theme.Palette, locked: bool) render.Color {
 fn submitLayerSurfaces(self: *Self, output: *Output, layer: Scene.Layer) void {
     var surfaces = self.scene.layerSurfaceIterator(layer);
     while (surfaces.next()) |entry| {
-        if (entry.layer_surface.mapped) {
-            if (self.exactEligibleGeneratedLayerRoot(entry.layer_surface.surface_id) != null)
-                self.submitGeneratedCompound(output, entry.layer_surface.surface_id)
-            else
-                self.submitSurfaceTree(output, entry.layer_surface.surface_id);
-        }
+        if (entry.layer_surface.mapped and
+            self.exactEligibleGeneratedLayerRoot(entry.layer_surface.surface_id) == null)
+            self.submitSurfaceTree(output, entry.layer_surface.surface_id);
     }
 }
 
@@ -12145,9 +12161,7 @@ fn submitLayerPopups(self: *Self, output: *Output) void {
             var popups = self.scene.layerPopupIterator(root.id);
             while (popups.next()) |entry| {
                 if (!entry.popup.mapped) continue;
-                if (self.exactEligibleGeneratedPopupRoot(entry.popup.surface_id))
-                    self.submitGeneratedCompound(output, entry.popup.surface_id)
-                else
+                if (!self.exactEligibleGeneratedPopupRoot(entry.popup.surface_id))
                     self.submitSurfaceTree(output, entry.popup.surface_id);
             }
         }
@@ -13399,16 +13413,25 @@ fn submitSurfaceTree(self: *Self, output: *Output, surface_id: Surface.Id) void 
     };
 }
 
-/// Generated surfaces have no mature presentation feedback to submit. This
-/// traversal deliberately mirrors generated rendering so output membership
-/// and sampled tags remain the sole acceptance criteria; sampled frame demand
-/// is completed by completeSampledHeadlessFrames after the frame is accepted.
-fn submitGeneratedCompound(self: *Self, output: *Output, root: SurfaceRegistry.Id) void {
-    var iterator = self.headless_surface_forest.subtreeRenderIterator(root);
-    while (iterator.next()) |entry| {
-        if (!output.containsSurface(entry.id)) continue;
-        _ = self.renderer.wasSampled(surfaceSampleTag(entry.id));
+/// Associates barriers after the accepted frame's role-specific submission
+/// work, independently of which role (if any) owns each generated node.
+fn associateGeneratedFifoBarriers(self: *Self, output: *Output, output_id: OutputLayout.Id) void {
+    const compositor = self.generated_fifo_compositor orelse return;
+    var iterator = self.headless_surface_forest.nodeIterator();
+    while (iterator.next()) |node| {
+        if (self.renderer.wasSampled(surfaceSampleTag(node.id)) and output.containsSurface(node.id))
+            compositor.markFifoBarrierVisible(node.id, output_id);
     }
+}
+
+/// Checks this frame's exact generated output membership before accepted-frame
+/// association mutates persistent FIFO output ownership.
+fn hasGeneratedFifoBarrierCandidate(self: *Self, output: *Output) bool {
+    const compositor = self.generated_fifo_compositor orelse return false;
+    var iterator = self.headless_surface_forest.nodeIterator();
+    while (iterator.next()) |node|
+        if (output.containsSurface(node.id) and compositor.hasCurrentFifoBarrier(node.id)) return true;
+    return false;
 }
 
 fn submitCapturedSurfaceTree(self: *Self, output: *Output, surface_id: Surface.Id) void {
@@ -14289,6 +14312,8 @@ test "generated cursor subtree paints stack and completes callbacks only while s
     try std.testing.expectEqualSlices(u32, &.{ root.pixel, child.pixel, root.pixel }, target.pixels);
     try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(root_id)));
     try std.testing.expect(server.renderer.wasSampled(surfaceSampleTag(child_id)));
+    try std.testing.expect(server.outputs.get(output.protocol_id).?.containsSurface(root_id));
+    try std.testing.expect(server.outputs.get(output.protocol_id).?.containsSurface(child_id));
     try std.testing.expectEqual(@as(usize, 2), completion.count);
     try std.testing.expect(completion.demand_cleared_before_call);
 
@@ -26509,6 +26534,7 @@ test "production generated data device completes the exact profile and supports 
     const WayringForeignToplevelList = @import("wayland/WayringForeignToplevelList.zig");
     const WayringColorRepresentation = @import("wayland/WayringColorRepresentation.zig");
     const WayringTearingControl = @import("wayland/WayringTearingControl.zig");
+    const WayringFifo = @import("wayland/WayringFifo.zig");
     const WayringBackgroundEffect = @import("wayland/WayringBackgroundEffect.zig");
     const WayringTextInput = @import("wayland/WayringTextInput.zig");
     const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
@@ -26654,6 +26680,13 @@ test "production generated data device completes the exact profile and supports 
         tearing_control.deinit();
     }
     try tearing_control.publish();
+    var fifo: WayringFifo = undefined;
+    fifo.init(std.testing.allocator, &protocol_server, &compositor);
+    defer {
+        if (fifo.global != null) fifo.unpublish();
+        fifo.deinit();
+    }
+    try fifo.publish();
     var background_effect: WayringBackgroundEffect = undefined;
     background_effect.init(std.testing.allocator, &protocol_server, &compositor);
     defer {
@@ -26946,6 +26979,7 @@ test "production generated data device completes the exact profile and supports 
         fractional_scale: *WayringFractionalScale,
         color_representation: *WayringColorRepresentation,
         tearing_control: *WayringTearingControl,
+        fifo: *WayringFifo,
         background_effect: *WayringBackgroundEffect,
         cursor_shape: *WayringCursorShape,
         decoration: *WayringXdgDecoration,
@@ -27041,6 +27075,7 @@ test "production generated data device completes the exact profile and supports 
             self.seat.destroyClientResources(client);
             self.outputs.destroyClientResources(client);
             self.background_effect.destroyClientResources(client);
+            self.fifo.destroyClientResources(client);
             self.tearing_control.destroyClientResources(client);
             self.color_representation.destroyClientResources(client);
             self.compositor.destroyClientResources(client);
@@ -27059,6 +27094,7 @@ test "production generated data device completes the exact profile and supports 
         .fractional_scale = &fractional_scale,
         .color_representation = &color_representation,
         .tearing_control = &tearing_control,
+        .fifo = &fifo,
         .background_effect = &background_effect,
         .cursor_shape = &cursor_shape,
         .decoration = &decoration,

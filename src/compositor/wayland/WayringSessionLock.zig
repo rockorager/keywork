@@ -251,12 +251,13 @@ fn invalidSerial(value: *Surface, resource: *protocol.ext_session_lock_surface_v
     value.lock.client.postProtocolError(&resource.runtime, @intCast(protocol.ext_session_lock_surface_v1.@"error".invalid_serial), "invalid, stale, or foreign configure serial");
 }
 fn commitHandler(value: *Surface) WayringCompositor.SessionLockCommitHandler {
-    return .{ .context = value, .prepare = prepareCommit, .abort_prepare = abortCommit, .validate = validateCommit, .pre_unmap = preUnmap, .post_apply = postApply, .surface_destroyed = compositorSurfaceDestroyed };
+    return .{ .context = value, .prepare = prepareCommit, .abort_prepare = abortCommit, .validate = validateCommit, .commit_prepared = commitPrepared, .pre_unmap = preUnmap, .post_apply = postApply, .surface_destroyed = compositorSurfaceDestroyed };
 }
 fn prepareCommit(_: *anyopaque, _: WayringCompositor.SessionLockDirectCommit) WayringCompositor.XdgCommitDecision {
     return .accept;
 }
-fn abortCommit(_: *anyopaque, _: WayringCompositor.SurfaceId) void {}
+fn abortCommit(_: *anyopaque, _: WayringCompositor.UpdateToken) void {}
+fn commitPrepared(_: *anyopaque, _: WayringCompositor.UpdateToken) void {}
 fn validateCommit(context: *anyopaque, commit: WayringCompositor.SessionLockDirectCommit) WayringCompositor.XdgCommitDecision {
     return validateDirect(@ptrCast(@alignCast(context)), commit);
 }
@@ -277,8 +278,8 @@ fn validateDirect(value: *Surface, commit: WayringCompositor.SessionLockDirectCo
     };
     return .accept;
 }
-fn preUnmap(_: *anyopaque, _: WayringCompositor.SurfaceId) void {}
-fn postApply(context: *anyopaque, _: WayringCompositor.SurfaceId) void {
+fn preUnmap(_: *anyopaque, _: WayringCompositor.UpdateToken) void {}
+fn postApply(context: *anyopaque, _: WayringCompositor.UpdateToken) void {
     const value: *Surface = @ptrCast(@alignCast(context));
     const id = value.neutral_id orelse return;
     const size = value.lock.owner.compositor.currentLogicalSize(value.surface_id) orelse {

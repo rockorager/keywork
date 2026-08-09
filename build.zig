@@ -135,6 +135,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/color-representation/color-representation-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/alpha-modifier/alpha-modifier-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/tearing-control/tearing-control-v1.xml"));
+    generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/fifo/fifo-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-background-effect/ext-background-effect-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/pointer-warp/pointer-warp-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("stable/linux-dmabuf/linux-dmabuf-v1.xml"));

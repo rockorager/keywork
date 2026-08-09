@@ -15,6 +15,7 @@ const XdgShell = @import("../XdgShell.zig");
 const MatureXdgShell = @import("xdg_shell.zig");
 const MatureSerials = @import("mature_serials.zig");
 const MatureClients = @import("MatureClients.zig");
+const WayringCompositor = @import("WayringCompositor.zig");
 const Core = @import("../LayerShell.zig");
 const ClientRegistry = @import("../ClientRegistry.zig");
 const SurfaceRegistry = @import("../SurfaceRegistry.zig");
@@ -60,7 +61,12 @@ const State = struct {
     scene_id: Scene.LayerSurfaceId,
     last_size: ?[2]u32 = null,
     prepared_layer: ?Scene.PreparedLayerSurfaceLayer = null,
-    prepared_commit: ?Core.PreparedCommit = null,
+    prepared_commits: std.ArrayList(PreparedDirectCommit) = .empty,
+};
+const PreparedDirectCommit = struct {
+    token: WayringCompositor.UpdateToken,
+    commit: Core.PreparedCommit,
+    layer: ?Scene.PreparedLayerSurfaceLayer,
 };
 const SerialMapping = struct { wire: u32, token: Core.ConfigureToken };
 const StateValue = Core.State;
@@ -132,30 +138,49 @@ pub fn validateDirectCommit(self: *Self, id: Id, has_buffer: bool) Core.CommitVa
 }
 
 /// Reserves all policy storage required by an atomic generated commit.
-pub fn prepareDirectCommit(self: *Self, id: Id, has_buffer: bool) bool {
+pub fn prepareDirectCommit(self: *Self, id: Id, token: WayringCompositor.UpdateToken, has_buffer: bool) bool {
     const state = self.states.get(id) orelse return false;
-    std.debug.assert(state.prepared_commit == null);
-    state.prepared_commit = self.core.prepareCommit(state.core_id, has_buffer) catch {
+    state.prepared_commits.ensureUnusedCapacity(self.allocator, 1) catch {
+        state.frontend.out_of_memory(state.frontend.context);
+        return false;
+    };
+    const prepared = self.core.prepareCommit(state.core_id, has_buffer) catch {
+        if (state.prepared_layer) |layer| self.scene.cancelPreparedLayerSurfaceLayer(layer);
         state.prepared_layer = null;
         state.frontend.out_of_memory(state.frontend.context);
         return false;
     };
+    state.prepared_commits.appendAssumeCapacity(.{
+        .token = token,
+        .commit = prepared,
+        .layer = state.prepared_layer,
+    });
+    state.prepared_layer = null;
     return true;
 }
 
-pub fn abortDirectCommit(self: *Self, id: Id) void {
+pub fn abortDirectCommit(self: *Self, id: Id, token: WayringCompositor.UpdateToken) void {
     const state = self.states.get(id) orelse return;
-    state.prepared_commit = null;
-    state.prepared_layer = null;
+    for (state.prepared_commits.items, 0..) |prepared, index| if (std.meta.eql(prepared.token, token)) {
+        const ticket = state.prepared_commits.orderedRemove(index);
+        if (ticket.layer) |layer| self.scene.cancelPreparedLayerSurfaceLayer(layer);
+        break;
+    };
 }
 
 /// Runs after content publication and is allocation-free.
-pub fn finishDirectCommit(self: *Self, id: Id) void {
+pub fn finishDirectCommit(self: *Self, id: Id, token: WayringCompositor.UpdateToken) void {
     const state = self.states.get(id) orelse return;
-    const prepared = state.prepared_commit orelse return;
+    const ticket = for (state.prepared_commits.items, 0..) |candidate, index| {
+        if (std.meta.eql(candidate.token, token)) break state.prepared_commits.orderedRemove(index);
+    } else return;
+    const prepared = ticket.commit;
     const was_mapped = self.core.snapshot(state.core_id).?.mapped;
-    state.prepared_commit = null;
+    state.prepared_layer = ticket.layer;
     self.core.finalizeCommit(prepared);
+    // A no-buffer commit on an already-unmapped surface does not invoke the
+    // applying observer, but may still carry a deliberately empty ticket.
+    state.prepared_layer = null;
     if (!prepared.has_buffer and was_mapped) {
         self.xdg_core.dismissLayerSurfacePopups(state.scene_id);
         state.last_size = null;
@@ -603,6 +628,10 @@ fn removeState(self: *Self, id: Id) bool {
     self.scene.removeLayerSurface(state.scene_id);
     self.invalidateFocus(state.frontend.surface);
     state.frontend.release_role(state.frontend.context);
+    for (state.prepared_commits.items) |prepared|
+        if (prepared.layer) |layer| self.scene.cancelPreparedLayerSurfaceLayer(layer);
+    state.prepared_commits.clearRetainingCapacity();
+    state.prepared_commits.deinit(self.allocator);
     return true;
 }
 

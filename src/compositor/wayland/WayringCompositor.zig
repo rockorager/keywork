@@ -98,6 +98,16 @@ pub const TearingControlAttachResult = union(enum) {
     not_live,
     wrong_client,
 };
+pub const FifoHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+pub const FifoAttachResult = union(enum) {
+    attached: SurfaceId,
+    already_exists,
+    not_live,
+    wrong_client,
+};
 pub const BackgroundEffectHandler = struct {
     context: *anyopaque,
     surface_destroyed: *const fn (*anyopaque) void,
@@ -232,6 +242,7 @@ pub const XdgCommitDecision = enum {
 /// Fully prepared direct-root content state. Validation observes this before
 /// buffer release or any adapter/content/topology mutation.
 pub const XdgDirectCommit = struct {
+    token: UpdateToken,
     surface: SurfaceId,
     current_size: ?render.Size,
     next_size: ?render.Size,
@@ -251,10 +262,11 @@ pub const XdgDirectCommit = struct {
 pub const XdgCommitHandler = struct {
     context: *anyopaque,
     prepare: *const fn (*anyopaque, XdgDirectCommit) XdgCommitDecision,
-    abort_prepare: *const fn (*anyopaque, SurfaceId) void,
+    abort_prepare: *const fn (*anyopaque, UpdateToken) void,
     validate: *const fn (*anyopaque, XdgDirectCommit) XdgCommitDecision,
-    pre_unmap: *const fn (*anyopaque, SurfaceId) void,
-    post_apply: *const fn (*anyopaque, SurfaceId) void,
+    commit_prepared: ?*const fn (*anyopaque, UpdateToken) void = null,
+    pre_unmap: *const fn (*anyopaque, UpdateToken) void,
+    post_apply: *const fn (*anyopaque, UpdateToken) void,
     surface_destroyed: *const fn (*anyopaque, SurfaceId) void,
 };
 
@@ -360,7 +372,7 @@ pub const SinglePixelResolver = struct {
 pub const CursorRoleResult = enum { assigned, already_cursor, role_conflict, not_live, wrong_client };
 pub const DragIconRoleResult = enum { assigned, already_drag_icon, role_conflict, not_live, wrong_client };
 
-const UpdateToken = struct {
+pub const UpdateToken = struct {
     surface: SurfaceId,
     sequence: u64,
 };
@@ -434,6 +446,11 @@ const Surface = struct {
     tearing_control_handler: ?TearingControlHandler = null,
     pending_allow_tearing: bool = false,
     current_allow_tearing: bool = false,
+    fifo_handler: ?FifoHandler = null,
+    pending_fifo_barrier: bool = false,
+    pending_fifo_wait: bool = false,
+    current_fifo_barrier: bool = false,
+    fifo_barrier_output: ?OutputLayout.Id = null,
     background_effect_handler: ?BackgroundEffectHandler = null,
     pending_blur_region: Region,
     pending_blur_region_dirty: bool = false,
@@ -514,7 +531,7 @@ const ContentUpdate = struct {
     claims: std.ArrayList(Claim) = .empty,
     claimed_by: ?UpdateToken = null,
     topology: ?std.ArrayList(TopologyEntry) = null,
-
+    direct_prepared: bool = false,
     fn deinit(self: *ContentUpdate, allocator: std.mem.Allocator) void {
         self.prepared.deinit();
         self.claims.deinit(allocator);
@@ -535,6 +552,7 @@ const ApplyScratch = struct {
     surfaces: std.ArrayList(AppliedSurfaceState) = .empty,
     parents: std.ArrayList(AppliedParentState) = .empty,
     stack_entries: std.ArrayList(AppliedStackEntry) = .empty,
+    fifo_ready_prefix_proven: bool = false,
 
     fn deinit(self: *ApplyScratch, allocator: std.mem.Allocator) void {
         self.stack_entries.deinit(allocator);
@@ -607,6 +625,8 @@ const PreparedCommit = struct {
     color_representation: ColorRepresentationState,
     alpha_multiplier: u32,
     allow_tearing: bool,
+    fifo_barrier: bool,
+    fifo_wait: bool,
     blur_region: ?Region = null,
     source: ?render.SourceRect = null,
     scale: i32,
@@ -626,6 +646,8 @@ const PreparedCommit = struct {
             .color_representation = surface.pending_color_representation,
             .alpha_multiplier = surface.pending_alpha_multiplier,
             .allow_tearing = surface.pending_allow_tearing,
+            .fifo_barrier = surface.pending_fifo_barrier,
+            .fifo_wait = surface.pending_fifo_wait,
             .scale = surface.pending_scale,
             .transform = surface.pending_transform,
             .offset_x = surface.pending_offset_x,
@@ -1143,6 +1165,89 @@ pub fn currentAllowTearing(self: *const WayringCompositor, id: SurfaceId) ?bool 
     return (self.surfaceForId(id) orelse return null).current_allow_tearing;
 }
 
+pub fn attachFifo(self: *WayringCompositor, client: *server.Client, object_id: u32, handler: FifoHandler) FifoAttachResult {
+    const objects = self.findClient(client) orelse return .not_live;
+    for (objects.surfaces.items) |surface| if (surface.resource.id() == object_id and !surface.destroying) {
+        if (surface.fifo_handler != null) return .already_exists;
+        surface.fifo_handler = handler;
+        return .{ .attached = surface.id };
+    };
+    if (client.lookup(object_id)) |resource| if (resource.interface() == &core.wl_surface.interface) return .wrong_client;
+    return .not_live;
+}
+
+pub fn detachFifo(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque) void {
+    const surface = self.surfaceForId(id) orelse return;
+    const handler = surface.fifo_handler orelse return;
+    if (handler.context != handler_context) return;
+    surface.fifo_handler = null;
+}
+
+pub fn setPendingFifoBarrier(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque) bool {
+    const surface = self.surfaceForId(id) orelse return false;
+    const handler = surface.fifo_handler orelse return false;
+    if (handler.context != handler_context) return false;
+    surface.pending_fifo_barrier = true;
+    return true;
+}
+
+pub fn setPendingFifoWait(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque) bool {
+    const surface = self.surfaceForId(id) orelse return false;
+    const handler = surface.fifo_handler orelse return false;
+    if (handler.context != handler_context) return false;
+    surface.pending_fifo_wait = true;
+    return true;
+}
+
+/// Associates a committed barrier only with an output where the generated
+/// surface's image survived submission.
+pub fn markFifoBarrierVisible(self: *WayringCompositor, id: SurfaceId, output: OutputLayout.Id) void {
+    const surface = self.surfaceForId(id) orelse return;
+    if (surface.current_fifo_barrier and surface.fifo_barrier_output == null)
+        surface.fifo_barrier_output = output;
+}
+
+pub fn hasFifoBarrierForOutput(self: *const WayringCompositor, output: OutputLayout.Id) bool {
+    for (self.clients.items) |objects| for (objects.surfaces.items) |surface| {
+        if (surface.current_fifo_barrier and
+            surface.fifo_barrier_output != null and
+            std.meta.eql(surface.fifo_barrier_output.?, output)) return true;
+    };
+    return false;
+}
+
+pub fn hasCurrentFifoBarrier(self: *const WayringCompositor, id: SurfaceId) bool {
+    return (self.surfaceForId(id) orelse return false).current_fifo_barrier;
+}
+
+/// Clears accepted-frame barriers and publishes each newly ready direct
+/// update in predecessor order. Each iteration observes barriers installed by
+/// the preceding update, so a later wait cannot pass a newly set barrier.
+pub fn clearFifoBarriersForOutput(self: *WayringCompositor, output: OutputLayout.Id) !void {
+    for (self.clients.items) |objects| for (objects.surfaces.items) |surface| {
+        if (surface.fifo_barrier_output != null and std.meta.eql(surface.fifo_barrier_output.?, output)) {
+            surface.current_fifo_barrier = false;
+            surface.fifo_barrier_output = null;
+        }
+    };
+    var progressed = true;
+    while (progressed) {
+        progressed = false;
+        for (self.clients.items) |objects| for (objects.surfaces.items) |surface| {
+            if (surface.content_updates.items.len == 0) continue;
+            const update = &surface.content_updates.items[0];
+            if (update.kind != .dcu or update.claimed_by != null) continue;
+            var scratch = self.prepareApplyScratch(&.{update.token}, null) catch |err| switch (err) {
+                error.ConstraintBlocked => continue,
+                else => return err,
+            };
+            defer scratch.deinit(self.allocator);
+            self.applyScratch(&scratch);
+            progressed = true;
+        };
+    }
+}
+
 pub fn attachBackgroundEffect(
     self: *WayringCompositor,
     client: *server.Client,
@@ -1441,6 +1546,8 @@ pub fn detachXdgCommitHandler(
     const association = self.exactLiveXdgAssociation(reservation) orelse return error.StaleReservation;
     const handler = association.handler orelse return error.HandlerMismatch;
     if (handler.context != context) return error.HandlerMismatch;
+    const surface = self.surfaceForId(reservation.surface) orelse return error.StaleReservation;
+    self.discardSurfaceQueue(surface);
     association.handler = null;
 }
 
@@ -1545,6 +1652,8 @@ pub fn detachLayerCommitHandler(self: *WayringCompositor, reservation: LayerRese
     const association = self.exactLiveLayerAssociation(reservation) orelse return error.StaleReservation;
     const handler = association.handler orelse return error.HandlerMismatch;
     if (handler.context != context) return error.HandlerMismatch;
+    const surface = self.surfaceForId(reservation.surface) orelse return error.StaleReservation;
+    self.discardSurfaceQueue(surface);
     association.handler = null;
 }
 
@@ -1608,6 +1717,8 @@ pub fn detachSessionLockCommitHandler(self: *WayringCompositor, reservation: Ses
     const association = self.exactLiveSessionLockAssociation(reservation) orelse return error.StaleReservation;
     const handler = association.handler orelse return error.HandlerMismatch;
     if (handler.context != context) return error.HandlerMismatch;
+    const surface = self.surfaceForId(reservation.surface) orelse return error.StaleReservation;
+    self.discardSurfaceQueue(surface);
     association.handler = null;
 }
 
@@ -1791,8 +1902,12 @@ fn prepareDesyncTransition(
     var index: usize = 0;
     while (index < transition.affected.items.len) : (index += 1) {
         const surface = self.surfaceForId(transition.affected.items[index]) orelse continue;
-        if (surface.content_updates.items.len != 0)
-            roots.appendAssumeCapacity(surface.content_updates.items[surface.content_updates.items.len - 1].token);
+        var ready_tail: ?UpdateToken = null;
+        for (surface.content_updates.items) |update| {
+            if (!fifoTokenInReadyPrefix(surface, update.token, null, true)) break;
+            ready_tail = update.token;
+        }
+        if (ready_tail) |token| roots.appendAssumeCapacity(token);
         for (surface.children.items) |entry| {
             const descendant = self.surfaceForId(entry.identity.child) orelse continue;
             const descendant_relationship = descendant.relationship orelse continue;
@@ -1805,15 +1920,16 @@ fn prepareDesyncTransition(
     transition.scratch = if (roots.items.len == 0)
         null
     else
-        try self.prepareApplyScratch(roots.items, null);
+        self.prepareApplyScratchProjected(roots.items, null, transition.affected.items) catch |err| switch (err) {
+            error.ConstraintBlocked => null,
+            else => return err,
+        };
     return transition;
 }
 
 fn applyDesyncTransition(self: *WayringCompositor, transition: *DesyncTransition) void {
-    // With no fifo, commit-timing, or explicit-sync constraints in Wave 4B,
-    // every converted queue is immediately eligible as a whole. Adding any
-    // such constraint invalidates this simplification and requires selecting
-    // candidates after constraint evaluation instead.
+    // Preparation selected only each constraint-ready prefix. Converted
+    // updates beyond a FIFO wait remain queued until frame completion.
     for (transition.affected.items) |id| {
         const surface = self.surfaceForId(id) orelse continue;
         for (surface.content_updates.items) |*update| {
@@ -2689,7 +2805,10 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     var scratch: ?ApplyScratch = null;
     defer if (scratch) |*value| value.deinit(self.allocator);
     if (kind == .dcu and !hasQueuedScu(surface))
-        scratch = try self.prepareApplyScratch(&.{token}, &candidate);
+        scratch = self.prepareApplyScratch(&.{token}, &candidate) catch |err| switch (err) {
+            error.ConstraintBlocked => null,
+            else => return err,
+        };
 
     const direct_handler = if (surface.xdg_association) |association|
         association.handler
@@ -2700,24 +2819,26 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     else
         null;
     if (direct_handler != null) {
-        std.debug.assert(surface.relationship == null and kind == .dcu and scratch != null);
+        std.debug.assert(surface.relationship == null and kind == .dcu);
     }
 
     const xdg_commit: XdgDirectCommit = .{
+        .token = token,
         .surface = surface.id,
-        .current_size = surface.current_logical_size,
+        .current_size = projectedLogicalSize(surface),
         .next_size = candidate.prepared.logical_size,
         .attachment_changed = candidate.prepared.attachment_changed,
     };
     var xdg_prepare_attempted = false;
     defer if (!published and xdg_prepare_attempted) {
         const handler = direct_handler.?;
-        handler.abort_prepare(handler.context, surface.id);
+        handler.abort_prepare(handler.context, token);
     };
     if (direct_handler) |handler| {
         xdg_prepare_attempted = true;
         if (handler.prepare(handler.context, xdg_commit) == .reject) return;
         if (handler.validate(handler.context, xdg_commit) == .reject) return;
+        candidate.direct_prepared = true;
     }
 
     // Release enqueue is the final fallible operation. Adapter preparation is
@@ -2730,8 +2851,9 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     if (shm_buffer_resource != null and self.failCommitAt(.release_enqueue)) return error.OutOfMemory;
     if (shm_buffer_resource) |resource| try self.shm.sendRelease(resource);
 
-    const unmaps_direct_root = direct_handler != null and surface.current_logical_size != null and
-        candidate.prepared.logical_size == null;
+    if (direct_handler) |handler| if (handler.commit_prepared) |accepted|
+        accepted(handler.context, token);
+
     surface.next_content_sequence = std.math.add(u64, sequence, 1) catch null;
     var callbacks_to_queue = candidate.callback_count;
     for (surface.frame_callbacks.items) |callback| switch (callback.state) {
@@ -2767,18 +2889,81 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     surface.pending_opaque_dirty = false;
     surface.pending_input_dirty = false;
     surface.pending_blur_region_dirty = false;
+    surface.pending_fifo_barrier = false;
+    surface.pending_fifo_wait = false;
     clearPendingAttachment(surface);
     clearPendingOffset(surface);
     surface.topology_dirty = false;
     if (publishes_snapshot) surface.next_source_version +%= 1;
     published = true;
-    if (unmaps_direct_root) {
-        const handler = direct_handler.?;
-        handler.pre_unmap(handler.context, surface.id);
-    }
     if (scratch) |*value| self.applyScratch(value);
-    if (direct_handler) |handler| handler.post_apply(handler.context, surface.id);
-    if (surface.relationship == null) std.debug.assert(surface.content_updates.items.len == 0);
+    if (surface.relationship == null and scratch != null) std.debug.assert(surface.content_updates.items.len == 0);
+}
+
+fn projectedLogicalSize(surface: *const Surface) ?render.Size {
+    if (surface.content_updates.items.len != 0)
+        return surface.content_updates.items[surface.content_updates.items.len - 1].prepared.logical_size;
+    return surface.current_logical_size;
+}
+
+/// Returns whether one exact queued token, or the proposed queue-tail token,
+/// belongs to this surface's maximal FIFO-ready prefix.
+fn fifoTokenInReadyPrefix(
+    surface: *const Surface,
+    token: UpdateToken,
+    proposed: ?*const ContentUpdate,
+    ignore_live_claims: bool,
+) bool {
+    var barrier = surface.current_fifo_barrier;
+    const ignored_through = fifoWaitIgnoredThrough(surface, proposed, ignore_live_claims);
+    for (surface.content_updates.items, 0..) |update, index| {
+        const ignore_wait = if (ignored_through) |last| index <= last else false;
+        if (update.prepared.fifo_wait and barrier and !ignore_wait) return false;
+        if (std.meta.eql(update.token, token)) return true;
+        if (update.prepared.fifo_barrier) barrier = true;
+    }
+    if (proposed) |candidate| {
+        if (!std.meta.eql(candidate.token, token) or
+            candidate.prepared.fifo_wait and barrier) return false;
+        return true;
+    }
+    return false;
+}
+
+/// A synchronized parent's claim applies the claimed SCU and every same-
+/// surface predecessor as one parent transaction, so FIFO waits in exactly
+/// that prefix are ignored. Deriving this from live/proposed claims prevents
+/// suppression from surviving claim removal or desynchronization.
+fn fifoWaitIgnoredThrough(
+    surface: *const Surface,
+    proposed: ?*const ContentUpdate,
+    ignore_live_claims: bool,
+) ?usize {
+    var last: ?usize = null;
+    if (!ignore_live_claims)
+        for (surface.content_updates.items, 0..) |update, index| {
+            if (update.claimed_by != null) last = index;
+        };
+    if (proposed) |candidate| for (candidate.claims.items) |claim| {
+        if (!std.meta.eql(claim.token.surface, surface.id)) continue;
+        for (surface.content_updates.items, 0..) |update, index| {
+            if (!std.meta.eql(update.token, claim.token)) continue;
+            last = if (last) |current| @max(current, index) else index;
+            break;
+        }
+    };
+    return last;
+}
+
+fn directCommitHandler(surface: *const Surface) ?XdgCommitHandler {
+    return if (surface.xdg_association) |association|
+        association.handler
+    else if (surface.layer_association) |association|
+        association.handler
+    else if (surface.session_lock_association) |association|
+        association.handler
+    else
+        null;
 }
 
 fn projectedPhysicalSize(self: *WayringCompositor, surface: *const Surface) ?render.Size {
@@ -2870,6 +3055,18 @@ fn prepareApplyScratch(
     roots: []const UpdateToken,
     proposed: ?*const ContentUpdate,
 ) !ApplyScratch {
+    return self.prepareApplyScratchProjected(roots, proposed, &.{});
+}
+
+/// Plans against live queues while treating incoming claims on the listed
+/// surfaces as already removed. Desynchronization uses this projected view so
+/// it can allocate before changing modes or claim ownership.
+fn prepareApplyScratchProjected(
+    self: *WayringCompositor,
+    roots: []const UpdateToken,
+    proposed: ?*const ContentUpdate,
+    removing_incoming_claims: []const SurfaceId,
+) !ApplyScratch {
     var total: usize = 0;
     var topology_entries: usize = 0;
     for (self.clients.items) |objects| {
@@ -2912,6 +3109,13 @@ fn prepareApplyScratch(
             if (tokenIn(scratch.plan.items, visit.token)) continue;
             if (tokenIn(scratch.active.items, visit.token)) return error.InvalidDependencyCycle;
             const update = self.updateForPlan(visit.token, proposed) orelse return error.InvalidDependencyToken;
+            const surface = self.surfaceForId(visit.token.surface) orelse return error.InvalidDependencyToken;
+            const incoming_claim_removed = surfaceIdIn(removing_incoming_claims, surface.id);
+            if (!fifoTokenInReadyPrefix(surface, visit.token, proposed, incoming_claim_removed)) return error.ConstraintBlocked;
+            if (!incoming_claim_removed) if (update.claimed_by) |owner| {
+                if (!tokenIn(scratch.active.items, owner) and !tokenIn(scratch.plan.items, owner))
+                    return error.ConstraintBlocked;
+            };
             scratch.active.appendAssumeCapacity(visit.token);
             scratch.visits.appendAssumeCapacity(.{ .token = visit.token, .exit = true });
             var claim_index = update.claims.items.len;
@@ -2927,7 +3131,25 @@ fn prepareApplyScratch(
         }
     }
     std.debug.assert(scratch.active.items.len == 0);
+    // This proof is against one pre-application snapshot. Applying an earlier
+    // planned barrier may change live state, so applyScratch must not re-test
+    // tokens independently against that evolving state.
+    for (scratch.plan.items) |token| {
+        const surface = self.surfaceForId(token.surface) orelse return error.InvalidDependencyToken;
+        if (!fifoTokenInReadyPrefix(
+            surface,
+            token,
+            proposed,
+            surfaceIdIn(removing_incoming_claims, surface.id),
+        )) return error.ConstraintBlocked;
+    }
+    scratch.fifo_ready_prefix_proven = true;
     return scratch;
+}
+
+fn surfaceIdIn(ids: []const SurfaceId, id: SurfaceId) bool {
+    for (ids) |candidate| if (std.meta.eql(candidate, id)) return true;
+    return false;
 }
 
 fn associationLive(
@@ -2942,9 +3164,13 @@ fn associationLive(
 }
 
 fn applyScratch(self: *WayringCompositor, scratch: *ApplyScratch) void {
+    std.debug.assert(scratch.fifo_ready_prefix_proven);
     for (scratch.plan.items) |token| {
         const update = self.updateForToken(token) orelse unreachable;
         const surface = self.surfaceForId(token.surface) orelse unreachable;
+        const handler = directCommitHandler(surface);
+        if (update.direct_prepared and surface.current_logical_size != null and
+            update.prepared.logical_size == null) handler.?.pre_unmap(handler.?.context, token);
         self.publishPreparedCommit(surface, &update.prepared, token, false);
 
         var state_found = false;
@@ -2992,7 +3218,6 @@ fn applyScratch(self: *WayringCompositor, scratch: *ApplyScratch) void {
         .surfaces = scratch.surfaces.items,
         .parents = scratch.parents.items,
     });
-
     for (self.clients.items) |objects| for (objects.surfaces.items) |surface| {
         while (surface.content_updates.items.len != 0 and
             tokenIn(scratch.plan.items, surface.content_updates.items[0].token))
@@ -3001,6 +3226,10 @@ fn applyScratch(self: *WayringCompositor, scratch: *ApplyScratch) void {
             update.deinit(self.allocator);
         }
     };
+    for (scratch.plan.items) |token| {
+        const handler = directCommitHandler(self.surfaceForId(token.surface) orelse unreachable) orelse continue;
+        handler.post_apply(handler.context, token);
+    }
 }
 
 fn clearOwnedClaims(self: *WayringCompositor, update: *ContentUpdate) void {
@@ -3025,6 +3254,8 @@ fn unlinkIncomingClaim(self: *WayringCompositor, update: *ContentUpdate) void {
 
 fn discardUpdateAt(self: *WayringCompositor, surface: *Surface, index: usize) void {
     const token = surface.content_updates.items[index].token;
+    if (surface.content_updates.items[index].direct_prepared) if (directCommitHandler(surface)) |handler|
+        handler.abort_prepare(handler.context, token);
     self.unlinkIncomingClaim(&surface.content_updates.items[index]);
     self.clearOwnedClaims(&surface.content_updates.items[index]);
     var callback_index: usize = 0;
@@ -3254,6 +3485,10 @@ fn publishPreparedCommit(
     surface.current_color_representation = prepared.color_representation;
     surface.current_alpha_multiplier = prepared.alpha_multiplier;
     surface.current_allow_tearing = prepared.allow_tearing;
+    if (prepared.fifo_barrier) {
+        surface.current_fifo_barrier = true;
+        surface.fifo_barrier_output = null;
+    }
     surface.current_source = prepared.source;
     surface.current_scale = prepared.scale;
     surface.current_transform = prepared.transform;
@@ -3508,10 +3743,17 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
         surface.tearing_control_handler = null;
         handler.surface_destroyed(handler.context);
     }
+    if (surface.fifo_handler) |handler| {
+        surface.fifo_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
     if (surface.background_effect_handler) |handler| {
         surface.background_effect_handler = null;
         handler.surface_destroyed(handler.context);
     }
+    // Direct tickets borrow their role adapter context. Drain them before
+    // invalidating any association or notifying its owner.
+    self.discardSurfaceQueue(surface);
     if (surface.xdg_association) |association| {
         const handler = association.handler;
         surface.xdg_association = null;
@@ -3537,7 +3779,6 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
         .drag_icon => if (self.drag_icon_listener) |listener| listener.removed(listener.context, surface.id),
         else => {},
     }
-    self.discardSurfaceQueue(surface);
     if (surface.relationship) |relationship| if (self.surfaceForId(relationship.identity.parent)) |parent| {
         for (parent.children.items, 0..) |entry, index| if (std.meta.eql(entry.identity, relationship.identity)) {
             _ = parent.children.orderedRemove(index);
@@ -4156,7 +4397,7 @@ const TestXdgCommitHandler = struct {
         return self.prepare_decision;
     }
 
-    fn abortPrepare(context: *anyopaque, _: SurfaceId) void {
+    fn abortPrepare(context: *anyopaque, _: UpdateToken) void {
         const self: *@This() = @ptrCast(@alignCast(context));
         self.preparation_aborts += 1;
         self.preparation_active = false;
@@ -4168,12 +4409,12 @@ const TestXdgCommitHandler = struct {
         return self.decision;
     }
 
-    fn preUnmap(context: *anyopaque, _: SurfaceId) void {
+    fn preUnmap(context: *anyopaque, _: UpdateToken) void {
         const self: *@This() = @ptrCast(@alignCast(context));
         self.pre_unmaps += 1;
     }
 
-    fn postApply(context: *anyopaque, _: SurfaceId) void {
+    fn postApply(context: *anyopaque, _: UpdateToken) void {
         const self: *@This() = @ptrCast(@alignCast(context));
         std.debug.assert(self.preparation_active);
         self.preparation_active = false;
@@ -8163,6 +8404,63 @@ test "destroying a synchronized ancestor role unlocks local-desync descendant SC
     try std.testing.expect(client.fatal() == null);
 }
 
+test "ancestor role removal replans claimed FIFO child against removed claims" {
+    const Recorder = struct {
+        fn handler(self: *@This()) FifoHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn surfaceDestroyed(_: *anyopaque) void {}
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositor(client, 3);
+    try bindTestSubcompositor(&compositor, client, 4);
+    for (5..8) |id| try createSurfaceResource(client, 3, @intCast(id));
+    try getSubsurface(client, 4, 8, 6, 5);
+    try getSubsurface(client, 4, 9, 7, 6);
+    try setSubsurfaceMode(client, 9, false);
+    const parent = compositor.surfaceForId(compositor.surfaceId(client, 6).?).?;
+    const child_id = compositor.surfaceId(client, 7).?;
+    const child = compositor.surfaceForId(child_id).?;
+    var recorder: Recorder = .{};
+    try std.testing.expect(compositor.attachFifo(client, 7, recorder.handler()) == .attached);
+
+    try std.testing.expect(compositor.setPendingFifoBarrier(child_id, &recorder));
+    try commitSurfaceResource(client, 7);
+    try std.testing.expect(compositor.setPendingFifoWait(child_id, &recorder));
+    try commitSurfaceResource(client, 7);
+    try commitSurfaceResource(client, 6);
+    try std.testing.expectEqual(@as(usize, 1), parent.content_updates.items.len);
+    try std.testing.expectEqual(parent.content_updates.items[0].token, child.content_updates.items[1].claimed_by.?);
+
+    // Removing the synchronized ancestor discards the parent owner. In the
+    // projected post-removal state only the barrier is FIFO-ready; the wait
+    // remains queued until that barrier's accepted output frame completes.
+    try destroySubsurfaceResource(client, 8);
+    try std.testing.expect(parent.relationship == null);
+    try std.testing.expectEqual(@as(usize, 0), parent.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 1), child.content_updates.items.len);
+    try std.testing.expectEqual(UpdateKind.dcu, child.content_updates.items[0].kind);
+    try std.testing.expect(child.content_updates.items[0].claimed_by == null);
+    try std.testing.expect(child.content_updates.items[0].prepared.fifo_wait);
+    try std.testing.expect(child.current_fifo_barrier);
+    try std.testing.expect(client.fatal() == null);
+}
+
 test "ancestor role destroy scratch OOM leaves resources topology and SCUs unchanged" {
     var host: server.Server = .init(std.testing.allocator);
     defer host.deinit();
@@ -8782,7 +9080,7 @@ test "direct XDG root hooks bracket the full atomic batch and exclude child scra
             return .accept;
         }
 
-        fn abortPrepare(_: *anyopaque, _: SurfaceId) void {}
+        fn abortPrepare(_: *anyopaque, _: UpdateToken) void {}
 
         fn validate(context: *anyopaque, commit: XdgDirectCommit) XdgCommitDecision {
             const self: *@This() = @ptrCast(@alignCast(context));
@@ -8795,16 +9093,18 @@ test "direct XDG root hooks bracket the full atomic batch and exclude child scra
             return self.decision;
         }
 
-        fn preUnmap(context: *anyopaque, id: SurfaceId) void {
+        fn preUnmap(context: *anyopaque, token: UpdateToken) void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            const id = token.surface;
             std.debug.assert(std.meta.eql(id, self.root));
             std.debug.assert(self.registry.renderState(id) != null);
             self.record(.pre_unmap);
             self.pre_unmaps += 1;
         }
 
-        fn postApply(context: *anyopaque, id: SurfaceId) void {
+        fn postApply(context: *anyopaque, token: UpdateToken) void {
             const self: *@This() = @ptrCast(@alignCast(context));
+            const id = token.surface;
             std.debug.assert(std.meta.eql(id, self.root));
             std.debug.assert(self.listener.committed_count > self.last_listener_count);
             std.debug.assert(self.compositor.surfaceForId(self.root).?.content_updates.items.len == 0);
@@ -9174,6 +9474,107 @@ test "tearing control is unique double buffered and resets pending state on dest
     try send(client, 4, 0, &core.wl_surface.request_messages[0], &.{});
     try std.testing.expect(second.destroyed);
     try std.testing.expect(compositor.currentAllowTearing(id) == null);
+}
+
+test "FIFO attachment is exact and detach preserves pending commit flags" {
+    const Recorder = struct {
+        destroyed: bool = false,
+
+        fn handler(self: *@This()) FifoHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn surfaceDestroyed(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.destroyed = true;
+        }
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try createSurfaceResource(client, 3, 4);
+    const id = compositor.surfaceId(client, 4).?;
+    var first: Recorder = .{};
+    var duplicate: Recorder = .{};
+    try std.testing.expect(compositor.attachFifo(client, 4, first.handler()) == .attached);
+    try std.testing.expectEqual(FifoAttachResult.already_exists, compositor.attachFifo(client, 4, duplicate.handler()));
+    try std.testing.expect(compositor.setPendingFifoBarrier(id, &first));
+    try std.testing.expect(compositor.setPendingFifoWait(id, &first));
+    compositor.detachFifo(id, &first);
+    try std.testing.expect(compositor.surfaceForId(id).?.pending_fifo_barrier);
+    try std.testing.expect(compositor.surfaceForId(id).?.pending_fifo_wait);
+    try commitSurfaceResource(client, 4);
+    try std.testing.expect(!compositor.surfaceForId(id).?.pending_fifo_barrier);
+    try std.testing.expect(!compositor.surfaceForId(id).?.pending_fifo_wait);
+
+    try std.testing.expect(compositor.attachFifo(client, 4, duplicate.handler()) == .attached);
+    try send(client, 4, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expect(duplicate.destroyed);
+    try std.testing.expectEqual(FifoAttachResult.not_live, compositor.attachFifo(client, 4, first.handler()));
+    try std.testing.expect(!compositor.setPendingFifoBarrier(id, &duplicate));
+}
+
+test "synchronized parent claims ignore FIFO waits in the claimed child prefix" {
+    const Recorder = struct {
+        fn handler(self: *@This()) FifoHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn surfaceDestroyed(_: *anyopaque) void {}
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try bindTestSubcompositor(&compositor, client, 4);
+    try createSurfaceResource(client, 3, 5);
+    try createSurfaceResource(client, 3, 6);
+    try getSubsurface(client, 4, 7, 6, 5);
+    const parent = compositor.surfaceForId(compositor.surfaceId(client, 5).?).?;
+    const child_id = compositor.surfaceId(client, 6).?;
+    const child = compositor.surfaceForId(child_id).?;
+    var recorder: Recorder = .{};
+    try std.testing.expect(compositor.attachFifo(client, 6, recorder.handler()) == .attached);
+
+    try std.testing.expect(compositor.setPendingFifoBarrier(child_id, &recorder));
+    try commitSurfaceResource(client, 6);
+    try std.testing.expect(compositor.setPendingFifoWait(child_id, &recorder));
+    try commitSurfaceResource(client, 6);
+    try std.testing.expectEqual(@as(usize, 2), child.content_updates.items.len);
+    try std.testing.expect(!child.current_fifo_barrier);
+
+    // The parent commit atomically claims both child updates. The wait applies
+    // with the preceding barrier instead of deadlocking its own transaction.
+    try commitSurfaceResource(client, 5);
+    try std.testing.expectEqual(@as(usize, 0), parent.content_updates.items.len);
+    try std.testing.expectEqual(@as(usize, 0), child.content_updates.items.len);
+    try std.testing.expect(child.current_fifo_barrier);
+    try std.testing.expect(client.fatal() == null);
 }
 
 test "background effect copies blur regions and resets pending state on destroy" {

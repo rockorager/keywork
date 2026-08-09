@@ -16,6 +16,7 @@ decorations: DecorationStore,
 shell_surfaces: ShellSurfaceStore,
 layer_surfaces: LayerSurfaceStore,
 layer_stacks: [layer_count]std.ArrayList(LayerSurfaceId),
+layer_reservations: [layer_count]usize,
 popups: PopupStore,
 popup_stack: std.ArrayList(PopupId),
 stack: std.ArrayList(NodeId),
@@ -35,6 +36,7 @@ pub const LayerSurfaceId = LayerSurfaceStore.Id;
 pub const PreparedLayerSurfaceLayer = struct {
     id: LayerSurfaceId,
     layer: Layer,
+    reserved: bool,
 };
 pub const PopupStore = slot_map.SlotMap(Popup, enum { scene_popup });
 pub const PopupId = PopupStore.Id;
@@ -431,6 +433,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator) void {
         .shell_surfaces = .{},
         .layer_surfaces = .{},
         .layer_stacks = @splat(.empty),
+        .layer_reservations = @splat(0),
         .popups = .{},
         .popup_stack = .empty,
         .stack = .empty,
@@ -455,8 +458,9 @@ pub fn deinit(self: *Self) void {
     self.decorations.deinit(self.allocator);
     self.shell_surfaces.deinit(self.allocator);
     self.layer_surfaces.deinit(self.allocator);
-    for (&self.layer_stacks) |*stack| {
+    for (&self.layer_stacks, self.layer_reservations) |*stack, reservations| {
         std.debug.assert(stack.items.len == 0);
+        std.debug.assert(reservations == 0);
         stack.deinit(self.allocator);
     }
     self.popups.deinit(self.allocator);
@@ -610,7 +614,12 @@ pub fn setLayerSurfaceLayer(
 ) error{OutOfMemory}!void {
     const layer_surface = self.layer_surfaces.get(id) orelse return;
     if (layer_surface.layer == layer) return;
-    try self.layer_stacks[layerIndex(layer)].append(self.allocator, id);
+    const index = layerIndex(layer);
+    try self.layer_stacks[index].ensureTotalCapacity(
+        self.allocator,
+        self.layer_stacks[index].items.len + self.layer_reservations[index] + 1,
+    );
+    self.layer_stacks[index].appendAssumeCapacity(id);
     // Damage under the old layer as well: backdrop blur stacked between the
     // two layers samples this surface's extent and must repaint too.
     self.requestNodeDamage(.{ .layer_surface = id });
@@ -620,16 +629,27 @@ pub fn setLayerSurfaceLayer(
 }
 
 /// Reserves the only allocation needed to move a layer surface between stacks.
-/// The returned value carries no semantic mutation and may simply be discarded.
 pub fn prepareLayerSurfaceLayer(
     self: *Self,
     id: LayerSurfaceId,
     layer: Layer,
 ) error{OutOfMemory}!?PreparedLayerSurfaceLayer {
     const layer_surface = self.layer_surfaces.get(id) orelse return null;
-    if (layer_surface.layer == layer) return .{ .id = id, .layer = layer };
-    try self.layer_stacks[layerIndex(layer)].ensureUnusedCapacity(self.allocator, 1);
-    return .{ .id = id, .layer = layer };
+    if (layer_surface.layer == layer) return .{ .id = id, .layer = layer, .reserved = false };
+    const index = layerIndex(layer);
+    try self.layer_stacks[index].ensureTotalCapacity(
+        self.allocator,
+        self.layer_stacks[index].items.len + self.layer_reservations[index] + 1,
+    );
+    self.layer_reservations[index] += 1;
+    return .{ .id = id, .layer = layer, .reserved = true };
+}
+
+pub fn cancelPreparedLayerSurfaceLayer(self: *Self, prepared: PreparedLayerSurfaceLayer) void {
+    if (!prepared.reserved) return;
+    const index = layerIndex(prepared.layer);
+    std.debug.assert(self.layer_reservations[index] != 0);
+    self.layer_reservations[index] -= 1;
 }
 
 /// Commits a previously prepared layer move without allocating.
@@ -637,6 +657,7 @@ pub fn commitPreparedLayerSurfaceLayer(
     self: *Self,
     prepared: PreparedLayerSurfaceLayer,
 ) void {
+    self.cancelPreparedLayerSurfaceLayer(prepared);
     const layer_surface = self.layer_surfaces.get(prepared.id) orelse return;
     if (layer_surface.layer == prepared.layer) return;
     self.layer_stacks[layerIndex(prepared.layer)].appendAssumeCapacity(prepared.id);
