@@ -37,7 +37,8 @@ const CursorShape = @import("wayland/cursor_shape.zig");
 const Tablet = @import("wayland/tablet.zig");
 const RelativePointer = @import("wayland/relative_pointer.zig");
 const PointerGestures = @import("wayland/pointer_gestures.zig");
-const PointerConstraints = @import("wayland/pointer_constraints.zig");
+const NeutralPointerConstraints = @import("PointerConstraints.zig");
+const WaylandPointerConstraints = @import("wayland/pointer_constraints.zig");
 const PointerWarp = @import("wayland/pointer_warp.zig");
 const IdleInhibit = @import("wayland/idle_inhibit.zig");
 const KeyboardShortcutsInhibit = @import("wayland/keyboard_shortcuts_inhibit.zig");
@@ -120,6 +121,7 @@ const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
 const WayringGtkShell = @import("wayland/WayringGtkShell.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
+const WayringPointerConstraints = @import("wayland/WayringPointerConstraints.zig");
 const IdleAlarmHost = @import("wayland/WayringHost.zig");
 const WayringInputMethod = @import("wayland/WayringInputMethod.zig");
 const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
@@ -376,7 +378,8 @@ cursor_shape: CursorShape,
 tablet: Tablet,
 relative_pointer: RelativePointer,
 pointer_gestures: PointerGestures,
-pointer_constraints: PointerConstraints,
+pointer_constraints_core: NeutralPointerConstraints,
+pointer_constraints: WaylandPointerConstraints,
 pointer_warp: PointerWarp,
 idle_inhibit: IdleInhibit,
 keyboard_shortcuts_inhibit: KeyboardShortcutsInhibit,
@@ -1226,6 +1229,7 @@ pub fn createWithVirtualOutput(
         .tablet = undefined,
         .relative_pointer = undefined,
         .pointer_gestures = undefined,
+        .pointer_constraints_core = undefined,
         .pointer_constraints = undefined,
         .pointer_warp = undefined,
         .idle_inhibit = undefined,
@@ -1588,11 +1592,14 @@ pub fn createWithVirtualOutput(
     errdefer self.relative_pointer.deinit();
     try self.pointer_gestures.init(allocator, display);
     errdefer self.pointer_gestures.deinit();
+    self.pointer_constraints_core = NeutralPointerConstraints.init(allocator);
+    errdefer self.pointer_constraints_core.deinit();
     try self.pointer_constraints.init(
         allocator,
         display,
         &self.seat,
         self.compositor.surfaceStore(),
+        &self.pointer_constraints_core,
     );
     errdefer self.pointer_constraints.deinit();
     try self.pointer_warp.init(
@@ -2270,6 +2277,7 @@ pub fn destroy(self: *Self) void {
     self.idle_inhibit.deinit();
     self.pointer_warp.deinit();
     self.pointer_constraints.deinit();
+    self.pointer_constraints_core.deinit();
     self.pointer_gestures.deinit();
     self.relative_pointer.deinit();
     self.cursor_shape.deinit();
@@ -2550,6 +2558,33 @@ fn seatForDevice(self: *Self, _: NativeInput.DeviceId) *Seat {
     return &self.seat;
 }
 
+fn syncPointerConstraints(self: *Self) void {
+    self.pointer_constraints_core.syncFocus(self.canonicalPointerConstraintFocus());
+}
+
+pub fn syncGeneratedPointerConstraints(context: *anyopaque) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    self.syncPointerConstraints();
+}
+
+fn canonicalPointerConstraintFocus(self: *const Self) ?NeutralPointerConstraints.Focus {
+    const focus = self.seat.pointerFocus() orelse return null;
+    return .{ .surface = focus.surface_id, .x = focus.x, .y = focus.y };
+}
+
+fn deactivatePointerConstraints(self: *Self) void {
+    self.pointer_constraints_core.deactivateAll();
+}
+
+fn constrainPointerMotion(self: *Self, target: Region.Point) NeutralPointerConstraints.Motion {
+    const position = self.seat.pointerPosition() orelse return .{ .point = target };
+    return self.pointer_constraints_core.constrainMotion(
+        self.canonicalPointerConstraintFocus(),
+        .{ .x = position.x, .y = position.y },
+        target,
+    );
+}
+
 fn refreshSeatCapabilities(self: *Self) void {
     var keyboard = false;
     var pointer = false;
@@ -2564,7 +2599,7 @@ fn refreshSeatCapabilities(self: *Self) void {
         }
     }
     if (!pointer and !self.seat.hasVirtualPointers()) {
-        self.pointer_constraints.deactivateAll();
+        self.deactivatePointerConstraints();
         self.data_device.cancelDrag();
         if (self.window_manager_initialized and self.window_manager.clientXdgPointerGrabActive())
             _ = self.endCompositorPointerGrab(false);
@@ -4115,6 +4150,10 @@ pub fn neutralTextInput(self: *Self) *NeutralTextInput {
     return &self.neutral_text_input;
 }
 
+pub fn neutralPointerConstraints(self: *Self) *NeutralPointerConstraints {
+    return &self.pointer_constraints_core;
+}
+
 /// Canonical seat authority used by protocol adapters that implement grabs.
 pub fn canonicalSeat(self: *Self) *Seat {
     return &self.seat;
@@ -4739,6 +4778,7 @@ fn headlessSurfaceDescendsFrom(
 }
 
 fn reconcileGeneratedPointerTopology(self: *Self) void {
+    defer self.syncPointerConstraints();
     const state = self.seat.generatedPointerState() orelse return;
     const generated = state.target;
     const focus = self.seat.pointerFocus();
@@ -6963,7 +7003,7 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
         requestRepaint(self);
     }
     self.seat.setCompositorCursor(null);
-    self.pointer_constraints.deactivateAll();
+    self.deactivatePointerConstraints();
     self.data_device.cancelDrag();
     self.tablet.cancelFocus();
     self.cancelSeatTouches(&self.seat);
@@ -6983,7 +7023,7 @@ fn sessionLockStateChanged(context: *anyopaque, locked: bool) void {
             const route = self.pointerRoute(position.x, position.y);
             self.seat.pointerEnter(position.x, position.y, route.focus);
             self.updateResizeCursor(route.root, position.x, position.y);
-            self.pointer_constraints.syncFocus();
+            self.syncPointerConstraints();
         }
     }
 }
@@ -7956,7 +7996,7 @@ fn pointerAvailable(context: *anyopaque, available: bool) void {
     const self = serverForOutput(context);
     if (!available) self.cancelSeatGestures(&self.seat);
     if (!available and self.window_manager_initialized) {
-        self.pointer_constraints.deactivateAll();
+        self.deactivatePointerConstraints();
         self.data_device.cancelDrag();
         if (self.window_manager.clientXdgPointerGrabActive())
             _ = self.endCompositorPointerGrab(false);
@@ -7979,7 +8019,7 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
         return;
     }
     if (self.data_device.isDragging()) {
-        self.pointer_constraints.deactivateAll();
+        self.deactivatePointerConstraints();
         self.seat.pointerEnter(
             point.x,
             point.y,
@@ -7998,14 +8038,14 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
     } else {
         self.seat.setCompositorCursor(null);
     }
-    self.pointer_constraints.syncFocus();
+    self.syncPointerConstraints();
 }
 
 fn pointerLeave(context: *anyopaque) void {
     const self = serverForOutput(context);
     if (self.endCompositorPointerGrab(false)) requestRepaint(self);
     self.seat.setCompositorCursor(null);
-    self.pointer_constraints.deactivateAll();
+    self.deactivatePointerConstraints();
     self.data_device.leave();
     if (self.xwm_initialized) self.xwm.dragLeft();
     self.forgetRoutedButtonsForSeat(&self.seat);
@@ -8042,14 +8082,14 @@ fn pointerMotionGlobalForSeat(
         return;
     }
     if (seat == &self.seat and self.window_manager.compositorPointerGrabActive()) {
-        self.pointer_constraints.deactivateAll();
+        self.deactivatePointerConstraints();
         seat.pointerMotion(time, x, y, null);
         if (self.window_manager.updateCompositorPointerGrab(x, y)) requestRepaint(self);
         return;
     }
     if (seat == &self.seat and self.data_device.isDragging()) {
         if (self.generatedDragIconInfo() != null) requestRepaint(self);
-        self.pointer_constraints.deactivateAll();
+        self.deactivatePointerConstraints();
         seat.pointerMotion(
             time,
             x,
@@ -8073,7 +8113,7 @@ fn pointerMotionGlobalForSeat(
         seat.pointerMotion(time, x, y, maturePointerFocus(route.focus));
         return;
     }
-    const motion = self.pointer_constraints.constrainMotion(.{ .x = x, .y = y });
+    const motion = self.constrainPointerMotion(.{ .x = x, .y = y });
     if (motion.point.x != x or motion.point.y != y) {
         if (backend_output != null) {
             self.synchronizeBackendPointer(
@@ -8098,7 +8138,7 @@ fn pointerMotionGlobalForSeat(
     } else {
         self.seat.setCompositorCursor(null);
     }
-    self.pointer_constraints.syncFocus();
+    self.syncPointerConstraints();
 }
 
 const VirtualPointerBounds = struct {
@@ -8396,7 +8436,7 @@ fn pointerButtonForSeat(
                 const route = self.pointerRoute(point.x, point.y);
                 seat.pointerEnter(point.x, point.y, route.focus);
                 self.updateResizeCursor(route.root, point.x, point.y);
-                self.pointer_constraints.syncFocus();
+                self.syncPointerConstraints();
             }
             requestRepaint(self);
         } else if (!client_xdg) {
@@ -8429,7 +8469,7 @@ fn pointerButtonForSeat(
             else
                 self.window_manager.beginInteractiveResize(root, position.x, position.y);
             if (started) {
-                self.pointer_constraints.deactivateAll();
+                self.deactivatePointerConstraints();
                 seat.suppressPointerFocus(true);
                 seat.setCompositorCursor(if (self.window_manager.interactiveResizeCursorShape()) |shape|
                     self.cursor_shape.cursorImage(shape)
@@ -8672,7 +8712,7 @@ fn dragStarted(context: *anyopaque) void {
     const self: *Self = @ptrCast(@alignCast(context));
     if (self.endCompositorPointerGrab(false)) requestRepaint(self);
     self.seat.setCompositorCursor(null);
-    self.pointer_constraints.deactivateAll();
+    self.deactivatePointerConstraints();
     if (self.xwm_initialized) self.xwm.dragStarted();
     self.reconcileOutputCursors();
     self.seat.dissolvePointerGrab();
@@ -8782,7 +8822,7 @@ fn restoreSeatPointerFocus(self: *Self, seat: *Seat) void {
         self.window_manager.pointerMoved(route.root);
         self.updateResizeCursor(route.root, position.x, position.y);
     }
-    self.pointer_constraints.syncFocus();
+    self.syncPointerConstraints();
 }
 
 fn dragExternalSourceDestroyed(context: *anyopaque, generation: u64) void {
@@ -27004,6 +27044,12 @@ test "production generated data device completes the exact profile and supports 
         if (generated_virtual_pointer.global != null) generated_virtual_pointer.unpublish();
         generated_virtual_pointer.deinit();
     }
+    var generated_pointer_constraints: WayringPointerConstraints = undefined;
+    generated_pointer_constraints.init(std.testing.allocator, &protocol_server, &seat, &compositor, server.neutralPointerConstraints(), server, Self.syncGeneratedPointerConstraints);
+    defer {
+        if (generated_pointer_constraints.global != null) generated_pointer_constraints.unpublish();
+        generated_pointer_constraints.deinit();
+    }
     var layer_shell: WayringLayerShell = undefined;
     layer_shell.init(
         std.testing.allocator,
@@ -27100,6 +27146,7 @@ test "production generated data device completes the exact profile and supports 
         input_method: *WayringInputMethod,
         virtual_keyboard: *WayringVirtualKeyboard,
         virtual_pointer: *WayringVirtualPointer,
+        pointer_constraints: *WayringPointerConstraints,
         layer_shell: *WayringLayerShell,
         idle_notify: *WayringIdleNotification,
         session_lock: *WayringSessionLock,
@@ -27129,6 +27176,7 @@ test "production generated data device completes the exact profile and supports 
         fn destroy(context: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             self.virtual_pointer.destroyClientResources(client);
+            self.pointer_constraints.destroyClientResources(client);
             self.screencopy.destroyClientResources(client);
             self.output_management.destroyClientResources(client);
             self.linux_dmabuf.destroyClientResources(client);
@@ -27219,6 +27267,7 @@ test "production generated data device completes the exact profile and supports 
         .input_method = &input_method,
         .virtual_keyboard = &virtual_keyboard,
         .virtual_pointer = &generated_virtual_pointer,
+        .pointer_constraints = &generated_pointer_constraints,
         .layer_shell = &layer_shell,
         .idle_notify = &idle_notify,
         .session_lock = &session_lock,
@@ -27409,6 +27458,7 @@ test "production generated data device completes the exact profile and supports 
     try generated_output_management.publish();
     try generated_screencopy.publish();
     try generated_virtual_pointer.publish();
+    try generated_pointer_constraints.publish();
     try signalWayringCommand(command_fd);
     try waitForWayringXdgStage(server, host, &peer, .manager_added);
     try std.testing.expect(peer.globals_exact);

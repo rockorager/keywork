@@ -4,6 +4,7 @@ const Self = @This();
 
 const std = @import("std");
 const wayland = @import("wayland");
+const NeutralPointerConstraints = @import("../PointerConstraints.zig");
 const Region = @import("../region.zig");
 const Seat = @import("seat.zig");
 const Surface = @import("surface.zig");
@@ -16,12 +17,8 @@ allocator: std.mem.Allocator,
 global: *wl.Global,
 seat: *Seat,
 surface_store: *Surface.Store,
+coordinator: *NeutralPointerConstraints,
 constraints: std.ArrayList(*Constraint),
-
-pub const Motion = struct {
-    point: Region.Point,
-    locked: bool = false,
-};
 
 pub fn init(
     self: *Self,
@@ -29,6 +26,7 @@ pub fn init(
     display: *wl.Server,
     seat: *Seat,
     surface_store: *Surface.Store,
+    coordinator: *NeutralPointerConstraints,
 ) !void {
     self.* = .{
         .allocator = allocator,
@@ -42,6 +40,7 @@ pub fn init(
         ),
         .seat = seat,
         .surface_store = surface_store,
+        .coordinator = coordinator,
         .constraints = .empty,
     };
 }
@@ -53,53 +52,13 @@ pub fn deinit(self: *Self) void {
     self.* = undefined;
 }
 
-/// Apply an already-active constraint before the compositor performs hit testing.
-pub fn constrainMotion(self: *Self, target: Region.Point) Motion {
-    self.syncFocus();
-    const constraint = self.activeConstraint() orelse return .{ .point = target };
-    const position = self.seat.pointerPosition() orelse return .{ .point = target };
-    if (constraint.kind() == .locked) {
-        return .{ .point = .{ .x = position.x, .y = position.y }, .locked = true };
-    }
-    const focus = self.seat.maturePointerFocus() orelse return .{ .point = target };
-    const start: Region.Point = .{ .x = focus.x, .y = focus.y };
-    const local_target: Region.Point = .{
-        .x = focus.x + target.x - position.x,
-        .y = focus.y + target.y - position.y,
-    };
-    const confined = constraint.effective_region.confine(start, local_target) orelse
-        return .{ .point = target };
-    return .{ .point = .{
-        .x = position.x + confined.x - focus.x,
-        .y = position.y + confined.y - focus.y,
-    } };
+fn syncFocus(self: *Self) void {
+    self.coordinator.syncFocus(canonicalFocus(self.seat));
 }
 
-/// Reconcile protocol activation with the seat's current pointer focus.
-pub fn syncFocus(self: *Self) void {
-    const focus = self.seat.maturePointerFocus();
-    for (self.constraints.items) |constraint| {
-        if (!constraint.active) continue;
-        if (!constraint.canRemainActive(focus)) constraint.deactivate();
-    }
-    if (self.activeConstraint() != null) return;
-    for (self.constraints.items) |constraint| {
-        if (!constraint.canActivate(focus)) continue;
-        constraint.activate();
-        return;
-    }
-}
-
-/// Pointer grabs and drag-and-drop take precedence over client constraints.
-pub fn deactivateAll(self: *Self) void {
-    for (self.constraints.items) |constraint| constraint.deactivate();
-}
-
-fn activeConstraint(self: *Self) ?*Constraint {
-    for (self.constraints.items) |constraint| {
-        if (constraint.active) return constraint;
-    }
-    return null;
+fn canonicalFocus(seat: *const Seat) ?NeutralPointerConstraints.Focus {
+    const focus = seat.pointerFocus() orelse return null;
+    return .{ .surface = focus.surface_id, .x = focus.x, .y = focus.y };
 }
 
 fn bind(client: *wl.Client, self: *Self, version: u32, id: u32) void {
@@ -150,14 +109,12 @@ fn createConstraint(
 ) !void {
     const surface = Surface.fromResource(surface_resource);
     const surface_id = surface.handle();
-    for (self.constraints.items) |constraint| {
-        if (!constraint.defunct and std.meta.eql(constraint.surface_id, surface_id)) {
-            manager_resource.postError(
-                .already_constrained,
-                "pointer constraint already requested on this surface",
-            );
-            return;
-        }
+    if (self.coordinator.isConstrained(surface_id)) {
+        manager_resource.postError(
+            .already_constrained,
+            "pointer constraint already requested on this surface",
+        );
+        return;
     }
 
     const protocol_resource: ConstraintResource = switch (kind) {
@@ -192,8 +149,24 @@ fn createConstraint(
         .cursor_hint = null,
         .pending_cursor_hint = null,
         .pending_cursor_hint_changed = false,
-        .active = false,
-        .defunct = false,
+        .neutral = undefined,
+    };
+    constraint.neutral = .{
+        .surface = surface_id,
+        .kind = switch (kind) {
+            .locked => .locked,
+            .confined => .confined,
+        },
+        .lifetime = switch (lifetime) {
+            .oneshot => .oneshot,
+            // The protocol specifies that unknown values behave as persistent.
+            else => .persistent,
+        },
+        .context = constraint,
+        .eligible = Constraint.eligible,
+        .effective_region = Constraint.effectiveRegion,
+        .activated = Constraint.activated,
+        .deactivated = Constraint.deactivated,
     };
     errdefer constraint.current_region.deinit();
     errdefer constraint.pending_region.deinit();
@@ -209,6 +182,8 @@ fn createConstraint(
     };
     try surface.addCommitListener(&constraint.listener);
     errdefer surface.removeCommitListener(&constraint.listener);
+    try self.coordinator.register(&constraint.neutral);
+    errdefer self.coordinator.unregister(&constraint.neutral);
     try self.constraints.append(self.allocator, constraint);
     switch (protocol_resource) {
         .locked => |locked| locked.setHandler(
@@ -277,47 +252,32 @@ const Constraint = struct {
     cursor_hint: ?Region.Point,
     pending_cursor_hint: ?Region.Point,
     pending_cursor_hint_changed: bool,
-    active: bool,
-    defunct: bool,
+    neutral: NeutralPointerConstraints.Constraint,
 
     fn kind(self: *const Constraint) Kind {
         return std.meta.activeTag(self.resource);
     }
 
-    fn canActivate(self: *Constraint, focus: ?Seat.PointerFocus) bool {
-        const position = self.focusPosition(focus) orelse return false;
-        return self.effective_region.containsPoint(.{ .x = position.x, .y = position.y });
+    fn eligible(context: *anyopaque) bool {
+        const self: *Constraint = @ptrCast(@alignCast(context));
+        if (self.surface == null) return false;
+        const pointer = self.pointer orelse return false;
+        return self.manager.seat.pointerHandleIsActive(pointer);
     }
 
-    fn canRemainActive(self: *Constraint, focus: ?Seat.PointerFocus) bool {
-        const position = self.focusPosition(focus) orelse return false;
-        // A lock region controls activation only. Confinement must continue to
-        // contain the pointer after a committed region or input-region change.
-        return self.kind() == .locked or
-            self.effective_region.containsPoint(.{ .x = position.x, .y = position.y });
+    fn effectiveRegion(context: *anyopaque) *const Region {
+        const self: *Constraint = @ptrCast(@alignCast(context));
+        return &self.effective_region;
     }
 
-    fn focusPosition(self: *Constraint, focus: ?Seat.PointerFocus) ?Seat.PointerFocus {
-        if (self.defunct or self.surface == null) return null;
-        const pointer = self.pointer orelse return null;
-        if (!self.manager.seat.pointerHandleIsActive(pointer)) return null;
-        const position = focus orelse return null;
-        if (position.generated != null) return null;
-        if (!std.meta.eql(position.surface_id, self.surface_id)) return null;
-        return position;
-    }
-
-    fn activate(self: *Constraint) void {
-        std.debug.assert(!self.active and !self.defunct);
-        self.active = true;
+    fn activated(context: *anyopaque) void {
+        const self: *Constraint = @ptrCast(@alignCast(context));
         self.resource.sendActivated();
     }
 
-    fn deactivate(self: *Constraint) void {
-        if (!self.active) return;
-        self.active = false;
+    fn deactivated(context: *anyopaque) void {
+        const self: *Constraint = @ptrCast(@alignCast(context));
         self.resource.sendDeactivated();
-        if (self.lifetime == .oneshot) self.defunct = true;
     }
 
     fn setPendingRegion(self: *Constraint, region_resource: ?*wl.Region) !void {
@@ -360,7 +320,7 @@ const Constraint = struct {
     }
 
     fn destroy(self: *Constraint) void {
-        self.active = false;
+        self.manager.coordinator.unregister(&self.neutral);
         if (self.surface) |surface| surface.removeCommitListener(&self.listener);
         for (self.manager.constraints.items, 0..) |constraint, index| {
             if (constraint != self) continue;
@@ -418,7 +378,7 @@ fn handleSurfaceApplied(context: *anyopaque) void {
     const constraint: *Constraint = @ptrCast(@alignCast(context));
     constraint.applyPending() catch {
         constraint.resource.postNoMemory();
-        constraint.deactivate();
+        constraint.manager.coordinator.deactivateConstraint(&constraint.neutral);
         return;
     };
     constraint.manager.syncFocus();
@@ -428,7 +388,6 @@ fn handleSurfaceDestroyed(context: *anyopaque) void {
     const constraint: *Constraint = @ptrCast(@alignCast(context));
     const surface = constraint.surface orelse unreachable;
     surface.removeCommitListener(&constraint.listener);
-    constraint.deactivate();
-    constraint.defunct = true;
+    constraint.manager.coordinator.surfaceDestroyed(&constraint.neutral);
     constraint.surface = null;
 }

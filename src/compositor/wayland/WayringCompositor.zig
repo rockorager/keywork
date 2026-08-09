@@ -387,6 +387,18 @@ pub const UpdateToken = struct {
     sequence: u64,
 };
 
+pub const PointerConstraintReservation = struct { surface: SurfaceId, generation: u64 };
+pub const PointerConstraintHandler = struct {
+    context: *anyopaque,
+    prepare_committed: *const fn (*anyopaque, UpdateToken) anyerror!void,
+    committed: *const fn (*anyopaque, UpdateToken) void,
+    abort_committed: *const fn (*anyopaque, UpdateToken) void,
+    applied: *const fn (*anyopaque, UpdateToken) void,
+    discarded: *const fn (*anyopaque, UpdateToken) void,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+pub const PointerConstraintError = error{ NotLive, WrongClient, AlreadyReserved, GenerationExhausted, StaleReservation };
+
 const FrameCallback = struct {
     const State = union(enum) {
         pending,
@@ -481,6 +493,7 @@ const Surface = struct {
     xdg_association: ?XdgAssociation = null,
     layer_association: ?LayerAssociation = null,
     session_lock_association: ?SessionLockAssociation = null,
+    pointer_constraint: ?PointerConstraintAssociation = null,
     input_popup: ?InputPopupReservation = null,
     children: std.ArrayList(ChildPlacement) = .empty,
     parent_sentinel_index: usize = 0,
@@ -502,6 +515,11 @@ const SessionLockAssociation = struct {
     reservation: SessionLockReservation,
     handler: ?SessionLockCommitHandler = null,
     published: bool = false,
+};
+
+const PointerConstraintAssociation = struct {
+    reservation: PointerConstraintReservation,
+    handler: PointerConstraintHandler,
 };
 
 const AssociationIdentity = struct {
@@ -545,6 +563,7 @@ const ContentUpdate = struct {
     claimed_by: ?UpdateToken = null,
     topology: ?std.ArrayList(TopologyEntry) = null,
     direct_prepared: bool = false,
+    pointer_constraint: ?PointerConstraintAssociation = null,
     fn deinit(self: *ContentUpdate, allocator: std.mem.Allocator) void {
         self.prepared.deinit();
         self.claims.deinit(allocator);
@@ -837,6 +856,7 @@ next_xdg_generation: ?u64 = 1,
 next_layer_generation: ?u64 = 1,
 next_session_lock_generation: ?u64 = 1,
 next_input_popup_generation: ?u64 = 1,
+next_pointer_constraint_generation: ?u64 = 1,
 completing_frame_callbacks: bool = false,
 commit_fault: if (builtin.is_test) ?CommitFault else void,
 
@@ -986,6 +1006,56 @@ pub fn currentLogicalSize(self: *const WayringCompositor, id: SurfaceId) ?render
     const surface = self.surfaceForId(id) orelse return null;
     if (surface.destroying or surface.resource.runtime.state() != .live) return null;
     return surface.current_logical_size;
+}
+
+pub fn reservePointerConstraint(
+    self: *WayringCompositor,
+    client: *server.Client,
+    object_id: u32,
+    handler: PointerConstraintHandler,
+) PointerConstraintError!PointerConstraintReservation {
+    const objects = self.findClient(client) orelse return error.NotLive;
+    const surface = for (objects.surfaces.items) |value| {
+        if (value.resource.id() == object_id and !value.destroying and value.resource.runtime.state() == .live) break value;
+    } else return if (client.lookup(object_id) != null) error.WrongClient else error.NotLive;
+    if (surface.pointer_constraint != null) return error.AlreadyReserved;
+    const generation = self.next_pointer_constraint_generation orelse return error.GenerationExhausted;
+    self.next_pointer_constraint_generation = std.math.add(u64, generation, 1) catch null;
+    const reservation: PointerConstraintReservation = .{ .surface = surface.id, .generation = generation };
+    surface.pointer_constraint = .{ .reservation = reservation, .handler = handler };
+    return reservation;
+}
+
+pub fn releasePointerConstraint(self: *WayringCompositor, reservation: PointerConstraintReservation) PointerConstraintError!void {
+    const surface = self.surfaceForId(reservation.surface) orelse return error.StaleReservation;
+    const association = surface.pointer_constraint orelse return error.StaleReservation;
+    if (!std.meta.eql(association.reservation, reservation)) return error.StaleReservation;
+    surface.pointer_constraint = null;
+    for (surface.content_updates.items) |*update| {
+        if (update.pointer_constraint) |queued_association| {
+            if (std.meta.eql(queued_association.reservation, reservation)) update.pointer_constraint = null;
+        }
+    }
+}
+
+pub fn copyRegion(self: *WayringCompositor, client: *server.Client, object_id: u32, destination: *Region) !bool {
+    const objects = self.findClient(client) orelse return false;
+    for (objects.regions.items) |region| if (region.resource.id() == object_id and region.resource.runtime.state() == .live) {
+        try destination.copyFrom(&region.value);
+        return true;
+    };
+    return false;
+}
+
+pub fn copyCurrentInputRegion(self: *const WayringCompositor, id: SurfaceId, destination: *Region) !bool {
+    const surface = self.surfaceForId(id) orelse return false;
+    const size = surface.current_logical_size orelse {
+        destination.clear();
+        return true;
+    };
+    destination.setRectangle(0, 0, size.width, size.height);
+    if (!surface.current_input.infinite) try destination.intersectWith(&surface.current_input.value);
+    return true;
 }
 
 /// Resolves a live canonical surface to a current neutral client identity.
@@ -2848,6 +2918,11 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     prepared = undefined;
     var candidate_owned = true;
     defer if (candidate_owned) candidate.deinit(self.allocator);
+    var pointer_constraint_prepared = false;
+    defer if (!published and pointer_constraint_prepared) {
+        const association = surface.pointer_constraint orelse unreachable;
+        association.handler.abort_committed(association.handler.context, token);
+    };
 
     if (self.failCommitAt(.queue_storage)) return error.OutOfMemory;
     try surface.content_updates.ensureUnusedCapacity(self.allocator, 1);
@@ -2925,6 +3000,12 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
         candidate.direct_prepared = true;
     }
 
+    if (surface.pointer_constraint) |association| {
+        try association.handler.prepare_committed(association.handler.context, token);
+        pointer_constraint_prepared = true;
+        candidate.pointer_constraint = association;
+    }
+
     // Release enqueue is the final fallible operation. Adapter preparation is
     // explicitly abortable; callbacks, pending state, claims, and applied
     // state are untouched before it.
@@ -2961,6 +3042,7 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     const commits_buffer = candidate.prepared.attachment_changed and candidate.prepared.logical_size != null;
     surface.content_updates.appendAssumeCapacity(candidate);
     candidate_owned = false;
+    if (candidate.pointer_constraint) |association| association.handler.committed(association.handler.context, token);
     if (commits_buffer) surface.has_committed_buffer = true;
     const stored = &surface.content_updates.items[surface.content_updates.items.len - 1];
     for (stored.claims.items) |claim| {
@@ -3262,6 +3344,8 @@ fn applyScratch(self: *WayringCompositor, scratch: *ApplyScratch) void {
         if (update.direct_prepared and surface.current_logical_size != null and
             update.prepared.logical_size == null) handler.?.pre_unmap(handler.?.context, token);
         self.publishPreparedCommit(surface, &update.prepared, token, false);
+        if (update.pointer_constraint) |association|
+            association.handler.applied(association.handler.context, token);
 
         var state_found = false;
         for (scratch.surfaces.items) |*state| if (std.meta.eql(state.id, surface.id)) {
@@ -3344,6 +3428,8 @@ fn unlinkIncomingClaim(self: *WayringCompositor, update: *ContentUpdate) void {
 
 fn discardUpdateAt(self: *WayringCompositor, surface: *Surface, index: usize) void {
     const token = surface.content_updates.items[index].token;
+    if (surface.content_updates.items[index].pointer_constraint) |association|
+        association.handler.discarded(association.handler.context, token);
     if (surface.content_updates.items[index].direct_prepared) if (directCommitHandler(surface)) |handler|
         handler.abort_prepare(handler.context, token);
     self.unlinkIncomingClaim(&surface.content_updates.items[index]);
@@ -3802,6 +3888,11 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     const objects = self.findClient(client) orelse unreachable;
     std.debug.assert(!surface.destroying);
     surface.destroying = true;
+    if (surface.pointer_constraint) |association| {
+        surface.pointer_constraint = null;
+        for (surface.content_updates.items) |*update| update.pointer_constraint = null;
+        association.handler.surface_destroyed(association.handler.context);
+    }
     while (surface.presentation_feedbacks.items.len != 0) {
         const handler = surface.presentation_feedbacks.items[0].handler;
         handler.discarded(handler.context);

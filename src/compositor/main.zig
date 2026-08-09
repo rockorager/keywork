@@ -31,6 +31,7 @@ const WayringIdleInhibit = @import("wayland/WayringIdleInhibit.zig");
 const WayringKeyboardShortcutsInhibit = @import("wayland/WayringKeyboardShortcutsInhibit.zig");
 const WayringRelativePointer = @import("wayland/WayringRelativePointer.zig");
 const WayringPointerGestures = @import("wayland/WayringPointerGestures.zig");
+const WayringPointerConstraints = @import("wayland/WayringPointerConstraints.zig");
 const WayringLayerShell = @import("wayland/WayringLayerShell.zig");
 const WayringProfile = @import("wayland/WayringProfile.zig");
 const WayringSessionLock = @import("wayland/WayringSessionLock.zig");
@@ -138,7 +139,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 53/41 profile is not default eligible
+    \\                            its limited 54/42 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -381,6 +382,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_pointer_gestures: WayringPointerGestures = undefined;
     var wayring_pointer_gestures_initialized = false;
     var wayring_pointer_gestures_published = false;
+    var wayring_pointer_constraints: WayringPointerConstraints = undefined;
+    var wayring_pointer_constraints_initialized = false;
+    var wayring_pointer_constraints_published = false;
     var wayring_data_device: WayringDataDevice = undefined;
     var wayring_data_device_initialized = false;
     var wayring_data_device_published = false;
@@ -471,6 +475,7 @@ pub fn main(init: std.process.Init) !void {
         seat: *WayringSeatAdapter,
         relative_pointer: ?*WayringRelativePointer,
         pointer_gestures: ?*WayringPointerGestures,
+        pointer_constraints: ?*WayringPointerConstraints,
         data_device: ?*WayringDataDevice,
         xdg_toplevel_drag: ?*WayringXdgToplevelDrag,
         primary_selection: ?*WayringPrimarySelection,
@@ -508,6 +513,7 @@ pub fn main(init: std.process.Init) !void {
             const self: *@This() = @ptrCast(@alignCast(erased));
             if (self.relative_pointer) |adapter| adapter.destroyClientResources(client);
             if (self.pointer_gestures) |adapter| adapter.destroyClientResources(client);
+            if (self.pointer_constraints) |adapter| adapter.destroyClientResources(client);
             if (self.virtual_pointer) |adapter| adapter.destroyClientResources(client);
             if (self.screencopy) |adapter| adapter.destroyClientResources(client);
             if (self.output_management) |adapter| adapter.destroyClientResources(client);
@@ -775,6 +781,10 @@ pub fn main(init: std.process.Init) !void {
                 if (wayring_pointer_gestures_published) wayring_pointer_gestures.unpublish();
                 wayring_pointer_gestures.deinit();
             }
+            if (wayring_pointer_constraints_initialized) {
+                if (wayring_pointer_constraints_published) wayring_pointer_constraints.unpublish();
+                wayring_pointer_constraints.deinit();
+            }
             if (wayring_seat_published) wayring_seat_adapter.unpublish();
             server.clearGeneratedSeatDeliverySink(&wayring_seat_adapter);
             wayring_seat_adapter.clearCursorListener();
@@ -818,6 +828,8 @@ pub fn main(init: std.process.Init) !void {
         wayring_pointer_gestures.init(init.gpa, &wayring_protocol_server.?, &wayring_seat_adapter, &wayring_compositor);
         wayring_pointer_gestures_initialized = true;
         server.setGeneratedPointerGestureObserver(wayring_pointer_gestures.observer());
+        wayring_pointer_constraints.init(init.gpa, &wayring_protocol_server.?, &wayring_seat_adapter, &wayring_compositor, server.neutralPointerConstraints(), server, Server.syncGeneratedPointerConstraints);
+        wayring_pointer_constraints_initialized = true;
         wayring_data_device.init(init.gpa, &wayring_protocol_server.?, &wayring_clients, &wayring_seat_adapter, server.neutralDataDevice(), &wayring_compositor);
         wayring_data_device_initialized = true;
         wayring_primary_selection.init(init.gpa, &wayring_protocol_server.?, &wayring_clients, &wayring_seat_adapter, server.neutralDataDevice());
@@ -935,6 +947,10 @@ pub fn main(init: std.process.Init) !void {
         wayring_relative_pointer_published = true;
         try wayring_pointer_gestures.publish();
         wayring_pointer_gestures_published = true;
+        if (server.wayringOutputLayout() != null) {
+            try wayring_pointer_constraints.publish();
+            wayring_pointer_constraints_published = true;
+        }
         if (server.wayringOutputLayout()) |output_layout| {
             try wayring_outputs.init(
                 init.gpa,
@@ -1194,6 +1210,7 @@ pub fn main(init: std.process.Init) !void {
             .seat = &wayring_seat_adapter,
             .relative_pointer = if (wayring_relative_pointer_initialized) &wayring_relative_pointer else null,
             .pointer_gestures = if (wayring_pointer_gestures_initialized) &wayring_pointer_gestures else null,
+            .pointer_constraints = if (wayring_pointer_constraints_initialized) &wayring_pointer_constraints else null,
             .data_device = if (wayring_data_device_initialized) &wayring_data_device else null,
             .xdg_toplevel_drag = if (wayring_xdg_toplevel_drag_initialized) &wayring_xdg_toplevel_drag else null,
             .primary_selection = if (wayring_primary_selection_initialized) &wayring_primary_selection else null,
@@ -1783,6 +1800,7 @@ test {
     _ = @import("window_manager/workspace.zig");
     _ = @import("wayland/compositor.zig");
     _ = @import("wayland/WayringCompositor.zig");
+    _ = @import("PointerConstraints.zig");
     _ = @import("wayland/WayringXdgShell.zig");
     _ = @import("wayland/WayringViewporter.zig");
     _ = @import("wayland/WayringClients.zig");
@@ -1890,6 +1908,7 @@ test {
     _ = @import("wayland/WayringKeyboardShortcutsInhibit.zig");
     _ = @import("wayland/WayringRelativePointer.zig");
     _ = @import("wayland/WayringPointerGestures.zig");
+    _ = @import("wayland/WayringPointerConstraints.zig");
     _ = @import("wayland/keyboard_shortcuts_inhibit.zig");
     _ = @import("IdleNotification.zig");
     _ = @import("wayland/idle_notify.zig");
