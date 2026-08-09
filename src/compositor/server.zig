@@ -26508,6 +26508,7 @@ test "production generated data device completes the exact profile and supports 
     const WayringForeignToplevelList = @import("wayland/WayringForeignToplevelList.zig");
     const WayringColorRepresentation = @import("wayland/WayringColorRepresentation.zig");
     const WayringTearingControl = @import("wayland/WayringTearingControl.zig");
+    const WayringBackgroundEffect = @import("wayland/WayringBackgroundEffect.zig");
     const WayringTextInput = @import("wayland/WayringTextInput.zig");
     const WayringVirtualKeyboard = @import("wayland/WayringVirtualKeyboard.zig");
     const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
@@ -26645,6 +26646,13 @@ test "production generated data device completes the exact profile and supports 
         tearing_control.deinit();
     }
     try tearing_control.publish();
+    var background_effect: WayringBackgroundEffect = undefined;
+    background_effect.init(std.testing.allocator, &protocol_server, &compositor);
+    defer {
+        if (background_effect.global != null) background_effect.unpublish();
+        background_effect.deinit();
+    }
+    try background_effect.publish();
     var cursor_shape: WayringCursorShape = undefined;
     cursor_shape.init(
         std.testing.allocator,
@@ -26929,6 +26937,7 @@ test "production generated data device completes the exact profile and supports 
         fractional_scale: *WayringFractionalScale,
         color_representation: *WayringColorRepresentation,
         tearing_control: *WayringTearingControl,
+        background_effect: *WayringBackgroundEffect,
         cursor_shape: *WayringCursorShape,
         decoration: *WayringXdgDecoration,
         activation: *WayringXdgActivation,
@@ -27021,6 +27030,7 @@ test "production generated data device completes the exact profile and supports 
             self.xdg.destroyClientResources(client);
             self.seat.destroyClientResources(client);
             self.outputs.destroyClientResources(client);
+            self.background_effect.destroyClientResources(client);
             self.tearing_control.destroyClientResources(client);
             self.color_representation.destroyClientResources(client);
             self.compositor.destroyClientResources(client);
@@ -27038,6 +27048,7 @@ test "production generated data device completes the exact profile and supports 
         .fractional_scale = &fractional_scale,
         .color_representation = &color_representation,
         .tearing_control = &tearing_control,
+        .background_effect = &background_effect,
         .cursor_shape = &cursor_shape,
         .decoration = &decoration,
         .activation = &activation,

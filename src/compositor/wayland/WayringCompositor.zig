@@ -98,6 +98,17 @@ pub const TearingControlAttachResult = union(enum) {
     not_live,
     wrong_client,
 };
+pub const BackgroundEffectHandler = struct {
+    context: *anyopaque,
+    surface_destroyed: *const fn (*anyopaque) void,
+};
+pub const BackgroundEffectAttachResult = union(enum) {
+    attached: SurfaceId,
+    background_effect_exists,
+    not_live,
+    wrong_client,
+};
+pub const BlurRegionResult = enum { applied, not_live, wrong_context, invalid_region, out_of_memory };
 pub const ColorRepresentationState = struct {
     pub const AlphaMode = enum(u32) { premultiplied_electrical, premultiplied_optical, straight, _ };
     pub const Coefficients = enum(u32) { identity = 1, bt709, fcc, bt601, smpte240, bt2020, bt2020_cl, ictcp, _ };
@@ -423,6 +434,10 @@ const Surface = struct {
     tearing_control_handler: ?TearingControlHandler = null,
     pending_allow_tearing: bool = false,
     current_allow_tearing: bool = false,
+    background_effect_handler: ?BackgroundEffectHandler = null,
+    pending_blur_region: Region,
+    pending_blur_region_dirty: bool = false,
+    current_blur_region: Region,
     current_source: ?render.SourceRect = null,
     source_cache_id: u64,
     next_source_version: u64 = 1,
@@ -592,6 +607,7 @@ const PreparedCommit = struct {
     color_representation: ColorRepresentationState,
     alpha_multiplier: u32,
     allow_tearing: bool,
+    blur_region: ?Region = null,
     source: ?render.SourceRect = null,
     scale: i32,
     transform: render.BufferTransform,
@@ -621,6 +637,7 @@ const PreparedCommit = struct {
         self.damage.deinit();
         if (self.opaque_region) |*opaque_region| opaque_region.deinit();
         if (self.input) |*input| input.deinit();
+        if (self.blur_region) |*blur_region| blur_region.deinit();
         if (self.buffer) |*buffer| buffer.deinit();
         self.* = undefined;
     }
@@ -1124,6 +1141,62 @@ pub fn setPendingAllowTearing(self: *WayringCompositor, id: SurfaceId, handler_c
 
 pub fn currentAllowTearing(self: *const WayringCompositor, id: SurfaceId) ?bool {
     return (self.surfaceForId(id) orelse return null).current_allow_tearing;
+}
+
+pub fn attachBackgroundEffect(
+    self: *WayringCompositor,
+    client: *server.Client,
+    object_id: u32,
+    handler: BackgroundEffectHandler,
+) BackgroundEffectAttachResult {
+    const objects = self.findClient(client) orelse return .not_live;
+    for (objects.surfaces.items) |surface| if (surface.resource.id() == object_id and !surface.destroying) {
+        if (surface.background_effect_handler != null) return .background_effect_exists;
+        surface.background_effect_handler = handler;
+        return .{ .attached = surface.id };
+    };
+    if (client.lookup(object_id)) |resource| if (resource.interface() == &core.wl_surface.interface) return .wrong_client;
+    return .not_live;
+}
+
+pub fn detachBackgroundEffect(self: *WayringCompositor, id: SurfaceId, handler_context: *anyopaque) void {
+    const surface = self.surfaceForId(id) orelse return;
+    const handler = surface.background_effect_handler orelse return;
+    if (handler.context != handler_context) return;
+    surface.background_effect_handler = null;
+    surface.pending_blur_region.clear();
+    surface.pending_blur_region_dirty = true;
+}
+
+pub fn setPendingBlurRegion(
+    self: *WayringCompositor,
+    client: *server.Client,
+    id: SurfaceId,
+    handler_context: *anyopaque,
+    region_object_id: ?u32,
+) BlurRegionResult {
+    const surface = self.surfaceForId(id) orelse return .not_live;
+    if (surface.destroying or surface.resource.runtime.state() != .live) return .not_live;
+    const handler = surface.background_effect_handler orelse return .wrong_context;
+    if (handler.context != handler_context) return .wrong_context;
+
+    if (region_object_id) |object_id| {
+        const objects = self.findClient(client) orelse return .invalid_region;
+        const source = for (objects.regions.items) |region| {
+            if (region.resource.id() == object_id and region.resource.runtime.state() == .live) break &region.value;
+        } else return .invalid_region;
+        var candidate = Region.init();
+        candidate.copyFrom(source) catch {
+            candidate.deinit();
+            return .out_of_memory;
+        };
+        std.mem.swap(Region, &surface.pending_blur_region, &candidate);
+        candidate.deinit();
+    } else {
+        surface.pending_blur_region.clear();
+    }
+    surface.pending_blur_region_dirty = true;
+    return .applied;
 }
 
 pub fn attachColorRepresentation(
@@ -2152,9 +2225,13 @@ fn createSurface(self: *WayringCompositor, compositor: *core.wl_compositor.Resou
         .current_opaque = .init(),
         .pending_input = .init(),
         .current_input = .init(),
+        .pending_blur_region = .init(),
+        .current_blur_region = .init(),
         .source_cache_id = render.allocateSourceCacheId(),
     };
     errdefer {
+        surface.current_blur_region.deinit();
+        surface.pending_blur_region.deinit();
         surface.current_input.deinit();
         surface.pending_input.deinit();
         surface.current_opaque.deinit();
@@ -2266,7 +2343,7 @@ fn surfaceRenderState(context: *anyopaque) ?SurfaceRegistry.RenderState {
         .alpha_multiplier = surface.current_alpha_multiplier,
         .allow_tearing = surface.current_allow_tearing,
         .opaque_region = &surface.current_opaque,
-        .blur_region = null,
+        .blur_region = if (surface.current_blur_region.isEmpty()) null else &surface.current_blur_region,
     };
 }
 
@@ -2689,6 +2766,7 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     surface.pending_damage.clear();
     surface.pending_opaque_dirty = false;
     surface.pending_input_dirty = false;
+    surface.pending_blur_region_dirty = false;
     clearPendingAttachment(surface);
     clearPendingOffset(surface);
     surface.topology_dirty = false;
@@ -2997,11 +3075,20 @@ fn prepareCommit(self: *WayringCompositor, surface: *Surface) !PreparedCommit {
         prepared.input = input;
         input_owned = false;
     }
+    if (surface.pending_blur_region_dirty) {
+        var blur_region = Region.init();
+        var blur_region_owned = true;
+        errdefer if (blur_region_owned) blur_region.deinit();
+        try blur_region.copyFrom(&surface.pending_blur_region);
+        prepared.blur_region = blur_region;
+        blur_region_owned = false;
+    }
 
     prepared.callback_only = prepared.damage.isEmpty() and
         !prepared.attachment_changed and
         prepared.opaque_region == null and
         prepared.input == null and
+        prepared.blur_region == null and
         prepared.scale == surface.current_scale and
         prepared.transform == surface.current_transform and
         std.meta.eql(prepared.viewport, surface.current_viewport) and
@@ -3160,6 +3247,7 @@ fn publishPreparedCommit(
     if (prepared.attachment_changed) std.mem.swap(?BufferSnapshot, &surface.current, &prepared.buffer);
     if (prepared.opaque_region) |*opaque_region| std.mem.swap(Region, &surface.current_opaque, opaque_region);
     if (prepared.input) |*input| std.mem.swap(InputRegion, &surface.current_input, input);
+    if (prepared.blur_region) |*blur_region| std.mem.swap(Region, &surface.current_blur_region, blur_region);
     surface.current_logical_size = prepared.logical_size;
     surface.current_viewport = prepared.viewport;
     surface.current_content_type = prepared.content_type;
@@ -3420,6 +3508,10 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
         surface.tearing_control_handler = null;
         handler.surface_destroyed(handler.context);
     }
+    if (surface.background_effect_handler) |handler| {
+        surface.background_effect_handler = null;
+        handler.surface_destroyed(handler.context);
+    }
     if (surface.xdg_association) |association| {
         const handler = association.handler;
         surface.xdg_association = null;
@@ -3477,6 +3569,8 @@ fn destroySurface(self: *WayringCompositor, surface: *Surface) void {
     if (surface.current) |*current| current.deinit();
     surface.current_input.deinit();
     surface.pending_input.deinit();
+    surface.current_blur_region.deinit();
+    surface.pending_blur_region.deinit();
     surface.current_opaque.deinit();
     surface.pending_opaque.deinit();
     surface.pending_damage.deinit();
@@ -9080,6 +9174,65 @@ test "tearing control is unique double buffered and resets pending state on dest
     try send(client, 4, 0, &core.wl_surface.request_messages[0], &.{});
     try std.testing.expect(second.destroyed);
     try std.testing.expect(compositor.currentAllowTearing(id) == null);
+}
+
+test "background effect copies blur regions and resets pending state on destroy" {
+    const Recorder = struct {
+        destroyed: bool = false,
+
+        fn handler(self: *@This()) BackgroundEffectHandler {
+            return .{ .context = self, .surface_destroyed = surfaceDestroyed };
+        }
+
+        fn surfaceDestroyed(context: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.destroyed = true;
+        }
+    };
+
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var registry = SurfaceRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &registry, null);
+    defer compositor.deinit();
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+
+    try bindCompositorVersion(client, 3, 5);
+    try createSurfaceResource(client, 3, 4);
+    try createRegionResource(client, 3, 5);
+    try addRegion(client, 5, 1, 2, 5, 6);
+    const id = compositor.surfaceId(client, 4).?;
+    const surface = compositor.findClient(client).?.surfaces.items[0];
+    var first: Recorder = .{};
+    var second: Recorder = .{};
+    try std.testing.expect(compositor.attachBackgroundEffect(client, 4, first.handler()) == .attached);
+    try std.testing.expectEqual(BackgroundEffectAttachResult.background_effect_exists, compositor.attachBackgroundEffect(client, 4, second.handler()));
+    try std.testing.expectEqual(BlurRegionResult.applied, compositor.setPendingBlurRegion(client, id, &first, 5));
+    try std.testing.expect(surface.pending_blur_region.contains(2, 3));
+    try std.testing.expect(surface.current_blur_region.isEmpty());
+
+    // The surface owns an immediate copy rather than retaining wl_region.
+    try subtractRegion(client, 5, 1, 2, 5, 6);
+    try send(client, 5, 0, &core.wl_region.request_messages[0], &.{});
+    try std.testing.expect(surface.pending_blur_region.contains(2, 3));
+    try commitSurfaceResource(client, 4);
+    try std.testing.expect(surface.current_blur_region.contains(2, 3));
+
+    compositor.detachBackgroundEffect(id, &first);
+    try std.testing.expect(surface.current_blur_region.contains(2, 3));
+    try commitSurfaceResource(client, 4);
+    try std.testing.expect(surface.current_blur_region.isEmpty());
+    try std.testing.expect(compositor.attachBackgroundEffect(client, 4, second.handler()) == .attached);
+    try send(client, 4, 0, &core.wl_surface.request_messages[0], &.{});
+    try std.testing.expect(second.destroyed);
+    try std.testing.expect(compositor.surfaceId(client, 4) == null);
 }
 
 test "alpha modifier is unique double buffered and resets pending state on destroy" {
