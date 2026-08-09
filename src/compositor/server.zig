@@ -407,6 +407,7 @@ generated_output_observer: ?GeneratedOutputObserver = null,
 generated_capture_observer: ?GeneratedCaptureObserver = null,
 generated_idle_inhibit_provider: ?GeneratedIdleInhibitProvider = null,
 generated_relative_pointer_observer: ?GeneratedRelativePointerObserver = null,
+generated_pointer_gesture_observer: ?GeneratedPointerGestureObserver = null,
 generated_input_popups: std.ArrayList(GeneratedInputPopup) = .empty,
 xdg_toplevel_drag: XdgToplevelDrag,
 xdg_toplevel_icon: XdgToplevelIcon,
@@ -1017,7 +1018,7 @@ const PointerButtonSource = union(enum) {
     virtual: u64,
 };
 
-const GestureKind = enum { swipe, pinch, hold };
+pub const GestureKind = enum { swipe, pinch, hold };
 
 const RoutedGesture = struct {
     device_id: NativeInput.DeviceId,
@@ -6766,6 +6767,18 @@ pub fn setGeneratedRelativePointerObserver(self: *Self, observer: ?GeneratedRela
     self.generated_relative_pointer_observer = observer;
 }
 
+pub const GeneratedPointerGestureObserver = struct {
+    context: *anyopaque,
+    begin: *const fn (*anyopaque, GestureKind, ClientRegistry.Id, SurfaceRegistry.Id, u32, u32) void,
+    update: *const fn (*anyopaque, GestureKind, u32, f64, f64, f64, f64) void,
+    end: *const fn (*anyopaque, GestureKind, u32, bool) void,
+};
+
+pub fn setGeneratedPointerGestureObserver(self: *Self, observer: ?GeneratedPointerGestureObserver) void {
+    std.debug.assert(observer == null or self.generated_pointer_gesture_observer == null);
+    self.generated_pointer_gesture_observer = observer;
+}
+
 fn relativePointerMotion(self: *Self, time: u64, dx: f64, dy: f64, dx_unaccelerated: f64, dy_unaccelerated: f64) void {
     std.debug.assert(std.math.isFinite(dx) and std.math.isFinite(dy));
     std.debug.assert(std.math.isFinite(dx_unaccelerated) and std.math.isFinite(dy_unaccelerated));
@@ -7220,6 +7233,8 @@ fn nativeSwipeUpdate(context: *anyopaque, id: NativeInput.DeviceId, time: u32, d
     const seat = self.gestureSeat(id, .swipe) orelse return;
     self.observeIdleActivity(seat);
     self.pointer_gestures.updateSwipe(seat, time, dx, dy);
+    if (seat == &self.seat) if (self.generated_pointer_gesture_observer) |observer|
+        observer.update(observer.context, .swipe, time, dx, dy, 0, 0);
 }
 fn nativeSwipeEnd(context: *anyopaque, id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
     serverForOutput(context).endGesture(id, time, .swipe, cancelled);
@@ -7240,6 +7255,8 @@ fn nativePinchUpdate(
     const seat = self.gestureSeat(id, .pinch) orelse return;
     self.observeIdleActivity(seat);
     self.pointer_gestures.updatePinch(seat, time, dx, dy, scale, rotation);
+    if (seat == &self.seat) if (self.generated_pointer_gesture_observer) |observer|
+        observer.update(observer.context, .pinch, time, dx, dy, scale, rotation);
 }
 fn nativePinchEnd(context: *anyopaque, id: NativeInput.DeviceId, time: u32, cancelled: bool) void {
     serverForOutput(context).endGesture(id, time, .pinch, cancelled);
@@ -7619,6 +7636,9 @@ fn beginGesture(
         .pinch => self.pointer_gestures.beginPinch(seat, time, fingers),
         .hold => self.pointer_gestures.beginHold(seat, time, fingers),
     }
+    if (seat == &self.seat) if (self.seat.pointerFocus()) |focus| if (focus.generated) |generated|
+        if (self.generated_pointer_gesture_observer) |observer|
+            observer.begin(observer.context, kind, generated.client, focus.surface_id, time, fingers);
 }
 
 fn endGesture(
@@ -7683,6 +7703,8 @@ fn sendGestureEnd(
         .pinch => self.pointer_gestures.endPinch(seat, time, cancelled),
         .hold => self.pointer_gestures.endHold(seat, time, cancelled),
     }
+    if (seat == &self.seat) if (self.generated_pointer_gesture_observer) |observer|
+        observer.end(observer.context, kind, time, cancelled);
 }
 
 fn routeTouchDown(
@@ -7885,6 +7907,7 @@ fn keyboardRepeatInfo(context: *anyopaque, rate: i32, delay: i32) void {
 
 fn pointerAvailable(context: *anyopaque, available: bool) void {
     const self = serverForOutput(context);
+    if (!available) self.cancelSeatGestures(&self.seat);
     if (!available and self.window_manager_initialized) {
         self.pointer_constraints.deactivateAll();
         self.data_device.cancelDrag();

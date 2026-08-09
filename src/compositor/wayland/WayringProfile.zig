@@ -28,6 +28,7 @@ pub const entries = [_]Entry{
     .{ .interface = "wl_subcompositor", .version = 1, .gate = .sidecar },
     .{ .interface = "wl_seat", .version = 11, .gate = .sidecar },
     .{ .interface = "zwp_relative_pointer_manager_v1", .version = 1, .gate = .sidecar },
+    .{ .interface = "zwp_pointer_gestures_v1", .version = 3, .gate = .sidecar },
     .{ .interface = "wl_output", .version = 4, .gate = .presenting_headless },
     .{ .interface = "zxdg_output_manager_v1", .version = 3, .gate = .presenting_headless },
     .{ .interface = "wp_presentation", .version = 2, .gate = .presenting_headless },
@@ -160,14 +161,14 @@ fn enabled(entry: Entry, gate: Gate) bool {
 }
 
 test "manifest pins exact direct and security-context profiles" {
-    try std.testing.expectEqual(@as(usize, 5), expectedCount(.sidecar, .direct));
-    try std.testing.expectEqual(@as(usize, 5), expectedCount(.sidecar, .security_context));
-    try std.testing.expectEqual(@as(usize, 41), expectedCount(.presenting_headless, .direct));
-    try std.testing.expectEqual(@as(usize, 32), expectedCount(.presenting_headless, .security_context));
-    try std.testing.expectEqual(@as(usize, 32), expectedCount(.presenting_headless, .unknown));
-    try std.testing.expectEqualStrings("wp_security_context_manager_v1", expectedAt(.presenting_headless, .direct, 35).?.interface);
-    try std.testing.expectEqualStrings("zwp_linux_dmabuf_v1", expectedAt(.presenting_headless, .security_context, 31).?.interface);
-    try std.testing.expect(expectedAt(.presenting_headless, .security_context, 32) == null);
+    try std.testing.expectEqual(@as(usize, 6), expectedCount(.sidecar, .direct));
+    try std.testing.expectEqual(@as(usize, 6), expectedCount(.sidecar, .security_context));
+    try std.testing.expectEqual(@as(usize, 42), expectedCount(.presenting_headless, .direct));
+    try std.testing.expectEqual(@as(usize, 33), expectedCount(.presenting_headless, .security_context));
+    try std.testing.expectEqual(@as(usize, 33), expectedCount(.presenting_headless, .unknown));
+    try std.testing.expectEqualStrings("wp_security_context_manager_v1", expectedAt(.presenting_headless, .direct, 36).?.interface);
+    try std.testing.expectEqualStrings("zwp_linux_dmabuf_v1", expectedAt(.presenting_headless, .security_context, 32).?.interface);
+    try std.testing.expect(expectedAt(.presenting_headless, .security_context, 33) == null);
 }
 
 test "security visibility requires trusted direct UID and keeps public open" {
@@ -206,9 +207,9 @@ test "security visibility requires trusted direct UID and keeps public open" {
 }
 
 test "diagnostics are deterministic and include order version and visibility" {
-    const expected = entries[14];
+    const expected = entries[29];
     const diagnostic: Diagnostic = .{ .mismatch = .{
-        .index = 14,
+        .index = 29,
         .expected = expected,
         .actual = .{ .interface = expected.interface, .version = 2, .visibility = .public },
     } };
@@ -216,7 +217,7 @@ test "diagnostics are deterministic and include order version and visibility" {
     var writer: std.Io.Writer = .fixed(&buffer);
     try diagnostic.format(&writer);
     try std.testing.expectEqualStrings(
-        "profile[14] expected ext_data_control_manager_v1@1 visibility=restricted; actual ext_data_control_manager_v1@2 visibility=public",
+        "profile[29] expected ext_data_control_manager_v1@1 visibility=restricted; actual ext_data_control_manager_v1@2 visibility=public",
         writer.buffered(),
     );
 }
