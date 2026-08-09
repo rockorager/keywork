@@ -37,6 +37,7 @@ pub const entries = [_]Entry{
     .{ .interface = "zwp_pointer_constraints_v1", .version = 1, .gate = .presenting_headless },
     .{ .interface = "wl_output", .version = 4, .gate = .scanner_output, .repeatable = true },
     .{ .interface = "zwlr_output_power_manager_v1", .version = 1, .visibility = .restricted, .gate = .drm },
+    .{ .interface = "zwlr_gamma_control_manager_v1", .version = 1, .visibility = .restricted, .gate = .drm },
     .{ .interface = "zxdg_output_manager_v1", .version = 3, .gate = .presenting_headless },
     .{ .interface = "wp_presentation", .version = 2, .gate = .presenting_headless },
     .{ .interface = "xdg_wm_base", .version = 7, .gate = .presenting_headless },
@@ -233,11 +234,12 @@ fn enabled(entry: Entry, gate: Gate) bool {
 test "manifest pins exact direct and security-context profiles" {
     try std.testing.expectEqual(@as(usize, 7), expectedCount(.sidecar, .direct));
     try std.testing.expectEqual(@as(usize, 7), expectedCount(.sidecar, .security_context));
-    try std.testing.expectEqual(@as(usize, 10), expectedCount(.drm, .direct));
+    try std.testing.expectEqual(@as(usize, 11), expectedCount(.drm, .direct));
     try std.testing.expectEqual(@as(usize, 8), expectedCount(.drm, .security_context));
     try std.testing.expectEqualStrings("wp_drm_lease_device_v1", expectedAt(.drm, .direct, 7).?.interface);
     try std.testing.expectEqualStrings("wl_output", expectedAt(.drm, .direct, 8).?.interface);
     try std.testing.expectEqualStrings("zwlr_output_power_manager_v1", expectedAt(.drm, .direct, 9).?.interface);
+    try std.testing.expectEqualStrings("zwlr_gamma_control_manager_v1", expectedAt(.drm, .direct, 10).?.interface);
     try std.testing.expectEqualStrings("wl_output", expectedAt(.drm, .security_context, 7).?.interface);
     try std.testing.expectEqual(@as(usize, 58), expectedCount(.presenting_headless, .direct));
     try std.testing.expectEqual(@as(usize, 43), expectedCount(.presenting_headless, .security_context));
@@ -250,7 +252,7 @@ test "manifest pins exact direct and security-context profiles" {
 }
 
 test "DRM profile accepts contiguous output globals for every monitor" {
-    var actuals: [11]Actual = undefined;
+    var actuals: [12]Actual = undefined;
     for (0..9) |index| {
         const expected = expectedAt(.drm, .direct, index).?;
         actuals[index] = .{ .interface = expected.interface, .version = expected.version, .visibility = expected.visibility };
@@ -258,6 +260,8 @@ test "DRM profile accepts contiguous output globals for every monitor" {
     actuals[9] = actuals[8];
     const final = expectedAt(.drm, .direct, 9).?;
     actuals[10] = .{ .interface = final.interface, .version = final.version, .visibility = final.visibility };
+    const gamma = expectedAt(.drm, .direct, 10).?;
+    actuals[11] = .{ .interface = gamma.interface, .version = gamma.version, .visibility = gamma.visibility };
     try std.testing.expect(validateActuals(&actuals, .drm) == null);
 }
 

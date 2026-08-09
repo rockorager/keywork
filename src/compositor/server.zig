@@ -93,6 +93,7 @@ const WayringScreencopy = @import("wayland/WayringScreencopy.zig");
 const WayringLinuxDmabuf = @import("wayland/WayringLinuxDmabuf.zig");
 const WayringDrmLease = @import("wayland/WayringDrmLease.zig");
 const WayringOutputPower = @import("wayland/WayringOutputPower.zig");
+const WayringGammaControl = @import("wayland/WayringGammaControl.zig");
 const OutputPower = @import("wayland/output_power.zig");
 const GammaControl = @import("wayland/gamma_control.zig");
 const DrmLease = @import("wayland/drm_lease.zig");
@@ -424,6 +425,7 @@ generated_output_observer: ?GeneratedOutputObserver = null,
 generated_capture_observer: ?GeneratedCaptureObserver = null,
 generated_drm_lease: ?*WayringDrmLease = null,
 generated_output_power: ?*WayringOutputPower = null,
+generated_gamma_control: ?*WayringGammaControl = null,
 generated_fifo_compositor: ?*WayringCompositor = null,
 generated_idle_inhibit_provider: ?GeneratedIdleInhibitProvider = null,
 generated_keyboard_shortcuts_inhibit_provider: ?GeneratedKeyboardShortcutsInhibitProvider = null,
@@ -513,6 +515,7 @@ const RenderOutput = struct {
     backend: OutputBackend,
     protocol_id: OutputLayout.Id,
     output_power_reserved: bool = false,
+    gamma_control_reserved: bool = false,
     color_description: render.ColorDescription,
     output_calibration: ?render.OutputCalibration,
     timer: ?*wl.EventSource,
@@ -1518,6 +1521,8 @@ pub fn createWithVirtualOutput(
             &self.security_context,
             .{
                 .context = self,
+                .reserve = reserveGammaControl,
+                .release = releaseGammaControl,
                 .gamma_size = outputGammaSize,
                 .set_gamma = setOutputGamma,
                 .reset_gamma = resetOutputGamma,
@@ -2661,6 +2666,7 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     finishWindowTransitionsForOutput(self, render_output.protocol_id);
     finishWorkspaceTransitionsForOutput(self, render_output.protocol_id);
     if (self.gamma_control_initialized) self.gamma_control.removeOutput(render_output.protocol_id);
+    if (self.generated_gamma_control) |adapter| adapter.removeOutput(render_output.protocol_id);
     if (self.output_power_initialized) self.output_power.removeOutput(render_output.protocol_id);
     if (self.generated_output_power) |adapter| adapter.removeOutput(render_output.protocol_id);
     const removed = self.render_outputs.remove(id) orelse unreachable;
@@ -2892,6 +2898,21 @@ fn outputGammaSize(context: *anyopaque, output_id: OutputLayout.Id) ?u32 {
     const render_output = self.findProtocolRenderOutput(output_id) orelse return null;
     const drm_output = render_output.backend.drmOutput() orelse return null;
     return drm_output.gammaSize();
+}
+
+fn reserveGammaControl(context: *anyopaque, output_id: OutputLayout.Id) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const render_output = self.findProtocolRenderOutput(output_id) orelse return false;
+    if (render_output.backend.drmOutput() == null or render_output.gamma_control_reserved) return false;
+    render_output.gamma_control_reserved = true;
+    return true;
+}
+
+fn releaseGammaControl(context: *anyopaque, output_id: OutputLayout.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const render_output = self.findProtocolRenderOutput(output_id) orelse return;
+    std.debug.assert(render_output.gamma_control_reserved);
+    render_output.gamma_control_reserved = false;
 }
 
 fn setOutputGamma(context: *anyopaque, output_id: OutputLayout.Id, table: []const u16) bool {
@@ -3557,6 +3578,7 @@ fn drmDeviceActivated(context: *anyopaque) void {
             return self.terminate();
     }
     if (self.gamma_control_initialized) self.gamma_control.refreshOutputs();
+    if (self.generated_gamma_control) |adapter| adapter.refreshOutputs();
     if (self.drm_lease_initialized) self.drm_lease.@"resume"();
     if (self.generated_drm_lease) |adapter| adapter.resumeLeasing() catch self.terminate();
 }
@@ -4608,6 +4630,27 @@ pub fn attachGeneratedOutputPower(self: *Self, adapter: *WayringOutputPower) voi
 pub fn detachGeneratedOutputPower(self: *Self, adapter: *WayringOutputPower) void {
     std.debug.assert(self.generated_output_power == adapter);
     self.generated_output_power = null;
+}
+
+pub fn generatedGammaControlListener(self: *Self) WayringGammaControl.Listener {
+    return .{
+        .context = self,
+        .reserve = reserveGammaControl,
+        .release = releaseGammaControl,
+        .gamma_size = outputGammaSize,
+        .set_gamma = setOutputGamma,
+        .reset_gamma = resetOutputGamma,
+    };
+}
+
+pub fn attachGeneratedGammaControl(self: *Self, adapter: *WayringGammaControl) void {
+    std.debug.assert(self.drm_device_initialized and self.generated_gamma_control == null);
+    self.generated_gamma_control = adapter;
+}
+
+pub fn detachGeneratedGammaControl(self: *Self, adapter: *WayringGammaControl) void {
+    std.debug.assert(self.generated_gamma_control == adapter);
+    self.generated_gamma_control = null;
 }
 
 pub fn generatedDrmLeaseAuthority(self: *Self) WayringDrmLease.Authority {

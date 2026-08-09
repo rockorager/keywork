@@ -161,6 +161,7 @@ pub fn build(b: *std.Build) void {
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/upstream/wlr-virtual-pointer-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/upstream/wlr-layer-shell-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/upstream/wlr-output-power-management-unstable-v1.xml"));
+    generate_xdg_protocol.addFileArg(b.path("protocols/wayland/upstream/wlr-gamma-control-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/wlr-output-management-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.path("protocols/wayland/wlr-screencopy-unstable-v1.xml"));
     generate_xdg_protocol.addFileArg(b.dependency("wayland_protocols", .{}).path("staging/ext-session-lock/ext-session-lock-v1.xml"));

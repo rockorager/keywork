@@ -8,6 +8,7 @@ const SurfaceRegistry = @import("../SurfaceRegistry.zig");
 const OutputLayout = @import("output_layout.zig");
 const SecurityContext = @import("security_context.zig");
 const Surface = @import("surface.zig");
+const gamma_table = @import("gamma_table.zig");
 
 const wl = wayland.server.wl;
 const zwlr = wayland.server.zwlr;
@@ -22,6 +23,8 @@ listener: Listener,
 
 pub const Listener = struct {
     context: *anyopaque,
+    reserve: *const fn (*anyopaque, OutputLayout.Id) bool,
+    release: *const fn (*anyopaque, OutputLayout.Id) void,
     gamma_size: *const fn (*anyopaque, OutputLayout.Id) ?u32,
     set_gamma: *const fn (*anyopaque, OutputLayout.Id, []const u16) bool,
     reset_gamma: *const fn (*anyopaque, OutputLayout.Id) void,
@@ -125,13 +128,15 @@ fn createControl(
     };
     const entry = self.outputs.findResource(output_resource);
     const output_id = if (entry) |output|
-        if (self.controlForOutput(output.id) == null) output.id else null
+        if (self.listener.reserve(self.listener.context, output.id)) output.id else null
     else
         null;
     const gamma_size = if (output_id) |controlled|
         self.listener.gamma_size(self.listener.context, controlled)
     else
         null;
+    if (output_id != null and gamma_size == null)
+        self.listener.release(self.listener.context, output_id.?);
     control.* = .{
         .manager = self,
         .resource = resource,
@@ -139,6 +144,8 @@ fn createControl(
         .gamma_size = gamma_size orelse 0,
     };
     self.controls.append(self.allocator, control) catch {
+        if (control.output_id) |controlled|
+            self.listener.release(self.listener.context, controlled);
         self.allocator.destroy(control);
         resource.postNoMemory();
         resource.destroy();
@@ -152,18 +159,11 @@ fn createControl(
     }
 }
 
-fn controlForOutput(self: *Self, output_id: OutputLayout.Id) ?*Control {
-    for (self.controls.items) |control| {
-        const controlled = control.output_id orelse continue;
-        if (std.meta.eql(controlled, output_id)) return control;
-    }
-    return null;
-}
-
 fn failControl(self: *Self, control: *Control, reset: bool) void {
     const output_id = control.output_id orelse return;
     control.output_id = null;
     if (reset) self.listener.reset_gamma(self.listener.context, output_id);
+    self.listener.release(self.listener.context, output_id);
     control.resource.sendFailed();
 }
 
@@ -176,6 +176,10 @@ fn handleControlRequest(
         .destroy => {
             if (control.output_id) |output_id| {
                 control.manager.listener.reset_gamma(
+                    control.manager.listener.context,
+                    output_id,
+                );
+                control.manager.listener.release(
                     control.manager.listener.context,
                     output_id,
                 );
@@ -218,6 +222,7 @@ fn handleControlRequest(
 fn handleControlDestroy(_: *zwlr.GammaControlV1, control: *Control) void {
     if (control.output_id) |output_id| {
         control.manager.listener.reset_gamma(control.manager.listener.context, output_id);
+        control.manager.listener.release(control.manager.listener.context, output_id);
     }
     for (control.manager.controls.items, 0..) |candidate, index| {
         if (candidate != control) continue;
@@ -234,20 +239,7 @@ fn readGammaTable(
     fd: std.posix.fd_t,
     gamma_size: u32,
 ) error{ OutOfMemory, InvalidGamma, ReadGammaFailed }![]u16 {
-    const value_count = std.math.mul(usize, gamma_size, 3) catch
-        return error.InvalidGamma;
-    const byte_count = std.math.mul(usize, value_count, @sizeOf(u16)) catch
-        return error.InvalidGamma;
-    const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-    const stat = file.stat(io) catch return error.ReadGammaFailed;
-    if (stat.kind != .file or stat.size != byte_count) return error.InvalidGamma;
-    const table = allocator.alloc(u16, value_count) catch return error.OutOfMemory;
-    errdefer allocator.free(table);
-    const bytes = std.mem.sliceAsBytes(table);
-    const bytes_read = file.readPositionalAll(io, bytes, 0) catch
-        return error.ReadGammaFailed;
-    if (bytes_read != bytes.len) return error.InvalidGamma;
-    return table;
+    return gamma_table.read(io, allocator, fd, gamma_size);
 }
 
 const Control = struct {
@@ -258,7 +250,21 @@ const Control = struct {
 };
 
 const TestListenerState = struct {
+    reserved: bool = true,
     reset_count: usize = 0,
+
+    fn reserve(context: *anyopaque, _: OutputLayout.Id) bool {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (self.reserved) return false;
+        self.reserved = true;
+        return true;
+    }
+
+    fn release(context: *anyopaque, _: OutputLayout.Id) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        std.debug.assert(self.reserved);
+        self.reserved = false;
+    }
 
     fn gammaSize(_: *anyopaque, _: OutputLayout.Id) ?u32 {
         return 256;
@@ -269,12 +275,12 @@ const TestListenerState = struct {
     }
 
     fn resetGamma(context: *anyopaque, _: OutputLayout.Id) void {
-        const self: *TestListenerState = @ptrCast(@alignCast(context));
+        const self: *@This() = @ptrCast(@alignCast(context));
         self.reset_count += 1;
     }
 };
 
-test "removed output fails its control and resets gamma once" {
+test "removed output fails its mature control and releases reservation once" {
     const display = try wl.Server.create();
     defer display.destroy();
 
@@ -314,6 +320,8 @@ test "removed output fails its control and resets gamma once" {
         .controls = .empty,
         .listener = .{
             .context = &state,
+            .reserve = TestListenerState.reserve,
+            .release = TestListenerState.release,
             .gamma_size = TestListenerState.gammaSize,
             .set_gamma = TestListenerState.setGamma,
             .reset_gamma = TestListenerState.resetGamma,
@@ -333,6 +341,7 @@ test "removed output fails its control and resets gamma once" {
 
     manager.removeOutput(output_id);
     try std.testing.expectEqual(@as(usize, 1), state.reset_count);
+    try std.testing.expect(!state.reserved);
     try std.testing.expect(control.output_id == null);
     try std.testing.expect(client.getObject(resource.getId()) != null);
 

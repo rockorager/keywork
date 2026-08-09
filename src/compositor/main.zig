@@ -45,6 +45,7 @@ const WayringScreencopy = @import("wayland/WayringScreencopy.zig");
 const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
 const WayringDrmLease = @import("wayland/WayringDrmLease.zig");
 const WayringOutputPower = @import("wayland/WayringOutputPower.zig");
+const WayringGammaControl = @import("wayland/WayringGammaControl.zig");
 
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgDialog = @import("wayland/WayringXdgDialog.zig");
@@ -484,6 +485,10 @@ pub fn main(init: std.process.Init) !void {
     var wayring_output_power_initialized = false;
     var wayring_output_power_attached = false;
     var wayring_output_power_published = false;
+    var wayring_gamma_control: WayringGammaControl = undefined;
+    var wayring_gamma_control_initialized = false;
+    var wayring_gamma_control_attached = false;
+    var wayring_gamma_control_published = false;
     var wayring_production_adapters: WayringProductionAdapters = undefined;
     const WayringLifecycle = struct {
         clients: *WayringClients,
@@ -542,6 +547,7 @@ pub fn main(init: std.process.Init) !void {
         virtual_pointer: ?*WayringVirtualPointer,
         drm_lease: ?*WayringDrmLease,
         output_power: ?*WayringOutputPower,
+        gamma_control: ?*WayringGammaControl,
         security_context: ?*WayringSecurityContext,
         authorized_uid: std.os.linux.uid_t,
 
@@ -562,6 +568,7 @@ pub fn main(init: std.process.Init) !void {
             const self: *@This() = @ptrCast(@alignCast(erased));
             if (self.drm_lease) |adapter| adapter.destroyClientResources(client);
             if (self.output_power) |adapter| adapter.destroyClientResources(client);
+            if (self.gamma_control) |adapter| adapter.destroyClientResources(client);
             if (self.relative_pointer) |adapter| adapter.destroyClientResources(client);
             if (self.pointer_gestures) |adapter| adapter.destroyClientResources(client);
             if (self.pointer_constraints) |adapter| adapter.destroyClientResources(client);
@@ -636,6 +643,11 @@ pub fn main(init: std.process.Init) !void {
             log.warn("failed to shut down Wayring socket: {t}", .{err});
         };
         if (wayring_protocol_server) |*protocol_server| protocol_server.clearGlobalFilter();
+        if (wayring_gamma_control_initialized) {
+            if (wayring_gamma_control_attached) server.detachGeneratedGammaControl(&wayring_gamma_control);
+            if (wayring_gamma_control_published) wayring_gamma_control.unpublish();
+            wayring_gamma_control.deinit();
+        }
         if (wayring_output_power_initialized) {
             if (wayring_output_power_attached) server.detachGeneratedOutputPower(&wayring_output_power);
             if (wayring_output_power_published) wayring_output_power.unpublish();
@@ -1069,6 +1081,12 @@ pub fn main(init: std.process.Init) !void {
             wayring_output_power_attached = true;
             try wayring_output_power.publish();
             wayring_output_power_published = true;
+            wayring_gamma_control.init(init.gpa, init.io, &wayring_protocol_server.?, .{ .context = &wayring_outputs, .output_id = resolveOutputPowerResource }, std.os.linux.getuid(), server.generatedGammaControlListener());
+            wayring_gamma_control_initialized = true;
+            server.attachGeneratedGammaControl(&wayring_gamma_control);
+            wayring_gamma_control_attached = true;
+            try wayring_gamma_control.publish();
+            wayring_gamma_control_published = true;
         }
         if (wayring_presenting_headless) {
             const output_layout = server.wayringOutputLayout().?;
@@ -1376,6 +1394,7 @@ pub fn main(init: std.process.Init) !void {
             .virtual_pointer = null,
             .drm_lease = if (wayring_drm_lease_initialized) &wayring_drm_lease else null,
             .output_power = if (wayring_output_power_initialized) &wayring_output_power else null,
+            .gamma_control = if (wayring_gamma_control_initialized) &wayring_gamma_control else null,
             .security_context = null,
             .authorized_uid = std.os.linux.getuid(),
         };
