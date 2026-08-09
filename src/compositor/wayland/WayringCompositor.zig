@@ -278,6 +278,10 @@ pub const DmabufResolver = struct {
     context: *anyopaque,
     resolve: *const fn (*anyopaque, *server.Resource) ?*linux_dmabuf.Buffer,
 };
+pub const SinglePixelResolver = struct {
+    context: *anyopaque,
+    resolve: *const fn (*anyopaque, *server.Resource) ?u32,
+};
 
 pub const CursorRoleResult = enum { assigned, already_cursor, role_conflict, not_live, wrong_client };
 pub const DragIconRoleResult = enum { assigned, already_drag_icon, role_conflict, not_live, wrong_client };
@@ -553,6 +557,7 @@ const PendingAttachment = struct {
     const Pin = union(enum) {
         shm: server.shm.Buffer.Pin,
         dmabuf: *linux_dmabuf.Buffer,
+        single_pixel: u32,
     };
 
     pin: Pin,
@@ -569,6 +574,7 @@ const PendingAttachment = struct {
         switch (self.pin) {
             .shm => |*pin| pin.deinit(),
             .dmabuf => |buffer| buffer.unreference(),
+            .single_pixel => {},
         }
         self.* = undefined;
     }
@@ -678,6 +684,7 @@ protocol_server: *server.Server,
 surface_registry: *SurfaceRegistry,
 presentation_listener: ?PresentationListener,
 dmabuf_resolver: ?DmabufResolver = null,
+single_pixel_resolver: ?SinglePixelResolver = null,
 cursor_listener: ?CursorListener = null,
 drag_icon_listener: ?DragIconListener = null,
 input_popup_listener: ?InputPopupListener = null,
@@ -709,6 +716,7 @@ pub fn init(
         .surface_registry = surface_registry,
         .presentation_listener = presentation_listener,
         .dmabuf_resolver = null,
+        .single_pixel_resolver = null,
         .global = undefined,
         .subcompositor_global = undefined,
         .shm = .init(allocator),
@@ -738,6 +746,7 @@ pub fn deinit(self: *WayringCompositor) void {
     std.debug.assert(self.clients.items.len == 0);
     std.debug.assert(self.owned_provider_count == 0);
     std.debug.assert(self.dmabuf_resolver == null);
+    std.debug.assert(self.single_pixel_resolver == null);
     self.protocol_server.removeGlobal(self.subcompositor_global) catch |err| switch (err) {
         error.AlreadyRemoved => {},
         error.ForeignGlobal => unreachable,
@@ -793,6 +802,16 @@ pub fn setDmabufResolver(self: *WayringCompositor, resolver: DmabufResolver) voi
 pub fn clearDmabufResolver(self: *WayringCompositor, context: *anyopaque) void {
     std.debug.assert(self.dmabuf_resolver != null and self.dmabuf_resolver.?.context == context);
     self.dmabuf_resolver = null;
+}
+
+pub fn setSinglePixelResolver(self: *WayringCompositor, resolver: SinglePixelResolver) void {
+    std.debug.assert(self.single_pixel_resolver == null);
+    self.single_pixel_resolver = resolver;
+}
+
+pub fn clearSinglePixelResolver(self: *WayringCompositor, context: *anyopaque) void {
+    std.debug.assert(self.single_pixel_resolver != null and self.single_pixel_resolver.?.context == context);
+    self.single_pixel_resolver = null;
 }
 
 pub fn regionCount(self: *const WayringCompositor) usize {
@@ -2295,17 +2314,17 @@ fn attachSurface(
         client.postImplementationError(&resource.runtime, "wl_surface.attach references an unknown buffer");
         return;
     };
-    const pin: PendingAttachment.Pin = if (self.shm.pin(buffer_resource)) |shm_pin|
-        .{ .shm = shm_pin }
-    else if (self.dmabuf_resolver) |resolver|
-        if (resolver.resolve(resolver.context, buffer_resource)) |buffer|
-            .{ .dmabuf = buffer }
-        else {
-            client.postImplementationError(&resource.runtime, "wl_surface.attach references an unsupported buffer");
-            return;
+    const pin: PendingAttachment.Pin = pin: {
+        if (self.shm.pin(buffer_resource)) |shm_pin| break :pin .{ .shm = shm_pin };
+        if (self.dmabuf_resolver) |resolver| {
+            if (resolver.resolve(resolver.context, buffer_resource)) |buffer|
+                break :pin .{ .dmabuf = buffer };
         }
-    else {
-        client.postImplementationError(&resource.runtime, "wl_surface.attach supports only Wayring wl_shm buffers");
+        if (self.single_pixel_resolver) |resolver| {
+            if (resolver.resolve(resolver.context, buffer_resource)) |pixel|
+                break :pin .{ .single_pixel = pixel };
+        }
+        client.postImplementationError(&resource.runtime, "wl_surface.attach references an unsupported buffer");
         return;
     };
     surface.pending_attachment = .{ .pin = pin, .resource = buffer_resource };
@@ -2449,7 +2468,7 @@ fn commitSurface(self: *WayringCompositor, surface: *Surface) !void {
     // state are untouched before it.
     const shm_buffer_resource = if (surface.pending_attachment) |*pending| switch (pending.pin) {
         .shm => pending.resource,
-        .dmabuf => null,
+        .dmabuf, .single_pixel => null,
     } else null;
     if (shm_buffer_resource != null and self.failCommitAt(.release_enqueue)) return error.OutOfMemory;
     if (shm_buffer_resource) |resource| try self.shm.sendRelease(resource);
@@ -2877,6 +2896,33 @@ fn preparePendingBuffer(
             prepared.logical_size = geometry.logical_size;
             prepared.source = geometry.source;
             prepared.buffer = .{ .dmabuf = .init(buffer) };
+            prepared.publishes_snapshot = true;
+        },
+        .single_pixel => |pixel| {
+            const physical_size: render.Size = .{ .width = 1, .height = 1 };
+            prepared.physical_size = physical_size;
+            const geometry = try surface_geometry.calculate(physical_size, prepared.scale, prepared.transform, prepared.viewport, surface.role == .cursor);
+            prepared.logical_size = geometry.logical_size;
+            prepared.source = geometry.source;
+            const source_cache: render.SourceCache = .{
+                .id = surface.source_cache_id,
+                .version = surface.next_source_version,
+            };
+            if (self.failCommitAt(.copy)) return error.OutOfMemory;
+            const pixels = [_]u32{pixel};
+            const snapshot = try CopiedBufferSnapshot.copy(
+                self.allocator,
+                .{
+                    .bytes = std.mem.sliceAsBytes(&pixels),
+                    .size = physical_size,
+                    .stride_bytes = @sizeOf(u32),
+                    .format = .argb8888,
+                },
+                null,
+                null,
+                source_cache,
+            );
+            prepared.buffer = .{ .copied = snapshot };
             prepared.publishes_snapshot = true;
         },
     }
@@ -5945,6 +5991,59 @@ test "scanner wl_surface version 5 and newer reject attach offsets before mutati
 
     try Case.run(5);
     if (core.wl_surface.interface.version > 5) try Case.run(core.wl_surface.interface.version);
+}
+
+test "single-pixel resolver snapshots one ARGB pixel without buffer release" {
+    var host: server.Server = .init(std.testing.allocator);
+    defer host.deinit();
+    var surface_registry = SurfaceRegistry.init(std.testing.allocator);
+    defer surface_registry.deinit();
+    var compositor: WayringCompositor = undefined;
+    try compositor.init(std.testing.allocator, &host, &surface_registry, null);
+    defer compositor.deinit();
+
+    const Resolver = struct {
+        resource: *server.Resource,
+        pixel: u32,
+
+        fn resolve(context: *anyopaque, resource: *server.Resource) ?u32 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return if (resource == self.resource) self.pixel else null;
+        }
+    };
+
+    const managed = try server.CoreClient.create(std.testing.allocator, &host, .{});
+    const client = managed.client();
+    defer {
+        compositor.destroyClientResources(client);
+        managed.destroy();
+    }
+    try bindCompositorVersion(client, 3, 4);
+    try createSurfaceResource(client, 3, 4);
+    const surface_id = compositor.surfaceId(client, 4).?;
+
+    var buffer: core.wl_buffer.Resource = .init(std.testing.allocator, 5, 1, .client, client.ownerHooks());
+    try client.installClientInitial(5, &buffer.runtime);
+    var resolver: Resolver = .{ .resource = &buffer.runtime, .pixel = 0x8040_2010 };
+    compositor.setSinglePixelResolver(.{ .context = &resolver, .resolve = Resolver.resolve });
+    defer compositor.clearSinglePixelResolver(&resolver);
+
+    try attachBuffer(client, 4, 5);
+    buffer.destroy();
+    buffer.deinit();
+    try commitSurfaceResource(client, 4);
+
+    const current = compositor.currentBuffer(surface_id).?;
+    try std.testing.expectEqualSlices(u32, &.{0x8040_2010}, current.pixels);
+    const render_state = surface_registry.renderState(surface_id).?;
+    try std.testing.expectEqual(render.Size{ .width = 1, .height = 1 }, render_state.buffer.size);
+    try std.testing.expectEqual(render.Size{ .width = 1, .height = 1 }, render_state.logical_size);
+    try std.testing.expectEqualSlices(u32, &.{0x8040_2010}, render_state.buffer.pixels);
+    try std.testing.expect(!render_state.force_opaque);
+
+    const output = try drain(client);
+    defer std.testing.allocator.free(output);
+    try expectDeleteIds(output, &.{5});
 }
 
 test "scanner-backed surface commits copied SHM and releases the buffer" {

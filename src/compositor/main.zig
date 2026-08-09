@@ -41,6 +41,7 @@ const WayringXdgOutput = @import("wayland/WayringXdgOutput.zig");
 const WayringSeatAdapter = @import("wayland/WayringSeatAdapter.zig");
 const WayringXdgShell = @import("wayland/WayringXdgShell.zig");
 const WayringViewporter = @import("wayland/WayringViewporter.zig");
+const WayringSinglePixelBuffer = @import("wayland/WayringSinglePixelBuffer.zig");
 const WayringContentType = @import("wayland/WayringContentType.zig");
 const WayringAlphaModifier = @import("wayland/WayringAlphaModifier.zig");
 const WayringFixes = @import("wayland/WayringFixes.zig");
@@ -111,7 +112,7 @@ const usage =
     \\  --drm-device PATH         use an explicit DRM device
     \\  --wayland-server MODE     select libwayland, dual, or wayring
     \\                            canonical Wayring is headless-only
-    \\                            its limited 32/23 profile is not default eligible
+    \\                            its limited 33/24 profile is not default eligible
     \\  --experimental-wayring    deprecated alias for --wayland-server dual
     \\  --log-level LEVEL         select error, warning, info, or debug logging
     \\  --version                 show the Keywork version
@@ -285,6 +286,9 @@ pub fn main(init: std.process.Init) !void {
     var wayring_fractional_scale: WayringFractionalScale = undefined;
     var wayring_fractional_scale_initialized = false;
     var wayring_fractional_scale_published = false;
+    var wayring_single_pixel_buffer: WayringSinglePixelBuffer = undefined;
+    var wayring_single_pixel_buffer_initialized = false;
+    var wayring_single_pixel_buffer_published = false;
     var wayring_content_type: WayringContentType = undefined;
     var wayring_content_type_initialized = false;
     var wayring_content_type_published = false;
@@ -363,6 +367,7 @@ pub fn main(init: std.process.Init) !void {
         xdg_shell: *WayringXdgShell,
         viewporter: *WayringViewporter,
         fractional_scale: ?*WayringFractionalScale,
+        single_pixel_buffer: ?*WayringSinglePixelBuffer,
         content_type: ?*WayringContentType,
         alpha_modifier: ?*WayringAlphaModifier,
         fixes: ?*WayringFixes,
@@ -427,6 +432,8 @@ pub fn main(init: std.process.Init) !void {
                 fractional_scale.destroyClientResources(client);
             if (self.alpha_modifier) |alpha_modifier| alpha_modifier.destroyClientResources(client);
             if (self.content_type) |content_type| content_type.destroyClientResources(client);
+            if (self.single_pixel_buffer) |single_pixel_buffer|
+                single_pixel_buffer.destroyClientResources(client);
             self.viewporter.destroyClientResources(client);
             self.xdg_shell.destroyClientResources(client);
             if (self.xdg_output) |adapter| adapter.destroyClientResources(client);
@@ -541,14 +548,18 @@ pub fn main(init: std.process.Init) !void {
             if (wayring_alpha_modifier_published) wayring_alpha_modifier.unpublish();
             wayring_alpha_modifier.deinit();
         }
+        if (wayring_content_type_initialized) {
+            if (wayring_content_type_published) wayring_content_type.unpublish();
+            wayring_content_type.deinit();
+        }
+        if (wayring_single_pixel_buffer_initialized) {
+            if (wayring_single_pixel_buffer_published) wayring_single_pixel_buffer.unpublish();
+            wayring_single_pixel_buffer.deinit();
+        }
         if (wayring_fractional_scale_initialized) {
             server.clearWayringDefaultOutputListener(&wayring_fractional_scale);
             if (wayring_fractional_scale_published) wayring_fractional_scale.unpublish();
             wayring_fractional_scale.deinit();
-        }
-        if (wayring_content_type_initialized) {
-            if (wayring_content_type_published) wayring_content_type.unpublish();
-            wayring_content_type.deinit();
         }
         if (wayring_viewporter_initialized) {
             if (wayring_viewporter_published) wayring_viewporter.unpublish();
@@ -757,6 +768,8 @@ pub fn main(init: std.process.Init) !void {
         wayring_system_bell_initialized = true;
         wayring_viewporter.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
         wayring_viewporter_initialized = true;
+        wayring_single_pixel_buffer.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
+        wayring_single_pixel_buffer_initialized = true;
         wayring_content_type.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
         wayring_content_type_initialized = true;
         wayring_alpha_modifier.init(init.gpa, &wayring_protocol_server.?, &wayring_compositor);
@@ -792,6 +805,8 @@ pub fn main(init: std.process.Init) !void {
             wayring_viewporter_published = true;
             try wayring_fractional_scale.publish();
             wayring_fractional_scale_published = true;
+            try wayring_single_pixel_buffer.publish();
+            wayring_single_pixel_buffer_published = true;
             try wayring_content_type.publish();
             wayring_content_type_published = true;
             try wayring_alpha_modifier.publish();
@@ -851,6 +866,7 @@ pub fn main(init: std.process.Init) !void {
             .xdg_shell = &wayring_xdg_shell,
             .viewporter = &wayring_viewporter,
             .fractional_scale = if (wayring_fractional_scale_initialized) &wayring_fractional_scale else null,
+            .single_pixel_buffer = if (wayring_single_pixel_buffer_initialized) &wayring_single_pixel_buffer else null,
             .content_type = if (wayring_content_type_initialized) &wayring_content_type else null,
             .alpha_modifier = if (wayring_alpha_modifier_initialized) &wayring_alpha_modifier else null,
             .fixes = if (wayring_fixes_initialized) &wayring_fixes else null,
@@ -1456,6 +1472,7 @@ test {
     _ = @import("wayland/presentation.zig");
     _ = @import("wayland/fractional_scale.zig");
     _ = @import("wayland/WayringFractionalScale.zig");
+    _ = @import("wayland/WayringSinglePixelBuffer.zig");
     _ = @import("wayland/WayringContentType.zig");
     _ = @import("wayland/WayringAlphaModifier.zig");
     _ = @import("wayland/WayringFixes.zig");
