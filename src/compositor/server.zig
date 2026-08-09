@@ -92,6 +92,7 @@ const WayringOutputManagement = @import("wayland/WayringOutputManagement.zig");
 const WayringScreencopy = @import("wayland/WayringScreencopy.zig");
 const WayringLinuxDmabuf = @import("wayland/WayringLinuxDmabuf.zig");
 const WayringDrmLease = @import("wayland/WayringDrmLease.zig");
+const WayringOutputPower = @import("wayland/WayringOutputPower.zig");
 const OutputPower = @import("wayland/output_power.zig");
 const GammaControl = @import("wayland/gamma_control.zig");
 const DrmLease = @import("wayland/drm_lease.zig");
@@ -422,6 +423,7 @@ generated_input_method_observer: ?GeneratedInputMethodObserver = null,
 generated_output_observer: ?GeneratedOutputObserver = null,
 generated_capture_observer: ?GeneratedCaptureObserver = null,
 generated_drm_lease: ?*WayringDrmLease = null,
+generated_output_power: ?*WayringOutputPower = null,
 generated_fifo_compositor: ?*WayringCompositor = null,
 generated_idle_inhibit_provider: ?GeneratedIdleInhibitProvider = null,
 generated_keyboard_shortcuts_inhibit_provider: ?GeneratedKeyboardShortcutsInhibitProvider = null,
@@ -510,6 +512,7 @@ const RenderOutput = struct {
     server: *Self,
     backend: OutputBackend,
     protocol_id: OutputLayout.Id,
+    output_power_reserved: bool = false,
     color_description: render.ColorDescription,
     output_calibration: ?render.OutputCalibration,
     timer: ?*wl.EventSource,
@@ -1496,6 +1499,8 @@ pub fn createWithVirtualOutput(
             &self.security_context,
             .{
                 .context = self,
+                .reserve = reserveOutputPower,
+                .release = releaseOutputPower,
                 .powered = outputPowerState,
                 .set_powered = setOutputPowerState,
             },
@@ -2656,6 +2661,8 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
     finishWindowTransitionsForOutput(self, render_output.protocol_id);
     finishWorkspaceTransitionsForOutput(self, render_output.protocol_id);
     if (self.gamma_control_initialized) self.gamma_control.removeOutput(render_output.protocol_id);
+    if (self.output_power_initialized) self.output_power.removeOutput(render_output.protocol_id);
+    if (self.generated_output_power) |adapter| adapter.removeOutput(render_output.protocol_id);
     const removed = self.render_outputs.remove(id) orelse unreachable;
     std.debug.assert(removed == render_output);
     stopRenderOutput(render_output);
@@ -2672,7 +2679,6 @@ fn removeRenderOutput(self: *Self, id: RenderOutputId) bool {
         self.image_copy_capture.removeOutput(render_output.protocol_id);
     }
     if (self.screencopy_initialized) self.screencopy.removeOutput(render_output.protocol_id);
-    if (self.output_power_initialized) self.output_power.removeOutput(render_output.protocol_id);
     if (self.window_manager_initialized) {
         self.window_manager.outputRemoved(render_output.protocol_id) catch self.terminate();
     }
@@ -2850,6 +2856,21 @@ fn outputPowerState(context: *anyopaque, output_id: OutputLayout.Id) ?bool {
     const render_output = self.findProtocolRenderOutput(output_id) orelse return null;
     const drm_output = render_output.backend.drmOutput() orelse return null;
     return drm_output.powered;
+}
+
+fn reserveOutputPower(context: *anyopaque, output_id: OutputLayout.Id) bool {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const render_output = self.findProtocolRenderOutput(output_id) orelse return false;
+    if (render_output.backend.drmOutput() == null or render_output.output_power_reserved) return false;
+    render_output.output_power_reserved = true;
+    return true;
+}
+
+fn releaseOutputPower(context: *anyopaque, output_id: OutputLayout.Id) void {
+    const self: *Self = @ptrCast(@alignCast(context));
+    const render_output = self.findProtocolRenderOutput(output_id) orelse return;
+    std.debug.assert(render_output.output_power_reserved);
+    render_output.output_power_reserved = false;
 }
 
 fn setOutputPowerState(context: *anyopaque, output_id: OutputLayout.Id, powered: bool) bool {
@@ -4567,6 +4588,26 @@ pub fn generatedOutputManagement(self: *Self) *NeutralOutputManagement {
 
 pub fn generatedOutputManagementListener(self: *Self) NeutralOutputManagement.Listener {
     return .{ .context = self, .test_configuration = testOutputConfiguration, .apply = applyOutputConfiguration };
+}
+
+pub fn generatedOutputPowerListener(self: *Self) WayringOutputPower.Listener {
+    return .{
+        .context = self,
+        .reserve = reserveOutputPower,
+        .release = releaseOutputPower,
+        .powered = outputPowerState,
+        .set_powered = setOutputPowerState,
+    };
+}
+
+pub fn attachGeneratedOutputPower(self: *Self, adapter: *WayringOutputPower) void {
+    std.debug.assert(self.drm_device_initialized and self.generated_output_power == null);
+    self.generated_output_power = adapter;
+}
+
+pub fn detachGeneratedOutputPower(self: *Self, adapter: *WayringOutputPower) void {
+    std.debug.assert(self.generated_output_power == adapter);
+    self.generated_output_power = null;
 }
 
 pub fn generatedDrmLeaseAuthority(self: *Self) WayringDrmLease.Authority {

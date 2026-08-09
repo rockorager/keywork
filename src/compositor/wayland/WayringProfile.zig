@@ -22,6 +22,7 @@ pub const Entry = struct {
     version: u32,
     visibility: Server.GlobalVisibility = .public,
     gate: Gate,
+    repeatable: bool = false,
 };
 
 pub const entries = [_]Entry{
@@ -34,7 +35,8 @@ pub const entries = [_]Entry{
     .{ .interface = "zwp_pointer_gestures_v1", .version = 3, .gate = .sidecar },
     .{ .interface = "wp_drm_lease_device_v1", .version = 1, .visibility = .restricted, .gate = .drm },
     .{ .interface = "zwp_pointer_constraints_v1", .version = 1, .gate = .presenting_headless },
-    .{ .interface = "wl_output", .version = 4, .gate = .scanner_output },
+    .{ .interface = "wl_output", .version = 4, .gate = .scanner_output, .repeatable = true },
+    .{ .interface = "zwlr_output_power_manager_v1", .version = 1, .visibility = .restricted, .gate = .drm },
     .{ .interface = "zxdg_output_manager_v1", .version = 3, .gate = .presenting_headless },
     .{ .interface = "wp_presentation", .version = 2, .gate = .presenting_headless },
     .{ .interface = "xdg_wm_base", .version = 7, .gate = .presenting_headless },
@@ -146,21 +148,68 @@ pub fn expectedAt(gate: Gate, peer: PeerClass, visible_index: usize) ?Entry {
 
 pub fn validate(server: *const Server, gate: Gate) ?Diagnostic {
     var iterator = server.iterator();
-    var index: usize = 0;
-    while (iterator.next()) |global| : (index += 1) {
+    var actual_index: usize = 0;
+    var expected_index: usize = 0;
+    var repeat_seen = false;
+    while (iterator.next()) |global| : (actual_index += 1) {
         const actual: Actual = .{
             .interface = global.interface().name,
             .version = global.version(),
             .visibility = global.visibility(),
         };
-        const expected = expectedAt(gate, .direct, index) orelse
-            return .{ .unexpected = .{ .index = index, .actual = actual } };
-        if (!std.mem.eql(u8, expected.interface, actual.interface) or
-            expected.version != actual.version or expected.visibility != actual.visibility)
-            return .{ .mismatch = .{ .index = index, .expected = expected, .actual = actual } };
+        if (validateActual(gate, actual, actual_index, &expected_index, &repeat_seen)) |diagnostic|
+            return diagnostic;
     }
-    if (expectedAt(gate, .direct, index)) |expected|
-        return .{ .missing = .{ .index = index, .expected = expected } };
+    return validateEnd(gate, actual_index, expected_index, repeat_seen);
+}
+
+fn validateActuals(actuals: []const Actual, gate: Gate) ?Diagnostic {
+    var expected_index: usize = 0;
+    var repeat_seen = false;
+    for (actuals, 0..) |actual, actual_index| {
+        if (validateActual(gate, actual, actual_index, &expected_index, &repeat_seen)) |diagnostic|
+            return diagnostic;
+    }
+    return validateEnd(gate, actuals.len, expected_index, repeat_seen);
+}
+
+fn validateActual(
+    gate: Gate,
+    actual: Actual,
+    actual_index: usize,
+    expected_index: *usize,
+    repeat_seen: *bool,
+) ?Diagnostic {
+    while (true) {
+        const expected = expectedAt(gate, .direct, expected_index.*) orelse
+            return .{ .unexpected = .{ .index = actual_index, .actual = actual } };
+        if (std.mem.eql(u8, expected.interface, actual.interface) and
+            expected.version == actual.version and expected.visibility == actual.visibility)
+        {
+            if (expected.repeatable) {
+                repeat_seen.* = true;
+            } else {
+                expected_index.* += 1;
+                repeat_seen.* = false;
+            }
+            return null;
+        }
+        if (expected.repeatable and repeat_seen.* and
+            !std.mem.eql(u8, expected.interface, actual.interface))
+        {
+            expected_index.* += 1;
+            repeat_seen.* = false;
+            continue;
+        }
+        return .{ .mismatch = .{ .index = actual_index, .expected = expected, .actual = actual } };
+    }
+}
+
+fn validateEnd(gate: Gate, actual_count: usize, initial_expected_index: usize, repeat_seen: bool) ?Diagnostic {
+    var expected_index = initial_expected_index;
+    if (repeat_seen) expected_index += 1;
+    if (expectedAt(gate, .direct, expected_index)) |expected|
+        return .{ .missing = .{ .index = actual_count, .expected = expected } };
     return null;
 }
 
@@ -184,10 +233,11 @@ fn enabled(entry: Entry, gate: Gate) bool {
 test "manifest pins exact direct and security-context profiles" {
     try std.testing.expectEqual(@as(usize, 7), expectedCount(.sidecar, .direct));
     try std.testing.expectEqual(@as(usize, 7), expectedCount(.sidecar, .security_context));
-    try std.testing.expectEqual(@as(usize, 9), expectedCount(.drm, .direct));
+    try std.testing.expectEqual(@as(usize, 10), expectedCount(.drm, .direct));
     try std.testing.expectEqual(@as(usize, 8), expectedCount(.drm, .security_context));
     try std.testing.expectEqualStrings("wp_drm_lease_device_v1", expectedAt(.drm, .direct, 7).?.interface);
     try std.testing.expectEqualStrings("wl_output", expectedAt(.drm, .direct, 8).?.interface);
+    try std.testing.expectEqualStrings("zwlr_output_power_manager_v1", expectedAt(.drm, .direct, 9).?.interface);
     try std.testing.expectEqualStrings("wl_output", expectedAt(.drm, .security_context, 7).?.interface);
     try std.testing.expectEqual(@as(usize, 58), expectedCount(.presenting_headless, .direct));
     try std.testing.expectEqual(@as(usize, 43), expectedCount(.presenting_headless, .security_context));
@@ -197,6 +247,18 @@ test "manifest pins exact direct and security-context profiles" {
     try std.testing.expectEqualStrings("wp_security_context_manager_v1", expectedAt(.presenting_headless, .direct, 53).?.interface);
     try std.testing.expectEqualStrings("zwp_linux_dmabuf_v1", expectedAt(.presenting_headless, .security_context, 42).?.interface);
     try std.testing.expect(expectedAt(.presenting_headless, .security_context, 43) == null);
+}
+
+test "DRM profile accepts contiguous output globals for every monitor" {
+    var actuals: [11]Actual = undefined;
+    for (0..9) |index| {
+        const expected = expectedAt(.drm, .direct, index).?;
+        actuals[index] = .{ .interface = expected.interface, .version = expected.version, .visibility = expected.visibility };
+    }
+    actuals[9] = actuals[8];
+    const final = expectedAt(.drm, .direct, 9).?;
+    actuals[10] = .{ .interface = final.interface, .version = final.version, .visibility = final.visibility };
+    try std.testing.expect(validateActuals(&actuals, .drm) == null);
 }
 
 test "security visibility requires trusted direct UID and keeps public open" {

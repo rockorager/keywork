@@ -19,6 +19,8 @@ listener: Listener,
 
 pub const Listener = struct {
     context: *anyopaque,
+    reserve: *const fn (*anyopaque, OutputLayout.Id) bool,
+    release: *const fn (*anyopaque, OutputLayout.Id) void,
     powered: *const fn (*anyopaque, OutputLayout.Id) ?bool,
     set_powered: *const fn (*anyopaque, OutputLayout.Id, bool) bool,
 };
@@ -64,8 +66,7 @@ pub fn removeOutput(self: *Self, output_id: OutputLayout.Id) void {
     for (self.controls.items) |control| {
         const controlled = control.output_id orelse continue;
         if (!std.meta.eql(controlled, output_id)) continue;
-        control.output_id = null;
-        control.resource.sendFailed();
+        self.failControl(control);
     }
 }
 
@@ -109,7 +110,7 @@ fn createControl(
     };
     const entry = self.outputs.findResource(output_resource);
     const output_id = if (entry) |output|
-        if (self.controlForOutput(output.id) == null) output.id else null
+        if (self.listener.reserve(self.listener.context, output.id)) output.id else null
     else
         null;
     control.* = .{
@@ -118,6 +119,8 @@ fn createControl(
         .output_id = output_id,
     };
     self.controls.append(self.allocator, control) catch {
+        if (output_id) |controlled|
+            self.listener.release(self.listener.context, controlled);
         self.allocator.destroy(control);
         resource.postNoMemory();
         resource.destroy();
@@ -126,8 +129,7 @@ fn createControl(
     resource.setHandler(*Control, handleControlRequest, handleControlDestroy, control);
     if (output_id) |controlled| {
         const powered = self.listener.powered(self.listener.context, controlled) orelse {
-            control.output_id = null;
-            resource.sendFailed();
+            self.failControl(control);
             return;
         };
         resource.sendMode(if (powered) .on else .off);
@@ -136,12 +138,11 @@ fn createControl(
     }
 }
 
-fn controlForOutput(self: *Self, output_id: OutputLayout.Id) ?*Control {
-    for (self.controls.items) |control| {
-        const controlled = control.output_id orelse continue;
-        if (std.meta.eql(controlled, output_id)) return control;
-    }
-    return null;
+fn failControl(self: *Self, control: *Control) void {
+    const output_id = control.output_id orelse return;
+    control.output_id = null;
+    self.listener.release(self.listener.context, output_id);
+    control.resource.sendFailed();
 }
 
 fn handleControlRequest(
@@ -165,8 +166,7 @@ fn handleControlRequest(
                 control.manager.listener.context,
                 output_id,
             ) orelse {
-                control.output_id = null;
-                resource.sendFailed();
+                control.manager.failControl(control);
                 return;
             };
             if (current == powered) return;
@@ -175,8 +175,7 @@ fn handleControlRequest(
                 output_id,
                 powered,
             )) {
-                control.output_id = null;
-                resource.sendFailed();
+                control.manager.failControl(control);
                 return;
             }
             resource.sendMode(if (powered) .on else .off);
@@ -185,6 +184,8 @@ fn handleControlRequest(
 }
 
 fn handleControlDestroy(_: *zwlr.OutputPowerV1, control: *Control) void {
+    if (control.output_id) |output_id|
+        control.manager.listener.release(control.manager.listener.context, output_id);
     for (control.manager.controls.items, 0..) |candidate, index| {
         if (candidate != control) continue;
         _ = control.manager.controls.orderedRemove(index);

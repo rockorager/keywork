@@ -44,6 +44,7 @@ const WayringOutputManagement = @import("wayland/WayringOutputManagement.zig");
 const WayringScreencopy = @import("wayland/WayringScreencopy.zig");
 const WayringVirtualPointer = @import("wayland/WayringVirtualPointer.zig");
 const WayringDrmLease = @import("wayland/WayringDrmLease.zig");
+const WayringOutputPower = @import("wayland/WayringOutputPower.zig");
 
 const WayringXdgDecoration = @import("wayland/WayringXdgDecoration.zig");
 const WayringXdgDialog = @import("wayland/WayringXdgDialog.zig");
@@ -479,6 +480,10 @@ pub fn main(init: std.process.Init) !void {
     var wayring_drm_lease_initialized = false;
     var wayring_drm_lease_attached = false;
     var wayring_drm_lease_published = false;
+    var wayring_output_power: WayringOutputPower = undefined;
+    var wayring_output_power_initialized = false;
+    var wayring_output_power_attached = false;
+    var wayring_output_power_published = false;
     var wayring_production_adapters: WayringProductionAdapters = undefined;
     const WayringLifecycle = struct {
         clients: *WayringClients,
@@ -536,6 +541,7 @@ pub fn main(init: std.process.Init) !void {
         screencopy: ?*WayringScreencopy,
         virtual_pointer: ?*WayringVirtualPointer,
         drm_lease: ?*WayringDrmLease,
+        output_power: ?*WayringOutputPower,
         security_context: ?*WayringSecurityContext,
         authorized_uid: std.os.linux.uid_t,
 
@@ -555,6 +561,7 @@ pub fn main(init: std.process.Init) !void {
         fn destroy(erased: *anyopaque, client: *wayring.server.Client) void {
             const self: *@This() = @ptrCast(@alignCast(erased));
             if (self.drm_lease) |adapter| adapter.destroyClientResources(client);
+            if (self.output_power) |adapter| adapter.destroyClientResources(client);
             if (self.relative_pointer) |adapter| adapter.destroyClientResources(client);
             if (self.pointer_gestures) |adapter| adapter.destroyClientResources(client);
             if (self.pointer_constraints) |adapter| adapter.destroyClientResources(client);
@@ -629,6 +636,11 @@ pub fn main(init: std.process.Init) !void {
             log.warn("failed to shut down Wayring socket: {t}", .{err});
         };
         if (wayring_protocol_server) |*protocol_server| protocol_server.clearGlobalFilter();
+        if (wayring_output_power_initialized) {
+            if (wayring_output_power_attached) server.detachGeneratedOutputPower(&wayring_output_power);
+            if (wayring_output_power_published) wayring_output_power.unpublish();
+            wayring_output_power.deinit();
+        }
         if (wayring_drm_lease_initialized) {
             if (wayring_drm_lease_attached) server.detachGeneratedDrmLease(&wayring_drm_lease);
             if (wayring_drm_lease_published) wayring_drm_lease.unpublish();
@@ -1050,6 +1062,14 @@ pub fn main(init: std.process.Init) !void {
             );
             wayring_outputs_initialized = true;
         }
+        if (output_kind == .drm) {
+            wayring_output_power.init(init.gpa, &wayring_protocol_server.?, .{ .context = &wayring_outputs, .output_id = resolveOutputPowerResource }, std.os.linux.getuid(), server.generatedOutputPowerListener());
+            wayring_output_power_initialized = true;
+            server.attachGeneratedOutputPower(&wayring_output_power);
+            wayring_output_power_attached = true;
+            try wayring_output_power.publish();
+            wayring_output_power_published = true;
+        }
         if (wayring_presenting_headless) {
             const output_layout = server.wayringOutputLayout().?;
             wayring_xdg_output.init(init.gpa, &wayring_protocol_server.?, &wayring_outputs, output_layout);
@@ -1355,6 +1375,7 @@ pub fn main(init: std.process.Init) !void {
             .screencopy = null,
             .virtual_pointer = null,
             .drm_lease = if (wayring_drm_lease_initialized) &wayring_drm_lease else null,
+            .output_power = if (wayring_output_power_initialized) &wayring_output_power else null,
             .security_context = null,
             .authorized_uid = std.os.linux.getuid(),
         };
@@ -1519,6 +1540,11 @@ fn generatedForeignToplevelRemoveOutput(context: *anyopaque, id: OutputLayout.Id
     const adapters: *WayringForeignToplevelAdapters = @ptrCast(@alignCast(context));
     adapters.foreign_toplevel.removeOutput(id);
     if (adapters.image_capture_source) |source| source.removeOutput(id);
+}
+
+fn resolveOutputPowerResource(context: *anyopaque, client: *wayring.server.Client, object_id: u32) ?@import("output_layout.zig").Id {
+    const outputs: *WayringOutput = @ptrCast(@alignCast(context));
+    return outputs.outputIdForResource(client, object_id);
 }
 
 fn canonicalDisplayName(
