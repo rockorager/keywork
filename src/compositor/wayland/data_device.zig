@@ -543,7 +543,9 @@ const DeviceResource = struct {
                 source.postError(.invalid_source, "drag-and-drop source used for selection");
                 return;
             }
-            if (state.used) {
+            // GTK 3 re-submits its current source after adding SAVE_TARGETS.
+            // Keep the exception identity-bound so other source reuse stays invalid.
+            if (state.used and !selectionIsLocalSource(self.manager.selection, adapter.id)) {
                 resource.postError(.used_source, "data source was already used");
                 return;
             }
@@ -1425,6 +1427,14 @@ fn setSelection(self: *Self, source_id: ?SourceId, serial: u32) void {
     self.replaceSelection(selection, serial, true);
 }
 
+fn selectionIsLocalSource(selection: ?Selection, source_id: SourceId) bool {
+    const current = selection orelse return false;
+    return switch (current) {
+        .local => |id| std.meta.eql(id, source_id),
+        .external => false,
+    };
+}
+
 fn replaceSelection(
     self: *Self,
     selection: ?Selection,
@@ -1770,4 +1780,17 @@ test "drag action negotiation honors a common preference then bit order" {
 test "drag icon position applies committed surface offsets" {
     try std.testing.expectEqual(@as(i32, 15), dragIconCoordinate(12.75, 3));
     try std.testing.expectEqual(std.math.maxInt(i32), dragIconCoordinate(1.0e20, 4));
+}
+
+test "only the current selection source may be submitted again" {
+    const current: SourceId = .{ .index = 1, .generation = 2 };
+    const replaced: SourceId = .{ .index = 1, .generation = 3 };
+    const other: SourceId = .{ .index = 2, .generation = 2 };
+    const external: *const SelectionSource = @ptrFromInt(0x1000);
+
+    try std.testing.expect(selectionIsLocalSource(.{ .local = current }, current));
+    try std.testing.expect(!selectionIsLocalSource(.{ .local = current }, replaced));
+    try std.testing.expect(!selectionIsLocalSource(.{ .local = current }, other));
+    try std.testing.expect(!selectionIsLocalSource(.{ .external = external }, current));
+    try std.testing.expect(!selectionIsLocalSource(null, current));
 }
