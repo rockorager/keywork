@@ -178,14 +178,14 @@ end
 --- Hidden are reported, not filtered: visibility is app policy.
 function M.parse(path, opts)
     opts = opts or {}
-    local file, err = io.open(path, "r")
-    if not file then
+    local data, err = require("keywork.fs").read(path)
+    if not data then
         return nil, err or ("cannot open " .. path)
     end
 
     local groups = {}
     local group = nil
-    for line in file:lines() do
+    for line in (data .. "\n"):gmatch("(.-)\n") do
         local header = line:match("^%[(.-)%]%s*$")
         if header then
             group = {}
@@ -197,8 +197,6 @@ function M.parse(path, opts)
             end
         end
     end
-    file:close()
-
     local main = groups["Desktop Entry"]
     if not main then
         return nil, "missing Desktop Entry group"
@@ -280,12 +278,8 @@ function M.data_dirs()
 end
 
 local function file_exists(path)
-    local file = io.open(path, "r")
-    if not file then
-        return false
-    end
-    file:close()
-    return true
+    local stat = require("keywork.fs").stat(path)
+    return stat ~= nil and stat.type == "file"
 end
 
 -- Desktop file ids replace "/" with "-", which is ambiguous to reverse;
@@ -336,18 +330,18 @@ end
 --- to parse.
 function M.list(opts)
     opts = opts or {}
-    local xdg = require("keywork.xdg")
+    local fs = require("keywork.fs")
     local entries = {}
     local claimed = {}
     local function scan(base, rel)
         local dir = rel == "" and base or (base .. "/" .. rel)
-        local items = xdg.read_dir(dir)
+        local items = fs.list(dir)
         if not items then
             return
         end
         for _, item in ipairs(items) do
             local child = rel == "" and item.name or (rel .. "/" .. item.name)
-            -- Symlinked subdirectories are followed (read_dir reports the
+            -- Symlinked subdirectories are followed (fs.list reports the
             -- link itself, so probe it as a directory first).
             if item.type == "dir" or (item.type == "symlink" and not item.name:match("%.desktop$")) then
                 scan(base, child)

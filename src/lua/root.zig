@@ -23,6 +23,7 @@ const lua_config = @import("config.zig");
 const lua_curl = @import("curl.zig");
 const lua_process = @import("process.zig");
 const lua_dbus = @import("dbus.zig");
+const lua_fs = @import("fs.zig");
 const lua_json = @import("json.zig");
 const lua_loop = @import("loop.zig");
 const lua_net = @import("net.zig");
@@ -36,7 +37,6 @@ const lua_value = @import("value.zig");
 const lua_varlink = @import("varlink.zig");
 const lua_image = @import("image.zig");
 const lua_widget = @import("widget.zig");
-const lua_xdg = @import("xdg.zig");
 const runtime_mod = @import("keywork-ui-engine");
 const c = @import("luajit_c");
 
@@ -54,6 +54,7 @@ const VarlinkClient = lua_varlink.Client;
 const PipeWireConnection = lua_pipewire.Connection;
 const FdWatch = lua_loop.FdWatch;
 const FsEvent = lua_loop.FsEvent;
+const FsOperation = lua_fs.FsOperation;
 const LuaTimer = lua_loop.LuaTimer;
 const Channel = lua_loop.Channel;
 const LuaTask = lua_task.LuaTask;
@@ -99,6 +100,7 @@ pub const App = struct {
     local_module_loader_installed: bool = false,
     fd_watches: std.ArrayList(*FdWatch) = .empty,
     fs_events: std.ArrayList(*FsEvent) = .empty,
+    fs_operations: std.ArrayList(*FsOperation) = .empty,
     timers: std.ArrayList(*LuaTimer) = .empty,
     channels: std.ArrayList(*Channel) = .empty,
     processes: std.ArrayList(*LuaProcess) = .empty,
@@ -117,6 +119,7 @@ pub const App = struct {
     dbus_host: lua_dbus.Host = undefined,
     varlink_host: lua_varlink.Host = undefined,
     loop_host: lua_loop.Host = undefined,
+    fs_host: lua_fs.Host = undefined,
     pipewire_host: lua_pipewire.Host = undefined,
     pixel_buffer_host: lua_pixel_buffer.Host = undefined,
     socket_host: lua_socket.Host = undefined,
@@ -204,6 +207,8 @@ pub const App = struct {
         self.fd_watches.deinit(self.allocator);
         for (self.fs_events.items) |fs_event| fs_event.destroy(self.allocator, self.state);
         self.fs_events.deinit(self.allocator);
+        for (self.fs_operations.items) |operation| operation.destroy(self.allocator, self.state);
+        self.fs_operations.deinit(self.allocator);
         for (self.timers.items) |timer| timer.destroy(self.allocator, self.state);
         self.timers.deinit(self.allocator);
         for (self.channels.items) |channel| channel.destroy(self.allocator, self.state);
@@ -311,6 +316,7 @@ pub const App = struct {
         self.scope_cancel_timer = null;
         for (self.fd_watches.items) |watch| watch.unregister(loop);
         for (self.fs_events.items) |fs_event| fs_event.unregister(loop);
+        for (self.fs_operations.items) |operation| operation.cancel(self.state, .silent);
         for (self.timers.items) |timer| timer.unregister(loop);
         for (self.processes.items) |process| process.unregister(loop);
         for (self.sockets.items) |socket| socket.unregister(loop);
@@ -379,6 +385,7 @@ pub const App = struct {
     pub fn hasLiveAsyncResources(self: *const App) bool {
         for (self.fd_watches.items) |watch| if (!watch.canceled) return true;
         for (self.fs_events.items) |fs_event| if (!fs_event.canceled) return true;
+        for (self.fs_operations.items) |operation| if (!operation.canceled and !operation.terminal) return true;
         for (self.timers.items) |timer| if (!timer.canceled and !timer.expired) return true;
         for (self.processes.items) |process| if (!process.canceled and !process.exited) return true;
         for (self.sockets.items) |socket| if (!socket.canceled and socket.fd != invalid_fd) return true;
@@ -896,6 +903,7 @@ pub const App = struct {
         for (self.tasks.items) |task| task.cancel(self.state, .silent);
         for (self.fd_watches.items) |watch| watch.cancel(self.state, .silent);
         for (self.fs_events.items) |fs_event| fs_event.cancel(self.state, .silent);
+        for (self.fs_operations.items) |operation| operation.cancel(self.state, .silent);
         for (self.timers.items) |timer| timer.cancel(self.state, .silent);
         for (self.channels.items) |channel| channel.cancel(self.state, .silent);
         for (self.processes.items) |process| process.cancel(self.state, .silent);
@@ -1068,6 +1076,27 @@ pub const App = struct {
         errdefer _ = self.fs_events.pop();
         try fs_event.register();
         return fs_event;
+    }
+
+    fn addFsOperation(self: *App, kind: lua_fs.Kind, path: []const u8, extra: ?[]const u8, option: bool, waiter_ref: c_int) !*FsOperation {
+        const operation = self.allocator.create(FsOperation) catch |err| {
+            c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, waiter_ref);
+            return err;
+        };
+        operation.* = lua_fs.FsOperation.init(self.fsHost(), kind, path, extra, option, waiter_ref) catch |err| {
+            c.luaL_unref(self.state, c.LUA_REGISTRYINDEX, waiter_ref);
+            self.allocator.destroy(operation);
+            return err;
+        };
+        errdefer operation.destroy(self.allocator, self.state);
+        try self.fs_operations.append(self.allocator, operation);
+        errdefer _ = self.fs_operations.pop();
+        try operation.start();
+        return operation;
+    }
+
+    fn fsHost(self: *App) lua_fs.Host {
+        return .{ .ptr = self, .vtable = &fs_host_vtable };
     }
 
     fn addChannel(self: *App) !*Channel {
@@ -1408,6 +1437,18 @@ const net_host_vtable: lua_net.Host.VTable = .{
     .addConnection = netHostAddConnection,
 };
 
+const fs_host_vtable: lua_fs.Host.VTable = .{
+    .allocator = hostAllocator,
+    .luaState = hostLuaState,
+    .eventLoop = hostEventLoop,
+    .addOperation = fsHostAddOperation,
+};
+
+fn fsHostAddOperation(ptr: *anyopaque, kind: lua_fs.Kind, path: []const u8, extra: ?[]const u8, option: bool, waiter_ref: c_int) anyerror!*FsOperation {
+    const app: *App = @ptrCast(@alignCast(ptr));
+    return app.addFsOperation(kind, path, extra, option, waiter_ref);
+}
+
 fn netHostAddConnection(ptr: *anyopaque, options: lua_net.ConnectOptions, waiter_ref: c_int) anyerror!*NetConnection {
     const app: *App = @ptrCast(@alignCast(ptr));
     return app.addNetConnection(options, waiter_ref);
@@ -1597,6 +1638,7 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) !void {
         .{ .name = "keywork.design.fluent", .loader = fluentModuleLoader },
         .{ .name = "keywork.storybook", .loader = storybookModuleLoader },
         .{ .name = "keywork.loop", .loader = loopModuleLoader, .uses_app = true },
+        .{ .name = "keywork.fs", .loader = fsModuleLoader, .uses_app = true },
         .{ .name = "keywork.net", .loader = netModuleLoader, .uses_app = true },
         .{ .name = "keywork.process", .loader = processModuleLoader, .uses_app = true },
         .{ .name = "keywork.dbus", .loader = dbusModuleLoader, .uses_app = true },
@@ -1607,7 +1649,7 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) !void {
         .{ .name = "keywork.json", .loader = jsonModuleLoader, .uses_app = true },
         .{ .name = "keywork.service", .loader = serviceModuleLoader },
         .{ .name = "keywork.stream", .loader = streamModuleLoader },
-        .{ .name = "keywork.xdg", .loader = xdgModuleLoader, .uses_app = true },
+        .{ .name = "keywork.xdg", .loader = xdgModuleLoader },
         .{ .name = "keywork.xdg.applications", .loader = xdgApplicationsModuleLoader },
         .{ .name = "keywork.notify", .loader = notifyModuleLoader },
         .{ .name = "keywork.portal", .loader = portalModuleLoader },
@@ -1842,6 +1884,14 @@ fn netModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
+fn fsModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
+    app.fs_host = app.fsHost();
+    lua_fs.pushModule(lua_state, &app.fs_host);
+    return 1;
+}
+
 fn streamModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return loadEmbeddedModule(lua_state_optional.?, embedded_stream_source, "@keywork/stream.lua");
 }
@@ -1851,15 +1901,7 @@ fn xdgApplicationsModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c
 }
 
 fn xdgModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
-    const lua_state = lua_state_optional.?;
-    const app = lua_value.upvaluePointer(*App, lua_state, 1);
-    c.lua_createtable(lua_state, 0, 12);
-    lua_xdg.installApi(lua_state, -1, &app.allocator);
-    // The embedded Lua layer adds the base-directory functions in place.
-    if (c.luaL_loadbuffer(lua_state, embedded_xdg_source.ptr, embedded_xdg_source.len, "@keywork/xdg.lua") != 0) return c.lua_error(lua_state);
-    c.lua_pushvalue(lua_state, -2);
-    if (c.lua_pcall(lua_state, 1, 0, 0) != 0) return c.lua_error(lua_state);
-    return 1;
+    return loadEmbeddedModule(lua_state_optional.?, embedded_xdg_source, "@keywork/xdg.lua");
 }
 
 fn notifyModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -5374,6 +5416,57 @@ test "lua stream.lines splits chunks and yields the unterminated tail" {
     try app.ensureLoaded();
 }
 
+test "lua fs operations are awaitable and preserve atomic writes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "fs" });
+    defer allocator.free(base);
+    const script_body =
+        \\local kw = require("keywork")
+        \\local fs = require("keywork.fs")
+        \\local loop = require("keywork.loop")
+        \\local xdg = require("keywork.xdg")
+        \\assert(xdg.read_file == nil and xdg.write_file == nil)
+        \\fs_done = false
+        \\loop.spawn(function()
+        \\  local nested = base .. "/a/b"
+        \\  assert(fs.mkdir(nested, { parents = true }))
+        \\  local path = nested .. "/state.txt"
+        \\  assert(fs.write(path, "first"))
+        \\  assert(fs.read(path) == "first")
+        \\  assert(fs.write(path, "second"))
+        \\  assert(fs.read(path) == "second")
+        \\  local stat = assert(fs.stat(path))
+        \\  assert(stat.type == "file" and stat.size == 6)
+        \\  local entries = assert(fs.list(nested))
+        \\  assert(#entries == 1 and entries[1].name == "state.txt" and entries[1].type == "file")
+        \\  local moved = nested .. "/moved.txt"
+        \\  assert(fs.rename(path, moved))
+        \\  assert(fs.stat(path) == nil)
+        \\  assert(fs.remove(moved))
+        \\  assert(fs.remove(nested, { directory = true }))
+        \\  assert(fs.remove(base .. "/a", { directory = true }))
+        \\  fs_done = true
+        \\end)
+        \\return kw.app({ child = kw.text("fs") })
+        \\
+    ;
+    const script = try std.mem.concat(allocator, u8, &.{ "local base = \"", base, "\"\n", script_body });
+    defer allocator.free(script);
+
+    var app = try initTestApp(allocator, &tmp, "fs.lua", script);
+    defer app.deinit();
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
+    try app.ensureLoaded();
+    try runUntilLuaBoolean(&loop, &app, "fs_done", 1000);
+    try expectLuaBoolean(&app, "fs_done", true);
+}
+
 test "lua xdg.applications parses entries, looks up ids, and expands exec" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5420,7 +5513,10 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
     const script_body =
         \\local kw = require("keywork")
         \\local apps = require("keywork.xdg.applications")
+        \\local loop = require("keywork.loop")
         \\local dirs = { data_dir }
+        \\xdg_done = false
+        \\loop.spawn(function()
         \\
         \\-- locale-aware parse: Name[de] wins for de_DE, lists and actions parse
         \\local entry = assert(apps.lookup("editor", { dirs = dirs, locale = "de_DE" }))
@@ -5468,6 +5564,8 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\local action_argv = assert(apps.exec_argv(plain, { action = "new-window" }))
         \\assert(action_argv[1] == "editor")
         \\assert(action_argv[2] == "--new-window")
+        \\xdg_done = true
+        \\end)
         \\
         \\return kw.app({ child = kw.text("xdg") })
         \\
@@ -5477,7 +5575,13 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
 
     var app = try initTestApp(allocator, &tmp, "xdg.lua", script);
     defer app.deinit();
+    var loop = try event_loop.EventLoop.init(allocator);
+    defer loop.deinit();
+    try app.bindEventLoop(&loop);
+    defer app.unbindEventLoop();
     try app.ensureLoaded();
+    try runUntilLuaBoolean(&loop, &app, "xdg_done", 1000);
+    try expectLuaBoolean(&app, "xdg_done", true);
 }
 
 test "lua process.capture collects output and exit status" {

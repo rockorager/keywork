@@ -1,4 +1,5 @@
-//! Small Linux epoll event loop with a Wayland prepare-read integration point.
+//! Linux event loop with an epoll readiness reactor, io_uring operations,
+//! and a Wayland prepare-read integration point.
 
 const std = @import("std");
 
@@ -8,24 +9,30 @@ pub const EventLoop = struct {
     allocator: std.mem.Allocator,
     epoll_fd: i32,
     wake_fd: i32,
+    completion_fd: i32,
+    ring: linux.IoUring,
     sources: std.ArrayList(Slot) = .empty,
     free_slots: std.ArrayList(u32) = .empty,
     pending_destroy: std.ArrayList(PendingDestroy) = .empty,
     timers: std.ArrayList(*Timer) = .empty,
     file_watches: std.ArrayList(*FileWatch) = .empty,
+    operations: std.ArrayList(*Operation) = .empty,
     wayland: ?WaylandSource = null,
     pre_poll: ?PrePollSource = null,
     after_platform_hook: ?PhaseHook = null,
     after_platform_context: ?*anyopaque = null,
     end_turn_hook: ?PhaseHook = null,
     end_turn_context: ?*anyopaque = null,
+    submission_pending: bool = false,
     running: bool = false,
     stop_requested: bool = false,
     dispatching: bool = false,
 
     const wake_token = std.math.maxInt(u64);
     const wayland_token = wake_token - 1;
+    const completion_token = wayland_token - 1;
     const max_events = 16;
+    const max_completions = 64;
 
     /// A reusable source slot. Epoll tokens pack the slot index with its
     /// generation, so events queued for a removed (or removed-and-reused)
@@ -46,6 +53,7 @@ pub const EventLoop = struct {
         },
         timer: *Timer,
         file_watch: *FileWatch,
+        operation: *Operation,
     };
 
     fn sourceToken(index: u32, generation: u32) u64 {
@@ -62,6 +70,19 @@ pub const EventLoop = struct {
         name: ?[]const u8,
     ) anyerror!void;
     pub const PhaseHook = *const fn (ctx: *anyopaque, loop: *EventLoop) anyerror!void;
+    pub const OperationCallback = *const fn (ctx: *anyopaque, loop: *EventLoop, operation: *Operation, result: i32) anyerror!void;
+
+    /// A stable completion identity. Buffers and path arguments passed to a
+    /// submission must remain valid until its callback (or destroy callback).
+    pub const Operation = struct {
+        ctx: *anyopaque,
+        callback: OperationCallback,
+        destroy_ctx: ?*const fn (allocator: std.mem.Allocator, ctx: *anyopaque) void,
+        result: ?i32 = null,
+        active: bool = false,
+        removed: bool = false,
+        cancel_queued: bool = false,
+    };
 
     pub const Source = struct {
         fd: i32,
@@ -151,10 +172,18 @@ pub const EventLoop = struct {
         const wake_fd = try linuxFd(linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK));
         errdefer _ = linux.close(wake_fd);
 
+        var ring = try linux.IoUring.init(256, 0);
+        errdefer ring.deinit();
+        const completion_fd = try linuxFd(linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK));
+        errdefer _ = linux.close(completion_fd);
+        try ring.register_eventfd(completion_fd);
+
         var self: EventLoop = .{
             .allocator = allocator,
             .epoll_fd = epoll_fd,
             .wake_fd = wake_fd,
+            .completion_fd = completion_fd,
+            .ring = ring,
         };
         errdefer self.sources.deinit(allocator);
 
@@ -163,11 +192,19 @@ pub const EventLoop = struct {
             .data = .{ .u64 = wake_token },
         };
         try linuxVoid(linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, wake_fd, &event));
+        event.data.u64 = completion_token;
+        try linuxVoid(linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, completion_fd, &event));
         return self;
     }
 
     pub fn deinit(self: *EventLoop) void {
         self.flushPendingDestroy();
+        self.quiesceOperations();
+        // All original CQEs have now been reaped, so no kernel request can
+        // still refer to an operation or to its caller-owned arguments.
+        self.ring.deinit();
+        for (self.operations.items) |operation| self.destroyOperation(operation);
+        self.operations.deinit(self.allocator);
         for (self.file_watches.items) |watch| {
             if (watch.source_handle) |handle| self.removeSource(handle);
             self.destroyFileWatch(watch);
@@ -187,6 +224,7 @@ pub const EventLoop = struct {
         self.sources.deinit(self.allocator);
         self.free_slots.deinit(self.allocator);
         self.pending_destroy.deinit(self.allocator);
+        _ = linux.close(self.completion_fd);
         _ = linux.close(self.wake_fd);
         _ = linux.close(self.epoll_fd);
     }
@@ -263,7 +301,198 @@ pub const EventLoop = struct {
             .source_ctx => |entry| entry.destroy(self.allocator, entry.ctx),
             .timer => |timer| self.destroyTimer(timer),
             .file_watch => |watch| self.destroyFileWatch(watch),
+            .operation => |operation| self.destroyOperation(operation),
         }
+    }
+
+    fn destroyOperation(self: *EventLoop, operation: *Operation) void {
+        if (operation.destroy_ctx) |destroy| destroy(self.allocator, operation.ctx);
+        self.allocator.destroy(operation);
+    }
+
+    pub fn addOperation(self: *EventLoop, ctx: *anyopaque, callback: OperationCallback, destroy_ctx: ?*const fn (std.mem.Allocator, *anyopaque) void) !*Operation {
+        const operation = try self.allocator.create(Operation);
+        errdefer self.allocator.destroy(operation);
+        operation.* = .{ .ctx = ctx, .callback = callback, .destroy_ctx = destroy_ctx };
+        try self.operations.append(self.allocator, operation);
+        return operation;
+    }
+
+    pub fn removeOperation(self: *EventLoop, operation: *Operation) void {
+        if (operation.removed) return;
+        operation.removed = true;
+        if (operation.active) {
+            _ = self.ring.cancel(operationUserData(operation) | 1, operationUserData(operation), 0) catch return;
+            operation.cancel_queued = true;
+            self.submitPrepared() catch {};
+            return;
+        }
+        self.untrackOperation(operation);
+        self.deferDestroy(.{ .operation = operation });
+    }
+
+    fn untrackOperation(self: *EventLoop, operation: *Operation) void {
+        for (self.operations.items, 0..) |item, index| if (item == operation) {
+            _ = self.operations.swapRemove(index);
+            return;
+        };
+    }
+
+    fn prepareOperation(operation: *Operation) !u64 {
+        if (operation.removed) return error.OperationRemoved;
+        if (operation.active) return error.OperationActive;
+        operation.result = null;
+        operation.cancel_queued = false;
+        operation.active = true;
+        return operationUserData(operation);
+    }
+
+    fn submitPrepared(self: *EventLoop) !void {
+        _ = self.ring.submit() catch {
+            // The SQE remains queued and may still execute. Preserve its
+            // operands and retry from the reactor instead of reporting a
+            // false terminal failure to the caller.
+            self.submission_pending = true;
+            self.wake() catch {};
+            return;
+        };
+        self.submission_pending = self.ring.sq_ready() > 0;
+        if (self.submission_pending) self.wake() catch {};
+    }
+
+    fn quiesceOperations(self: *EventLoop) void {
+        var active_count: usize = 0;
+        for (self.operations.items) |operation| {
+            if (!operation.active) continue;
+            operation.removed = true;
+            active_count += 1;
+        }
+
+        var cqes: [max_completions]linux.io_uring_cqe = undefined;
+        while (active_count > 0) {
+            const ready_count = self.ring.copy_cqes(&cqes, 0) catch |err| switch (err) {
+                error.SignalInterrupt, error.SystemResources, error.CompletionQueueOvercommitted => continue,
+                else => std.debug.panic("io_uring failed while draining operations: {}", .{err}),
+            };
+            recordTeardownCompletions(cqes[0..ready_count], &active_count);
+            if (active_count == 0) break;
+
+            var all_cancels_queued = true;
+            for (self.operations.items) |operation| {
+                if (!operation.active or operation.cancel_queued) continue;
+                _ = self.ring.cancel(operationUserData(operation) | 1, operationUserData(operation), 0) catch {
+                    all_cancels_queued = false;
+                    break;
+                };
+                operation.cancel_queued = true;
+            }
+
+            const submitted = self.ring.submit() catch |err| switch (err) {
+                error.SignalInterrupt, error.SystemResources, error.CompletionQueueOvercommitted => continue,
+                else => std.debug.panic("io_uring failed while canceling operations: {}", .{err}),
+            };
+            _ = submitted;
+            if (!all_cancels_queued or self.ring.sq_ready() > 0) continue;
+
+            const count = self.ring.copy_cqes(&cqes, 1) catch |err| switch (err) {
+                error.SignalInterrupt, error.SystemResources, error.CompletionQueueOvercommitted => continue,
+                else => std.debug.panic("io_uring failed while awaiting operation cancellation: {}", .{err}),
+            };
+            recordTeardownCompletions(cqes[0..count], &active_count);
+        }
+    }
+
+    fn recordTeardownCompletions(cqes: []const linux.io_uring_cqe, active_count: *usize) void {
+        for (cqes) |cqe| {
+            if (cqe.user_data & 1 != 0) continue;
+            const operation: *Operation = @ptrFromInt(cqe.user_data);
+            if (!operation.active) continue;
+            operation.active = false;
+            operation.result = cqe.res;
+            active_count.* -= 1;
+        }
+    }
+
+    pub fn submitNop(self: *EventLoop, operation: *Operation) !void {
+        const data = try prepareOperation(operation);
+        _ = self.ring.nop(data) catch |err| {
+            operation.active = false;
+            return err;
+        };
+        try self.submitPrepared();
+    }
+
+    pub fn submitOpenAt(self: *EventLoop, operation: *Operation, fd: linux.fd_t, path: [*:0]const u8, flags: linux.O, mode: std.posix.mode_t) !void {
+        const data = try prepareOperation(operation);
+        _ = self.ring.openat(data, fd, path, flags, mode) catch |err| {
+            operation.active = false;
+            return err;
+        };
+        try self.submitPrepared();
+    }
+    pub fn submitRead(self: *EventLoop, operation: *Operation, fd: linux.fd_t, buffer: linux.IoUring.ReadBuffer, offset: u64) !void {
+        const data = try prepareOperation(operation);
+        _ = self.ring.read(data, fd, buffer, offset) catch |err| {
+            operation.active = false;
+            return err;
+        };
+        try self.submitPrepared();
+    }
+    pub fn submitWrite(self: *EventLoop, operation: *Operation, fd: linux.fd_t, buffer: []const u8, offset: u64) !void {
+        const data = try prepareOperation(operation);
+        _ = self.ring.write(data, fd, buffer, offset) catch |err| {
+            operation.active = false;
+            return err;
+        };
+        try self.submitPrepared();
+    }
+    pub fn submitFsync(self: *EventLoop, operation: *Operation, fd: linux.fd_t, flags: u32) !void {
+        const data = try prepareOperation(operation);
+        _ = self.ring.fsync(data, fd, flags) catch |err| {
+            operation.active = false;
+            return err;
+        };
+        try self.submitPrepared();
+    }
+    pub fn submitClose(self: *EventLoop, operation: *Operation, fd: linux.fd_t) !void {
+        const data = try prepareOperation(operation);
+        _ = self.ring.close(data, fd) catch |err| {
+            operation.active = false;
+            return err;
+        };
+        try self.submitPrepared();
+    }
+    pub fn submitStatx(self: *EventLoop, operation: *Operation, fd: linux.fd_t, path: [:0]const u8, flags: u32, mask: linux.STATX, buf: *linux.Statx) !void {
+        const data = try prepareOperation(operation);
+        _ = self.ring.statx(data, fd, path, flags, mask, buf) catch |err| {
+            operation.active = false;
+            return err;
+        };
+        try self.submitPrepared();
+    }
+    pub fn submitRenameAt(self: *EventLoop, operation: *Operation, old_fd: linux.fd_t, old_path: [*:0]const u8, new_fd: linux.fd_t, new_path: [*:0]const u8, flags: u32) !void {
+        const data = try prepareOperation(operation);
+        _ = self.ring.renameat(data, old_fd, old_path, new_fd, new_path, flags) catch |err| {
+            operation.active = false;
+            return err;
+        };
+        try self.submitPrepared();
+    }
+    pub fn submitUnlinkAt(self: *EventLoop, operation: *Operation, fd: linux.fd_t, path: [*:0]const u8, flags: u32) !void {
+        const data = try prepareOperation(operation);
+        _ = self.ring.unlinkat(data, fd, path, flags) catch |err| {
+            operation.active = false;
+            return err;
+        };
+        try self.submitPrepared();
+    }
+    pub fn submitMkdirAt(self: *EventLoop, operation: *Operation, fd: linux.fd_t, path: [*:0]const u8, mode: std.posix.mode_t) !void {
+        const data = try prepareOperation(operation);
+        _ = self.ring.mkdirat(data, fd, path, mode) catch |err| {
+            operation.active = false;
+            return err;
+        };
+        try self.submitPrepared();
     }
 
     fn flushPendingDestroy(self: *EventLoop) void {
@@ -505,6 +734,8 @@ pub const EventLoop = struct {
             for (events[0..ready]) |event| {
                 if (event.data.u64 == wake_token) {
                     drainWake(self.wake_fd);
+                } else if (event.data.u64 == completion_token) {
+                    drainWake(self.completion_fd);
                 } else if (event.data.u64 == wayland_token) {
                     wayland_events |= event.events;
                 } else {
@@ -531,6 +762,12 @@ pub const EventLoop = struct {
 
         if (self.after_platform_hook) |hook| try hook(self.after_platform_context.?, self);
 
+        try self.dispatchCompletions();
+
+        if (self.submission_pending) {
+            try self.submitPrepared();
+        }
+
         for (source_events) |event| {
             const token = event.data.u64;
             const index: usize = @intCast(@as(u32, @truncate(token)));
@@ -546,7 +783,36 @@ pub const EventLoop = struct {
 
         if (self.end_turn_hook) |hook| try hook(self.end_turn_context.?, self);
     }
+
+    fn dispatchCompletions(self: *EventLoop) !void {
+        var cqes: [max_completions]linux.io_uring_cqe = undefined;
+        const count = try self.ring.copy_cqes(&cqes, 0);
+        var callback_error: ?anyerror = null;
+        for (cqes[0..count]) |cqe| {
+            if (cqe.user_data & 1 != 0) continue;
+            const operation: *Operation = @ptrFromInt(cqe.user_data);
+            std.debug.assert(operation.active);
+            operation.active = false;
+            operation.result = cqe.res;
+            if (operation.removed) {
+                self.untrackOperation(operation);
+                self.deferDestroy(.{ .operation = operation });
+                continue;
+            }
+            operation.callback(operation.ctx, self, operation, cqe.res) catch |err| {
+                if (callback_error == null) callback_error = err;
+            };
+        }
+        if (self.ring.cq_ready() > 0) try self.wake();
+        if (callback_error) |err| return err;
+    }
 };
+
+fn operationUserData(operation: *EventLoop.Operation) u64 {
+    const value: u64 = @intFromPtr(operation);
+    std.debug.assert(value & 1 == 0);
+    return value;
+}
 
 fn timerSourceCallback(ctx: *anyopaque, loop: *EventLoop, _: u32) !void {
     const timer: *EventLoop.Timer = @ptrCast(@alignCast(ctx));
@@ -686,6 +952,112 @@ test "wall timer expiration aligns to the next epoch interval" {
     try std.testing.expectEqual(linux.timespec{ .sec = 120, .nsec = 0 }, try nextAlignedExpiration(.{ .sec = 61, .nsec = 500_000_000 }, 60_000));
     try std.testing.expectEqual(linux.timespec{ .sec = 61, .nsec = 0 }, try nextAlignedExpiration(.{ .sec = 60, .nsec = 0 }, 1_000));
     try std.testing.expectEqual(linux.timespec{ .sec = 60, .nsec = 500_000_000 }, try nextAlignedExpiration(.{ .sec = 60, .nsec = 499_000_000 }, 500));
+}
+
+test "io_uring nop completes through epoll" {
+    const Context = struct {
+        completed: bool = false,
+        fn callback(ctx: *anyopaque, loop: *EventLoop, _: *EventLoop.Operation, result: i32) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqual(@as(i32, 0), result);
+            self.completed = true;
+            loop.quit();
+        }
+    };
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: Context = .{};
+    const operation = try loop.addOperation(&context, Context.callback, null);
+    try loop.submitNop(operation);
+    try loop.run();
+    try std.testing.expect(context.completed);
+}
+
+test "deinit reaps an active operation before destroying its context" {
+    const Context = struct {
+        operation: ?*EventLoop.Operation = null,
+        callback_called: bool = false,
+        destroyed: bool = false,
+        result: ?i32 = null,
+
+        fn callback(ctx: *anyopaque, _: *EventLoop, _: *EventLoop.Operation, _: i32) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.callback_called = true;
+        }
+
+        fn destroy(_: std.mem.Allocator, ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.result = self.operation.?.result;
+            if (self.result.? >= 0) _ = linux.close(self.result.?);
+            self.destroyed = true;
+        }
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    var context: Context = .{};
+    const operation = try loop.addOperation(&context, Context.callback, Context.destroy);
+    context.operation = operation;
+    try loop.submitOpenAt(operation, linux.AT.FDCWD, "/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    while (loop.ring.cq_ready() == 0) std.atomic.spinLoopHint();
+
+    loop.deinit();
+    try std.testing.expect(!context.callback_called);
+    try std.testing.expect(context.destroyed);
+    try std.testing.expect(context.result.? >= 0);
+}
+
+test "removing active operation suppresses callback and destroys context" {
+    const Context = struct {
+        callback_called: bool = false,
+        destroyed: bool = false,
+        fn callback(ctx: *anyopaque, _: *EventLoop, _: *EventLoop.Operation, _: i32) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.callback_called = true;
+        }
+        fn destroy(_: std.mem.Allocator, ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.destroyed = true;
+        }
+        fn timeout(ctx: *anyopaque, loop: *EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!self.destroyed) return error.OperationWasNotDestroyed;
+            loop.quit();
+        }
+    };
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: Context = .{};
+    const operation = try loop.addOperation(&context, Context.callback, Context.destroy);
+    try loop.submitNop(operation);
+    loop.removeOperation(operation);
+    const timer = try loop.addTimer(&context, Context.timeout);
+    try timer.arm(10, 0);
+    try loop.run();
+    try std.testing.expect(!context.callback_called);
+    try std.testing.expect(context.destroyed);
+}
+
+test "operation callback can remove itself" {
+    const Context = struct {
+        destroyed: bool = false,
+        fn callback(ctx: *anyopaque, loop: *EventLoop, operation: *EventLoop.Operation, _: i32) !void {
+            loop.removeOperation(operation);
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expect(!self.destroyed);
+            loop.quit();
+        }
+        fn destroy(_: std.mem.Allocator, ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.destroyed = true;
+        }
+    };
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+    var context: Context = .{};
+    const operation = try loop.addOperation(&context, Context.callback, Context.destroy);
+    try loop.submitNop(operation);
+    try loop.run();
+    try std.testing.expect(context.destroyed);
 }
 
 test "repeating timer fires and can quit the loop" {

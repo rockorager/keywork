@@ -1,8 +1,8 @@
 local kw = require("keywork")
 local dbus = require("keywork.dbus")
+local fs = require("keywork.fs")
 local log = require("keywork.log")
 local loop = require("keywork.loop")
-local xdg = require("keywork.xdg")
 local audio = require("shell.audio")
 
 local M = {}
@@ -208,19 +208,18 @@ function Controller:adjust_audio(kind, action)
 end
 
 local function read_number(path)
-    local value = xdg.read_file(path)
+    local value = fs.read(path)
     return value and tonumber(value:match("^%s*(%d+)")) or nil
 end
 
-function Controller.read_backlight(name)
-    local root = "/sys/class/backlight/" .. name
+function Controller.read_backlight(root, name)
     local value = read_number(root .. "/brightness")
     local maximum = read_number(root .. "/max_brightness")
     if not value or not maximum or maximum <= 0 then
         return nil
     end
     return {
-        name = name,
+        name = name or root:match("([^/]+)$"),
         value = value,
         maximum = maximum,
     }
@@ -229,18 +228,18 @@ end
 function Controller:backlight()
     local preferred = os.getenv("KEYWORK_BACKLIGHT_DEVICE")
     if preferred and preferred ~= "" then
-        return self.read_backlight(preferred)
+        return self.read_backlight("/sys/class/backlight/" .. preferred, preferred)
     end
     -- EmmyLua 0.24 narrows mutable instance fields from their initializer.
     ---@diagnostic disable-next-line: unnecessary-if
     if self.backlight_name then
-        local current = self.read_backlight(self.backlight_name)
+        local current = self.read_backlight("/sys/class/backlight/" .. self.backlight_name, self.backlight_name)
         if current then
             return current
         end
         self.backlight_name = nil
     end
-    local entries, err = xdg.read_dir("/sys/class/backlight")
+    local entries, err = fs.list("/sys/class/backlight")
     if not entries then
         log.warn("backlight discovery failed", err or "unknown")
         return nil
@@ -249,7 +248,7 @@ function Controller:backlight()
         return left.name < right.name
     end)
     for _, entry in ipairs(entries) do
-        local current = self.read_backlight(entry.name)
+        local current = self.read_backlight("/sys/class/backlight/" .. entry.name, entry.name)
         if current then
             self.backlight_name = entry.name
             return current

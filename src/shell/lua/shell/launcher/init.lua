@@ -66,7 +66,9 @@ local function run_action(self, entry, action)
     if not entry or not action then
         return
     end
-    history.bump(self.counts, entry.id)
+    self.scope:spawn(function()
+        history.bump(self.counts, entry.id)
+    end)
     if self.actions_open then
         self.actions_open = false
         self:mutate()
@@ -306,7 +308,9 @@ local Launcher = kw.component({
     hot_version = 2,
     init = function(self)
         self.revision = kw.signal(0)
-        self.counts = history.load()
+        self.counts = {}
+        self.entries = {}
+        self.results = {}
         self.query = ""
         self.selected = 1
         self.actions_open = false
@@ -319,13 +323,17 @@ local Launcher = kw.component({
     end,
 
     start = function(self)
-        self.entries = providers.load()
-        self.results = rank(self.entries, self.counts, self.query)
-        self.selected = math.max(1, math.min(self.selected, #self.results))
-        if self.actions_open and not self.results[self.selected] then
-            self.actions_open = false
-            self.action_selected = 1
-        end
+        self.scope:spawn(function()
+            self.counts = history.load()
+            self.entries = providers.load()
+            self.results = rank(self.entries, self.counts, self.query)
+            self.selected = math.max(1, math.min(self.selected, #self.results))
+            if self.actions_open and not self.results[self.selected] then
+                self.actions_open = false
+                self.action_selected = 1
+            end
+            self:mutate()
+        end)
     end,
 
     build = function(self, context)

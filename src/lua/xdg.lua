@@ -1,10 +1,7 @@
---- XDG base directories and filesystem helpers for application state.
---- Loaded by the module loader with the native xdg table (mkdir_all,
---- read_dir, read_file, write_file) as its sole argument; augments it in
---- place. Directory functions follow the XDG Base Directory spec:
+--- XDG base directories. Directory functions follow the XDG Base Directory spec:
 --- environment overrides win, otherwise the spec's defaults apply.
 
-local xdg = ...
+local xdg = {}
 
 local function env_dir(name)
     local value = os.getenv(name)
@@ -77,3 +74,5 @@ function xdg.config_dirs()
     end
     return dirs
 end
+
+return xdg

@@ -14,9 +14,10 @@ all checked-in Wayland XML live outside `src/`.
 
 ### Loop (`src/loop/`)
 
-Owns the `keywork-loop` Zig module: a concrete Linux reactor built on epoll,
-eventfd, timerfd, and inotify. It owns source dispatch and lifetime safety, but
-not application lifecycle or protocol-specific policy.
+Owns the `keywork-loop` Zig module: a concrete Linux reactor with epoll as its
+outer readiness wait, io_uring for completion-based operations, and eventfd,
+timerfd, and inotify sources. It owns source and operation dispatch and lifetime
+safety, but not application lifecycle or protocol-specific policy.
 
 The loop must not depend on the runtime, UI, Lua, compositor, systemd, or
 Wayland libraries. Consumer-owned adapters may integrate those systems through
