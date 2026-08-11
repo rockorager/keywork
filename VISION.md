@@ -1,17 +1,18 @@
 # Keywork Vision
 
-Keywork is a native Zig application and UI platform for Wayland. LuaJIT is its
-first high-level application host, not a requirement of the UI engine or event
-loop.
+Keywork is a Lua application and UI platform for Wayland, powered by a native
+Zig runtime. LuaJIT is the supported application language; the UI engine,
+event loop, rendering, and platform integration remain native implementation
+components.
 
 Keywork aims to be **systemd for the desktop**: a coherent, Varlink-first
 foundation for the runtime, service, integration, and UI facilities that
 desktop applications otherwise assemble piecemeal.
 
-Applications may be native Zig programs or Lua scripts (`keywork <script.lua>`)
-running on the same retained widget tree and Vulkan or CPU rendering backends.
-The platform should scale from status bars and layer-shell overlays to full
-desktop applications without forcing native applications through Lua.
+Applications are Lua scripts (`keywork <script.lua>`) running on the retained
+widget tree and Vulkan or CPU rendering backends. The platform should scale
+from status bars and layer-shell overlays to full desktop applications while
+providing one coherent lifecycle, state, and standard-library model.
 
 Beyond the UI engine, Keywork provides an asynchronous runtime and standard
 library for application code: common utilities desktop applications need —
@@ -22,10 +23,9 @@ loop that drives the UI.
 ## Principles
 
 1. **Low resource usage, high performance.** The native engine does the
-   heavy lifting — layout, painting, text shaping, compositing. Lua-hosted
-   applications declare structure and handle events while native applications
-   use the same engine directly. Minimize language-boundary crossings; idle
-   applications cost nothing.
+   heavy lifting — layout, painting, text shaping, compositing. Lua
+   applications declare structure and handle events. Minimize
+   language-boundary crossings; idle applications cost nothing.
 
 2. **Flutter-like vocabulary and model.** Composable widgets, explicit
    constraint-based layout, themes. Rows, columns, padding — not a
@@ -44,3 +44,10 @@ loop that drives the UI.
    themes, desktop entries, D-Bus interoperability, portals. Keywork
    applications behave like first-class citizens of the Linux desktop, not a
    parallel ecosystem.
+
+6. **One application API.** Lua is the supported, compatibility-conscious
+   application surface. Native modules remain independently testable and keep
+   typed boundaries for the Lua host and first-party infrastructure, but they
+   are not a second application SDK. Native integrations should prefer
+   focused Lua bindings, shared image buffers, or service protocols such as
+   Varlink over bypassing the Lua application model.

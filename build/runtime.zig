@@ -142,26 +142,6 @@ pub fn add(
     keywork_runtime_module.addIncludePath(b.path("src/runtime/ffi"));
     linkKeyworkNativeSystemLibraries(keywork_runtime_module);
 
-    const native_example_module = b.createModule(.{
-        .root_source_file = b.path("src/runtime/examples/native/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    native_example_module.addImport("keywork-loop", keywork_loop_module);
-    native_example_module.addImport("keywork-runtime", keywork_runtime_module);
-    native_example_module.addImport("keywork-ui", ui_output.module);
-
-    const native_example = b.addExecutable(.{
-        .name = "keywork-native-example",
-        .root_module = native_example_module,
-        .use_llvm = use_llvm,
-        .use_lld = use_llvm,
-    });
-    const run_native_example = b.addRunArtifact(native_example);
-    const run_native_example_step = b.step("run-native-example", "Run the native Wayland example");
-    run_native_example_step.dependOn(&run_native_example.step);
-
     const fluent_icons = addFluentIcons(b);
     b.installDirectory(.{
         .source_dir = fluent_icons,

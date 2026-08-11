@@ -1,4 +1,4 @@
-//! Native Keywork application runtime facade.
+//! Native host runtime facade for Keywork Lua applications.
 
 pub const BackendKind = @import("app/options.zig").BackendKind;
 

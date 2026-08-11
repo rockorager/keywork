@@ -1,8 +1,10 @@
 # Keywork
 
-This repository contains the Keywork native application runtime and UI,
-Wayland compositor, and desktop shell. A single build graph enables explicit
-modules and coordinated changes without erasing component ownership.
+This repository contains the Keywork Lua application platform, native UI and
+Wayland runtime, compositor, and desktop shell. Applications use the supported
+Lua API while the native Zig modules own rendering, platform integration, and
+host lifecycle. A single build graph enables explicit modules and coordinated
+changes without erasing component ownership.
 
 ## Repository layout
 
@@ -10,8 +12,8 @@ modules and coordinated changes without erasing component ownership.
 | --- | --- |
 | `src/loop/` | The reusable Linux event loop exposed as the `keywork-loop` Zig module |
 | `src/ui/` | The platform-neutral retained UI model and engine |
-| `src/runtime/` | The native Wayland application runtime and platform backends |
-| `src/lua/` | The LuaJIT adapter, `keywork` executable, examples, and public Lua types |
+| `src/runtime/` | The native Wayland host runtime and platform backends |
+| `src/lua/` | The supported Lua application API, `keywork` executable, examples, and public types |
 | `src/compositor/` | The Wayland compositor, its control adapter, and compositor-owned session integration |
 | `src/keyworkctl/` | The umbrella `keyworkctl` CLI and application-control commands |
 | `src/shell/` | The Lua desktop shell and its native C helpers |
@@ -20,6 +22,30 @@ modules and coordinated changes without erasing component ownership.
 | `scripts/` | Procedural repository automation that does not belong directly in `build.zig` |
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for ownership and dependency rules.
+
+## Applications
+
+Keywork applications are trusted Lua scripts that return a `keywork.app`.
+Application state, components, widgets, asynchronous work, platform services,
+testing, and Storybook all use the Lua API; the Zig modules are native host
+implementation rather than an alternative application SDK.
+
+```lua
+local kw = require("keywork")
+
+return kw.app({
+    app_id = "dev.keywork.Hello",
+    width = 480,
+    height = 240,
+    child = kw.center({
+        child = kw.text("Hello from Keywork"),
+    }),
+})
+```
+
+Run an installed application with `keywork app.lua`. During development, use
+`zig build run -- app.lua`. See `src/lua/examples/` for applications covering
+components, reactive state, layer-shell windows, services, and Storybook.
 
 ## Build model
 
@@ -30,10 +56,10 @@ and `keywork-control`. Source may use relative imports within a cohesive
 module; dependencies between modules are explicit named imports wired by the
 root build.
 
-Native UI and runtime modules allow Zig applications to use the full Wayland
-platform without building or linking LuaJIT. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the dependency graph and ownership
-boundaries.
+Native UI and runtime modules are independently testable implementation and
+host boundaries consumed by the Lua adapter; they are not a second supported
+application SDK. See [ARCHITECTURE.md](ARCHITECTURE.md) for the dependency
+graph, API policy, and ownership boundaries.
 
 The same Zig graph builds the shell's native C modules, generates its Wayland
 bindings, checks its Lua sources, and installs its application and service
@@ -77,10 +103,8 @@ zig build install-pam
 systemctl --user daemon-reload
 ```
 
-Additional focused steps such as `zig build run`, `zig build
-run-native-example`, `zig build run-compositor`, and `zig build renderer-check`
-are available from the repository root. The native example opens a Wayland
-window without compiling or linking LuaJIT.
+Additional focused steps such as `zig build run`, `zig build run-compositor`,
+and `zig build renderer-check` are available from the repository root.
 
 ## Shell bar configuration
 

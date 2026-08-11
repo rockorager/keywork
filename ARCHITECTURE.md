@@ -37,26 +37,28 @@ Wayland, or a concrete rendering backend.
 
 ### Native runtime (`src/runtime/`)
 
-Owns `keywork-runtime`: the general Wayland application platform, including
-application lifecycle, window declarations, platform services, Wayland
-backends, CPU and Vulkan renderers, Linux integration, and event-loop adapters.
-It also owns the process-lifetime application control Varlink interface and
-per-instance server. Language hosts provide reload behavior through the
-runtime's typed callback contract; the server itself remains language-neutral.
+Owns `keywork-runtime`: the native host platform behind Lua applications,
+including application lifecycle, window declarations, platform services,
+Wayland backends, CPU and Vulkan renderers, Linux integration, and event-loop
+adapters. It also owns the process-lifetime application control Varlink
+interface and per-instance server. The Lua host provides reload behavior
+through the runtime's typed callback contract; the server itself remains
+language-neutral.
 
 The native runtime depends on the UI and loop modules. It must compile and link
-without LuaJIT and must not acquire shell or compositor policy. Native Zig
-applications and language adapters consume the same public runtime contract.
+without LuaJIT and must not acquire shell or compositor policy. Its exported
+Zig declarations are repository-internal host contracts, not a supported
+native application SDK.
 
 ### Lua host (`src/lua/`)
 
-Owns `keywork-lua`, the `keywork` executable, LuaJIT integration, Lua-facing
-APIs, script lifecycle, Storybook and test commands, Lua examples, and public
-Lua type information.
+Owns `keywork-lua`, the `keywork` executable, LuaJIT integration, the supported
+application API, script lifecycle, Storybook and test commands, Lua examples,
+and public Lua type information.
 
-Lua is a first-class adapter to the native runtime, not the owner of native
-application lifecycle. It may depend on the runtime, UI, and loop modules;
-those modules must never depend on it.
+Lua owns the application model while adapting to lifecycle implemented by the
+native runtime. It may depend on the runtime, UI, and loop modules; those
+modules must never depend on it.
 
 ### Compositor (`src/compositor/`)
 
@@ -94,9 +96,9 @@ Owns the Lua desktop experience: bar, launcher, lock screen, notifications,
 backgrounds, OSD, shell D-Bus API, native C helpers, PAM policy, and shell
 service assets.
 
-The shell is a demanding consumer of the runtime's public API. Runtime defects
-or missing abstractions found while developing the shell should be fixed in
-the runtime rather than hidden behind shell-specific workarounds.
+The shell is a demanding consumer of the public Lua API and its native runtime.
+Runtime defects or missing abstractions found while developing the shell should
+be fixed in the runtime rather than hidden behind shell-specific workarounds.
 
 ### Protocols (`protocols/`)
 
@@ -151,9 +153,9 @@ Arrows mean "depends on":
 ```
 
 The native runtime consumes `keywork-ui-engine`, `keywork-ui`, and
-`keywork-loop`. The Lua host consumes public native modules and supplies an
-application host; native Zig applications do the same without LuaJIT. The
-shell relies on the deployed `keywork` executable and public Lua API.
+`keywork-loop`. The Lua host consumes their typed repository-internal module
+contracts and supplies the application host. Applications and the shell rely
+on the deployed `keywork` executable and public Lua API.
 
 The compositor and runtime have no source-code dependency on each other.
 Session integration between the compositor and shell is a deployed-process
@@ -205,7 +207,7 @@ Current source module roots are:
 | `keywork-ui-engine` | `src/ui/engine/root.zig` | `keywork-ui`, `uucode` |
 | `keywork-runtime` | `src/runtime/root.zig` | `keywork-loop`, `keywork-ui`, `keywork-ui-engine`, `varlink` |
 | `keywork-application-control` | `src/runtime/app/control_protocol.zig` | none |
-| `keywork-lua` | `src/lua/root.zig` | public native modules |
+| `keywork-lua` | `src/lua/root.zig` | named native host modules |
 | `linebreak` | `src/ui/linebreak/root.zig` | `uucode` |
 | `varlink` | `src/varlink/root.zig` | none |
 | `keywork-control` | `src/compositor/control/root.zig` | embedded compositor interface |
@@ -219,21 +221,30 @@ depends back on the umbrella CLI.
 
 The `keywork` executable root is `src/lua/main.zig`. It consumes the adapter
 through `keywork-lua`, and the adapter consumes native runtime source through
-public named modules. Native modules must not import the Lua tree.
+named modules. Native modules must not import the Lua tree.
 
-## Native application acceptance criteria
+## Application API policy
 
-The native boundary is complete only when all of these are true:
+Lua is Keywork's supported application API. Its documented modules, lifecycle,
+widgets, and services are the compatibility-conscious surface for application
+authors. The named Zig modules are public to other repository modules because
+Zig module boundaries require explicit declarations; that visibility does not
+make them a supported third-party application SDK.
 
-- A repository example opens and drives a real Wayland window as a native Zig
-  application using `keywork-runtime` and `keywork-ui`.
-- Building that example does not build or link LuaJIT.
+Keep the native host boundary healthy without developing a parallel framework:
+
 - `src/runtime/app/`, `backend/`, `graphics/`, and `linux/` have no imports from
   the Lua component.
 - The Lua host consumes native source only through named modules and their
   public declarations.
 - Native runtime tests run without LuaJIT; Lua adapter tests remain a separate
   test root.
+- Application-facing lifecycle, state, async, testing, and tooling features
+  belong in the Lua API rather than receiving a second native authoring API.
+- Native integrations should use focused bindings, shared image-buffer
+  contracts, or deployed service protocols such as Varlink. Do not expose
+  implementation directories or broaden native APIs solely for third-party
+  application ergonomics.
 
 ## Build ownership
 
