@@ -60,18 +60,21 @@ ensure_dns
 package_stamp=/var/lib/keywork-orb/packages-v9
 if [[ ! -e "$package_stamp" ]]; then
     echo "Installing native build dependencies"
-    sudo install -Dm0644 /dev/stdin /etc/apt/sources.list.d/keywork-orb.sources <<'EOF'
+    . /etc/os-release
+    if [[ "${VERSION_CODENAME:-}" != trixie ]]; then
+        sudo install -Dm0644 /dev/stdin /etc/apt/sources.list.d/keywork-orb.sources <<'EOF'
 Types: deb
 URIs: https://deb.debian.org/debian
 Suites: trixie
 Components: main
 Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
 EOF
-    sudo install -Dm0644 /dev/stdin /etc/apt/preferences.d/keywork-orb <<'EOF'
+        sudo install -Dm0644 /dev/stdin /etc/apt/preferences.d/keywork-orb <<'EOF'
 Package: *
 Pin: release n=trixie
 Pin-Priority: 100
 EOF
+    fi
     sudo apt-get update
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         bison build-essential ca-certificates curl dbus-daemon ffmpeg git gperf meson ninja-build \
