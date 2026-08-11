@@ -81,7 +81,7 @@ EOF
         nodejs npm pkg-config \
         python3 python3-jinja2 xz-utils \
         glslc libcurl4-openssl-dev libfontconfig1-dev \
-        libcap-dev libexpat1-dev libffi-dev libfreetype-dev libgbm-dev \
+        libaudit-dev libcap-dev libexpat1-dev libffi-dev libfreetype-dev libgbm-dev \
         libharfbuzz-dev libpam0g-dev libpixman-1-dev \
         libseat-dev libunwind-dev libvulkan-dev libwayland-bin libwayland-dev \
         libxml2-dev \
