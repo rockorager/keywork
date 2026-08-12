@@ -1619,6 +1619,7 @@ const embedded_xdg_source = @embedFile("xdg.lua");
 const embedded_xdg_applications_source = @embedFile("xdg_applications.lua");
 const embedded_notify_source = @embedFile("notify.lua");
 const embedded_portal_source = @embedFile("portal.lua");
+const embedded_secrets_source = @embedFile("secrets.lua");
 
 fn installKeyworkModule(lua_state: *c.lua_State, app: *App) !void {
     try installLocalModuleLoader(lua_state, app);
@@ -1653,6 +1654,7 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) !void {
         .{ .name = "keywork.xdg.applications", .loader = xdgApplicationsModuleLoader },
         .{ .name = "keywork.notify", .loader = notifyModuleLoader },
         .{ .name = "keywork.portal", .loader = portalModuleLoader },
+        .{ .name = "keywork.secrets", .loader = secretsModuleLoader },
         .{ .name = "keywork.test", .loader = lua_testing.moduleLoader, .test_only = true },
     };
     for (modules) |module| {
@@ -1910,6 +1912,10 @@ fn notifyModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn portalModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return loadEmbeddedModule(lua_state_optional.?, embedded_portal_source, "@keywork/portal.lua");
+}
+
+fn secretsModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return loadEmbeddedModule(lua_state_optional.?, embedded_secrets_source, "@keywork/secrets.lua");
 }
 
 fn dbusModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {

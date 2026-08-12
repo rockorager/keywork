@@ -64,6 +64,7 @@ pub fn pushModule(lua_state: *c.lua_State, host: *Host) void {
     lua_value.setClosureField(lua_state, dbus_table, "uint32", luaDbusUint32, 0);
     lua_value.setClosureField(lua_state, dbus_table, "double", luaDbusDouble, 0);
     lua_value.setClosureField(lua_state, dbus_table, "array", luaDbusArray, 0);
+    lua_value.setClosureField(lua_state, dbus_table, "struct", luaDbusStruct, 0);
     lua_value.setClosureField(lua_state, dbus_table, "variant", luaDbusVariant, 0);
 
     // The property/proxy/observe sugar must suspend through bus:call, so it
@@ -876,6 +877,13 @@ fn luaDbusArray(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return pushDbusTypedValue(lua_state, "array", 2, 1);
 }
 
+fn luaDbusStruct(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    c.luaL_checktype(lua_state, 1, c.LUA_TSTRING);
+    c.luaL_checktype(lua_state, 2, c.LUA_TTABLE);
+    return pushDbusTypedValue(lua_state, "struct", 2, 1);
+}
+
 fn luaDbusVariant(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     c.luaL_checktype(lua_state, 1, c.LUA_TSTRING);
@@ -1238,6 +1246,7 @@ fn appendLuaValueToDbusIter(lua_state: *c.lua_State, index: c_int, message: *sys
             if (std.mem.eql(u8, type_name, "uint32")) return appendTypedField(lua_state, absolute, "u", message);
             if (std.mem.eql(u8, type_name, "double")) return appendTypedField(lua_state, absolute, "d", message);
             if (std.mem.eql(u8, type_name, "array")) return appendTypedArray(lua_state, absolute, message);
+            if (std.mem.eql(u8, type_name, "struct")) return appendTypedStruct(lua_state, absolute, message);
             if (std.mem.eql(u8, type_name, "variant")) return appendTypedVariant(lua_state, absolute, message);
             return error.UnsupportedDbusArgument;
         }
@@ -1274,6 +1283,15 @@ fn appendTypedVariant(lua_state: *c.lua_State, table: c_int, message: *systemd.s
     try openDbusContainer(message, systemd.SD_BUS_TYPE_VARIANT, signature);
     try appendLuaValueWithSignature(lua_state, -1, signature, message);
     try closeDbusContainer(message);
+}
+
+fn appendTypedStruct(lua_state: *c.lua_State, table: c_int, message: *systemd.sd_bus_message) !void {
+    c.lua_getfield(lua_state, table, "signature");
+    const signature = try stringFromStack(lua_state, -1);
+    defer pop(lua_state, 1);
+    c.lua_getfield(lua_state, table, "value");
+    defer pop(lua_state, 1);
+    try appendStructWithSignature(lua_state, -1, signature, message);
 }
 
 fn appendLuaValueWithSignature(lua_state: *c.lua_State, index: c_int, signature: []const u8, message: *systemd.sd_bus_message) anyerror!void {
@@ -1489,8 +1507,10 @@ fn pushDbusSignal(lua_state: *c.lua_State, message: *systemd.sd_bus_message) voi
 }
 
 fn pushDbusReply(lua_state: *c.lua_State, message: *systemd.sd_bus_message) void {
-    c.lua_createtable(lua_state, 0, 2);
+    c.lua_createtable(lua_state, 0, 3);
     const table = c.lua_gettop(lua_state);
+    pushOptionalDbusString(lua_state, systemd.sd_bus_message_get_sender(message));
+    c.lua_setfield(lua_state, table, "sender");
     const signature = systemd.sd_bus_message_get_signature(message, 1);
     if (signature != null) {
         c.lua_pushstring(lua_state, signature);
@@ -2055,9 +2075,9 @@ test "dbus dict and struct arguments encode from Lua tables" {
     defer c.lua_close(lua_state);
     c.luaL_openlibs(lua_state);
 
-    // Tables shaped as dbus.variant/dbus.array produce them, covering
-    // the dict ({sv}) and struct ((sa(us))) paths portals and
-    // notifications rely on.
+    // Tables shaped as dbus.variant/dbus.array/dbus.struct produce them,
+    // covering the dict and struct paths used by portals, notifications,
+    // and Secret Service.
     const build_script =
         \\local function variant(sig, value)
         \\  return { __dbus_type = "variant", signature = sig, value = value }
@@ -2071,6 +2091,9 @@ test "dbus dict and struct arguments encode from Lua tables" {
         \\    } },
         \\    { __dbus_type = "array", signature = "(sa(us))", value = {
         \\      { "Images", { { 0, "*.png" }, { 0, "*.svg" } } },
+        \\    } },
+        \\    { __dbus_type = "struct", signature = "(says)", value = {
+        \\      "session", { __dbus_type = "array", signature = "y", value = { 4, 2 } }, "text/plain",
         \\    } },
         \\  },
         \\}
@@ -2096,6 +2119,9 @@ test "dbus dict and struct arguments encode from Lua tables" {
         \\assert(args[2][1][1] == "Images")
         \\assert(args[2][1][2][1][1] == 0 and args[2][1][2][1][2] == "*.png")
         \\assert(args[2][1][2][2][2] == "*.svg")
+        \\assert(args[3][1] == "session")
+        \\assert(args[3][2][1] == 4 and args[3][2][2] == 2)
+        \\assert(args[3][3] == "text/plain")
     ;
     if (c.luaL_loadstring(lua_state, check_script) != 0) return error.LoadFailed;
     if (c.lua_pcall(lua_state, 0, 0, 0) != 0) {

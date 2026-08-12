@@ -54,7 +54,9 @@ native application SDK.
 
 Owns `keywork-lua`, the `keywork` executable, LuaJIT integration, the supported
 application API, script lifecycle, Storybook and test commands, Lua examples,
-and public Lua type information.
+and public Lua type information. Its `keywork.secrets` module is the
+application-facing client for the standard freedesktop.org Secret Service;
+Keywork does not define a parallel storage protocol.
 
 Lua owns the application model while adapting to lifecycle implemented by the
 native runtime. It may depend on the runtime, UI, and loop modules; those

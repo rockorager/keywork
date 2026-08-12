@@ -47,6 +47,23 @@ Run an installed application with `keywork app.lua`. During development, use
 `zig build run -- app.lua`. See `src/lua/examples/` for applications covering
 components, reactive state, layer-shell windows, services, and Storybook.
 
+Applications access the desktop secret store through the standard Secret
+Service client rather than prompt UI primitives:
+
+```lua
+local secrets = require("keywork.secrets")
+
+local password, metadata, err = secrets.lookup({
+    application = "dev.keywork.Example",
+    account = "alice",
+})
+```
+
+`keywork.secrets` also provides `store` and `delete`. These yielding operations
+run in a `keywork.loop` task. The client uses Secret Service's baseline `plain`
+session algorithm and relies on local session-bus isolation;
+application-facing secret values are ordinary Lua strings.
+
 ## Build model
 
 Root `build.zig` and `build.zig.zon` build every Zig artifact in one graph and
