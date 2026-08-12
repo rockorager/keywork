@@ -2120,7 +2120,7 @@ test "dbus dict and struct arguments encode from Lua tables" {
         \\assert(args[2][1][2][1][1] == 0 and args[2][1][2][1][2] == "*.png")
         \\assert(args[2][1][2][2][2] == "*.svg")
         \\assert(args[3][1] == "session")
-        \\assert(args[3][2][1] == 4 and args[3][2][2] == 2)
+        \\assert(args[3][2] == string.char(4, 2))
         \\assert(args[3][3] == "text/plain")
     ;
     if (c.luaL_loadstring(lua_state, check_script) != 0) return error.LoadFailed;
