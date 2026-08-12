@@ -430,6 +430,16 @@ const RenderOutput = struct {
                         &self.frame_statistics.render_budget_resets_no_timing,
                     ),
                 }
+                if (cause == .missed_deadline) {
+                    const target = pending.target_vblank_nanoseconds orelse unreachable;
+                    std.debug.assert(presented_nanoseconds > target);
+                    const lateness: u64 = @intCast(presented_nanoseconds - target);
+                    self.frame_statistics.render_budget_last_miss_nanoseconds = lateness;
+                    self.frame_statistics.render_budget_maximum_miss_nanoseconds = @max(
+                        self.frame_statistics.render_budget_maximum_miss_nanoseconds,
+                        lateness,
+                    );
+                }
             },
             .sample => |duration| self.render_budget.record(duration),
         }
@@ -3231,6 +3241,11 @@ fn controlPerformanceStatistics(
             .importedTextures = wireInteger(@intCast(renderer_statistics.imported_textures)),
             .pendingTextures = wireInteger(@intCast(renderer_statistics.pending_textures)),
             .pendingGpuSubmissions = wireInteger(@intCast(renderer_statistics.pending_gpu_submissions)),
+            .pendingGpuTimings = wireInteger(@intCast(renderer_statistics.pending_gpu_timings)),
+            .gpuTimingQueueHighWater = wireInteger(@intCast(
+                renderer_statistics.gpu_timing_queue_high_water,
+            )),
+            .gpuTimingDrops = wireInteger(renderer_statistics.gpu_timing_drops),
             .calibrationTextures = wireInteger(@intCast(renderer_statistics.calibration_textures)),
             .videoGraphicsPipelines = wireInteger(@intCast(renderer_statistics.video_graphics_pipelines)),
             .blurScratchImages = wireInteger(@intCast(renderer_statistics.blur_scratch_images)),

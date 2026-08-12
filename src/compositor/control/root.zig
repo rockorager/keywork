@@ -148,6 +148,10 @@ pub const OutputStatistics = struct {
     repaintsImmediate: i64 = 0,
     renderBudgetResetsMissedDeadline: i64 = 0,
     renderBudgetResetsNoTiming: i64 = 0,
+    /// Lateness beyond the predicted vblank for the most recent and worst
+    /// missed repaint deadline since reset.
+    renderBudgetLastMissMicroseconds: i64 = 0,
+    renderBudgetMaximumMissMicroseconds: i64 = 0,
     /// Current warmed worst-case render cost, or 0 while the sample window
     /// is not full and repaint delays are disabled.
     renderBudgetMicroseconds: i64 = 0,
@@ -182,6 +186,9 @@ pub const ResourceStatistics = struct {
     importedTextures: i64 = 0,
     pendingTextures: i64 = 0,
     pendingGpuSubmissions: i64 = 0,
+    pendingGpuTimings: i64 = 0,
+    gpuTimingQueueHighWater: i64 = 0,
+    gpuTimingDrops: i64 = 0,
     calibrationTextures: i64 = 0,
     videoGraphicsPipelines: i64 = 0,
     blurScratchImages: i64 = 0,

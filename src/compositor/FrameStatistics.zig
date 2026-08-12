@@ -98,6 +98,8 @@ repaints_delayed: u64 = 0,
 repaints_immediate: u64 = 0,
 render_budget_resets_missed: u64 = 0,
 render_budget_resets_no_timing: u64 = 0,
+render_budget_last_miss_nanoseconds: u64 = 0,
+render_budget_maximum_miss_nanoseconds: u64 = 0,
 render_fence_samples: u64 = 0,
 render_fences_signaled_before_commit: u64 = 0,
 latency_samples: [sample_capacity]FrameLatency = undefined,
@@ -324,6 +326,12 @@ pub fn snapshot(
         .repaintsImmediate = wireInteger(self.repaints_immediate),
         .renderBudgetResetsMissedDeadline = wireInteger(self.render_budget_resets_missed),
         .renderBudgetResetsNoTiming = wireInteger(self.render_budget_resets_no_timing),
+        .renderBudgetLastMissMicroseconds = wireInteger(
+            nanosecondsToMicroseconds(self.render_budget_last_miss_nanoseconds),
+        ),
+        .renderBudgetMaximumMissMicroseconds = wireInteger(
+            nanosecondsToMicroseconds(self.render_budget_maximum_miss_nanoseconds),
+        ),
         .renderBudgetMicroseconds = wireInteger(
             nanosecondsToMicroseconds(render_budget_nanoseconds orelse 0),
         ),
@@ -645,6 +653,8 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try damage.add(0, 0, 10, 20);
     try damage.add(20, 0, 5, 5);
     statistics.recordFrame(.composited, .xrgb8888, &damage);
+    statistics.render_budget_last_miss_nanoseconds = 2_500 * std.time.ns_per_us;
+    statistics.render_budget_maximum_miss_nanoseconds = 9_000 * std.time.ns_per_us;
     const output_snapshot = statistics.snapshot(
         "HEADLESS-1",
         .{ .width = 100, .height = 100 },
@@ -655,6 +665,8 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(ControlProtocol.FramePath.composited, output_snapshot.lastFrame.path);
     // A cold repaint-delay budget reports zero microseconds.
     try std.testing.expectEqual(@as(i64, 0), output_snapshot.renderBudgetMicroseconds);
+    try std.testing.expectEqual(@as(i64, 2_500), output_snapshot.renderBudgetLastMissMicroseconds);
+    try std.testing.expectEqual(@as(i64, 9_000), output_snapshot.renderBudgetMaximumMissMicroseconds);
     try std.testing.expectEqual(ControlProtocol.BufferFormat.rgba16f_linear, output_snapshot.lastFrame.workingFormat);
     try std.testing.expectEqual(ControlProtocol.BufferFormat.xrgb8888, output_snapshot.lastFrame.scanoutFormat);
     try std.testing.expectEqual(@as(i64, 3), output_snapshot.lastFrame.damageRectangles);
@@ -726,6 +738,8 @@ test "frame statistics summarize rolling latency and classify over-budget frames
     try std.testing.expectEqual(@as(usize, 0), statistics.latency_count);
     try std.testing.expectEqual(@as(usize, 0), statistics.gpu_execution_count);
     try std.testing.expectEqual(@as(u64, 0), statistics.frames_presented);
+    try std.testing.expectEqual(@as(u64, 0), statistics.render_budget_last_miss_nanoseconds);
+    try std.testing.expectEqual(@as(u64, 0), statistics.render_budget_maximum_miss_nanoseconds);
     try std.testing.expectEqual(@as(i64, 0), statistics.directScanoutRejection(.color_conversion));
     try std.testing.expectEqual(@as(i64, 0), statistics.overlayScanoutRejection(.atomic_test_failed));
     try std.testing.expectEqual(@as(u64, 0), statistics.cpu_uploads);

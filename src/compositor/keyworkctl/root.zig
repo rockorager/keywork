@@ -296,10 +296,13 @@ fn writeStatistics(writer: *std.Io.Writer, statistics: StatisticsParameters) !vo
             try writer.writeAll("none\n");
         }
         try writer.print(
-            "  render budget resets: missed deadline {d}, no GPU timing {d}\n",
+            "  render budget resets: missed deadline {d}, no GPU timing {d}; " ++
+                "miss lateness last {d}us, max {d}us\n",
             .{
                 output.renderBudgetResetsMissedDeadline,
                 output.renderBudgetResetsNoTiming,
+                output.renderBudgetLastMissMicroseconds,
+                output.renderBudgetMaximumMissMicroseconds,
             },
         );
         try writeLatency(writer, "GPU total", output.gpuExecution);
@@ -343,6 +346,7 @@ fn writeResourceStatistics(writer: *std.Io.Writer, resources: control.ResourceSt
             "  renderer targets: {d} (pixel {d}, offscreen {d}, DMA-BUF {d})\n" ++
             "  textures: cached {d} (imported {d}), pending {d}\n" ++
             "  GPU submissions pending: {d}\n" ++
+            "  GPU timings: pending {d}, queue high-water {d}, dropped {d}\n" ++
             "  GPU submission ring: overlapped frames {d}, slot waits {d} ({d}us blocked)\n" ++
             "  effects: calibration textures {d}, video pipelines {d}, blur images {d}, backdrop images {d}\n" ++
             "  mapped buffer capacity: {d} bytes\n" ++
@@ -357,6 +361,9 @@ fn writeResourceStatistics(writer: *std.Io.Writer, resources: control.ResourceSt
             resources.importedTextures,
             resources.pendingTextures,
             resources.pendingGpuSubmissions,
+            resources.pendingGpuTimings,
+            resources.gpuTimingQueueHighWater,
+            resources.gpuTimingDrops,
             resources.gpuSubmissionOverlapFrames,
             resources.gpuSubmissionSlotWaits,
             resources.gpuSubmissionSlotWaitMicroseconds,
@@ -778,7 +785,7 @@ test "performance statistics decode and render human-readable output" {
         \\  buffer operations: CPU uploads 4, DMA-BUF imports 6
         \\  acquire retries: 2, frames over budget: 2
         \\  repaint scheduling: delayed 0, immediate 0, budget none
-        \\  render budget resets: missed deadline 0, no GPU timing 0
+        \\  render budget resets: missed deadline 0, no GPU timing 0; miss lateness last 0us, max 0us
         \\  GPU total: p50 2100us, p95 4400us, p99 6100us, max 7200us (7 samples)
         \\  GPU composition/effects: p50 1500us, p95 3300us, p99 4700us, max 5400us (7 samples)
         \\  GPU preparation/uploads: p50 100us, p95 200us, p99 300us, max 400us (7 samples)
