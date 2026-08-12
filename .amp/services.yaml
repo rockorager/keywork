@@ -1,6 +1,0 @@
-services:
-  keywork-stream:
-    command: scripts/run-stream-demo
-    portal:
-      title: Keywork Web Stream
-      description: CPU-rendered Keywork compositor streamed with WebSocket and WebCodecs.

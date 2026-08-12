@@ -73,16 +73,6 @@ Its control implementation is compositor-private. User-facing commands must
 remain synchronized across configuration keybindings, Varlink declarations
 and dispatch, and `keyworkctl` parsing and help.
 
-### Stream (`src/stream/`)
-
-Owns browser streaming as two deployed processes: the native `keywork-streamd`
-Wayland capture and encoding client, and the unprivileged Go stream gateway
-that terminates web protocols and serves the browser client. The native process
-uses public Wayland protocols and must not import compositor implementation
-source. Encoded media and bounded control messages are the process boundary;
-the gateway must not receive raw compositor internals or acquire authority to
-control the compositor directly.
-
 ### Keywork control CLI (`src/keyworkctl/`)
 
 Owns the `keyworkctl` executable's top-level namespace, help, and error
@@ -165,15 +155,6 @@ contract, not permission for source imports between them. Compositor
 consumption of `keywork-loop` may be added later without introducing a
 compositor-runtime dependency.
 
-The stream component is likewise a deployed Wayland client of the compositor,
-not a consumer of compositor implementation source. Its browser gateway
-depends only on the encoded media and fixed-size control transport contracts
-exposed by `keywork-streamd`; the stream client captures and injects input
-through public Wayland protocols and configures an existing output through
-`wlr-output-management-v1`. Creating that virtual or headless output remains a
-session-launcher and compositor responsibility. Internet-facing parsers and
-connections never run in the compositor process.
-
 There is intentionally no general-purpose `common/` directory. Shared code is
 promoted only when it has a stable responsibility and a clear owner.
 
@@ -214,7 +195,6 @@ Current source module roots are:
 | `varlink` | `src/varlink/root.zig` | none |
 | `keywork-control` | `src/compositor/control/root.zig` | embedded compositor interface |
 | `keyworkctl-compositor` | `src/compositor/keyworkctl/root.zig` | `keywork-control`, `varlink` |
-| `keywork-stream` | `src/stream/main.zig` | generated Wayland bindings |
 
 The `keyworkctl` executable root is `src/keyworkctl/main.zig`. It imports the
 compositor adapter through the named `keyworkctl-compositor` module and the
