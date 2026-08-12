@@ -5479,6 +5479,12 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "share/applications/org/example");
+    try tmp.dir.symLink(
+        std.testing.io,
+        ".",
+        "share/applications/loop",
+        .{ .is_directory = true },
+    );
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "share/applications/editor.desktop",
         .data =
@@ -5570,6 +5576,10 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\local action_argv = assert(apps.exec_argv(plain, { action = "new-window" }))
         \\assert(action_argv[1] == "editor")
         \\assert(action_argv[2] == "--new-window")
+        \\
+        \\-- symlink cycles are visited once rather than blocking launcher enumeration
+        \\local listed = apps.list({ dirs = dirs })
+        \\assert(#listed == 2)
         \\xdg_done = true
         \\end)
         \\

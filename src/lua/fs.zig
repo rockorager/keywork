@@ -98,7 +98,7 @@ pub const FsOperation = struct {
                 self.offset = if (!self.option) self.path.len else if (self.path.len > 0 and self.path[0] == '/') 1 else 0;
                 try self.submitMkdir(loop);
             },
-            .stat => try loop.submitStatx(op, linux.AT.FDCWD, self.path, 0, .{ .TYPE = true, .SIZE = true, .MTIME = true }, &self.stat_buf),
+            .stat => try loop.submitStatx(op, linux.AT.FDCWD, self.path, 0, .{ .TYPE = true, .SIZE = true, .MTIME = true, .INO = true }, &self.stat_buf),
             .remove => try loop.submitUnlinkAt(op, linux.AT.FDCWD, self.path.ptr, if (self.option) linux.AT.REMOVEDIR else 0),
             .rename => try loop.submitRenameAt(op, linux.AT.FDCWD, self.path.ptr, linux.AT.FDCWD, self.extra.?.ptr, 0),
         }
@@ -352,11 +352,20 @@ pub const FsOperation = struct {
     }
     fn finishStat(self: *FsOperation, loop: *event_loop.EventLoop) void {
         const state = self.host.luaState();
-        c.lua_createtable(state, 0, 4);
+        c.lua_createtable(state, 0, 5);
         lua_value.setStringField(state, -1, "type", @tagName(kindFromMode(self.stat_buf.mode)));
         lua_value.setIntegerField(state, -1, "size", @intCast(self.stat_buf.size));
         lua_value.setIntegerField(state, -1, "mtime_sec", self.stat_buf.mtime.sec);
         lua_value.setIntegerField(state, -1, "mtime_nsec", self.stat_buf.mtime.nsec);
+        if (self.stat_buf.mask.INO) {
+            var identity_buffer: [64]u8 = undefined;
+            const identity = std.fmt.bufPrint(
+                &identity_buffer,
+                "{x}:{x}:{x}",
+                .{ self.stat_buf.dev_major, self.stat_buf.dev_minor, self.stat_buf.ino },
+            ) catch unreachable;
+            lua_value.setStringField(state, -1, "identity", identity);
+        }
         self.finish(loop, 1);
     }
     fn finishOk(self: *FsOperation, loop: *event_loop.EventLoop) void {

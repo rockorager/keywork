@@ -333,8 +333,19 @@ function M.list(opts)
     local fs = require("keywork.fs")
     local entries = {}
     local claimed = {}
+    local visited = {}
     local function scan(base, rel)
         local dir = rel == "" and base or (base .. "/" .. rel)
+        local stat = fs.stat(dir)
+        if not stat then
+            return
+        end
+        if stat.identity then
+            if visited[stat.identity] then
+                return
+            end
+            visited[stat.identity] = true
+        end
         local items = fs.list(dir)
         if not items then
             return

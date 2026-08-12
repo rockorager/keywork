@@ -9,6 +9,7 @@
 ---@field size integer
 ---@field mtime_sec integer
 ---@field mtime_nsec integer
+---@field identity? string Stable filesystem device/inode identity when supported.
 
 local M = {}
 ---@param path string
