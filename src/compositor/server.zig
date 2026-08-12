@@ -553,7 +553,9 @@ const RenderBudget = struct {
     count: usize = 0,
     next: usize = 0,
 
-    const sample_capacity = 32;
+    // Retain intermittent expensive frames long enough that ordinary GPU
+    // variance cannot fall out of the budget between bursts of activity.
+    const sample_capacity = 256;
 
     fn record(self: *RenderBudget, duration_nanoseconds: u64) void {
         self.samples[self.next] = duration_nanoseconds;
