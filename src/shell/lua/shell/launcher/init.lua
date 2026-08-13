@@ -278,10 +278,14 @@ local function footer(self, entry_commands, theme)
 end
 
 local function build_commands(self)
+    ---@type keywork.Action[]
     local scoped_actions = {}
+    ---@type table<table, { primary: keywork.Command, actions: keywork.Action[], commands: keywork.Command[] }>
     local entry_commands = {}
     for _, entry in ipairs(self.results) do
+        ---@type keywork.Command[]
         local commands = {}
+        ---@type keywork.Action[]
         local actions = {}
         for index, provider_action in ipairs(entry.actions) do
             local action = kw.action({
@@ -301,13 +305,14 @@ local function build_commands(self)
                 })
             )
         end
+        local default_command = assert(commands[1], "launcher entry requires a default action")
         entry_commands[entry] = {
             primary = kw.command({
                 id = entry.id,
                 title = entry.title,
                 subtitle = entry.subtitle,
                 icon = entry.icon,
-                intent = commands[1].intent,
+                intent = default_command.intent,
             }),
             actions = actions,
             commands = commands,
