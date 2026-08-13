@@ -246,7 +246,7 @@ fn resolveExecutable(
 ) ![]u8 {
     const current_path = try std.process.currentPathAlloc(io, allocator);
     defer allocator.free(current_path);
-    var directories = std.mem.tokenizeScalar(u8, search_path, ':');
+    var directories = std.mem.splitScalar(u8, search_path, ':');
     var access_denied = false;
     while (directories.next()) |directory| {
         const candidate = try std.fs.path.join(
@@ -338,4 +338,26 @@ test "bare executables resolve through the configured search path" {
         error.FileNotFound,
         resolveExecutable(std.testing.allocator, std.testing.io, directory, "missing"),
     );
+}
+
+test "empty search path components resolve against the current directory" {
+    const name = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".keywork-launcher-path-test-{d}",
+        .{std.c.getpid()},
+    );
+    defer std.testing.allocator.free(name);
+    const executable = try std.Io.Dir.cwd().createFile(std.testing.io, name, .{
+        .permissions = .executable_file,
+    });
+    executable.close(std.testing.io);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, name) catch {};
+
+    const resolved = try resolveExecutable(std.testing.allocator, std.testing.io, ":", name);
+    defer std.testing.allocator.free(resolved);
+    const current_path = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(current_path);
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ current_path, name });
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
 }
