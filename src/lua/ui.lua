@@ -15,6 +15,79 @@ local function validate(options, allowed, name)
     return options
 end
 
+local ACTION_KIND = "keywork.action"
+local INTENT_KIND = "keywork.intent"
+
+local function is_action(value)
+    return type(value) == "table" and value.__keywork_kind == ACTION_KIND
+end
+
+local function is_intent(value)
+    return type(value) == "table" and value.__keywork_kind == INTENT_KIND
+end
+
+local function action_enabled(action)
+    local enabled = action.enabled
+    if type(enabled) == "function" then
+        enabled = enabled()
+    end
+    if type(enabled) ~= "boolean" then
+        error("action enabled must resolve to a boolean", 3)
+    end
+    return enabled
+end
+
+--- Declares an executable capability. Actions acquire meaning when installed
+--- in an `action_scope`; controls and shortcuts refer to them through intents.
+function ui.action(options)
+    options = validate(options, { id=true, enabled=true, activate=true }, "action")
+    if type(options.id) ~= "string" or options.id == "" then
+        error("action requires a non-empty id", 2)
+    end
+    if type(options.activate) ~= "function" then
+        error("action requires activate", 2)
+    end
+    if options.enabled ~= nil and type(options.enabled) ~= "boolean" and type(options.enabled) ~= "function" then
+        error("action enabled must be a boolean or function", 2)
+    end
+    return {
+        __keywork_kind = ACTION_KIND,
+        id = options.id,
+        enabled = options.enabled == nil and true or options.enabled,
+        activate = options.activate,
+    }
+end
+
+--- Refers to an action without executing it. Passing the action object keeps
+--- its enabled state available to controls while dispatch still uses its id.
+function ui.intent(value)
+    if is_intent(value) then
+        return value
+    end
+    if is_action(value) then
+        return {
+            __keywork_kind = INTENT_KIND,
+            action = value.id,
+            _action = value,
+        }
+    end
+    if type(value) ~= "string" or value == "" then
+        error("intent requires an action or non-empty action id", 2)
+    end
+    return {
+        __keywork_kind = INTENT_KIND,
+        action = value,
+    }
+end
+
+local function resolve_intent(value)
+    if value == nil then
+        return nil, false
+    end
+    local intent = ui.intent(value)
+    return intent, intent._action ~= nil and not action_enabled(intent._action)
+end
+
 local function copy_table(value)
     local result = {}
     for key, child in pairs(value or {}) do
@@ -446,11 +519,16 @@ end
 --- outside or receiving a pointer cancellation aborts the press. Set
 --- `activation = "press"` to activate immediately on pointer-down instead.
 function ui.pressable(options)
-    options = validate(options, { id=true, child=true, action=true, disabled=true, hover_background=true,
+    options = validate(options, { id=true, child=true, action=true, intent=true, disabled=true, hover_background=true,
         pressed_background=true, focused_border=true, focused_border_width=true, cursor=true, buttons=true,
         activation=true,
         on_activate=true, on_press_start=true, on_press_end=true, on_press_cancel=true,
         on_hover=true, on_scroll=true }, "pressable")
+    if options.action ~= nil and options.intent ~= nil then
+        error("pressable action and intent are mutually exclusive", 2)
+    end
+    local intent, action_disabled = resolve_intent(options.intent or options.action)
+    local disabled = options.disabled or action_disabled
     return {
         type = "gesture",
         id = options.id,
@@ -461,9 +539,9 @@ function ui.pressable(options)
         focused_border_width = options.focused_border_width,
         cursor = options.cursor,
         activation = options.activation or "release",
-        focusable = not options.disabled and (options.on_activate ~= nil or options.action ~= nil),
-        action_id = not options.disabled and options.action or nil,
-        on_tap = not options.disabled and options.on_activate or nil,
+        focusable = not disabled and (options.on_activate ~= nil or intent ~= nil),
+        action_id = not disabled and intent or nil,
+        on_tap = not disabled and options.on_activate or nil,
         on_tap_down = options.on_press_start,
         on_tap_up = options.on_press_end,
         on_tap_cancel = options.on_press_cancel,
@@ -829,6 +907,7 @@ local button_keys = {
     on_activate = true,
     on_hover = true,
     action = true,
+    intent = true,
 }
 local icon_button_keys = {
     id = true,
@@ -841,6 +920,7 @@ local icon_button_keys = {
     on_activate = true,
     on_hover = true,
     action = true,
+    intent = true,
 }
 local toggle_button_keys = {
     id = true,
@@ -855,10 +935,13 @@ local toggle_button_keys = {
     on_activate = true,
     on_hover = true,
     action = true,
+    intent = true,
 }
 
 local function build_button(options, theme)
     local recipe = theme.components.button
+    local intent, action_disabled = resolve_intent(options.intent or options.action)
+    local disabled = options.disabled or action_disabled
     local size = options.size or "medium"
     local appearance = options.appearance or options.default_appearance or "secondary"
     if size ~= "small" and size ~= "medium" then
@@ -887,7 +970,7 @@ local function build_button(options, theme)
             colors.foreground = tone.foreground
         end
     end
-    if options.disabled then
+    if disabled then
         colors = {
             background = recipe.disabled.background,
             foreground = recipe.disabled.foreground,
@@ -915,8 +998,8 @@ local function build_button(options, theme)
     end
     return ui.pressable({
         id = options.id,
-        action = options.action,
-        disabled = options.disabled,
+        intent = intent and intent.action,
+        disabled = disabled,
         activation = options.activation,
         on_activate = options.on_activate,
         on_hover = options.on_hover,
@@ -944,8 +1027,11 @@ local Button = ui.component({
 })
 local function button_options(options, name)
     options = validate(options, button_keys, name)
-    if options.action and options.on_activate then
-        error(name .. " action and on_activate are mutually exclusive", 3)
+    if options.action ~= nil and options.intent ~= nil then
+        error(name .. " action and intent are mutually exclusive", 3)
+    end
+    if (options.action ~= nil or options.intent ~= nil) and options.on_activate then
+        error(name .. " intent and on_activate are mutually exclusive", 3)
     end
     return options
 end
@@ -954,8 +1040,11 @@ function ui.button(options)
 end
 function ui.icon_button(options)
     options = validate(options, icon_button_keys, "icon_button")
-    if options.action and options.on_activate then
-        error("icon_button action and on_activate are mutually exclusive", 2)
+    if options.action ~= nil and options.intent ~= nil then
+        error("icon_button action and intent are mutually exclusive", 2)
+    end
+    if (options.action ~= nil or options.intent ~= nil) and options.on_activate then
+        error("icon_button intent and on_activate are mutually exclusive", 2)
     end
     if not options.icon then
         error("icon_button requires icon", 2)
@@ -966,8 +1055,11 @@ function ui.icon_button(options)
 end
 function ui.toggle_button(options)
     options = validate(options, toggle_button_keys, "toggle_button")
-    if options.action and options.on_activate then
-        error("toggle_button action and on_activate are mutually exclusive", 2)
+    if options.action ~= nil and options.intent ~= nil then
+        error("toggle_button action and intent are mutually exclusive", 2)
+    end
+    if (options.action ~= nil or options.intent ~= nil) and options.on_activate then
+        error("toggle_button intent and on_activate are mutually exclusive", 2)
     end
     if type(options.selected) ~= "boolean" then
         error("toggle_button requires selected", 2)
@@ -1045,6 +1137,8 @@ end
 local function build_menu_item(options, theme)
     local menu_theme = theme and theme.components and theme.components.menu or {}
     local item_theme = menu_theme.item or {}
+    local intent, action_disabled = resolve_intent(options.intent or options.action)
+    local disabled = options.disabled or action_disabled
     local selected = options.selected or false
     local background
     local hover_background = item_theme.hover_background
@@ -1062,7 +1156,7 @@ local function build_menu_item(options, theme)
         }
     end
     local foreground = item_theme.foreground
-    if options.disabled then
+    if disabled then
         foreground = item_theme.disabled_foreground
     end
     local child = ui.icon_theme({
@@ -1078,8 +1172,8 @@ local function build_menu_item(options, theme)
         id = options.id,
         hover_background = hover_background,
         pressed_background = pressed_background,
-        disabled = options.disabled,
-        action = options.action,
+        disabled = disabled,
+        intent = intent and intent.action,
         on_activate = options.on_activate,
         on_hover = options.on_hover,
         child = ui.container({
@@ -1102,9 +1196,12 @@ local MenuItem = ui.component({
 --- metrics. `selected` lets keyboard and pointer selection share one highlight.
 function ui.menu_item(options)
     options = validate(options, { id=true, child=true, selected=true, disabled=true,
-        action=true, on_activate=true, on_hover=true }, "menu_item")
-    if options.action and options.on_activate then
-        error("menu_item action and on_activate are mutually exclusive", 2)
+        action=true, intent=true, on_activate=true, on_hover=true }, "menu_item")
+    if options.action ~= nil and options.intent ~= nil then
+        error("menu_item action and intent are mutually exclusive", 2)
+    end
+    if (options.action ~= nil or options.intent ~= nil) and options.on_activate then
+        error("menu_item intent and on_activate are mutually exclusive", 2)
     end
     return MenuItem(options)
 end
@@ -1217,11 +1314,43 @@ function ui.actions(options)
     }
 end
 
+--- Installs first-class actions for a subtree. Disabled actions remain absent
+--- from native dispatch and controls receiving the action object also render
+--- disabled.
+function ui.action_scope(options)
+    options = validate(options, { actions=true, child=true }, "action_scope")
+    if type(options.actions) ~= "table" then
+        error("action_scope requires actions", 2)
+    end
+    local bindings = {}
+    local seen = {}
+    for _, action in ipairs(options.actions) do
+        if not is_action(action) then
+            error("action_scope actions must be created with action()", 2)
+        end
+        if seen[action.id] then
+            error("duplicate action id in action_scope: " .. action.id, 2)
+        end
+        seen[action.id] = true
+        if action_enabled(action) then
+            bindings[action.id] = action.activate
+        end
+    end
+    return ui.actions({ bindings = bindings, child = options.child })
+end
+
 function ui.shortcuts(options)
     options = validate(options, { bindings=true, child=true }, "shortcuts")
+    if type(options.bindings) ~= "table" then
+        error("shortcuts requires bindings", 2)
+    end
+    local bindings = {}
+    for key, intent in pairs(options.bindings) do
+        bindings[key] = ui.intent(intent)
+    end
     return {
         type = "shortcuts",
-        bindings = options.bindings,
+        bindings = bindings,
         child = options.child,
     }
 end

@@ -1525,7 +1525,16 @@ fn getOptionalIntentField(lua_state: *c.lua_State, allocator: std.mem.Allocator,
 }
 
 fn intentFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) !keywork.Intent {
-    return .action(try allocator.dupe(u8, try stringFromStack(lua_state, index)));
+    if (c.lua_isstring(lua_state, index) != 0) {
+        return .action(try allocator.dupe(u8, try stringFromStack(lua_state, index)));
+    }
+    if (c.lua_istable(lua_state, index)) {
+        const table = absoluteIndex(lua_state, index);
+        c.lua_getfield(lua_state, table, "action");
+        defer pop(lua_state, 1);
+        return .action(try allocator.dupe(u8, try stringFromStack(lua_state, -1)));
+    }
+    return error.ExpectedLuaString;
 }
 
 fn getOptionalCallbackField(

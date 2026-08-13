@@ -28,6 +28,14 @@
 
 ---@class keywork.Widget
 
+---@class keywork.Action
+---@field id       string
+---@field enabled  boolean | fun(): boolean
+---@field activate fun()
+
+---@class keywork.Intent
+---@field action string
+
 ---@class keywork.Signal<T>
 ---@operator call(): T
 ---@field set fun(self: keywork.Signal<T>, value: T)
@@ -582,7 +590,8 @@
 ---@class keywork.PressableOptions
 ---@field id                    string
 ---@field child                 keywork.Widget
----@field action?               string
+---@field intent?               keywork.Intent | keywork.Action | string
+---@field action?               string | keywork.Action Legacy alias for `intent`.
 ---@field disabled?             boolean
 ---@field hover_background?     keywork.Color
 ---@field pressed_background?   keywork.Color
@@ -779,7 +788,8 @@ function PixelBuffer:commit(options) end
 ---@field child        keywork.Widget
 ---@field selected?    boolean
 ---@field disabled?    boolean
----@field action?      string
+---@field intent?      keywork.Intent | keywork.Action | string
+---@field action?      string | keywork.Action Legacy alias for `intent`.
 ---@field on_activate? fun(event: keywork.TapEvent)
 ---@field on_hover?    fun(hovered: boolean)
 
@@ -809,7 +819,8 @@ function PixelBuffer:commit(options) end
 ---@field tone?       'danger'
 ---@field disabled?   boolean
 ---@field activation? keywork.ActivationMode Defaults to `release`.
----@field action?     string
+---@field intent?     keywork.Intent | keywork.Action | string
+---@field action?     string | keywork.Action Legacy alias for `intent`.
 ---@field on_activate? fun(event: keywork.TapEvent)
 ---@field on_hover?   fun(hovered: boolean)
 
@@ -840,8 +851,17 @@ function PixelBuffer:commit(options) end
 ---@field bindings table<string, fun()>
 ---@field child    keywork.Widget
 
+---@class keywork.ActionOptions
+---@field id       string
+---@field enabled? boolean | fun(): boolean
+---@field activate fun()
+
+---@class keywork.ActionScopeOptions
+---@field actions keywork.Action[]
+---@field child   keywork.Widget
+
 ---@class keywork.ShortcutsOptions
----@field bindings table<keywork.ShortcutKey, string>
+---@field bindings table<keywork.ShortcutKey, keywork.Intent | keywork.Action | string>
 ---@field child    keywork.Widget
 
 ---@class keywork.App: keywork.AppBaseOptions
@@ -1112,9 +1132,21 @@ function M.tag(options) end
 ---@return keywork.Widget
 function M.badge(options) end
 
+---@param options keywork.ActionOptions
+---@return keywork.Action
+function M.action(options) end
+
+---@param value keywork.Action | keywork.Intent | string
+---@return keywork.Intent
+function M.intent(value) end
+
 ---@param options keywork.ActionsOptions
 ---@return keywork.Widget
 function M.actions(options) end
+
+---@param options keywork.ActionScopeOptions
+---@return keywork.Widget
+function M.action_scope(options) end
 
 ---@param options keywork.ShortcutsOptions
 ---@return keywork.Widget

@@ -4975,6 +4975,53 @@ test "lua disabled menu items use the disabled foreground" {
     try std.testing.expectEqual(keywork.colors.neutral_foreground_disabled_light, node.text_style.color);
 }
 
+test "lua first-class actions drive controls and shortcuts through intents" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\activated = false
+        \\local enabled = kw.action({
+        \\  id = "activate",
+        \\  activate = function() activated = true end,
+        \\})
+        \\local disabled = kw.action({
+        \\  id = "unavailable",
+        \\  enabled = function() return false end,
+        \\  activate = function() error("disabled action activated") end,
+        \\})
+        \\return kw.app({ child = kw.action_scope({
+        \\  actions = { enabled, disabled },
+        \\  child = kw.shortcuts({
+        \\    bindings = { enter = enabled },
+        \\    child = kw.column({ children = {
+        \\      kw.button({ id = "enabled", label = "Enabled", intent = kw.intent(enabled) }),
+        \\      kw.button({ id = "disabled", label = "Disabled", intent = disabled }),
+        \\    } }),
+        \\  }),
+        \\}) })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "first-class-actions.lua", script);
+    defer app.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 200, .max_height = 100 }, .light);
+    defer runtime.deinit();
+    app.bindRuntime(&runtime);
+
+    try std.testing.expect(keywork.findClickHitById(runtime.root.?, "disabled") == null);
+    const enabled_hit = keywork.findClickHitById(runtime.root.?, "enabled").?;
+    try runtime.click(.{
+        .x = enabled_hit.rect.x + enabled_hit.rect.width / 2,
+        .y = enabled_hit.rect.y + enabled_hit.rect.height / 2,
+    });
+    try expectLuaBoolean(&app, "activated", true);
+}
+
 test "lua buttons default to release activation and accept press override" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
