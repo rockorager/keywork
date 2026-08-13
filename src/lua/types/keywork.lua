@@ -869,6 +869,26 @@ function PixelBuffer:commit(options) end
 ---@field label?   string
 ---@field selected boolean
 
+---@class keywork.ListItemOptions
+---@field id           string
+---@field title        string
+---@field subtitle?    string
+---@field leading?     keywork.Widget
+---@field trailing?    keywork.Widget
+---@field selected?    boolean
+---@field disabled?    boolean
+---@field intent?      keywork.Intent | keywork.Action | string
+---@field action?      string | keywork.Action Legacy alias for `intent`.
+---@field on_activate? fun(event: keywork.TapEvent)
+---@field on_hover?    fun(hovered: boolean)
+
+---@class keywork.StatusStateOptions
+---@field id?      string Required when `command` is set.
+---@field title?   string
+---@field message? string
+---@field icon?    string
+---@field command? keywork.Command
+
 ---@class keywork.FlexibleOptions
 ---@field child keywork.Widget
 ---@field flex? number
@@ -1172,6 +1192,22 @@ function M.button(options) end
 ---@param options keywork.ToggleButtonOptions
 ---@return keywork.Widget
 function M.toggle_button(options) end
+
+---@param options keywork.ListItemOptions
+---@return keywork.Widget
+function M.list_item(options) end
+
+---@param options? keywork.StatusStateOptions
+---@return keywork.Widget
+function M.loading_state(options) end
+
+---@param options? keywork.StatusStateOptions
+---@return keywork.Widget
+function M.empty_state(options) end
+
+---@param options? keywork.StatusStateOptions
+---@return keywork.Widget
+function M.error_state(options) end
 
 ---@param options keywork.TagOptions
 ---@return keywork.Widget

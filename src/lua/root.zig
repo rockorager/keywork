@@ -5089,6 +5089,50 @@ test "lua generic surfaces and progress bars resolve from the ambient theme" {
     try std.testing.expectEqual(keywork.colors.neutral_background6_dark, runtime.root.?.background);
 }
 
+test "lua list items and status states activate intents" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\selected = false
+        \\local select = kw.action({ id = "select", activate = function() selected = true end })
+        \\return kw.app({ child = kw.action_scope({
+        \\  actions = { select },
+        \\  child = kw.column({ children = {
+        \\    kw.list_item({
+        \\      id = "result", title = "Result", subtitle = "Supporting detail",
+        \\      leading = kw.icon({ name = "document" }), intent = select,
+        \\    }),
+        \\    kw.loading_state({ title = "Loading" }),
+        \\    kw.empty_state({ title = "No results", message = "Try another query" }),
+        \\    kw.error_state({
+        \\      id = "failure", title = "Could not load", icon = "error-circle",
+        \\      command = kw.command({ title = "Retry", intent = select }),
+        \\    }),
+        \\  } }),
+        \\}) })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "list-items-and-states.lua", script);
+    defer app.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 320, .max_height = 360 }, .light);
+    defer runtime.deinit();
+    app.bindRuntime(&runtime);
+
+    const result_hit = keywork.findClickHitById(runtime.root.?, "result").?;
+    try runtime.click(.{
+        .x = result_hit.rect.x + result_hit.rect.width / 2,
+        .y = result_hit.rect.y + result_hit.rect.height / 2,
+    });
+    try expectLuaBoolean(&app, "selected", true);
+    try std.testing.expect(keywork.findClickHitById(runtime.root.?, "failure:action") != null);
+}
+
 test "lua buttons default to release activation and accept press override" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

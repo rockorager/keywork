@@ -1184,6 +1184,142 @@ function ui.toggle_button(options)
     return Button(props)
 end
 
+local ListItem = ui.component({
+    build = function(self, context)
+        local options = self.props
+        local theme = context.theme
+        local intent, action_disabled = resolve_intent(options.intent or options.action)
+        local disabled = options.disabled or action_disabled
+        local foreground = disabled and theme.colors.neutral_foreground_disabled or theme.colors.text
+        local secondary = disabled and theme.colors.neutral_foreground_disabled or theme.colors.text_secondary
+        local children = {}
+        if options.leading then
+            table.insert(children, options.leading)
+        end
+        local labels = { ui.text(options.title, { role = "label", color = foreground }) }
+        if options.subtitle then
+            table.insert(labels, ui.text(options.subtitle, { role = "body", color = secondary }))
+        end
+        table.insert(children, ui.expanded({
+            child = ui.column({ spacing = options.subtitle and 2 or 0, children = labels }),
+        }))
+        if options.trailing then
+            table.insert(children, options.trailing)
+        end
+        local child = ui.container({
+            padding = { x = theme.space[3], y = theme.space[2] },
+            background = options.selected and theme.colors.fill or theme.colors.subtle_background,
+            radius = theme.radius[2],
+            min_height = 40,
+            child = ui.row({ spacing = theme.space[3], align = "center", children = children }),
+        })
+        if intent == nil and options.on_activate == nil then
+            return child
+        end
+        return ui.pressable({
+            id = options.id,
+            child = child,
+            intent = intent and intent.action,
+            disabled = disabled,
+            on_activate = options.on_activate,
+            on_hover = options.on_hover,
+            hover_background = theme.colors.subtle_background_hover,
+            pressed_background = theme.colors.subtle_background_pressed,
+            focused_border = theme.colors.focus8,
+            focused_border_width = 2,
+        })
+    end,
+})
+
+--- A standard row for lists, settings, results, and other repeated content.
+function ui.list_item(options)
+    options = validate(options, { id=true, title=true, subtitle=true, leading=true, trailing=true,
+        selected=true, disabled=true, action=true, intent=true, on_activate=true, on_hover=true }, "list_item")
+    if type(options.id) ~= "string" or options.id == "" then
+        error("list_item requires a non-empty id", 2)
+    end
+    if type(options.title) ~= "string" or options.title == "" then
+        error("list_item requires a non-empty title", 2)
+    end
+    if options.subtitle ~= nil and type(options.subtitle) ~= "string" then
+        error("list_item subtitle must be a string", 2)
+    end
+    if options.action ~= nil and options.intent ~= nil then
+        error("list_item action and intent are mutually exclusive", 2)
+    end
+    if (options.action ~= nil or options.intent ~= nil) and options.on_activate then
+        error("list_item intent and on_activate are mutually exclusive", 2)
+    end
+    return ListItem(options)
+end
+
+local StatusView = ui.component({
+    build = function(self, context)
+        local options = self.props
+        local theme = context.theme
+        local children = {}
+        if options.kind == "loading" then
+            table.insert(children, ui.progress_ring({ size = 28, color = theme.colors.accent }))
+        elseif options.icon then
+            table.insert(children, ui.icon({
+                name = options.icon,
+                size = 32,
+                color = options.kind == "error" and theme.colors.danger or theme.colors.text_secondary,
+            }))
+        end
+        if options.title then
+            table.insert(children, ui.text(options.title, { role = "title", color = theme.colors.text }))
+        end
+        if options.message then
+            table.insert(children, ui.text(options.message, { role = "body", color = theme.colors.text_secondary }))
+        end
+        if options.command then
+            table.insert(children, ui.button({
+                id = options.id .. ":action",
+                label = options.command.title,
+                icon = options.command.icon,
+                intent = options.command.intent.action,
+                disabled = options.command.disabled,
+                appearance = "primary",
+            }))
+        end
+        return ui.center({
+            child = ui.column({ spacing = theme.space[3], align = "center", children = children }),
+        })
+    end,
+})
+
+local function status_state(kind, options)
+    options = validate(options, { id=true, title=true, message=true, icon=true, command=true }, kind .. "_state")
+    if options.title ~= nil and type(options.title) ~= "string" then
+        error(kind .. "_state title must be a string", 3)
+    end
+    if options.message ~= nil and type(options.message) ~= "string" then
+        error(kind .. "_state message must be a string", 3)
+    end
+    if options.command ~= nil and not is_command(options.command) then
+        error(kind .. "_state command must be created with command()", 3)
+    end
+    if options.command ~= nil and (type(options.id) ~= "string" or options.id == "") then
+        error(kind .. "_state requires an id when it has a command", 3)
+    end
+    local props = copy_table(options)
+    props.kind = kind
+    return StatusView(props)
+end
+
+function ui.loading_state(options)
+    return status_state("loading", options)
+end
+
+function ui.empty_state(options)
+    return status_state("empty", options)
+end
+
+function ui.error_state(options)
+    return status_state("error", options)
+end
+
 local function token(options, theme, kind)
     local recipe = theme.components[kind]
     local child = options.icon and icon_label(options.icon, options.label, {
