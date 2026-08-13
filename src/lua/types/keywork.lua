@@ -584,6 +584,10 @@
 ---@class keywork.ContainerOptions: keywork.ContainerStyleOptions
 ---@field child keywork.Widget
 
+---@class keywork.SurfaceOptions
+---@field child    keywork.Widget
+---@field padding? number | keywork.EdgeInsets
+
 ---@class keywork.GestureDetectorOptions
 ---@field id?               string
 ---@field child             keywork.Widget
@@ -714,6 +718,13 @@
 ---@field size?      number
 ---@field color?     keywork.Color
 ---@field period_ms? integer
+
+---@class keywork.ProgressBarOptions
+---@field value       number Clamped to 0...1.
+---@field width       number
+---@field height?     number
+---@field color?      keywork.Color
+---@field background? keywork.Color
 
 ---@class keywork.SvgIconOptions
 ---@field path   string
@@ -1026,6 +1037,14 @@ function M.icon_theme(options) end
 ---@return keywork.Widget
 function M.container(options) end
 
+---@param options keywork.SurfaceOptions
+---@return keywork.Widget
+function M.card(options) end
+
+---@param options keywork.SurfaceOptions
+---@return keywork.Widget
+function M.floating_panel(options) end
+
 ---@param options keywork.GestureDetectorOptions
 ---@return keywork.Widget
 function M.gesture_detector(options) end
@@ -1093,6 +1112,10 @@ function M.spacer(flex) end
 ---@param options? keywork.ProgressRingOptions
 ---@return keywork.Widget
 function M.progress_ring(options) end
+
+---@param options keywork.ProgressBarOptions
+---@return keywork.Widget
+function M.progress_bar(options) end
 
 ---@param options keywork.SvgIconOptions
 ---@return keywork.Widget

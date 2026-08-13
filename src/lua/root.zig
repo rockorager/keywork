@@ -5063,6 +5063,32 @@ test "lua command menus present and activate command intents" {
     try expectLuaBoolean(&app, "opened", true);
 }
 
+test "lua generic surfaces and progress bars resolve from the ambient theme" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\return kw.app({ child = kw.floating_panel({
+        \\  child = kw.card({
+        \\    child = kw.progress_bar({ value = 0.75, width = 120 }),
+        \\  }),
+        \\}) })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "surfaces-and-progress.lua", script);
+    defer app.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 240, .max_height = 160 }, .dark);
+    defer runtime.deinit();
+
+    try std.testing.expect(runtime.root.?.rect.width >= 120);
+    try std.testing.expectEqual(keywork.colors.neutral_background6_dark, runtime.root.?.background);
+}
+
 test "lua buttons default to release activation and accept press override" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

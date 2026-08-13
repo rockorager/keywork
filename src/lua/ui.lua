@@ -524,6 +524,35 @@ function ui.container(options)
     }, child)
 end
 
+local Surface = ui.component({
+    build = function(self, context)
+        local options = self.props
+        local theme = context.theme
+        local floating = options.floating
+        return ui.container({
+            padding = options.padding or theme.space[floating and 4 or 3],
+            background = floating and theme.colors.surface_high or theme.colors.surface,
+            border = floating and theme.colors.panel_border or theme.colors.border,
+            border_width = 1,
+            radius = theme.radius[floating and 4 or 3],
+            shadow = floating and theme.shadow[5] or nil,
+            child = options.child,
+        })
+    end,
+})
+
+--- A bounded surface for grouping related application content.
+function ui.card(options)
+    options = validate(options, { child=true, padding=true }, "card")
+    return Surface({ child = options.child, padding = options.padding, floating = false })
+end
+
+--- An elevated surface for transient or spatially detached content.
+function ui.floating_panel(options)
+    options = validate(options, { child=true, padding=true }, "floating_panel")
+    return Surface({ child = options.child, padding = options.padding, floating = true })
+end
+
 function ui.gesture_detector(options)
     options = validate(options, { id=true, child=true, cursor=true, buttons=true, on_pointer_down=true,
         on_pointer_up=true, on_pointer_cancel=true, on_hover=true, on_scroll=true }, "gesture_detector")
@@ -846,6 +875,55 @@ function ui.progress_ring(options)
         color = options.color,
         period_ms = options.period_ms,
     }
+end
+
+local ProgressBar = ui.component({
+    build = function(self, context)
+        local options = self.props
+        local theme = context.theme
+        local value = math.max(0, math.min(1, options.value))
+        local height = options.height or theme.space[1]
+        local fill_width = options.width * value
+        local fill = ui.sized_box({
+            width = fill_width,
+            height = height,
+            child = ui.container({
+                background = options.color or theme.colors.accent,
+                radius = height / 2,
+                min_width = fill_width,
+                min_height = height,
+                child = ui.text(""),
+            }),
+        })
+        return ui.sized_box({
+            width = options.width,
+            height = height,
+            child = ui.container({
+                background = options.background or theme.colors.fill_secondary,
+                radius = height / 2,
+                min_width = options.width,
+                min_height = height,
+                horizontal_align = "start",
+                vertical_align = "center",
+                child = fill,
+            }),
+        })
+    end,
+})
+
+--- A determinate horizontal progress indicator. `value` is clamped to 0...1.
+function ui.progress_bar(options)
+    options = validate(options, { value=true, width=true, height=true, color=true, background=true }, "progress_bar")
+    if type(options.value) ~= "number" or options.value ~= options.value then
+        error("progress_bar requires a numeric value", 2)
+    end
+    if type(options.width) ~= "number" or options.width <= 0 then
+        error("progress_bar requires a positive width", 2)
+    end
+    if options.height ~= nil and (type(options.height) ~= "number" or options.height <= 0) then
+        error("progress_bar height must be positive", 2)
+    end
+    return ProgressBar(options)
 end
 
 function ui.svg_icon(options)
