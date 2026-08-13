@@ -148,14 +148,11 @@ local function device_label(kind, device, detailed)
     return device.description or device.name
 end
 
-local function device_row(palette, kind, device, on_select)
+local function device_row(palette, kind, device, intent)
     local color = not device.default and palette.muted or nil
     return kw.menu_item({
         id = "audio-" .. kind .. "-" .. tostring(device.id),
-        on_activate = on_select
-            and function()
-                on_select(device)
-            end or nil,
+        intent = intent,
         child = kw.row({
             spacing = palette.space[2],
             align = "center",
@@ -184,11 +181,21 @@ local function unavailable_row(palette, label)
     })
 end
 
-local function device_rows(palette, kind, devices, on_select)
+local function device_rows(palette, kind, devices, actions, on_select)
     local rows = {}
     for _, device in ipairs(devices) do
         if device.available ~= false then
-            rows[#rows + 1] = device_row(palette, kind, device, on_select)
+            local action
+            if on_select then
+                action = kw.action({
+                    id = "audio.select." .. kind .. "." .. tostring(device.id),
+                    activate = function()
+                        on_select(device)
+                    end,
+                })
+                actions[#actions + 1] = action
+            end
+            rows[#rows + 1] = device_row(palette, kind, device, action)
         end
     end
     if #rows == 0 then
@@ -207,16 +214,23 @@ end
 
 local function audio_menu(palette, audio, on_select, on_open_settings)
     audio = audio or {}
+    local actions = {}
     local rows = { kw.menu_label({ text = "Output" }) }
-    for _, row in ipairs(device_rows(palette, "sink", audio.outputs or {}, on_select)) do
+    for _, row in ipairs(device_rows(palette, "sink", audio.outputs or {}, actions, on_select)) do
         rows[#rows + 1] = row
     end
     rows[#rows + 1] = kw.menu_label({ text = "Input" })
     rows[#rows + 1] = default_device_row(palette, "source", audio.input)
     rows[#rows + 1] = kw.menu_separator({})
+    local open_settings = kw.action({
+        id = "audio.open-settings",
+        enabled = on_open_settings ~= nil,
+        activate = on_open_settings or function() end,
+    })
+    actions[#actions + 1] = open_settings
     rows[#rows + 1] = kw.menu_item({
         id = "audio-settings",
-        on_activate = on_open_settings,
+        intent = open_settings,
         child = kw.row({
             spacing = palette.space[2],
             align = "center",
@@ -227,24 +241,31 @@ local function audio_menu(palette, audio, on_select, on_open_settings)
             },
         }),
     })
-    return kw.menu_surface({
-        child = kw.column({ children = rows }),
+    return kw.action_scope({
+        actions = actions,
+        child = kw.menu_surface({
+            child = kw.column({ children = rows }),
+        }),
     })
 end
 
 local function settings_menu(palette, audio, on_select)
     audio = audio or { outputs = {}, inputs = {} }
     on_select = on_select or function(_) end
+    local actions = {}
     local rows = { kw.menu_label({ text = "Output" }) }
-    for _, row in ipairs(device_rows(palette, "sink", audio.outputs or {}, on_select)) do
+    for _, row in ipairs(device_rows(palette, "sink", audio.outputs or {}, actions, on_select)) do
         rows[#rows + 1] = row
     end
     rows[#rows + 1] = kw.menu_label({ text = "Input" })
-    for _, row in ipairs(device_rows(palette, "source", audio.inputs or {}, on_select)) do
+    for _, row in ipairs(device_rows(palette, "source", audio.inputs or {}, actions, on_select)) do
         rows[#rows + 1] = row
     end
-    return kw.menu_surface({
-        child = kw.column({ children = rows }),
+    return kw.action_scope({
+        actions = actions,
+        child = kw.menu_surface({
+            child = kw.column({ children = rows }),
+        }),
     })
 end
 
@@ -380,16 +401,18 @@ local Settings = kw.component({
             }),
         })
 
+        local dismiss = kw.action({
+            id = "audio.dismiss-settings",
+            activate = function()
+                if self.props.on_close then self.props.on_close() end
+            end,
+        })
         return kw.theme({
             data = palette.theme,
-            child = kw.actions({
-                bindings = {
-                    dismiss = function()
-                        if self.props.on_close then self.props.on_close() end
-                    end,
-                },
+            child = kw.action_scope({
+                actions = { dismiss },
                 child = kw.shortcuts({
-                    bindings = { escape = "dismiss" },
+                    bindings = { escape = dismiss },
                     child = content,
                 }),
             }),

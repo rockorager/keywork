@@ -136,7 +136,7 @@ local function network_name(entry, text_color, subtle_color)
     return label(entry.name, text_color)
 end
 
-local function network_row(palette, entry, on_select)
+local function network_row(palette, entry, intent)
     local icon_color = entry.connected and palette.selection or palette.muted
     local text_color = entry.connected and palette.foreground or palette.muted
     local trailing
@@ -178,9 +178,7 @@ local function network_row(palette, entry, on_select)
     return kw.menu_item({
         id = "wifi-" .. entry.path,
         selected = entry.connected,
-        on_activate = function()
-            on_select(entry)
-        end,
+        intent = intent,
         child = kw.row({
             spacing = palette.space[2],
             align = "center",
@@ -234,102 +232,113 @@ local function wifi_auth_page(palette, auth, on_back, on_change, on_submit)
         helper_text = auth.error
         helper_color = palette.error
     end
-    return kw.menu_surface({
-        child = kw.column({
-            children = {
-                kw.menu_label({
-                    min_height = 40,
-                    child = kw.row({
-                        spacing = palette.space[1],
-                        align = "center",
-                        children = {
-                            kw.icon_button({
-                                id = "wifi-auth-back",
-                                icon = "go-previous",
-                                size = "small",
-                                appearance = "subtle",
-                                disabled = auth.connecting,
-                                on_activate = on_back,
-                            }),
-                            kw.text("Connect to Wi-Fi", {
-                                color = palette.foreground,
-                                font_size = 16,
-                                line_height = 22,
-                            }),
-                        },
+    local back = kw.action({
+        id = "network.auth.back",
+        enabled = not auth.connecting,
+        activate = on_back,
+    })
+    local connect = kw.action({
+        id = "network.auth.connect",
+        enabled = not auth.connecting,
+        activate = function()
+            on_submit(auth.password or "")
+        end,
+    })
+    return kw.action_scope({
+        actions = { back, connect },
+        child = kw.menu_surface({
+            child = kw.column({
+                children = {
+                    kw.menu_label({
+                        min_height = 40,
+                        child = kw.row({
+                            spacing = palette.space[1],
+                            align = "center",
+                            children = {
+                                kw.icon_button({
+                                    id = "wifi-auth-back",
+                                    icon = "go-previous",
+                                    size = "small",
+                                    appearance = "subtle",
+                                    intent = back,
+                                }),
+                                kw.text("Connect to Wi-Fi", {
+                                    color = palette.foreground,
+                                    font_size = 16,
+                                    line_height = 22,
+                                }),
+                            },
+                        }),
                     }),
-                }),
-                kw.menu_separator({}),
-                kw.padding({
-                    all = palette.space[3],
-                    child = kw.column({
-                        align = "stretch",
-                        spacing = palette.space[3],
-                        children = {
-                            kw.row({
-                                spacing = palette.space[3],
-                                align = "center",
-                                children = {
-                                    kw.container({
-                                        background = palette.accent,
-                                        radius = theme.radius[2],
-                                        min_width = 40,
-                                        min_height = 40,
-                                        horizontal_align = "center",
-                                        vertical_align = "center",
-                                        child = kw.icon({
-                                            name = "network-wireless-encrypted",
-                                            color = palette.on_accent,
+                    kw.menu_separator({}),
+                    kw.padding({
+                        all = palette.space[3],
+                        child = kw.column({
+                            align = "stretch",
+                            spacing = palette.space[3],
+                            children = {
+                                kw.row({
+                                    spacing = palette.space[3],
+                                    align = "center",
+                                    children = {
+                                        kw.container({
+                                            background = palette.accent,
+                                            radius = theme.radius[2],
+                                            min_width = 40,
+                                            min_height = 40,
+                                            horizontal_align = "center",
+                                            vertical_align = "center",
+                                            child = kw.icon({
+                                                name = "network-wireless-encrypted",
+                                                color = palette.on_accent,
+                                            }),
                                         }),
-                                    }),
-                                    kw.expanded({
-                                        child = kw.column({
-                                            spacing = 0,
-                                            children = {
-                                                kw.text(auth.name or "Wi-Fi network", {
-                                                    color = palette.foreground,
-                                                    font_size = 16,
-                                                    line_height = 22,
-                                                    max_lines = 1,
-                                                }),
-                                                kw.text("Password required", {
-                                                    color = palette.subtle,
-                                                    font_size = 12,
-                                                    line_height = 16,
-                                                }),
-                                            },
+                                        kw.expanded({
+                                            child = kw.column({
+                                                spacing = 0,
+                                                children = {
+                                                    kw.text(auth.name or "Wi-Fi network", {
+                                                        color = palette.foreground,
+                                                        font_size = 16,
+                                                        line_height = 22,
+                                                        max_lines = 1,
+                                                    }),
+                                                    kw.text("Password required", {
+                                                        color = palette.subtle,
+                                                        font_size = 12,
+                                                        line_height = 16,
+                                                    }),
+                                                },
+                                            }),
                                         }),
-                                    }),
-                                },
-                            }),
-                            kw.text_field({
-                                id = "wifi-password",
-                                placeholder = "Password",
-                                value = auth.password or "",
-                                obscured = true,
-                                autofocus = auth.autofocus ~= false,
-                                on_change = on_change,
-                                on_submit = on_submit,
-                            }),
-                            kw.text(helper_text, {
-                                color = helper_color,
-                                font_size = 12,
-                                line_height = 16,
-                                max_lines = 2,
-                            }),
-                            kw.button({
-                                id = "wifi-auth-connect",
-                                label = auth.connecting and "Connecting…" or "Connect",
-                                appearance = "primary",
-                                disabled = auth.connecting,
-                                on_activate = function()
-                                    on_submit(auth.password or "")
-                                end,
-                            }),
-                        },
+                                    },
+                                }),
+                                kw.text_field({
+                                    id = "wifi-password",
+                                    placeholder = "Password",
+                                    value = auth.password or "",
+                                    obscured = true,
+                                    autofocus = auth.autofocus ~= false,
+                                    on_change = on_change,
+                                    on_submit = on_submit,
+                                }),
+                                kw.text(helper_text, {
+                                    color = helper_color,
+                                    font_size = 12,
+                                    line_height = 16,
+                                    max_lines = 2,
+                                }),
+                                kw.button({
+                                    id = "wifi-auth-connect",
+                                    label = auth.connecting and "Connecting…" or "Connect",
+                                    appearance = "primary",
+                                    intent = connect,
+                                }),
+                            },
+                        }),
                     }),
-                }),
-            },
+                },
+            }),
         }),
     })
 end
@@ -346,6 +355,7 @@ local function wifi_menu(palette, wifi, on_select, on_scan)
         )
     end
     on_select = on_select or function(_) end
+    local actions = {}
     local header_children = {
         kw.text("Network", {
             color = palette.foreground,
@@ -361,13 +371,18 @@ local function wifi_menu(palette, wifi, on_select, on_scan)
             line_height = 16,
         })
     end
+    local refresh = kw.action({
+        id = "network.refresh",
+        enabled = not wifi.scanning and on_scan ~= nil,
+        activate = on_scan or function() end,
+    })
+    actions[#actions + 1] = refresh
     header_children[#header_children + 1] = kw.icon_button({
         id = "wifi-refresh",
         icon = "view-refresh",
         size = "small",
         appearance = "subtle",
-        disabled = wifi.scanning or on_scan == nil,
-        on_activate = on_scan,
+        intent = refresh,
     })
     local rows = {
         kw.menu_label({
@@ -383,7 +398,14 @@ local function wifi_menu(palette, wifi, on_select, on_scan)
 
     if connected then
         rows[#rows + 1] = kw.menu_label({ text = "Connected" })
-        rows[#rows + 1] = network_row(palette, connected, on_select)
+        local select_connected = kw.action({
+            id = "network.select." .. connected.path,
+            activate = function()
+                on_select(connected)
+            end,
+        })
+        actions[#actions + 1] = select_connected
+        rows[#rows + 1] = network_row(palette, connected, select_connected)
         rows[#rows + 1] = kw.menu_separator({})
     end
 
@@ -395,7 +417,14 @@ local function wifi_menu(palette, wifi, on_select, on_scan)
 
     for _, entry in ipairs(wifi.networks or {}) do
         if not entry.connected then
-            rows[#rows + 1] = network_row(palette, entry, on_select)
+            local select_network = kw.action({
+                id = "network.select." .. entry.path,
+                activate = function()
+                    on_select(entry)
+                end,
+            })
+            actions[#actions + 1] = select_network
+            rows[#rows + 1] = network_row(palette, entry, select_network)
         end
     end
 
@@ -418,8 +447,11 @@ local function wifi_menu(palette, wifi, on_select, on_scan)
         })
     end
 
-    return kw.menu_surface({
-        child = kw.column({ children = rows }),
+    return kw.action_scope({
+        actions = actions,
+        child = kw.menu_surface({
+            child = kw.column({ children = rows }),
+        }),
     })
 end
 
