@@ -858,6 +858,12 @@ pub const ResourceStatistics = struct {
     imported_textures: usize = 0,
     pending_textures: usize = 0,
     pending_gpu_submissions: usize = 0,
+    /// Completed GPU timing samples waiting for the compositor to consume
+    /// them, the largest queue depth since reset, and samples dropped because
+    /// the queue could not grow.
+    pending_gpu_timings: usize = 0,
+    gpu_timing_queue_high_water: usize = 0,
+    gpu_timing_drops: u64 = 0,
     calibration_textures: usize = 0,
     video_graphics_pipelines: usize = 0,
     blur_scratch_images: usize = 0,

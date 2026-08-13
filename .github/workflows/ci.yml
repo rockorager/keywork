@@ -35,18 +35,8 @@ jobs:
       - name: Run repository tests
         run: dbus-run-session -- zig build test -Doptimize=ReleaseSafe
 
-      - name: Run gateway checks
-        working-directory: src/stream/gateway
-        run: |
-          test -z "$(gofmt -l .)"
-          go test -race ./...
-          go vet ./...
-
-      - name: Check browser SDK and release scripts
-        run: |
-          node --input-type=module --check < src/stream/gateway/sdk/keywork-stream.js
-          node --check src/stream/gateway/sdk/audio-player.js
-          bash -n scripts/package-release scripts/run-stream-demo
+      - name: Check release script
+        run: bash -n scripts/package-release
 
       - name: Build release packages
         run: zig build release -Doptimize=ReleaseSafe
@@ -57,10 +47,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           bundles=(zig-out/release/keywork-*-linux-x86_64.tar.gz)
-          sdks=(zig-out/release/rockorager-keywork-stream-*.tgz)
           test "${#bundles[@]}" -eq 1
-          test "${#sdks[@]}" -eq 1
-          test "$(find zig-out/release -maxdepth 1 -type f | wc -l)" -eq 3
+          test "$(find zig-out/release -maxdepth 1 -type f | wc -l)" -eq 2
           (cd zig-out/release && sha256sum -c SHA256SUMS)
 
           temporary="$(mktemp -d)"
@@ -68,23 +56,7 @@ jobs:
           tar -xzf "${bundles[0]}" -C "$temporary"
           bundle="$(find "$temporary" -mindepth 1 -maxdepth 1 -type d -print -quit)"
           "$bundle/bin/keywork-compositor" --version
-          "$bundle/bin/keywork-streamd" --version
-          "$bundle/bin/keywork-stream-gateway" --version
           ! readelf -d "$bundle/bin/keywork-compositor" | grep -q 'NEEDED.*libwayland'
-          ! readelf -d "$bundle/bin/keywork-streamd" | grep -q 'NEEDED.*libwayland'
-          ! readelf -l "$bundle/bin/keywork-stream-gateway" | grep -q 'Requesting program interpreter'
-          ! readelf -d "$bundle/bin/keywork-stream-gateway" | grep -q NEEDED
-
-          sdk_archive="$(realpath "${sdks[0]}")"
-          mkdir "$temporary/consumer"
-          cd "$temporary/consumer"
-          npm init -y >/dev/null
-          npm install "$sdk_archive" --ignore-scripts --no-audit --no-fund >/dev/null
-          node --input-type=module -e '
-            import("@rockorager/keywork-stream").then((sdk) => {
-              if (typeof sdk.KeyworkSession !== "function") process.exit(1);
-            });
-          '
 
       - uses: actions/upload-artifact@v4
         with:
@@ -107,7 +79,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            ca-certificates curl ffmpeg \
+            ca-certificates \
             libdisplay-info2 libdrm2 libffi8 libgbm1 libinput10 liblcms2-2 \
             libpixman-1-0 libseat1 libsystemd0 libudev1 \
             libxkbcommon0 libxcb-composite0 libxcb-icccm4 libxcb-res0 \
@@ -118,7 +90,7 @@ jobs:
           name: keywork-release-linux-x86_64
           path: release
 
-      - name: Start a released streaming session
+      - name: Start the released compositor
         shell: bash
         run: |
           set -euo pipefail
@@ -128,14 +100,9 @@ jobs:
 
           temporary="$(mktemp -d)"
           compositor_pid=
-          gateway_pid=
           cleanup() {
-            for pid in "$gateway_pid" "$compositor_pid"; do
-              if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
-            done
-            for pid in "$gateway_pid" "$compositor_pid"; do
-              if [[ -n "$pid" ]]; then wait "$pid" 2>/dev/null || true; fi
-            done
+            if [[ -n "$compositor_pid" ]]; then kill "$compositor_pid" 2>/dev/null || true; fi
+            if [[ -n "$compositor_pid" ]]; then wait "$compositor_pid" 2>/dev/null || true; fi
             rm -rf "$temporary"
           }
           trap cleanup EXIT
@@ -143,10 +110,7 @@ jobs:
           tar -xzf "${bundles[0]}" -C "$temporary"
           bundle="$(find "$temporary" -mindepth 1 -maxdepth 1 -type d -print -quit)"
           ! ldd "$bundle/bin/keywork-compositor" | grep -q 'not found'
-          ! ldd "$bundle/bin/keywork-streamd" | grep -q 'not found'
           "$bundle/bin/keywork-compositor" --version
-          "$bundle/bin/keywork-streamd" --version
-          "$bundle/bin/keywork-stream-gateway" --version
 
           export XDG_RUNTIME_DIR="$temporary/runtime"
           mkdir -m 700 "$XDG_RUNTIME_DIR"
@@ -173,33 +137,5 @@ jobs:
             cat "$compositor_log"
             exit 1
           }
-          export WAYLAND_DISPLAY
-
-          gateway_log="$temporary/gateway.log"
-          "$bundle/bin/keywork-stream-gateway" \
-            -listen 127.0.0.1:18080 \
-            -streamd "$bundle/bin/keywork-streamd" \
-            -frame-rate 30 \
-            -bitrate 4000 \
-            >"$gateway_log" 2>&1 &
-          gateway_pid=$!
-
-          ready=false
-          for _ in $(seq 1 200); do
-            if curl --fail --silent --show-error http://127.0.0.1:18080/ >/dev/null; then
-              ready=true
-              break
-            fi
-            kill -0 "$gateway_pid" 2>/dev/null || {
-              cat "$gateway_log"
-              exit 1
-            }
-            sleep 0.05
-          done
-          [[ "$ready" == true ]] || {
-            cat "$gateway_log"
-            exit 1
-          }
           sleep 1
           kill -0 "$compositor_pid"
-          kill -0 "$gateway_pid"

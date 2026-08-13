@@ -1084,18 +1084,6 @@ pub fn discardUnsubmittedFeedback(store: *Store) void {
     }
 }
 
-pub fn sendSubmittedFrameCallbacks(
-    store: *Store,
-    output_context: *anyopaque,
-    time_milliseconds: u32,
-) void {
-    var surfaces = store.iterator();
-    while (surfaces.next()) |entry| {
-        if (entry.value.presentation_output != output_context) continue;
-        sendFrameDoneFor(store, entry.id, time_milliseconds);
-    }
-}
-
 pub fn finishPresentation(
     store: *Store,
     output_context: *anyopaque,
@@ -1107,6 +1095,9 @@ pub fn finishPresentation(
         if (surface_state.presentation_output != output_context) continue;
         surface_state.presentation_output = null;
         surface_state.commit_after_submission = false;
+        // Release the client at presentation so its next commit can arrive
+        // before the compositor's vblank-targeted repaint for the next frame.
+        sendFrameDoneFor(store, entry.id, info.timestamp.milliseconds());
         while (commitFeedbackWithState(surface_state, .submitted)) |feedback| {
             feedback.presented(feedback.context, info);
         }

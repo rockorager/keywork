@@ -430,6 +430,16 @@ const RenderOutput = struct {
                         &self.frame_statistics.render_budget_resets_no_timing,
                     ),
                 }
+                if (cause == .missed_deadline) {
+                    const target = pending.target_vblank_nanoseconds orelse unreachable;
+                    std.debug.assert(presented_nanoseconds > target);
+                    const lateness: u64 = @intCast(presented_nanoseconds - target);
+                    self.frame_statistics.render_budget_last_miss_nanoseconds = lateness;
+                    self.frame_statistics.render_budget_maximum_miss_nanoseconds = @max(
+                        self.frame_statistics.render_budget_maximum_miss_nanoseconds,
+                        lateness,
+                    );
+                }
             },
             .sample => |duration| self.render_budget.record(duration),
         }
@@ -543,7 +553,9 @@ const RenderBudget = struct {
     count: usize = 0,
     next: usize = 0,
 
-    const sample_capacity = 32;
+    // Retain intermittent expensive frames long enough that ordinary GPU
+    // variance cannot fall out of the budget between bursts of activity.
+    const sample_capacity = 256;
 
     fn record(self: *RenderBudget, duration_nanoseconds: u64) void {
         self.samples[self.next] = duration_nanoseconds;
@@ -3231,6 +3243,11 @@ fn controlPerformanceStatistics(
             .importedTextures = wireInteger(@intCast(renderer_statistics.imported_textures)),
             .pendingTextures = wireInteger(@intCast(renderer_statistics.pending_textures)),
             .pendingGpuSubmissions = wireInteger(@intCast(renderer_statistics.pending_gpu_submissions)),
+            .pendingGpuTimings = wireInteger(@intCast(renderer_statistics.pending_gpu_timings)),
+            .gpuTimingQueueHighWater = wireInteger(@intCast(
+                renderer_statistics.gpu_timing_queue_high_water,
+            )),
+            .gpuTimingDrops = wireInteger(renderer_statistics.gpu_timing_drops),
             .calibrationTextures = wireInteger(@intCast(renderer_statistics.calibration_textures)),
             .videoGraphicsPipelines = wireInteger(@intCast(renderer_statistics.video_graphics_pipelines)),
             .blurScratchImages = wireInteger(@intCast(renderer_statistics.blur_scratch_images)),
@@ -8763,12 +8780,6 @@ fn renderFrame(self: *Self, render_output: *RenderOutput) Renderer.Error!void {
     if (drag_icon) |info| self.submitSurfaceTree(output, info.surface_id);
     if (paint_primary_cursor) self.submitSeatCursor(output, &self.seat, false);
     self.submitTabletCursors(output, false);
-    const callback_timestamp = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io));
-    Surface.sendSubmittedFrameCallbacks(
-        self.compositor.surfaceStore(),
-        output,
-        callback_timestamp.milliseconds(),
-    );
     Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), output);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(render_output, info);
@@ -9004,12 +9015,6 @@ fn presentSessionLockFrame(
         frame.render_output.cursor_state == .deactivating)
         self.submitSeatCursor(frame.output, &self.seat, true);
     self.submitTabletCursors(frame.output, true);
-    const callback_timestamp = presentation.Timestamp.fromNanoseconds(nowNanoseconds(self.io));
-    Surface.sendSubmittedFrameCallbacks(
-        self.compositor.surfaceStore(),
-        frame.output,
-        callback_timestamp.milliseconds(),
-    );
     Surface.clearFifoBarriersForOutput(self.compositor.surfaceStore(), frame.output);
     self.finishRepaintIfIdle();
     if (presented) |info| outputPresented(frame.render_output, info);

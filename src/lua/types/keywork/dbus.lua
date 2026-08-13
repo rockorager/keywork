@@ -27,6 +27,10 @@
 ---@field __dbus_type 'array'
 ---@field signature   string  Element signature.
 
+---@class keywork.dbus.StructValue<T>: keywork.dbus.TypedValue<T>
+---@field __dbus_type 'struct'
+---@field signature   string  Complete struct signature, including parentheses.
+
 ---@class keywork.dbus.VariantValue<T>: keywork.dbus.TypedValue<T>
 ---@field __dbus_type 'variant'
 ---@field signature   string    Contained value signature.
@@ -42,6 +46,7 @@ function UnixFd:close() end
 function UnixFd:closed() end
 
 ---@class keywork.dbus.Reply
+---@field sender?    string
 ---@field signature? string
 ---@field args       any[]  Signature-dependent decoded values.
 
@@ -278,6 +283,12 @@ function M.double(value) end
 ---@param value             T
 ---@return keywork.dbus.ArrayValue<T>
 function M.array(element_signature, value) end
+
+---@generic T
+---@param signature string Complete struct signature, including parentheses.
+---@param value     T
+---@return keywork.dbus.StructValue<T>
+function M.struct(signature, value) end
 
 ---@generic T
 ---@param signature string

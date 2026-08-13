@@ -45,8 +45,9 @@ command_buffer: vk.CommandBuffer,
 timestamp_valid_bits: u32,
 timestamp_period: f32,
 scanout_sync_enabled: bool,
-completed_gpu_timings: [4]GpuTiming,
-completed_gpu_timing_count: usize,
+completed_gpu_timings: std.ArrayList(GpuTiming) = .empty,
+completed_gpu_timing_high_water: usize = 0,
+gpu_timing_drops: u64 = 0,
 format: vk.Format,
 swap_red_blue: bool,
 render_pass: vk.RenderPass,
@@ -2139,8 +2140,6 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
         .timestamp_valid_bits = timestamp_valid_bits,
         .timestamp_period = timestamp_period,
         .scanout_sync_enabled = sync_fd_capable,
-        .completed_gpu_timings = undefined,
-        .completed_gpu_timing_count = 0,
         .format = format,
         .swap_red_blue = format == .r8g8b8a8_unorm,
         .render_pass = graphics.render_pass,
@@ -2204,6 +2203,7 @@ pub fn init(allocator: std.mem.Allocator, drm_device_id: ?render.DrmDeviceId) In
 pub fn deinit(self: *Self) void {
     self.device_wrapper.deviceWaitIdle(self.device) catch {};
     self.releaseAllPendingAfterDeviceIdle();
+    self.completed_gpu_timings.deinit(self.allocator);
     self.fallback.deinit();
     self.destroyCachedResources();
     for (self.wait_semaphore_pool.items) |semaphore| {
@@ -2836,31 +2836,27 @@ fn finishPendingGpuTiming(self: *Self, submission: *Submission) void {
         log.warn("Vulkan timestamp queries were unavailable after fence completion", .{});
         return;
     }
-    if (self.completed_gpu_timing_count == self.completed_gpu_timings.len) {
-        log.warn("dropping Vulkan GPU timestamp because the completion queue is full", .{});
-        return;
-    }
-    self.completed_gpu_timings[self.completed_gpu_timing_count] = gpu_timing.fromTimestamps(
+    const timing = gpu_timing.fromTimestamps(
         tag,
         timestamps[0..query_count],
         plan,
         self.timestamp_valid_bits,
         self.timestamp_period,
     );
-    self.completed_gpu_timing_count += 1;
+    self.completed_gpu_timings.append(self.allocator, timing) catch {
+        self.gpu_timing_drops +|= 1;
+        log.warn("dropping Vulkan GPU timestamp because the completion queue could not grow", .{});
+        return;
+    };
+    self.completed_gpu_timing_high_water = @max(
+        self.completed_gpu_timing_high_water,
+        self.completed_gpu_timings.items.len,
+    );
 }
 
 pub fn takeGpuTiming(self: *Self) ?GpuTiming {
-    if (self.completed_gpu_timing_count == 0) return null;
-    const timing = self.completed_gpu_timings[0];
-    if (self.completed_gpu_timing_count > 1) {
-        @memmove(
-            self.completed_gpu_timings[0 .. self.completed_gpu_timing_count - 1],
-            self.completed_gpu_timings[1..self.completed_gpu_timing_count],
-        );
-    }
-    self.completed_gpu_timing_count -= 1;
-    return timing;
+    if (self.completed_gpu_timings.items.len == 0) return null;
+    return self.completed_gpu_timings.orderedRemove(0);
 }
 
 pub fn discardGpuTimings(self: *Self) void {
@@ -2868,7 +2864,7 @@ pub fn discardGpuTimings(self: *Self) void {
     while (iterator.next()) |output| {
         for (&output.submissions) |*submission| submission.pending_gpu_sample_tag = null;
     }
-    self.completed_gpu_timing_count = 0;
+    self.completed_gpu_timings.clearRetainingCapacity();
 }
 
 /// Monotonic clock read for measuring in-process wait durations. Returns 0
@@ -2886,6 +2882,8 @@ pub fn resetStatistics(self: *Self) void {
     self.submission_overlap_frames = 0;
     self.submission_slot_waits = 0;
     self.submission_slot_wait_nanoseconds = 0;
+    self.completed_gpu_timing_high_water = self.completed_gpu_timings.items.len;
+    self.gpu_timing_drops = 0;
 }
 
 pub fn resourceStatistics(self: *const Self) render.ResourceStatistics {
@@ -2897,6 +2895,9 @@ pub fn resourceStatistics(self: *const Self) render.ResourceStatistics {
         .submission_overlap_frames = self.submission_overlap_frames,
         .submission_slot_waits = self.submission_slot_waits,
         .submission_slot_wait_nanoseconds = self.submission_slot_wait_nanoseconds,
+        .pending_gpu_timings = self.completed_gpu_timings.items.len,
+        .gpu_timing_queue_high_water = self.completed_gpu_timing_high_water,
+        .gpu_timing_drops = self.gpu_timing_drops,
     };
     var target_iterator = self.outputs.iterator();
     while (target_iterator.next()) |entry| {
@@ -9989,6 +9990,51 @@ test "Vulkan renderer reports tagged GPU timestamps for cached frames" {
     try std.testing.expectEqual(@as(u64, 19), cached_timing.tag);
     try std.testing.expect(cached_timing.pass_timings_available);
     try std.testing.expect(renderer.takeGpuTiming() == null);
+}
+
+test "Vulkan renderer retains timings from every submission drained in a batch" {
+    var renderer = Self.init(std.testing.allocator, null) catch |err| switch (err) {
+        error.VulkanUnavailable, error.NoPhysicalDevice, error.NoQueueFamily => return error.SkipZigTest,
+        else => return err,
+    };
+    defer renderer.deinit();
+
+    var targets: [4]render.OffscreenTarget = undefined;
+    var target_count: usize = 0;
+    defer for (targets[0..target_count]) |target| {
+        renderer.releaseOutput(.{ .offscreen = target.id });
+    };
+    while (target_count < targets.len) : (target_count += 1) {
+        targets[target_count] = try renderer.createOffscreenTarget(.{ .width = 1, .height = 1 });
+    }
+    if (renderer.outputs.getPtr(.{ .offscreen = targets[0].id }).?.submissions[0].timestamp_query_pool == .null_handle) {
+        return error.SkipZigTest;
+    }
+    const frame: render.Frame = .{
+        .size = .{ .width = 1, .height = 1 },
+        .commands = &.{.{ .clear = render.Color.rgba(1, 2, 3, 255) }},
+    };
+    var tag: u64 = 1;
+    for (0..submission_ring_size) |_| {
+        for (targets) |target| {
+            _ = try renderer.renderFrameScanout(frame, .{ .offscreen = target }, tag);
+            tag += 1;
+        }
+    }
+
+    try renderer.drainAllPending();
+    var found: [targets.len * submission_ring_size]bool = @splat(false);
+    var timing_count: usize = 0;
+    while (renderer.takeGpuTiming()) |timing| {
+        try std.testing.expect(timing.tag >= 1 and timing.tag <= found.len);
+        const index: usize = @intCast(timing.tag - 1);
+        try std.testing.expect(!found[index]);
+        found[index] = true;
+        timing_count += 1;
+    }
+    try std.testing.expectEqual(found.len, timing_count);
+    try std.testing.expectEqual(@as(u64, 0), renderer.gpu_timing_drops);
+    try std.testing.expectEqual(found.len, renderer.completed_gpu_timing_high_water);
 }
 
 test "Vulkan renderer keeps independent output submissions in flight" {

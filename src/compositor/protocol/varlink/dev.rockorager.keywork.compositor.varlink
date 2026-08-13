@@ -163,6 +163,10 @@ type OutputStatistics (
     # deadline, and frames without trustworthy GPU completion timing.
     renderBudgetResetsMissedDeadline: int,
     renderBudgetResetsNoTiming: int,
+    # Lateness beyond the predicted vblank for the most recent and worst
+    # missed repaint deadline since the last statistics reset.
+    renderBudgetLastMissMicroseconds: int,
+    renderBudgetMaximumMissMicroseconds: int,
     # Current warmed worst-case render cost driving repaint delays, or 0 while
     # the sample window is not full and delays are disabled.
     renderBudgetMicroseconds: int,
@@ -200,6 +204,11 @@ type ResourceStatistics (
     importedTextures: int,
     pendingTextures: int,
     pendingGpuSubmissions: int,
+    # Completed GPU timing samples waiting for collection, the highest queue
+    # depth since reset, and samples dropped because the queue could not grow.
+    pendingGpuTimings: int,
+    gpuTimingQueueHighWater: int,
+    gpuTimingDrops: int,
     calibrationTextures: int,
     videoGraphicsPipelines: int,
     blurScratchImages: int,

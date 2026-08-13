@@ -1619,6 +1619,7 @@ const embedded_xdg_source = @embedFile("xdg.lua");
 const embedded_xdg_applications_source = @embedFile("xdg_applications.lua");
 const embedded_notify_source = @embedFile("notify.lua");
 const embedded_portal_source = @embedFile("portal.lua");
+const embedded_secrets_source = @embedFile("secrets.lua");
 
 fn installKeyworkModule(lua_state: *c.lua_State, app: *App) !void {
     try installLocalModuleLoader(lua_state, app);
@@ -1653,6 +1654,7 @@ fn installKeyworkModule(lua_state: *c.lua_State, app: *App) !void {
         .{ .name = "keywork.xdg.applications", .loader = xdgApplicationsModuleLoader },
         .{ .name = "keywork.notify", .loader = notifyModuleLoader },
         .{ .name = "keywork.portal", .loader = portalModuleLoader },
+        .{ .name = "keywork.secrets", .loader = secretsModuleLoader },
         .{ .name = "keywork.test", .loader = lua_testing.moduleLoader, .test_only = true },
     };
     for (modules) |module| {
@@ -1910,6 +1912,10 @@ fn notifyModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 
 fn portalModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     return loadEmbeddedModule(lua_state_optional.?, embedded_portal_source, "@keywork/portal.lua");
+}
+
+fn secretsModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    return loadEmbeddedModule(lua_state_optional.?, embedded_secrets_source, "@keywork/secrets.lua");
 }
 
 fn dbusModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
@@ -5631,6 +5637,12 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "share/applications/org/example");
+    try tmp.dir.symLink(
+        std.testing.io,
+        ".",
+        "share/applications/loop",
+        .{ .is_directory = true },
+    );
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "share/applications/editor.desktop",
         .data =
@@ -5718,10 +5730,21 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\assert(uris[1] == "viewer")
         \\assert(uris[2] == "file:///tmp/a%20b.txt")
         \\
+        \\-- %F converts only local file URIs; remote authorities stay URIs
+        \\local file_args = assert(apps.exec_argv(plain, {
+        \\  uris = { "file://fileserver/share/remote.txt", "file://localhost/tmp/local%20file.txt" },
+        \\}))
+        \\assert(file_args[5] == "/tmp/local file.txt")
+        \\assert(file_args[6] == "--icon-args")
+        \\
         \\-- action Exec replaces the entry Exec
         \\local action_argv = assert(apps.exec_argv(plain, { action = "new-window" }))
         \\assert(action_argv[1] == "editor")
         \\assert(action_argv[2] == "--new-window")
+        \\
+        \\-- symlink cycles are visited once rather than blocking launcher enumeration
+        \\local listed = apps.list({ dirs = dirs })
+        \\assert(#listed == 2)
         \\xdg_done = true
         \\end)
         \\

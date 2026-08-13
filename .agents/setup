@@ -77,8 +77,8 @@ EOF
     fi
     sudo apt-get update
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        bison build-essential ca-certificates curl dbus-daemon ffmpeg git gperf meson ninja-build \
-        nodejs npm pkg-config \
+        bison build-essential ca-certificates curl dbus-daemon git gperf meson ninja-build \
+        pkg-config \
         python3 python3-jinja2 xz-utils \
         glslc libcurl4-openssl-dev libfontconfig1-dev \
         libaudit-dev libcap-dev libexpat1-dev libffi-dev libfreetype-dev libgbm-dev \
@@ -175,29 +175,6 @@ if [[ "$(zig version 2>/dev/null || true)" != 0.16.0 ]]; then
     sudo mv "$temporary/zig-x86_64-linux-0.16.0" /opt/zig-0.16.0
     sudo ln -sfn /opt/zig-0.16.0/zig /usr/local/bin/zig
     rm -rf "$temporary"
-fi
-
-if [[ "$(go version 2>/dev/null || true)" != "go version go1.26.5 linux/amd64" ]]; then
-    echo "Installing Go 1.26.5"
-    temporary="$(mktemp -d)"
-    archive="$temporary/go.tar.gz"
-    download \
-        https://go.dev/dl/go1.26.5.linux-amd64.tar.gz \
-        5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053 \
-        "$archive"
-    sudo rm -rf /opt/go-1.26.5
-    sudo mkdir -p /opt/go-1.26.5
-    sudo tar -xzf "$archive" -C /opt/go-1.26.5 --strip-components=1
-    sudo ln -sfn /opt/go-1.26.5/bin/go /usr/local/bin/go
-    sudo ln -sfn /opt/go-1.26.5/bin/gofmt /usr/local/bin/gofmt
-    rm -rf "$temporary"
-fi
-
-if ! command -v ffmpeg >/dev/null || ! command -v node >/dev/null || ! command -v npm >/dev/null; then
-    echo "Installing browser-streaming tools"
-    sudo apt-get update
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ffmpeg nodejs npm
 fi
 
 if ! command -v zigdoc >/dev/null || ! zigdoc --help >/dev/null 2>&1; then

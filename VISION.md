@@ -20,6 +20,10 @@ Varlink-first service IPC, D-Bus compatibility, PipeWire, XDG integration,
 processes, timers, robust client-side networking — built on the same event
 loop that drives the UI.
 
+Applications use `keywork.secrets` to look up, store, and delete credentials
+through the standard freedesktop.org Secret Service API. Keywork remains
+provider-neutral and does not introduce its own secret storage protocol.
+
 ## Principles
 
 1. **Low resource usage, high performance.** The native engine does the

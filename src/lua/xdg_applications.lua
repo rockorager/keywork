@@ -163,8 +163,11 @@ local function to_file_uri(path)
 end
 
 local function to_path(uri)
-    local path = uri:match("^file://([^#?]*)")
+    local authority, path = uri:match("^file://([^/?#]*)(/[^#?]*)")
     if not path then
+        return nil
+    end
+    if authority ~= "" and authority:lower() ~= "localhost" then
         return nil
     end
     return (path:gsub("%%(%x%x)", function(hex)
@@ -333,8 +336,19 @@ function M.list(opts)
     local fs = require("keywork.fs")
     local entries = {}
     local claimed = {}
+    local visited = {}
     local function scan(base, rel)
         local dir = rel == "" and base or (base .. "/" .. rel)
+        local stat = fs.stat(dir)
+        if not stat then
+            return
+        end
+        if stat.identity then
+            if visited[stat.identity] then
+                return
+            end
+            visited[stat.identity] = true
+        end
         local items = fs.list(dir)
         if not items then
             return

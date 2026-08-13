@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 12 ]]; then
-    echo "usage: package-release VERSION TARGET OPTIMIZE COMPOSITOR STREAMD GATEWAY SDK_DIR LICENSE STREAM_README BUILD_ZON WAYLAND_LICENSE OUTPUT_DIR" >&2
+if [[ $# -ne 9 ]]; then
+    echo "usage: package-release VERSION TARGET OPTIMIZE COMPOSITOR LICENSE README BUILD_ZON WAYLAND_LICENSE OUTPUT_DIR" >&2
     exit 2
 fi
 
@@ -10,14 +10,11 @@ version=$1
 target=$2
 optimize=$3
 compositor=$4
-streamd=$5
-gateway=$6
-sdk_dir=$7
-license=$8
-stream_readme=$9
-build_zon=${10}
-wayland_license=${11}
-output=${12}
+license=$5
+readme=$6
+build_zon=$7
+wayland_license=$8
+output=$9
 
 if [[ "$optimize" != ReleaseSafe ]]; then
     echo "release packages require -Doptimize=ReleaseSafe" >&2
@@ -25,9 +22,8 @@ if [[ "$optimize" != ReleaseSafe ]]; then
 fi
 
 zon_version="$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)",/\1/p' "$build_zon" | head -n 1)"
-sdk_version="$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).version' "$sdk_dir/package.json")"
-if [[ "$zon_version" != "$version" || "$sdk_version" != "$version" ]]; then
-    printf 'release version mismatch: build=%s zon=%s npm=%s\n' "$version" "$zon_version" "$sdk_version" >&2
+if [[ "$zon_version" != "$version" ]]; then
+    printf 'release version mismatch: build=%s zon=%s\n' "$version" "$zon_version" >&2
     exit 1
 fi
 
@@ -39,11 +35,9 @@ bundle_name="keywork-$version-$target"
 mkdir -p "$temporary/$bundle_name/bin"
 mkdir -p "$temporary/$bundle_name/LICENSES"
 install -m0755 "$compositor" "$temporary/$bundle_name/bin/keywork-compositor"
-install -m0755 "$streamd" "$temporary/$bundle_name/bin/keywork-streamd"
-install -m0755 "$gateway" "$temporary/$bundle_name/bin/keywork-stream-gateway"
 install -m0644 "$license" "$temporary/$bundle_name/LICENSE"
 install -m0644 "$wayland_license" "$temporary/$bundle_name/LICENSES/wayland.txt"
-install -m0644 "$stream_readme" "$temporary/$bundle_name/README.md"
+install -m0644 "$readme" "$temporary/$bundle_name/README.md"
 
 archive() {
     local name=$1
@@ -59,10 +53,9 @@ archive() {
 }
 
 archive "$bundle_name"
-npm pack "$sdk_dir" --pack-destination "$output" --silent >/dev/null
 
 (
     cd "$output"
     export LC_ALL=C
-    sha256sum -- *.tar.gz *.tgz >SHA256SUMS
+    sha256sum -- *.tar.gz >SHA256SUMS
 )

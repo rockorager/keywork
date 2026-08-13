@@ -7,7 +7,6 @@ const release = @import("build/release.zig");
 const runtime = @import("build/runtime.zig");
 const shell = @import("build/shell.zig");
 const static_wayland = @import("build/static_wayland.zig");
-const stream = @import("build/stream.zig");
 const ui = @import("build/ui.zig");
 const version = @import("build/version.zig");
 
@@ -51,16 +50,6 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(lint_step);
 
     const wayland = static_wayland.add(b, target, optimize);
-    const stream_output = stream.add(
-        b,
-        target,
-        optimize,
-        build_options,
-        wayland,
-        wayland.wayland_xml,
-        wayland.protocols,
-        test_step,
-    );
     const ui_output = ui.add(b, target, optimize, test_step);
     const runtime_output = runtime.add(
         b,
@@ -104,7 +93,6 @@ pub fn build(b: *std.Build) void {
         optimize,
         version.string,
         compositor_output.executable,
-        stream_output,
     );
     keyworkctl.add(
         b,
