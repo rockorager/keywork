@@ -529,21 +529,27 @@ local function invoke(server, notification, action)
     server:invoke(notification.id, action.key, token)
 end
 
-local function action_buttons(server, notification, on_hover)
+local function action_buttons(server, notification, on_hover, scoped_actions)
     local buttons = {}
     for _, action in ipairs(notification.actions) do
         if action.key ~= "default" and #buttons < 3 then
             local current = action
+            local capability = kw.action({
+                id = "notification." .. notification.id .. "." .. current.key,
+                activate = function()
+                    invoke(server, notification, current)
+                end,
+            })
+            scoped_actions[#scoped_actions + 1] = capability
+            local command = kw.command({ title = current.label, intent = capability })
             buttons[#buttons + 1] = kw.expanded({
                 child = kw.button({
                     id = "notification-action-" .. notification.id .. "-" .. current.key,
-                    label = current.label,
+                    label = command.title,
                     size = "small",
                     appearance = "secondary",
                     on_hover = on_hover,
-                    on_activate = function()
-                        invoke(server, notification, current)
-                    end,
+                    intent = command.intent,
                 }),
             })
         end
@@ -562,7 +568,8 @@ local NotificationCard = kw.component({
         local on_hover = function(hovered)
             server:set_hovered(notification.id, hovered)
         end
-        local actions = action_buttons(server, notification, on_hover)
+        local scoped_actions = {}
+        local actions = action_buttons(server, notification, on_hover, scoped_actions)
         local icon
         if notification.image then
             icon = kw.image({
@@ -595,15 +602,20 @@ local NotificationCard = kw.component({
             }),
             kw.spacer(),
         }
+        local dismiss = kw.action({
+            id = "notification." .. notification.id .. ".dismiss",
+            activate = function()
+                server:dismiss(notification.id)
+            end,
+        })
+        scoped_actions[#scoped_actions + 1] = dismiss
         header[#header + 1] = kw.icon_button({
             id = "notification-close-" .. notification.id,
             icon = "window-close",
             size = "small",
             appearance = "subtle",
             on_hover = on_hover,
-            on_activate = function()
-                server:dismiss(notification.id)
-            end,
+            intent = dismiss,
         })
 
         local text_children = {
@@ -636,12 +648,17 @@ local NotificationCard = kw.component({
             },
         })
         if action then
+            local invoke_default = kw.action({
+                id = "notification." .. notification.id .. ".default",
+                activate = function()
+                    invoke(server, notification, action)
+                end,
+            })
+            scoped_actions[#scoped_actions + 1] = invoke_default
             content = kw.pressable({
                 id = "notification-content-" .. notification.id,
                 on_hover = on_hover,
-                on_activate = function()
-                    invoke(server, notification, action)
-                end,
+                intent = invoke_default,
                 child = content,
             })
         end
@@ -669,10 +686,13 @@ local NotificationCard = kw.component({
                 children = children,
             }),
         })
-        return kw.gesture_detector({
-            id = "notification-hover-" .. notification.id,
-            on_hover = on_hover,
-            child = card,
+        return kw.action_scope({
+            actions = scoped_actions,
+            child = kw.gesture_detector({
+                id = "notification-hover-" .. notification.id,
+                on_hover = on_hover,
+                child = card,
+            }),
         })
     end,
 })
