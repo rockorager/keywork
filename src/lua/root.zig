@@ -5572,6 +5572,13 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\assert(uris[1] == "viewer")
         \\assert(uris[2] == "file:///tmp/a%20b.txt")
         \\
+        \\-- %F converts only local file URIs; remote authorities stay URIs
+        \\local file_args = assert(apps.exec_argv(plain, {
+        \\  uris = { "file://fileserver/share/remote.txt", "file://localhost/tmp/local%20file.txt" },
+        \\}))
+        \\assert(file_args[5] == "/tmp/local file.txt")
+        \\assert(file_args[6] == "--icon-args")
+        \\
         \\-- action Exec replaces the entry Exec
         \\local action_argv = assert(apps.exec_argv(plain, { action = "new-window" }))
         \\assert(action_argv[1] == "editor")

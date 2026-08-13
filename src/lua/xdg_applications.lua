@@ -163,8 +163,11 @@ local function to_file_uri(path)
 end
 
 local function to_path(uri)
-    local path = uri:match("^file://([^#?]*)")
+    local authority, path = uri:match("^file://([^/?#]*)(/[^#?]*)")
     if not path then
+        return nil
+    end
+    if authority ~= "" and authority:lower() ~= "localhost" then
         return nil
     end
     return (path:gsub("%%(%x%x)", function(hex)
