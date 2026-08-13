@@ -131,7 +131,7 @@ pub const LuaProcess = struct {
         }
 
         const pid: linux.pid_t = @intCast(fork_result);
-        errdefer _ = linux.kill(pid, .TERM);
+        errdefer terminateAndReap(pid);
         var result: LuaProcess = .{
             .host = host,
             .pid = pid,
@@ -289,11 +289,7 @@ pub const LuaProcess = struct {
     }
 
     pub fn cleanup(self: *LuaProcess, lua_state: *c.lua_State) void {
-        if (!self.exited and !self.canceled) {
-            _ = linux.kill(self.pid, .TERM);
-            var status: u32 = 0;
-            _ = linux.waitpid(self.pid, &status, linux.W.NOHANG);
-        }
+        if (!self.exited) terminateAndReap(self.pid);
         self.closeFds(lua_state, .silent);
         // Free queued output that no reader will consume.
         self.stdout_pipe.stream.cancel(self.host.allocator(), lua_state, .silent);
@@ -307,13 +303,52 @@ pub const LuaProcess = struct {
 
     pub fn destroy(self: *LuaProcess, allocator: std.mem.Allocator, lua_state: *c.lua_State) void {
         self.cancel(lua_state, .silent);
-        if (!self.exited) {
-            var status: u32 = 0;
-            _ = linux.waitpid(self.pid, &status, linux.W.NOHANG);
-        }
         self.deinit(allocator, lua_state);
     }
 };
+
+/// Terminates a child whose owner is being destroyed and guarantees that its
+/// process-table entry is reaped. The initial nonblocking wait preserves a
+/// graceful SIGTERM exit when it completes immediately; once no owner remains
+/// to observe the pidfd, escalation is required to avoid leaving a zombie.
+fn terminateAndReap(pid: linux.pid_t) void {
+    _ = linux.kill(pid, .TERM);
+    var status: u32 = 0;
+    while (true) {
+        const result = linux.waitpid(pid, &status, linux.W.NOHANG);
+        switch (linux.errno(result)) {
+            .SUCCESS => if (result != 0) return else break,
+            .INTR => continue,
+            .CHILD => return,
+            else => break,
+        }
+    }
+
+    _ = linux.kill(pid, .KILL);
+    while (true) {
+        switch (linux.errno(linux.waitpid(pid, &status, 0))) {
+            .SUCCESS, .CHILD => return,
+            .INTR => continue,
+            else => return,
+        }
+    }
+}
+
+test "terminating an owned child always reaps it" {
+    const fork_result = linux.fork();
+    try linux_syscall.check(fork_result);
+    if (fork_result == 0) {
+        while (true) _ = linux.pause();
+    }
+
+    const pid: linux.pid_t = @intCast(fork_result);
+    terminateAndReap(pid);
+    var status: u32 = 0;
+    try std.testing.expectEqual(
+        linux.E.CHILD,
+        linux.errno(linux.waitpid(pid, &status, linux.W.NOHANG)),
+    );
+}
 
 pub fn parseArgv(lua_state: *c.lua_State, allocator: std.mem.Allocator, table: c_int) ![]const []const u8 {
     c.lua_getfield(lua_state, table, "argv");
