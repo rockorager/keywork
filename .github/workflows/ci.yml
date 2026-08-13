@@ -41,7 +41,7 @@ jobs:
         run: bash -n scripts/package-release
 
       - name: Build release packages
-        run: zig build release -Doptimize=ReleaseSafe
+        run: zig build release -Doptimize=ReleaseSafe -Dcpu=baseline
 
       - name: Verify release packages
         shell: bash
