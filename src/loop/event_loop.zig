@@ -562,6 +562,7 @@ pub const EventLoop = struct {
 
     pub fn addRepeatingTimer(self: *EventLoop, interval_ms: u64, ctx: *anyopaque, callback: TimerCallback) !void {
         const timer = try self.addTimer(ctx, callback);
+        errdefer self.removeTimer(timer);
         try timer.arm(interval_ms, interval_ms);
     }
 
@@ -1079,6 +1080,25 @@ test "repeating timer fires and can quit the loop" {
     try loop.run();
 
     try std.testing.expect(context.fired > 0);
+}
+
+test "failed repeating timer setup removes its timer and source" {
+    const TimerTest = struct {
+        fn callback(_: *anyopaque, _: *EventLoop, _: u64) !void {}
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+
+    var context: u8 = 0;
+    try std.testing.expectError(
+        error.InvalidTimerInterval,
+        loop.addRepeatingTimer(0, &context, TimerTest.callback),
+    );
+    try std.testing.expectEqual(@as(usize, 0), loop.timers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), loop.sources.items.len);
+    try std.testing.expect(loop.sources.items[0].source == null);
+    try std.testing.expectEqual(@as(usize, 1), loop.free_slots.items.len);
 }
 
 test "quit before run is consumed without poisoning a later run" {
