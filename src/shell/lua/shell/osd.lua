@@ -33,32 +33,10 @@ local function icon_for(kind, value, muted)
     return prefix .. "-high"
 end
 
-local function level_bar(theme, value, muted)
-    local fill_width = math.floor(TRACK_WIDTH * (muted and 0 or clamp(value, 0, 1)) + 0.5)
-    local track_height = theme.space[1]
-    local fill = kw.sized_box({
-        width = fill_width,
-        height = track_height,
-        child = kw.container({
-            background = theme.colors.accent,
-            radius = theme.radius[6],
-            min_width = fill_width,
-            min_height = track_height,
-            child = kw.text(""),
-        }),
-    })
-    return kw.sized_box({
+local function level_bar(value, muted)
+    return kw.progress_bar({
+        value = muted and 0 or value,
         width = TRACK_WIDTH,
-        height = track_height,
-        child = kw.container({
-            background = theme.colors.fill_secondary,
-            radius = theme.radius[6],
-            min_width = TRACK_WIDTH,
-            min_height = track_height,
-            horizontal_align = "start",
-            vertical_align = "center",
-            child = fill,
-        }),
     })
 end
 
@@ -91,7 +69,7 @@ local Level = kw.component({
                         size = theme.space[5],
                         color = muted and theme.colors.text_tertiary or theme.colors.text,
                     }),
-                    level_bar(theme, value, muted),
+                    level_bar(value, muted),
                 },
             }),
         })
