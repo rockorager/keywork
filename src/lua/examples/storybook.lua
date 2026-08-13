@@ -116,5 +116,52 @@ return sb.book({
                 )
             end,
         }),
+        sb.story({
+            id = "composition/commands",
+            group = "Composition",
+            name = "Actions and commands",
+            viewport = { width = 480, height = 420 },
+            render = function(context)
+                local theme = kw.theme_for(context)
+                local open = kw.action({ id = "document.open", activate = function() end })
+                local share = kw.action({ id = "document.share", activate = function() end })
+                local archive = kw.action({
+                    id = "document.archive",
+                    enabled = false,
+                    activate = function() end,
+                })
+                local commands = {
+                    kw.command({ title = "Open", icon = "document", intent = open }),
+                    kw.command({ title = "Share", icon = "document-send", intent = share }),
+                    kw.command({ title = "Archive", icon = "archive", intent = archive }),
+                }
+                return kw.action_scope({
+                    actions = { open, share, archive },
+                    child = kw.padding({
+                        all = theme.space[4],
+                        child = kw.card({
+                            child = kw.column({
+                                spacing = theme.space[4],
+                                children = {
+                                    kw.text("Agent-composed workspace", { role = "title" }),
+                                    kw.progress_bar({ value = 0.65, width = 400 }),
+                                    kw.list_item({
+                                        id = "recent-document",
+                                        title = "Quarterly plan",
+                                        subtitle = "Edited a few minutes ago",
+                                        leading = kw.icon({ name = "document" }),
+                                        intent = open,
+                                    }),
+                                    kw.command_menu({
+                                        id = "document-actions",
+                                        commands = commands,
+                                    }),
+                                },
+                            }),
+                        }),
+                    }),
+                })
+            end,
+        }),
     },
 })
