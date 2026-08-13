@@ -161,47 +161,31 @@ local function divider()
     return kw.separator({})
 end
 
-local function result_row(self, index, entry, theme)
+local function result_row(self, index, entry, command, theme)
     local selected = index == self.selected
-    local row_height = theme.components.menu.item.min_height + theme.space[3]
-    return kw.pressable({
+    return kw.list_item({
         id = "result-" .. entry.id,
+        title = command.title,
+        leading = entry_icon(entry, theme.space[5], theme),
+        trailing = kw.text(command.subtitle or "", { color = theme.colors.text_tertiary }),
+        selected = selected,
+        intent = command.intent,
         -- Raycast model: one highlight. Pointer hover moves the selection
-    -- instead of painting a second hover state; keyboard and mouse
-    -- drive the same index. Hover only fires on real pointer motion,
-    -- so keyboard-driven list scrolling can't yank the selection back.
-    -- While the actions menu is open the selection is pinned: moving
-    -- it would silently retarget the open menu.
+        -- instead of painting a second hover state; keyboard and mouse
+        -- drive the same index. Hover only fires on real pointer motion,
+        -- so keyboard-driven list scrolling can't yank the selection back.
+        -- While the actions menu is open the selection is pinned: moving
+        -- it would silently retarget the open menu.
         on_hover = function(hovered)
             if hovered and not self.actions_open and self.selected ~= index then
                 self.selected = index
                 self:mutate()
             end
         end,
-        on_activate = function()
-            run_action(self, entry, entry.actions[1])
-        end,
-        child = kw.container({
-            background = selected and theme.components.menu.item.selected_background or nil,
-            radius = theme.components.menu.item.radius,
-            min_height = row_height,
-            vertical_align = "center",
-            padding = { x = theme.components.menu.item.padding_x },
-            child = kw.row({
-                spacing = theme.space[3],
-                align = "center",
-                children = {
-                    entry_icon(entry, theme.space[5], theme),
-                    kw.text(entry.title),
-                    kw.spacer(),
-                    kw.text(entry.subtitle or "", { color = theme.colors.text_tertiary }),
-                },
-            }),
-        }),
     })
 end
 
-local function result_list(self, theme)
+local function result_list(self, entry_commands, theme)
     local row_height = theme.components.menu.item.min_height + theme.space[3]
     if #self.results == 0 then
         return kw.container({
@@ -218,7 +202,8 @@ local function result_list(self, theme)
         item_extent = row_height,
         reveal_index = self.selected,
         build_item = function(index)
-            return result_row(self, index, self.results[index], theme)
+            local entry = self.results[index]
+            return result_row(self, index, entry, entry_commands[entry].primary, theme)
         end,
     })
 end
@@ -226,34 +211,21 @@ end
 -- The actions menu for the selected entry, shown as a popup anchored to
 -- the footer's actions hint. Selection mirrors the result list: one
 -- highlight driven by both keyboard and pointer.
-local function action_menu(self, entry)
-    local rows = {}
-    for index, action in ipairs(entry.actions) do
-        local selected = index == self.action_selected
-        table.insert(
-            rows,
-            kw.menu_item({
-                id = "action-" .. index,
-                selected = selected,
-                on_hover = function(hovered)
-                    if hovered and self.action_selected ~= index then
-                        self.action_selected = index
-                        self:mutate()
-                    end
-                end,
-                on_activate = function()
-                    run_action(self, entry, action)
-                end,
-                child = kw.text(action.title),
-            })
-        )
-    end
-    return kw.menu_surface({
-        child = kw.column({ align = "stretch", children = rows }),
+local function action_menu(self, commands)
+    return kw.command_menu({
+        id = "entry-actions",
+        commands = commands,
+        selected = self.action_selected,
+        on_hover = function(_, index, hovered)
+            if hovered and self.action_selected ~= index then
+                self.action_selected = index
+                self:mutate()
+            end
+        end,
     })
 end
 
-local function footer(self, theme)
+local function footer(self, entry_commands, theme)
     local hint_color = theme.colors.text_tertiary
     -- One step below the label role (font_size[2]).
     local hint_size = theme.font_size[1]
@@ -286,11 +258,15 @@ local function footer(self, theme)
                     placement = { edge = "top", alignment = "end", gap = theme.space[2] },
                     width = 260,
                     content = function()
-                        return action_menu(self, entry)
+                        local model = entry_commands[entry]
+                        return kw.action_scope({
+                            actions = model.actions,
+                            child = action_menu(self, model.commands),
+                        })
                     end,
                     -- Escape with the menu open lands here (the runtime routes
-            -- it to popups first), so it closes the menu, not the
-            -- launcher.
+                    -- it to popups first), so it closes the menu, not the
+                    -- launcher.
                     on_close = function()
                         close_actions(self)
                     end,
@@ -299,6 +275,68 @@ local function footer(self, theme)
             },
         }),
     })
+end
+
+local function build_commands(self)
+    local scoped_actions = {}
+    local entry_commands = {}
+    for _, entry in ipairs(self.results) do
+        local commands = {}
+        local actions = {}
+        for index, provider_action in ipairs(entry.actions) do
+            local action = kw.action({
+                id = "launcher.entry." .. entry.id .. "." .. index,
+                activate = function()
+                    run_action(self, entry, provider_action)
+                end,
+            })
+            table.insert(scoped_actions, action)
+            table.insert(actions, action)
+            table.insert(
+                commands,
+                kw.command({
+                    id = tostring(index),
+                    title = provider_action.title,
+                    intent = action,
+                })
+            )
+        end
+        entry_commands[entry] = {
+            primary = kw.command({
+                id = entry.id,
+                title = entry.title,
+                subtitle = entry.subtitle,
+                icon = entry.icon,
+                intent = commands[1].intent,
+            }),
+            actions = actions,
+            commands = commands,
+        }
+    end
+
+    local function navigation_action(id, activate_navigation)
+        local action = kw.action({ id = "launcher." .. id, activate = activate_navigation })
+        table.insert(scoped_actions, action)
+        return action
+    end
+    local navigation = {
+        activate = navigation_action("activate", function()
+            activate(self)
+        end),
+        next = navigation_action("next", function()
+            move_selection(self, 1)
+        end),
+        previous = navigation_action("previous", function()
+            move_selection(self, -1)
+        end),
+        actions = navigation_action("actions", function()
+            toggle_actions(self)
+        end),
+        dismiss = navigation_action("dismiss", function()
+            dismiss(self)
+        end),
+    }
+    return scoped_actions, entry_commands, navigation
 end
 
 -- Launcher view hosted inside the shell's launcher window. The window's
@@ -339,6 +377,7 @@ local Launcher = kw.component({
     build = function(self, context)
         self.revision()
         local theme = context.theme
+        local scoped_actions, entry_commands, navigation = build_commands(self)
 
         local content = kw.column({
             align = "stretch",
@@ -346,38 +385,27 @@ local Launcher = kw.component({
                 search_field(self, theme),
                 divider(),
                 -- Expanded so the list's viewport is the remaining window
-        -- height; the visible row count derives from it.
-                kw.expanded({ child = kw.container({ padding = theme.space[2], child = result_list(self, theme) }) }),
+                -- height; the visible row count derives from it.
+                kw.expanded({
+                    child = kw.container({
+                        padding = theme.space[2],
+                        child = result_list(self, entry_commands, theme),
+                    }),
+                }),
                 divider(),
-                footer(self, theme),
+                footer(self, entry_commands, theme),
             },
         })
 
-        return kw.actions({
-            bindings = {
-                activate = function()
-                    activate(self)
-                end,
-                next = function()
-                    move_selection(self, 1)
-                end,
-                previous = function()
-                    move_selection(self, -1)
-                end,
-                actions = function()
-                    toggle_actions(self)
-                end,
-                dismiss = function()
-                    dismiss(self)
-                end,
-            },
+        return kw.action_scope({
+            actions = scoped_actions,
             child = kw.shortcuts({
                 bindings = {
-                    enter = "activate",
-                    down = "next",
-                    up = "previous",
-                    tab = "actions",
-                    escape = "dismiss",
+                    enter = navigation.activate,
+                    down = navigation.next,
+                    up = navigation.previous,
+                    tab = navigation.actions,
+                    escape = navigation.dismiss,
                 },
                 child = kw.container({
                     background = theme.colors.surface,

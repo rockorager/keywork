@@ -1504,7 +1504,7 @@ function ui.command_menu(options)
         table.insert(children, command_menu_item(command, options, index))
     end
     return ui.menu_surface({
-        child = ui.column({ children = children }),
+        child = ui.column({ align = "stretch", children = children }),
     })
 end
 
