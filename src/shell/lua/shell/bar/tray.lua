@@ -629,17 +629,23 @@ local TrayItems = kw.component({
                     width = 320,
                     content = function()
                         local rows = {}
+                        local actions = {}
                         if self.menu_loading then
                             rows[1] = kw.menu_label({ text = "Loading…" })
                         else
                             local page = self.menu_pages[#self.menu_pages]
                             local last_was_separator = true
                             if #self.menu_pages > 1 then
-                                rows[#rows + 1] = kw.menu_item({
-                                    id = "tray-menu-back-" .. item.id,
-                                    on_activate = function()
+                                local back = kw.action({
+                                    id = "tray." .. item.id .. ".back",
+                                    activate = function()
                                         self:close_submenu()
                                     end,
+                                })
+                                actions[#actions + 1] = back
+                                rows[#rows + 1] = kw.menu_item({
+                                    id = "tray-menu-back-" .. item.id,
+                                    intent = back,
                                     child = kw.row({
                                         spacing = palette.space[2],
                                         align = "center",
@@ -686,12 +692,17 @@ local TrayItems = kw.component({
                                         end
                                         local shortcut = menu_shortcut(props.shortcut)
                                         local submenu = props["children-display"] == "submenu" or #node.children > 0
-                                        rows[#rows + 1] = kw.menu_item({
-                                            id = "tray-menu-" .. item.id .. "-" .. tostring(node.id),
-                                            disabled = disabled,
-                                            on_activate = function()
+                                        local activate = kw.action({
+                                            id = "tray." .. item.id .. ".menu." .. tostring(node.id),
+                                            enabled = not disabled,
+                                            activate = function()
                                                 self:activate_menu_item(node)
                                             end,
+                                        })
+                                        actions[#actions + 1] = activate
+                                        rows[#rows + 1] = kw.menu_item({
+                                            id = "tray-menu-" .. item.id .. "-" .. tostring(node.id),
+                                            intent = activate,
                                             child = kw.row({
                                                 spacing = palette.space[2],
                                                 align = "center",
@@ -735,8 +746,11 @@ local TrayItems = kw.component({
                                 rows[1] = kw.menu_label({ text = "No actions" })
                             end
                         end
-                        return kw.menu_surface({
-                            child = kw.column({ children = rows }),
+                        return kw.action_scope({
+                            actions = actions,
+                            child = kw.menu_surface({
+                                child = kw.column({ children = rows }),
+                            }),
                         })
                     end,
                     on_close = function()
