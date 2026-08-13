@@ -5092,7 +5092,10 @@ test "lua generic surfaces and progress bars resolve from the ambient theme" {
     defer runtime.deinit();
 
     try std.testing.expect(runtime.root.?.rect.width >= 120);
-    try std.testing.expectEqual(keywork.colors.neutral_background6_dark, runtime.root.?.background);
+    try runtime.repaint();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "color=#ff333333") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "color=#ff292929") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "color=#ff115ea3") != null);
 }
 
 test "lua list items and status states activate intents" {

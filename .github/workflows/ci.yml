@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 90
     container:
       image: debian:13
+      # The event loop exercises io_uring, which Docker's default profile blocks.
+      options: --security-opt seccomp=unconfined
 
     steps:
       - name: Bootstrap checkout tools
