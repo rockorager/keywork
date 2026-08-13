@@ -5022,6 +5022,47 @@ test "lua first-class actions drive controls and shortcuts through intents" {
     try expectLuaBoolean(&app, "activated", true);
 }
 
+test "lua command menus present and activate command intents" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script =
+        \\local kw = require("keywork")
+        \\opened = false
+        \\local open = kw.action({ id = "open", activate = function() opened = true end })
+        \\local unavailable = kw.action({ id = "unavailable", enabled = false, activate = function() end })
+        \\return kw.app({ child = kw.action_scope({
+        \\  actions = { open, unavailable },
+        \\  child = kw.command_menu({
+        \\    id = "file-menu",
+        \\    selected = "open",
+        \\    commands = {
+        \\      kw.command({ title = "Open", subtitle = "Open a file", icon = "folder-open", intent = open }),
+        \\      kw.command({ title = "Unavailable", intent = unavailable }),
+        \\    },
+        \\  }),
+        \\}) })
+        \\
+    ;
+    var app = try initTestApp(allocator, &tmp, "command-menu.lua", script);
+    defer app.deinit();
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    var log_backend: log_backend_mod.LogBackend = .{ .writer = &output.writer };
+    var runtime = try initTestRuntime(allocator, &log_backend, &app, .{ .max_width = 240, .max_height = 160 }, .light);
+    defer runtime.deinit();
+    app.bindRuntime(&runtime);
+
+    try std.testing.expect(keywork.findClickHitById(runtime.root.?, "file-menu:unavailable") == null);
+    const open_hit = keywork.findClickHitById(runtime.root.?, "file-menu:open").?;
+    try runtime.click(.{
+        .x = open_hit.rect.x + open_hit.rect.width / 2,
+        .y = open_hit.rect.y + open_hit.rect.height / 2,
+    });
+    try expectLuaBoolean(&app, "opened", true);
+}
+
 test "lua buttons default to release activation and accept press override" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -36,6 +36,14 @@
 ---@class keywork.Intent
 ---@field action string
 
+---@class keywork.Command
+---@field id        string
+---@field title     string
+---@field subtitle? string
+---@field icon?     string
+---@field intent    keywork.Intent
+---@field disabled  boolean
+
 ---@class keywork.Signal<T>
 ---@operator call(): T
 ---@field set fun(self: keywork.Signal<T>, value: T)
@@ -783,6 +791,20 @@ function PixelBuffer:commit(options) end
 ---@class keywork.MenuSurfaceOptions
 ---@field child keywork.Widget
 
+---@class keywork.CommandOptions
+---@field id?       string Defaults to the intent's action id.
+---@field title     string
+---@field subtitle? string
+---@field icon?     string
+---@field intent    keywork.Intent | keywork.Action | string
+---@field disabled? boolean
+
+---@class keywork.CommandMenuOptions
+---@field id        string
+---@field commands  keywork.Command[]
+---@field selected? string | integer Command id or one-based index.
+---@field on_hover? fun(command: keywork.Command, index: integer, hovered: boolean)
+
 ---@class keywork.MenuItemOptions
 ---@field id           string
 ---@field child        keywork.Widget
@@ -1088,6 +1110,10 @@ function M.icon(options) end
 ---@return keywork.Widget
 function M.menu_surface(options) end
 
+---@param options keywork.CommandMenuOptions
+---@return keywork.Widget
+function M.command_menu(options) end
+
 ---@param options keywork.MenuItemOptions
 ---@return keywork.Widget
 function M.menu_item(options) end
@@ -1139,6 +1165,10 @@ function M.action(options) end
 ---@param value keywork.Action | keywork.Intent | string
 ---@return keywork.Intent
 function M.intent(value) end
+
+---@param options keywork.CommandOptions
+---@return keywork.Command
+function M.command(options) end
 
 ---@param options keywork.ActionsOptions
 ---@return keywork.Widget

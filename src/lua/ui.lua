@@ -17,6 +17,7 @@ end
 
 local ACTION_KIND = "keywork.action"
 local INTENT_KIND = "keywork.intent"
+local COMMAND_KIND = "keywork.command"
 
 local function is_action(value)
     return type(value) == "table" and value.__keywork_kind == ACTION_KIND
@@ -86,6 +87,42 @@ local function resolve_intent(value)
     end
     local intent = ui.intent(value)
     return intent, intent._action ~= nil and not action_enabled(intent._action)
+end
+
+--- Describes how an intent should be presented. Commands are inert data: the
+--- action scope still owns execution and enabled state.
+function ui.command(options)
+    options = validate(options, { id=true, title=true, subtitle=true, icon=true, intent=true, disabled=true }, "command")
+    if type(options.title) ~= "string" or options.title == "" then
+        error("command requires a non-empty title", 2)
+    end
+    if options.subtitle ~= nil and type(options.subtitle) ~= "string" then
+        error("command subtitle must be a string", 2)
+    end
+    if options.icon ~= nil and type(options.icon) ~= "string" then
+        error("command icon must be a string", 2)
+    end
+    local intent, action_disabled = resolve_intent(options.intent)
+    if intent == nil then
+        error("command requires an intent", 2)
+    end
+    local id = options.id or intent.action
+    if type(id) ~= "string" or id == "" then
+        error("command requires a non-empty id", 2)
+    end
+    return {
+        __keywork_kind = COMMAND_KIND,
+        id = id,
+        title = options.title,
+        subtitle = options.subtitle,
+        icon = options.icon,
+        intent = intent,
+        disabled = options.disabled or action_disabled,
+    }
+end
+
+local function is_command(value)
+    return type(value) == "table" and value.__keywork_kind == COMMAND_KIND
 end
 
 local function copy_table(value)
@@ -1204,6 +1241,57 @@ function ui.menu_item(options)
         error("menu_item intent and on_activate are mutually exclusive", 2)
     end
     return MenuItem(options)
+end
+
+local function command_menu_item(command, options, index)
+    local content = {}
+    if command.icon then
+        table.insert(content, ui.icon({ name = command.icon }))
+    end
+    local labels = { ui.text(command.title, { role = "label" }) }
+    if command.subtitle then
+        table.insert(labels, ui.text(command.subtitle, { role = "body" }))
+    end
+    table.insert(content, ui.expanded({
+        child = ui.column({ spacing = 2, children = labels }),
+    }))
+    return ui.menu_item({
+        id = options.id .. ":" .. command.id,
+        child = ui.row({ spacing = 8, align = "center", children = content }),
+        selected = options.selected == command.id or options.selected == index,
+        disabled = command.disabled,
+        intent = command.intent.action,
+        on_hover = options.on_hover and function(hovered)
+            options.on_hover(command, index, hovered)
+        end or nil,
+    })
+end
+
+--- Builds a menu from presentation-level commands. Selection is visual only;
+--- command intents remain the single activation path.
+function ui.command_menu(options)
+    options = validate(options, { id=true, commands=true, selected=true, on_hover=true }, "command_menu")
+    if type(options.id) ~= "string" or options.id == "" then
+        error("command_menu requires a non-empty id", 2)
+    end
+    if type(options.commands) ~= "table" then
+        error("command_menu requires commands", 2)
+    end
+    local children = {}
+    local seen = {}
+    for index, command in ipairs(options.commands) do
+        if not is_command(command) then
+            error("command_menu commands must be created with command()", 2)
+        end
+        if seen[command.id] then
+            error("duplicate command id in command_menu: " .. command.id, 2)
+        end
+        seen[command.id] = true
+        table.insert(children, command_menu_item(command, options, index))
+    end
+    return ui.menu_surface({
+        child = ui.column({ children = children }),
+    })
 end
 
 local function build_menu_label(options, theme)
