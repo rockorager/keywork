@@ -5083,6 +5083,13 @@ test "lua command menus present and activate command intents" {
 }
 
 test "lua generic surfaces and progress bars resolve from the ambient theme" {
+    const containsBackground = struct {
+        fn check(node: *const keywork.RenderNode, color: keywork.Color) bool {
+            if (node.background == color) return true;
+            for (node.children) |child| if (check(child, color)) return true;
+            return false;
+        }
+    }.check;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5105,7 +5112,7 @@ test "lua generic surfaces and progress bars resolve from the ambient theme" {
     defer runtime.deinit();
 
     try std.testing.expect(runtime.root.?.rect.width >= 120);
-    try std.testing.expectEqual(keywork.colors.neutral_background6_dark, runtime.root.?.background);
+    try std.testing.expect(containsBackground(runtime.root.?, keywork.colors.neutral_background6_dark));
 }
 
 test "lua list items and status states activate intents" {

@@ -92,13 +92,6 @@ function ui.intent(value, target)
     }
 end
 
-local function native_intent(intent)
-    if intent == nil or intent.target == nil then
-        return intent and intent.action
-    end
-    return { action = intent.action, target = intent.target }
-end
-
 local function resolve_intent(value)
     if value == nil then
         return nil, false
@@ -1131,7 +1124,7 @@ local function build_button(options, theme)
     end
     return ui.pressable({
         id = options.id,
-        intent = native_intent(intent),
+        intent = intent,
         disabled = disabled,
         activation = options.activation,
         on_activate = options.on_activate,
@@ -1237,7 +1230,7 @@ local ListItem = ui.component({
         return ui.pressable({
             id = options.id,
             child = child,
-            intent = native_intent(intent),
+            intent = intent,
             disabled = disabled,
             on_activate = options.on_activate,
             on_hover = options.on_hover,
@@ -1296,7 +1289,7 @@ local StatusView = ui.component({
                 id = options.id .. ":action",
                 label = options.command.title,
                 icon = options.command.icon,
-                intent = native_intent(options.command.intent),
+                intent = options.command.intent,
                 disabled = options.command.disabled,
                 appearance = "primary",
             }))
@@ -1442,7 +1435,7 @@ local function build_menu_item(options, theme)
         hover_background = hover_background,
         pressed_background = pressed_background,
         disabled = disabled,
-        intent = native_intent(intent),
+        intent = intent,
         on_activate = options.on_activate,
         on_hover = options.on_hover,
         child = ui.container({
@@ -1492,7 +1485,7 @@ local function command_menu_item(command, options, index)
         child = ui.row({ spacing = 8, align = "center", children = content }),
         selected = options.selected == command.id or options.selected == index,
         disabled = command.disabled,
-        intent = native_intent(command.intent),
+        intent = command.intent,
         on_hover = options.on_hover and function(hovered)
             options.on_hover(command, index, hovered)
         end or nil,
