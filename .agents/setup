@@ -57,7 +57,7 @@ install_tar_binary() {
 
 ensure_dns
 
-package_stamp=/var/lib/keywork-orb/packages-v9
+package_stamp=/var/lib/keywork-orb/packages-v10
 if [[ ! -e "$package_stamp" ]]; then
     echo "Installing native build dependencies"
     . /etc/os-release
@@ -87,10 +87,63 @@ EOF
         libxml2-dev \
         libxcb-composite0-dev libxcb-icccm4-dev libxcb-res0-dev \
         libxcb-xfixes0-dev libxcb1-dev libxcursor-dev luajit
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -t trixie \
-        libbz2-dev libdisplay-info-dev libdrm-dev libinput-dev libpipewire-0.3-dev \
-        libsystemd-dev libudev-dev
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libbz2-dev libdrm-dev libevdev-dev libmtdev-dev libpipewire-0.3-dev libudev-dev
+    if [[ "${VERSION_CODENAME:-}" == trixie ]]; then
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libdisplay-info-dev libinput-dev libsystemd-dev
+    else
+        # Pulling libinput-dev from trixie into Debian 12 also pulls a partial
+        # GLib transition that apt cannot solve. Only display-info is safe to
+        # mix; a current libinput is built below instead.
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -t trixie \
+            libdisplay-info-dev
+    fi
     sudo install -Dm0644 /dev/null "$package_stamp"
+    native_changed=true
+fi
+
+if ! pkg-config --atleast-version=2.4.124 libdrm 2>/dev/null; then
+    echo "Building libdrm 2.4.124"
+    temporary="$(mktemp -d)"
+    archive="$temporary/libdrm.tar.gz"
+    download \
+        https://gitlab.freedesktop.org/mesa/drm/-/archive/libdrm-2.4.124/drm-libdrm-2.4.124.tar.gz \
+        543544aeadf0c8bea920d00f75e5dc2ff2ac3702e034651a11db40d3ec38becf \
+        "$archive"
+    tar -xzf "$archive" -C "$temporary"
+    source_directory="$(find "$temporary" -mindepth 1 -maxdepth 1 -type d -name 'libdrm-*' -print -quit)"
+    test -n "$source_directory"
+    meson setup "$temporary/build" "$source_directory" \
+        --prefix=/usr/local --libdir=lib --buildtype=release \
+        -Dintel=disabled -Dradeon=disabled -Damdgpu=disabled -Dnouveau=disabled \
+        -Dvmwgfx=disabled -Domap=disabled -Dexynos=disabled -Dfreedreno=disabled \
+        -Dtegra=disabled -Dvc4=disabled -Detnaviv=disabled \
+        -Dcairo-tests=disabled -Dman-pages=disabled -Dvalgrind=disabled -Dtests=false
+    ninja -C "$temporary/build"
+    sudo ninja -C "$temporary/build" install
+    sudo ldconfig
+    rm -rf "$temporary"
+    native_changed=true
+fi
+
+if ! pkg-config --atleast-version=1.28.1 libinput 2>/dev/null; then
+    echo "Building libinput 1.28.1"
+    temporary="$(mktemp -d)"
+    archive="$temporary/libinput.tar.gz"
+    download \
+        https://gitlab.freedesktop.org/libinput/libinput/-/archive/1.28.1/libinput-1.28.1.tar.gz \
+        a13f8c9a7d93df3c85c66afd135f0296701d8d32f911991b7aa4273fdd6a42a3 \
+        "$archive"
+    tar -xzf "$archive" -C "$temporary"
+    meson setup "$temporary/build" "$temporary/libinput-1.28.1" \
+        --prefix=/usr/local --libdir=lib --buildtype=release \
+        -Dlibwacom=false -Ddebug-gui=false -Dtests=false -Ddocumentation=false \
+        -Dzshcompletiondir=no
+    ninja -C "$temporary/build"
+    sudo ninja -C "$temporary/build" install
+    sudo ldconfig
+    rm -rf "$temporary"
     native_changed=true
 fi
 
