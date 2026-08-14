@@ -9,8 +9,20 @@ type Status (
     reloadSupported: bool
 )
 
+type Action (
+    handle: string,
+    id: string,
+    enabled: bool,
+    inputSchemaJson: ?string
+)
+
 method GetStatus() -> (status: Status)
 method Reload() -> (generation: int)
+method ListActions() -> (actions: []Action)
+method InvokeAction(handle: string, targetJson: ?string) -> ()
 
 error ReloadUnsupported()
 error ReloadFailed(message: string)
+error ActionsUnavailable()
+error ActionNotFound()
+error ActionFailed(message: string)

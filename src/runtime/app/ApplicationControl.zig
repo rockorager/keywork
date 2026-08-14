@@ -142,6 +142,8 @@ pub fn create(
     try check(systemd.sd_varlink_server_bind_connect(self.native, connectCallback));
     try check(systemd.sd_varlink_server_bind_method(self.native, protocol.get_status_method, statusCallback));
     try check(systemd.sd_varlink_server_bind_method(self.native, protocol.reload_method, reloadCallback));
+    try check(systemd.sd_varlink_server_bind_method(self.native, protocol.list_actions_method, listActionsCallback));
+    try check(systemd.sd_varlink_server_bind_method(self.native, protocol.invoke_action_method, invokeActionCallback));
     try check(systemd.sd_varlink_server_attach_event(self.native, bridge.sdEvent(), 0));
     errdefer _ = systemd.sd_varlink_server_detach_event(self.native);
     // sd-varlink's server API accepts a filesystem path; `unix:` is the
@@ -241,6 +243,119 @@ fn reloadCallback(
     return 1;
 }
 
+const ActionReplyWriter = struct {
+    json: *std.json.Stringify,
+
+    fn emit(ptr: *anyopaque, action: ActionDescription) !void {
+        const self: *ActionReplyWriter = @ptrCast(@alignCast(ptr));
+        var handle_buffer: [96]u8 = undefined;
+        const handle = try std.fmt.bufPrint(
+            &handle_buffer,
+            "{d}:{d}:{d}",
+            .{ action.token.owner_id, action.token.revision, action.token.index },
+        );
+        try self.json.beginObject();
+        try self.json.objectField("handle");
+        try self.json.write(handle);
+        try self.json.objectField("id");
+        try self.json.write(action.id);
+        try self.json.objectField("enabled");
+        try self.json.write(true);
+        try self.json.objectField("inputSchemaJson");
+        if (action.input_schema_json) |schema| {
+            try self.json.write(schema);
+        } else {
+            try self.json.write(null);
+        }
+        try self.json.endObject();
+    }
+};
+
+fn listActionsCallback(
+    link_optional: ?*systemd.sd_varlink,
+    _: ?*systemd.sd_json_variant,
+    _: systemd.sd_varlink_method_flags_t,
+    userdata: ?*anyopaque,
+) callconv(.c) c_int {
+    const self: *ApplicationControl = @ptrCast(@alignCast(userdata orelse return -1));
+    const link = link_optional orelse return -1;
+    const host = self.action_host orelse {
+        return replyResult(systemd.keywork_application_error_actions_unavailable(link));
+    };
+
+    var output: std.Io.Writer.Allocating = .init(self.allocator);
+    defer output.deinit();
+    var json: std.json.Stringify = .{ .writer = &output.writer };
+    json.beginObject() catch return -1;
+    json.objectField("actions") catch return -1;
+    json.beginArray() catch return -1;
+    var reply_writer: ActionReplyWriter = .{ .json = &json };
+    host.enumerate(.{ .ptr = &reply_writer, .emit_fn = ActionReplyWriter.emit }) catch |err| {
+        return replyActionFailed(self, link, @errorName(err));
+    };
+    json.endArray() catch return -1;
+    json.endObject() catch return -1;
+    const reply = output.toOwnedSlice() catch return -1;
+    defer self.allocator.free(reply);
+    const reply_z = self.allocator.dupeZ(u8, reply) catch return -1;
+    defer self.allocator.free(reply_z);
+    return replyResult(systemd.keywork_application_reply_json(link, reply_z.ptr));
+}
+
+fn invokeActionCallback(
+    link_optional: ?*systemd.sd_varlink,
+    parameters: ?*systemd.sd_json_variant,
+    _: systemd.sd_varlink_method_flags_t,
+    userdata: ?*anyopaque,
+) callconv(.c) c_int {
+    const self: *ApplicationControl = @ptrCast(@alignCast(userdata orelse return -1));
+    const link = link_optional orelse return -1;
+    const host = self.action_host orelse {
+        return replyResult(systemd.keywork_application_error_actions_unavailable(link));
+    };
+    const parameter_variant = parameters orelse return -1;
+    var parameter_json: [*c]u8 = null;
+    if (systemd.keywork_application_parameters_json(parameter_variant, &parameter_json) < 0 or parameter_json == null) return -1;
+    defer systemd.keywork_application_free_json(parameter_json);
+    const parsed = std.json.parseFromSlice(protocol.InvokeParameters, self.allocator, std.mem.span(parameter_json), .{}) catch {
+        return replyActionFailed(self, link, "InvalidParameters");
+    };
+    defer parsed.deinit();
+    const token = parseActionHandle(parsed.value.handle) catch {
+        return replyResult(systemd.keywork_application_error_action_not_found(link));
+    };
+    if (parsed.value.targetJson) |target_json| {
+        var target = std.json.parseFromSlice(std.json.Value, self.allocator, target_json, .{}) catch {
+            return replyActionFailed(self, link, "InvalidTargetJson");
+        };
+        target.deinit();
+    }
+    host.invoke(token, parsed.value.targetJson) catch |err| switch (err) {
+        error.StaleAction => return replyResult(systemd.keywork_application_error_action_not_found(link)),
+        else => return replyActionFailed(self, link, @errorName(err)),
+    };
+    return replyResult(systemd.keywork_application_reply_json(link, "{}"));
+}
+
+fn parseActionHandle(handle: []const u8) !ActionToken {
+    var parts = std.mem.splitScalar(u8, handle, ':');
+    const owner_id = try std.fmt.parseUnsigned(u64, parts.next() orelse return error.InvalidActionHandle, 10);
+    const revision = try std.fmt.parseUnsigned(u64, parts.next() orelse return error.InvalidActionHandle, 10);
+    const index = try std.fmt.parseUnsigned(usize, parts.next() orelse return error.InvalidActionHandle, 10);
+    if (parts.next() != null) return error.InvalidActionHandle;
+    return .{ .owner_id = owner_id, .revision = revision, .index = index };
+}
+
+fn replyActionFailed(self: *ApplicationControl, link: *systemd.sd_varlink, message: []const u8) c_int {
+    const message_z = self.allocator.dupeZ(u8, message) catch return -1;
+    defer self.allocator.free(message_z);
+    return replyResult(systemd.keywork_application_error_action_failed(link, message_z.ptr));
+}
+
+fn replyResult(result: c_int) c_int {
+    return if (result < 0) -1 else 1;
+}
+
 fn reloadCompleted(ptr: *anyopaque, success: bool, message: []const u8) void {
     const self: *ApplicationControl = @ptrCast(@alignCast(ptr));
     self.complete(success, message);
@@ -273,4 +388,13 @@ fn check(result: c_int) !void {
         log.warn("sd-varlink operation failed with errno {d}", .{-result});
         return error.SystemdVarlinkFailed;
     }
+}
+
+test "action handles round-trip retained runtime tokens" {
+    const token = try parseActionHandle("12:34:56");
+    try std.testing.expectEqual(@as(u64, 12), token.owner_id);
+    try std.testing.expectEqual(@as(u64, 34), token.revision);
+    try std.testing.expectEqual(@as(usize, 56), token.index);
+    try std.testing.expectError(error.InvalidActionHandle, parseActionHandle("12:34"));
+    try std.testing.expectError(error.InvalidActionHandle, parseActionHandle("12:34:56:78"));
 }
