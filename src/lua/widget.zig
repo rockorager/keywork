@@ -1440,13 +1440,25 @@ fn parseActionBindings(
     try expectType(lua_state, bindings_table, c.LUA_TTABLE);
 
     var bindings: std.ArrayList(keywork.Widget.ActionBinding) = .empty;
+    errdefer {
+        for (bindings.items) |binding| {
+            allocator.free(binding.id);
+            binding.callback.destroy(callback_allocator);
+            if (binding.invoke) |invoke| invoke.destroy(callback_allocator);
+            if (binding.input_schema_json) |schema| allocator.free(schema);
+        }
+        bindings.deinit(allocator);
+    }
     c.lua_pushnil(lua_state);
     while (c.lua_next(lua_state, bindings_table) != 0) {
         defer pop(lua_state, 1);
         const id = try stringFromStack(lua_state, -2);
         if (c.lua_type(lua_state, -1) == c.LUA_TFUNCTION) {
             const callback = try callbackFromStack(lua_state, callback_allocator, -1);
-            try bindings.append(allocator, .{ .id = try allocator.dupe(u8, id), .callback = callback });
+            errdefer callback.destroy(callback_allocator);
+            const owned_id = try allocator.dupe(u8, id);
+            errdefer allocator.free(owned_id);
+            try bindings.append(allocator, .{ .id = owned_id, .callback = callback });
             continue;
         }
 
@@ -1455,13 +1467,18 @@ fn parseActionBindings(
         c.lua_getfield(lua_state, action, "activate");
         defer pop(lua_state, 1);
         const callback = try callbackFromStack(lua_state, callback_allocator, -1);
+        errdefer callback.destroy(callback_allocator);
         const invoke = try actionCallbackFromStack(lua_state, callback_allocator, -1);
+        errdefer invoke.destroy(callback_allocator);
 
         c.lua_getfield(lua_state, action, "input");
         defer pop(lua_state, 1);
         const input_schema_json = if (c.lua_isnil(lua_state, -1)) null else try lua_json.encodeAlloc(lua_state, -1, allocator);
+        errdefer if (input_schema_json) |schema| allocator.free(schema);
+        const owned_id = try allocator.dupe(u8, id);
+        errdefer allocator.free(owned_id);
         try bindings.append(allocator, .{
-            .id = try allocator.dupe(u8, id),
+            .id = owned_id,
             .callback = callback,
             .invoke = invoke,
             .input_schema_json = input_schema_json,
