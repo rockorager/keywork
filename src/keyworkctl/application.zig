@@ -10,9 +10,10 @@ const Empty = struct {};
 pub const usage =
     \\usage: keyworkctl app COMMAND [INSTANCE | --address ADDRESS]
     \\
-    \\commands: list | status | reload
+    \\commands: list | status | reload | actions
+    \\          invoke HANDLE [--target JSON] [INSTANCE | --address ADDRESS]
     \\
-    \\With no instance, status and reload require exactly one running app.
+    \\With no instance, commands require exactly one running app.
     \\
 ;
 
@@ -26,6 +27,12 @@ const Command = union(enum) {
     list,
     status: Target,
     reload: Target,
+    actions: Target,
+    invoke: struct {
+        handle: []const u8,
+        target_json: ?[]const u8,
+        target: Target,
+    },
 };
 
 pub fn run(init: std.process.Init, arguments: []const []const u8) !void {
@@ -36,7 +43,63 @@ pub fn run(init: std.process.Init, arguments: []const []const u8) !void {
         .list => list(init, runtime_directory),
         .status => |target| status(init, runtime_directory, target),
         .reload => |target| reload(init, runtime_directory, target),
+        .actions => |target| actions(init, runtime_directory, target),
+        .invoke => |invocation| invoke(init, runtime_directory, invocation.handle, invocation.target_json, invocation.target),
     };
+}
+
+fn actions(init: std.process.Init, runtime_directory: []const u8, target: Target) !void {
+    const address = try resolveAddress(init.gpa, init.io, runtime_directory, target);
+    defer init.gpa.free(address);
+    var client = try connect(init.gpa, init.io, address);
+    defer client.deinit();
+    var reply = try client.call(control.list_actions_method, Empty{});
+    defer reply.deinit();
+    try checkRemote(init.io, reply.value);
+    const parameters = try std.json.parseFromValue(
+        control.ActionsReply,
+        init.gpa,
+        reply.value.parameters orelse return error.MissingActionsReply,
+        .{},
+    );
+    defer parameters.deinit();
+
+    var buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+    defer stdout.interface.flush() catch {};
+    for (parameters.value.actions) |action| {
+        try stdout.interface.print("{s}\t{s}", .{ action.handle, action.id });
+        if (action.inputSchemaJson) |schema| try stdout.interface.print("\t{s}", .{schema});
+        try stdout.interface.writeByte('\n');
+    }
+}
+
+fn invoke(
+    init: std.process.Init,
+    runtime_directory: []const u8,
+    handle: []const u8,
+    target_json: ?[]const u8,
+    target: Target,
+) !void {
+    if (target_json) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, init.gpa, json, .{});
+        parsed.deinit();
+    }
+    const address = try resolveAddress(init.gpa, init.io, runtime_directory, target);
+    defer init.gpa.free(address);
+    var client = try connect(init.gpa, init.io, address);
+    defer client.deinit();
+    var reply = try client.call(control.invoke_action_method, control.InvokeParameters{
+        .handle = handle,
+        .targetJson = target_json,
+    });
+    defer reply.deinit();
+    try checkRemote(init.io, reply.value);
+
+    var buffer: [64]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+    defer stdout.interface.flush() catch {};
+    try stdout.interface.writeAll("invoked\n");
 }
 
 fn list(init: std.process.Init, runtime_directory: []const u8) !void {
@@ -154,7 +217,9 @@ fn checkRemote(io: std.Io, reply: varlink.Reply) !void {
 }
 
 fn remoteErrorMessage(name: []const u8, parameters: ?std.json.Value) ?[]const u8 {
-    if (!std.mem.eql(u8, name, control.reload_failed_error)) return null;
+    if (std.mem.eql(u8, name, control.action_not_found_error)) return "action handle is stale or unknown";
+    if (std.mem.eql(u8, name, control.actions_unavailable_error)) return "application actions are unavailable";
+    if (!std.mem.eql(u8, name, control.reload_failed_error) and !std.mem.eql(u8, name, control.action_failed_error)) return null;
     const value = parameters orelse return null;
     const object = switch (value) {
         .object => |object| object,
@@ -245,28 +310,56 @@ fn instanceAddress(allocator: std.mem.Allocator, runtime_directory: []const u8, 
 fn parse(arguments: []const []const u8) !Command {
     if (arguments.len == 1 and std.mem.eql(u8, arguments[0], "list")) return .list;
     if (arguments.len == 0) return error.InvalidArguments;
-    const target: Target = if (arguments.len == 1)
-        .automatic
-    else if (arguments.len == 2)
-        .{ .instance = arguments[1] }
-    else if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "--address"))
-        .{ .address = arguments[2] }
-    else
-        return error.InvalidArguments;
+    if (std.mem.eql(u8, arguments[0], "invoke")) return parseInvoke(arguments);
+    const target = try parseTarget(arguments[1..]);
     if (std.mem.eql(u8, arguments[0], "status")) return .{ .status = target };
     if (std.mem.eql(u8, arguments[0], "reload")) return .{ .reload = target };
+    if (std.mem.eql(u8, arguments[0], "actions")) return .{ .actions = target };
     return error.UnknownCommand;
+}
+
+fn parseTarget(arguments: []const []const u8) !Target {
+    return if (arguments.len == 0)
+        .automatic
+    else if (arguments.len == 1)
+        .{ .instance = arguments[0] }
+    else if (arguments.len == 2 and std.mem.eql(u8, arguments[0], "--address"))
+        .{ .address = arguments[1] }
+    else
+        return error.InvalidArguments;
+}
+
+fn parseInvoke(arguments: []const []const u8) !Command {
+    if (arguments.len < 2) return error.InvalidArguments;
+    var target_json: ?[]const u8 = null;
+    var target_offset: usize = 2;
+    if (arguments.len > 2 and std.mem.eql(u8, arguments[2], "--target")) {
+        if (arguments.len < 4) return error.InvalidArguments;
+        target_json = arguments[3];
+        target_offset = 4;
+    }
+    return .{ .invoke = .{
+        .handle = arguments[1],
+        .target_json = target_json,
+        .target = try parseTarget(arguments[target_offset..]),
+    } };
 }
 
 test "application command parsing supports discovery and explicit addresses" {
     try std.testing.expectEqual(Command.list, try parse(&.{"list"}));
     try std.testing.expectEqual(Target.automatic, (try parse(&.{"status"})).status);
     try std.testing.expectEqualStrings("abc", (try parse(&.{ "reload", "abc" })).reload.instance);
+    try std.testing.expectEqual(Target.automatic, (try parse(&.{"actions"})).actions);
+    const invocation = (try parse(&.{ "invoke", "1:2:3", "--target", "{\"id\":7}", "abc" })).invoke;
+    try std.testing.expectEqualStrings("1:2:3", invocation.handle);
+    try std.testing.expectEqualStrings("{\"id\":7}", invocation.target_json.?);
+    try std.testing.expectEqualStrings("abc", invocation.target.instance);
     try std.testing.expectEqualStrings(
         "unix:/tmp/app",
         (try parse(&.{ "status", "--address", "unix:/tmp/app" })).status.address,
     );
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "reload", "--address" }));
+    try std.testing.expectError(error.InvalidArguments, parse(&.{ "invoke", "1:2:3", "--target" }));
 }
 
 test "application discovery quietly rejects an unavailable socket" {
