@@ -120,9 +120,10 @@ end
 function M.load()
     local entries = {}
     -- list() handles data-dir precedence and shadowing (including
-    -- NoDisplay overrides); visibility filtering stays here.
+    -- NoDisplay overrides); should_show applies desktop visibility and
+    -- verifies that each entry has an available launch route.
     for _, app in ipairs(xdg.list()) do
-        if app.exec and not app.no_display and not app.hidden then
+        if xdg.should_show(app) then
             table.insert(entries, {
                 id = "app:" .. app.id,
                 title = app.name,

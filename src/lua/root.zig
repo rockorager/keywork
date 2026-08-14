@@ -5659,7 +5659,9 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\Categories=Utility\sTools;TextEditor;
         \\Icon=editor-icon
         \\Exec=editor --title %c %%x %F --icon-args %i
+        \\TryExec=/bin/sh
         \\Terminal=false
+        \\OnlyShowIn=keywork;GNOME;
         \\Actions=new-window;
         \\MimeType=text/plain;
         \\
@@ -5676,6 +5678,7 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\Type=Application
         \\Name=Viewer
         \\Exec=viewer %U
+        \\NotShowIn=keywork;
         \\
         ,
     });
@@ -5706,6 +5709,9 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\assert(#entry.actions == 1)
         \\assert(entry.actions[1].id == "new-window")
         \\assert(entry.actions[1].name == "New Window")
+        \\assert(apps.should_show(entry, { current_desktop = "keywork" }))
+        \\assert(apps.should_show(entry, { current_desktop = "KDE:keywork" }))
+        \\assert(not apps.should_show(entry, { current_desktop = "KDE" }))
         \\
         \\-- unmatched locale falls back to the plain key
         \\local plain = assert(apps.lookup("editor.desktop", { dirs = dirs, locale = "C" }))
@@ -5714,6 +5720,24 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\-- desktop-id dashes map to subdirectories
         \\local viewer = assert(apps.lookup("org-example-Viewer", { dirs = dirs }))
         \\assert(viewer.name == "Viewer")
+        \\assert(not apps.should_show(viewer, { current_desktop = "keywork" }))
+        \\assert(apps.should_show(viewer, { current_desktop = "KDE" }))
+        \\assert(not apps.should_show({
+        \\  hidden = false,
+        \\  no_display = false,
+        \\  only_show_in = {},
+        \\  not_show_in = {},
+        \\  try_exec = "keywork-definitely-missing-executable",
+        \\  exec = "missing",
+        \\  dbus_activatable = false,
+        \\}))
+        \\assert(apps.should_show({
+        \\  hidden = false,
+        \\  no_display = false,
+        \\  only_show_in = {},
+        \\  not_show_in = {},
+        \\  dbus_activatable = true,
+        \\}))
         \\
         \\-- missing entries report an error
         \\local missing, err = apps.lookup("nope", { dirs = dirs })

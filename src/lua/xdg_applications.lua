@@ -511,6 +511,43 @@ local function try_exec_ok(try_exec)
     return false
 end
 
+local function desktop_list_contains(list, current_desktop)
+    for desktop in (current_desktop or ""):gmatch("[^:]+") do
+        for _, candidate in ipairs(list) do
+            if desktop == candidate then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+--- Reports whether an entry belongs in an application launcher.
+--- opts.current_desktop overrides XDG_CURRENT_DESKTOP for deterministic
+--- callers and tests; colon-separated desktop names are matched against the
+--- entry's semicolon-separated OnlyShowIn and NotShowIn lists.
+function M.should_show(entry, opts)
+    opts = opts or {}
+    if entry.hidden or entry.no_display then
+        return false
+    end
+
+    local current_desktop = opts.current_desktop
+    if current_desktop == nil then
+        current_desktop = os.getenv("XDG_CURRENT_DESKTOP") or ""
+    end
+    if #entry.only_show_in > 0 and not desktop_list_contains(entry.only_show_in, current_desktop) then
+        return false
+    end
+    if desktop_list_contains(entry.not_show_in, current_desktop) then
+        return false
+    end
+    if entry.try_exec and entry.try_exec ~= "" and not try_exec_ok(entry.try_exec) then
+        return false
+    end
+    return (entry.exec ~= nil and entry.exec ~= "") or entry.dbus_activatable
+end
+
 -- D-Bus activation per the Application interface: the bus name is the
 -- desktop id minus .desktop, the object path is the name with . and -
 -- mapped to / and _.

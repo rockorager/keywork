@@ -38,6 +38,9 @@
 ---@field dirs?   string[]
 ---@field locale? string
 
+---@class keywork.xdg.applications.VisibilityOptions
+---@field current_desktop? string Colon-separated desktop names; defaults to XDG_CURRENT_DESKTOP.
+
 ---@class keywork.xdg.applications.ExecOptions
 ---@field action? string
 ---@field files?  string[]
@@ -70,6 +73,11 @@ function M.lookup(desktop_id, options) end
 ---@param options? keywork.xdg.applications.SearchOptions
 ---@return keywork.xdg.applications.Entry[]
 function M.list(options) end
+
+---@param entry    keywork.xdg.applications.Entry
+---@param options? keywork.xdg.applications.VisibilityOptions
+---@return boolean
+function M.should_show(entry, options) end
 
 ---@param entry    keywork.xdg.applications.Entry
 ---@param options? keywork.xdg.applications.ExecOptions
