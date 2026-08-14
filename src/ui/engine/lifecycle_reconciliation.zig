@@ -37,6 +37,7 @@ pub fn rebuild(self: anytype) !void {
         } else {
             self.element_root = try keywork.buildElementTreeScoped(self.allocator, &scope, &app_root, self.constraints);
         }
+        self.action_revision +%= 1;
 
         try rebuildRetainedTrees(self);
 
@@ -59,6 +60,7 @@ pub fn rebuildDirtyState(self: anytype) !void {
         return;
     }
 
+    self.action_revision +%= 1;
     try rebuildRetainedTrees(self);
     if (try reconcileFocusAfterRebuild(self)) {
         try rebuild(self);

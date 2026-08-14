@@ -8,6 +8,7 @@ const event_loop = @import("keywork-loop");
 const SystemdEvent = @import("../linux/SystemdEvent.zig");
 const log_backend_mod = @import("../backend/log.zig");
 const HostBindings = @import("HostBindings.zig");
+const ApplicationControl = @import("ApplicationControl.zig");
 const app_options = @import("options.zig");
 const app_windows = @import("windows.zig");
 const platform_mod = @import("platform.zig");
@@ -58,7 +59,93 @@ pub const Options = struct {
     /// Declarative window-set host; when present the Wayland backends run
     /// one runtime per declared window instead of a single main window.
     windows_host: ?app_windows.WindowsHost = null,
+    /// Per-process control endpoint that exposes actions from live retained
+    /// runtimes while this runner owns them.
+    action_control: ?*ApplicationControl = null,
 };
+
+fn bindActionHost(options: Options, host: ApplicationControl.ActionHost) void {
+    if (options.action_control) |control| control.bindActionHost(host);
+}
+
+fn unbindActionHost(options: Options) void {
+    if (options.action_control) |control| control.unbindActionHost();
+}
+
+fn enumerateRuntimeActions(runtime: *const runtime_mod.Runtime, sink: ApplicationControl.ActionSink) !void {
+    for (0..runtime.actionCount()) |index| {
+        const action = runtime.actionDescription(index).?;
+        try sink.emit(.{
+            .token = .{
+                .owner_id = action.token.owner_id,
+                .revision = action.token.revision,
+                .index = action.token.index,
+            },
+            .id = action.id,
+            .input_schema_json = action.input_schema_json,
+        });
+    }
+}
+
+fn invokeRuntimeAction(
+    runtime: *runtime_mod.Runtime,
+    token: ApplicationControl.ActionToken,
+    target_json: ?[]const u8,
+) !bool {
+    if (runtime.action_owner_id != token.owner_id) return false;
+    try runtime.invokeAction(.{
+        .owner_id = token.owner_id,
+        .revision = token.revision,
+        .index = token.index,
+    }, target_json);
+    return true;
+}
+
+const SingleActionHost = struct {
+    runtime: *runtime_mod.Runtime,
+
+    fn host(self: *SingleActionHost) ApplicationControl.ActionHost {
+        return .{ .ptr = self, .enumerate_fn = enumerate, .invoke_fn = invoke };
+    }
+
+    fn enumerate(ptr: *anyopaque, sink: ApplicationControl.ActionSink) !void {
+        const self: *SingleActionHost = @ptrCast(@alignCast(ptr));
+        try enumerateRuntimeActions(self.runtime, sink);
+    }
+
+    fn invoke(ptr: *anyopaque, token: ApplicationControl.ActionToken, target_json: ?[]const u8) !void {
+        const self: *SingleActionHost = @ptrCast(@alignCast(ptr));
+        if (!try invokeRuntimeAction(self.runtime, token, target_json)) return error.StaleAction;
+    }
+};
+
+fn WaylandActionHost(comptime Backend: type) type {
+    return struct {
+        runtime: *runtime_mod.Runtime,
+        popups: *PopupManager(Backend),
+
+        const Self = @This();
+
+        fn host(self: *Self) ApplicationControl.ActionHost {
+            return .{ .ptr = self, .enumerate_fn = enumerate, .invoke_fn = invoke };
+        }
+
+        fn enumerate(ptr: *anyopaque, sink: ApplicationControl.ActionSink) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try enumerateRuntimeActions(self.runtime, sink);
+            for (self.popups.popups.items) |popup| try enumerateRuntimeActions(&popup.runtime, sink);
+        }
+
+        fn invoke(ptr: *anyopaque, token: ApplicationControl.ActionToken, target_json: ?[]const u8) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (try invokeRuntimeAction(self.runtime, token, target_json)) return;
+            for (self.popups.popups.items) |popup| {
+                if (try invokeRuntimeAction(&popup.runtime, token, target_json)) return;
+            }
+            return error.StaleAction;
+        }
+    };
+}
 
 pub fn run(allocator: std.mem.Allocator, loop: *event_loop.EventLoop, app: keywork.AppHost, options: Options) !void {
     const initial_width = if (options.layer_shell != null and options.width <= 0) 640 else options.width;
@@ -107,6 +194,9 @@ fn runHeadlessRuntime(
         &raster_cache,
     );
     defer runtime.deinit();
+    var action_host: SingleActionHost = .{ .runtime = &runtime };
+    bindActionHost(options, action_host.host());
+    defer unbindActionHost(options);
     if (options.host_bindings) |bindings| bindings.bindInvalidator(.fromRuntime(&runtime));
     defer if (options.host_bindings) |bindings| bindings.unbindInvalidator();
     runtime.setDeferredRepaint(true);
@@ -219,6 +309,12 @@ fn runWayland(
         .runtime = &runtime,
     } else {};
     defer if (popups_supported) popup_manager.deinit();
+    var action_host: if (popups_supported) WaylandActionHost(Backend) else SingleActionHost = if (popups_supported)
+        .{ .runtime = &runtime, .popups = &popup_manager }
+    else
+        .{ .runtime = &runtime };
+    bindActionHost(options, action_host.host());
+    defer unbindActionHost(options);
     if (popups_supported) queue.popup_manager = popup_manager.hooks();
     win.setPointerButtonHandler(&queue, QueuedPlatformEvents.pointerButton);
     win.setPointerMoveHandler(&queue, QueuedPlatformEvents.pointerMove);
@@ -859,6 +955,8 @@ fn runWaylandWindowed(
     if (backend.sessionLockDenied()) return error.SessionLockDenied;
     if (backend.sessionLockFinished()) return;
     if (manager.shouldQuit()) return;
+    bindActionHost(options, manager.actionHost());
+    defer unbindActionHost(options);
 
     // Loop lifetime is the manager's decision, not the backend's: zero
     // live windows is a valid state while the app waits for outputs.
@@ -1002,6 +1100,29 @@ fn WindowManager(comptime Backend: type) type {
                 .invalidate_state_fn = invalidateStateAll,
                 .reconcile_fn = reconcileWindows,
             };
+        }
+
+        fn actionHost(self: *Self) ApplicationControl.ActionHost {
+            return .{ .ptr = self, .enumerate_fn = enumerateActions, .invoke_fn = invokeAction };
+        }
+
+        fn enumerateActions(ptr: *anyopaque, sink: ApplicationControl.ActionSink) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            for (self.windows.items) |managed| {
+                try enumerateRuntimeActions(&managed.runtime, sink);
+                for (managed.popups.popups.items) |popup| try enumerateRuntimeActions(&popup.runtime, sink);
+            }
+        }
+
+        fn invokeAction(ptr: *anyopaque, token: ApplicationControl.ActionToken, target_json: ?[]const u8) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            for (self.windows.items) |managed| {
+                if (try invokeRuntimeAction(&managed.runtime, token, target_json)) return;
+                for (managed.popups.popups.items) |popup| {
+                    if (try invokeRuntimeAction(&popup.runtime, token, target_json)) return;
+                }
+            }
+            return error.StaleAction;
         }
 
         fn reconcileWindows(ptr: *anyopaque) anyerror!void {

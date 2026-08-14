@@ -1010,6 +1010,34 @@ pub const Element = struct {
     };
 };
 
+pub fn actionCount(element: *const Element) usize {
+    var count: usize = switch (element.widget) {
+        .actions => |actions_widget| actions_widget.bindings.len,
+        else => 0,
+    };
+    for (element.children) |*child| count += actionCount(child);
+    return count;
+}
+
+pub fn actionAt(element: *const Element, target_index: usize) ?*const Widget.ActionBinding {
+    var index = target_index;
+    return actionAtOffset(element, &index);
+}
+
+fn actionAtOffset(element: *const Element, index: *usize) ?*const Widget.ActionBinding {
+    switch (element.widget) {
+        .actions => |actions_widget| {
+            if (index.* < actions_widget.bindings.len) return &actions_widget.bindings[index.*];
+            index.* -= actions_widget.bindings.len;
+        },
+        else => {},
+    }
+    for (element.children) |*child| {
+        if (actionAtOffset(child, index)) |action| return action;
+    }
+    return null;
+}
+
 const ActionTapAdapter = struct {
     invocation: Widget.ActionInvocation,
     owned_target_json: ?[]const u8,

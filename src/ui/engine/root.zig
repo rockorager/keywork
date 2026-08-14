@@ -25,6 +25,8 @@ const focus_scroll = @import("focus_scroll.zig");
 const input_behavior = @import("input.zig");
 const lifecycle_reconciliation = @import("lifecycle_reconciliation.zig");
 
+var next_action_owner_id: std.atomic.Value(u64) = .init(1);
+
 pub const UiColorScheme = enum {
     no_preference,
     dark,
@@ -137,6 +139,10 @@ pub const Runtime = struct {
     /// a repaint so the backend's frame pacing sustains the loop; when it
     /// clears, the runtime returns to zero-cost idle.
     animations_active: bool = false,
+    /// Stable identity plus rebuild revision make externally held action
+    /// handles reject destroyed or replaced retained trees.
+    action_owner_id: u64,
+    action_revision: u64 = 0,
 
     pub const RepaintScheduler = *const fn (ctx: *anyopaque) anyerror!void;
     pub const ClipboardReader = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8;
@@ -201,6 +207,7 @@ pub const Runtime = struct {
             .build_arena = .init(allocator),
             .color_scheme = color_scheme,
             .external_raster_cache = raster_cache,
+            .action_owner_id = next_action_owner_id.fetchAdd(1, .monotonic),
         };
         errdefer self.deinit();
         try self.rebuild();
@@ -439,6 +446,40 @@ pub const Runtime = struct {
 
     pub fn waylandKeyInput(ctx: *anyopaque, input: KeyInput) void {
         input_behavior.waylandKeyInput(Runtime, ctx, input);
+    }
+
+    pub const ActionToken = struct {
+        owner_id: u64,
+        revision: u64,
+        index: usize,
+    };
+
+    pub const ActionDescription = struct {
+        token: ActionToken,
+        id: []const u8,
+        input_schema_json: ?[]const u8,
+    };
+
+    pub fn actionCount(self: *const Runtime) usize {
+        const root = if (self.element_root) |*element_root| element_root else return 0;
+        return keywork.actionCount(root);
+    }
+
+    pub fn actionDescription(self: *const Runtime, index: usize) ?ActionDescription {
+        const root = if (self.element_root) |*element_root| element_root else return null;
+        const binding = keywork.actionAt(root, index) orelse return null;
+        return .{
+            .token = .{ .owner_id = self.action_owner_id, .revision = self.action_revision, .index = index },
+            .id = binding.id,
+            .input_schema_json = binding.input_schema_json,
+        };
+    }
+
+    pub fn invokeAction(self: *Runtime, token: ActionToken, target_json: ?[]const u8) !void {
+        if (token.owner_id != self.action_owner_id or token.revision != self.action_revision) return error.StaleAction;
+        const root = if (self.element_root) |*element_root| element_root else return error.StaleAction;
+        const binding = keywork.actionAt(root, token.index) orelse return error.StaleAction;
+        try (keywork.Widget.ActionInvocation{ .binding = binding.*, .target_json = target_json }).call();
     }
 
     fn rebuild(self: *Runtime) !void {
@@ -704,6 +745,46 @@ test "rebuilds that change nothing present nothing" {
     // layout and paint output does not manufacture damage.
     try runtime.invalidate();
     try std.testing.expectEqual(@as(usize, 1), backend.presents);
+}
+
+test "retained actions expose metadata and reject stale tokens" {
+    const TestApp = struct {
+        received_target: ?[]const u8 = null,
+
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const bindings = [_]keywork.Widget.ActionBinding{.{
+                .id = "select",
+                .callback = .{ .ptr = self, .call_fn = ignore },
+                .invoke = .{ .ptr = self, .call_fn = activate },
+                .input_schema_json = "{\"type\":\"object\"}",
+            }};
+            return keywork.widgets.actions(scope.allocator, &bindings, keywork.widgets.text("Action"));
+        }
+
+        fn ignore(_: *anyopaque) !void {}
+
+        fn activate(ptr: *anyopaque, target_json: ?[]const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.received_target = target_json;
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 100, .max_height = 40 });
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.actionCount());
+    const action = runtime.actionDescription(0).?;
+    try std.testing.expectEqualStrings("select", action.id);
+    try std.testing.expectEqualStrings("{\"type\":\"object\"}", action.input_schema_json.?);
+    try runtime.invokeAction(action.token, "{\"id\":7}");
+    try std.testing.expectEqualStrings("{\"id\":7}", app.received_target.?);
+
+    try runtime.invalidate();
+    try runtime.flushPendingRepaint();
+    try std.testing.expectError(error.StaleAction, runtime.invokeAction(action.token, null));
 }
 
 test "backend capability gates damage-only display lists" {

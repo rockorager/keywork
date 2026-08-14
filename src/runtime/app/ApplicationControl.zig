@@ -29,10 +29,48 @@ pub const ReloadObserver = struct {
     }
 };
 
+pub const ActionToken = struct {
+    owner_id: u64,
+    revision: u64,
+    index: usize,
+};
+
+pub const ActionDescription = struct {
+    token: ActionToken,
+    id: []const u8,
+    input_schema_json: ?[]const u8,
+};
+
+pub const ActionSink = struct {
+    ptr: *anyopaque,
+    emit_fn: *const fn (*anyopaque, ActionDescription) anyerror!void,
+
+    pub fn emit(self: ActionSink, action: ActionDescription) !void {
+        try self.emit_fn(self.ptr, action);
+    }
+};
+
+/// UI-thread view of the currently retained action scopes. Tokens identify a
+/// particular retained-tree revision and must fail after that tree rebuilds.
+pub const ActionHost = struct {
+    ptr: *anyopaque,
+    enumerate_fn: *const fn (*anyopaque, ActionSink) anyerror!void,
+    invoke_fn: *const fn (*anyopaque, ActionToken, ?[]const u8) anyerror!void,
+
+    pub fn enumerate(self: ActionHost, sink: ActionSink) !void {
+        try self.enumerate_fn(self.ptr, sink);
+    }
+
+    pub fn invoke(self: ActionHost, token: ActionToken, target_json: ?[]const u8) !void {
+        try self.invoke_fn(self.ptr, token, target_json);
+    }
+};
+
 allocator: std.mem.Allocator,
 io: std.Io,
 native: *systemd.sd_varlink_server,
 reload_host: ReloadHost,
+action_host: ?ActionHost = null,
 app_id: [:0]u8,
 address: [:0]u8,
 instance_id: [instance_id_length:0]u8,
@@ -132,6 +170,15 @@ pub fn destroy(self: *ApplicationControl) void {
 
 pub fn observer(self: *ApplicationControl) ReloadObserver {
     return .{ .ptr = self, .completed_fn = reloadCompleted };
+}
+
+pub fn bindActionHost(self: *ApplicationControl, host: ActionHost) void {
+    std.debug.assert(self.action_host == null);
+    self.action_host = host;
+}
+
+pub fn unbindActionHost(self: *ApplicationControl) void {
+    self.action_host = null;
 }
 
 pub fn controlAddress(self: *const ApplicationControl) []const u8 {
