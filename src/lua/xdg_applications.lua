@@ -62,7 +62,9 @@ local function unescape(value)
     end))
 end
 
--- Multiple values are ;-separated with \; escaping the separator.
+-- Multiple values are ;-separated with \; escaping the separator. Decode
+-- escapes while splitting so an escaped backslash before a separator is not
+-- mistaken for an escaped semicolon.
 local function split_list(value)
     local items = {}
     local current = {}
@@ -70,10 +72,12 @@ local function split_list(value)
     while index <= #value do
         local ch = value:sub(index, index)
         if ch == "\\" and index < #value then
-            table.insert(current, value:sub(index + 1, index + 1))
+            local escaped = value:sub(index + 1, index + 1)
+            local decoded = escaped == ";" and ";" or escapes[escaped]
+            table.insert(current, decoded or ("\\" .. escaped))
             index = index + 2
         elseif ch == ";" then
-            local item = unescape(table.concat(current))
+            local item = table.concat(current)
             if item ~= "" then
                 table.insert(items, item)
             end
@@ -84,22 +88,26 @@ local function split_list(value)
             index = index + 1
         end
     end
-    local tail = unescape(table.concat(current))
+    local tail = table.concat(current)
     if tail ~= "" then
         table.insert(items, tail)
     end
     return items
 end
 
--- Reads a group's key with locale fallback: Key[variant] wins over Key.
-local function localized(group, key, variants)
+-- Selects a group's raw key with locale fallback: Key[variant] wins over Key.
+local function localized_raw(group, key, variants)
     for _, variant in ipairs(variants) do
         local value = group[key .. "[" .. variant .. "]"]
         if value then
-            return unescape(value)
+            return value
         end
     end
-    local value = group[key]
+    return group[key]
+end
+
+local function localized(group, key, variants)
+    local value = localized_raw(group, key, variants)
     return value and unescape(value) or nil
 end
 
@@ -225,7 +233,7 @@ function M.parse(path, opts)
         hidden = main.Hidden == "true",
         single_main_window = main.SingleMainWindow == "true",
         startup_wm_class = main.StartupWMClass,
-        keywords = split_list(localized(main, "Keywords", variants) or ""),
+        keywords = split_list(localized_raw(main, "Keywords", variants) or ""),
         categories = split_list(main.Categories or ""),
         mime_types = split_list(main.MimeType or ""),
         only_show_in = split_list(main.OnlyShowIn or ""),

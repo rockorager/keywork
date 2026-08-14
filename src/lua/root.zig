@@ -5655,8 +5655,8 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\Name[de]=Bearbeiter
         \\GenericName=Text Editor
         \\Comment=Edit text files
-        \\Keywords=semi\;colon;plain;
-        \\Categories=Utility;TextEditor;
+        \\Keywords=semi\;colon;hello\sworld;path\\;plain;
+        \\Categories=Utility\sTools;TextEditor;
         \\Icon=editor-icon
         \\Exec=editor --title %c %%x %F --icon-args %i
         \\Terminal=false
@@ -5696,9 +5696,12 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\assert(entry.name == "Bearbeiter")
         \\assert(entry.generic_name == "Text Editor")
         \\assert(entry.icon == "editor-icon")
-        \\assert(#entry.keywords == 2)
+        \\assert(#entry.keywords == 4)
         \\assert(entry.keywords[1] == "semi;colon")
-        \\assert(entry.keywords[2] == "plain")
+        \\assert(entry.keywords[2] == "hello world")
+        \\assert(entry.keywords[3] == "path\\")
+        \\assert(entry.keywords[4] == "plain")
+        \\assert(entry.categories[1] == "Utility Tools")
         \\assert(entry.categories[2] == "TextEditor")
         \\assert(#entry.actions == 1)
         \\assert(entry.actions[1].id == "new-window")
