@@ -247,7 +247,7 @@ fn parse(arguments: []const []const u8) !Command {
     if (arguments.len == 0) return error.InvalidArguments;
     const target: Target = if (arguments.len == 1)
         .automatic
-    else if (arguments.len == 2)
+    else if (arguments.len == 2 and !std.mem.eql(u8, arguments[1], "--address"))
         .{ .instance = arguments[1] }
     else if (arguments.len == 3 and std.mem.eql(u8, arguments[1], "--address"))
         .{ .address = arguments[2] }
