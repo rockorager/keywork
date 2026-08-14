@@ -260,6 +260,8 @@ pub const Widget = union(enum) {
     pub const ActionBinding = struct {
         id: []const u8,
         callback: Callback,
+        invoke: ?ActionCallback = null,
+        input_schema_json: ?[]const u8 = null,
     };
 
     pub const ShortcutBinding = struct {
@@ -516,6 +518,48 @@ pub const Widget = union(enum) {
         pub fn destroy(self: Callback, allocator: std.mem.Allocator) void {
             const destroy_fn = self.destroy_fn orelse return;
             destroy_fn(allocator, self.ptr);
+        }
+    };
+
+    /// An action callback optionally receives the JSON target carried by an
+    /// intent. It is separate from `Callback`, whose zero-argument contract
+    /// is also used by lifecycle APIs.
+    pub const ActionCallback = struct {
+        ptr: *anyopaque,
+        call_fn: *const fn (ptr: *anyopaque, target_json: ?[]const u8) anyerror!void,
+        clone_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) anyerror!*anyopaque = null,
+        destroy_fn: ?*const fn (allocator: std.mem.Allocator, ptr: *anyopaque) void = null,
+
+        pub fn call(self: ActionCallback, target_json: ?[]const u8) !void {
+            try self.call_fn(self.ptr, target_json);
+        }
+
+        pub fn clone(self: ActionCallback, allocator: std.mem.Allocator) !ActionCallback {
+            const clone_fn = self.clone_fn orelse return self;
+            return .{
+                .ptr = try clone_fn(allocator, self.ptr),
+                .call_fn = self.call_fn,
+                .clone_fn = self.clone_fn,
+                .destroy_fn = self.destroy_fn,
+            };
+        }
+
+        pub fn destroy(self: ActionCallback, allocator: std.mem.Allocator) void {
+            const destroy_fn = self.destroy_fn orelse return;
+            destroy_fn(allocator, self.ptr);
+        }
+    };
+
+    pub const ActionInvocation = struct {
+        binding: ActionBinding,
+        target_json: ?[]const u8,
+
+        pub fn call(self: ActionInvocation) !void {
+            if (self.binding.invoke) |invoke| {
+                try invoke.call(self.target_json);
+            } else {
+                try self.binding.callback.call();
+            }
         }
     };
 
@@ -966,20 +1010,29 @@ pub const Element = struct {
     };
 };
 
+const ActionTapAdapter = struct {
+    invocation: Widget.ActionInvocation,
+    owned_target_json: ?[]const u8,
+};
+
 fn callActionAsTap(ptr: *anyopaque, _: TapEvent) !void {
-    const callback: *Widget.Callback = @ptrCast(@alignCast(ptr));
-    try callback.call();
+    const adapter: *ActionTapAdapter = @ptrCast(@alignCast(ptr));
+    try adapter.invocation.call();
 }
 
 fn cloneActionAdapter(allocator: std.mem.Allocator, ptr: *anyopaque) !*anyopaque {
-    const original: *Widget.Callback = @ptrCast(@alignCast(ptr));
-    const copy = try allocator.create(Widget.Callback);
+    const original: *ActionTapAdapter = @ptrCast(@alignCast(ptr));
+    const copy = try allocator.create(ActionTapAdapter);
+    errdefer allocator.destroy(copy);
     copy.* = original.*;
+    copy.owned_target_json = if (original.owned_target_json) |target| try allocator.dupe(u8, target) else null;
+    copy.invocation.target_json = copy.owned_target_json;
     return copy;
 }
 
 fn destroyActionAdapter(allocator: std.mem.Allocator, ptr: *anyopaque) void {
-    const stored: *Widget.Callback = @ptrCast(@alignCast(ptr));
+    const stored: *ActionTapAdapter = @ptrCast(@alignCast(ptr));
+    if (stored.owned_target_json) |target| allocator.free(target);
     allocator.destroy(stored);
 }
 
@@ -987,8 +1040,13 @@ fn resolveClickableIntent(allocator: std.mem.Allocator, actions: ?*const ActionS
     if (clickable.on_click != null) return;
     const intent = clickable.intent orelse return;
     const action = findActionForIntent(actions, intent) orelse return;
-    const stored = try allocator.create(Widget.Callback);
-    stored.* = action;
+    const stored = try allocator.create(ActionTapAdapter);
+    errdefer allocator.destroy(stored);
+    const target_json = if (intent.target_json) |target| try allocator.dupe(u8, target) else null;
+    stored.* = .{
+        .invocation = .{ .binding = action.binding, .target_json = target_json },
+        .owned_target_json = target_json,
+    };
     clickable.on_click = .{
         .ptr = stored,
         .call_fn = callActionAsTap,
@@ -3237,16 +3295,22 @@ fn cloneActionBindings(allocator: std.mem.Allocator, bindings: []const Widget.Ac
         for (result[0..initialized]) |binding| {
             allocator.free(binding.id);
             binding.callback.destroy(allocator);
+            if (binding.invoke) |invoke| invoke.destroy(allocator);
+            if (binding.input_schema_json) |schema| allocator.free(schema);
         }
         allocator.free(result);
     }
     for (bindings, 0..) |binding, index| {
         const id = try allocator.dupe(u8, binding.id);
+        errdefer allocator.free(id);
         const callback = binding.callback.clone(allocator) catch |err| {
-            allocator.free(id);
             return err;
         };
-        result[index] = .{ .id = id, .callback = callback };
+        errdefer callback.destroy(allocator);
+        const invoke = if (binding.invoke) |invoke| try invoke.clone(allocator) else null;
+        errdefer if (invoke) |action_callback| action_callback.destroy(allocator);
+        const input_schema_json = if (binding.input_schema_json) |schema| try allocator.dupe(u8, schema) else null;
+        result[index] = .{ .id = id, .callback = callback, .invoke = invoke, .input_schema_json = input_schema_json };
         initialized += 1;
     }
     return result;
@@ -3256,6 +3320,8 @@ fn destroyActionBindings(allocator: std.mem.Allocator, bindings: []const Widget.
     for (bindings) |binding| {
         allocator.free(binding.id);
         binding.callback.destroy(allocator);
+        if (binding.invoke) |invoke| invoke.destroy(allocator);
+        if (binding.input_schema_json) |schema| allocator.free(schema);
     }
     allocator.free(bindings);
 }
@@ -3280,11 +3346,17 @@ fn destroyShortcutBindings(allocator: std.mem.Allocator, bindings: []const Widge
 }
 
 fn cloneIntent(allocator: std.mem.Allocator, intent: Intent) !Intent {
-    return .{ .action_id = try allocator.dupe(u8, intent.action_id) };
+    const action_id = try allocator.dupe(u8, intent.action_id);
+    errdefer allocator.free(action_id);
+    return .{
+        .action_id = action_id,
+        .target_json = if (intent.target_json) |target| try allocator.dupe(u8, target) else null,
+    };
 }
 
 fn destroyIntent(allocator: std.mem.Allocator, intent: Intent) void {
     allocator.free(intent.action_id);
+    if (intent.target_json) |target| allocator.free(target);
 }
 
 fn cloneKey(allocator: std.mem.Allocator, key: Widget.Key) !Widget.Key {
@@ -4970,7 +5042,7 @@ test "shortcuts invoke ambient actions" {
     const callback = findShortcutAction(&element, .enter).?;
     try callback.call();
     try std.testing.expectEqual(@as(usize, 1), counter.value);
-    try std.testing.expectEqual(@as(?Widget.Callback, null), findShortcutAction(&element, .space));
+    try std.testing.expect(findShortcutAction(&element, .space) == null);
 }
 
 test "button and shortcut can share an intent" {

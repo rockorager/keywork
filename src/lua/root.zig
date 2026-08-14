@@ -4989,9 +4989,18 @@ test "lua first-class actions drive controls and shortcuts through intents" {
     const script =
         \\local kw = require("keywork")
         \\activated = false
+        \\button_target = false
+        \\shortcut_target = false
         \\local enabled = kw.action({
         \\  id = "activate",
-        \\  activate = function() activated = true end,
+        \\  input = { type = "object", required = { "source" } },
+        \\  activate = function(target)
+        \\    activated = true
+        \\    if target then
+        \\      button_target = target.source == "button"
+        \\      shortcut_target = target.source == "shortcut"
+        \\    end
+        \\  end,
         \\})
         \\local disabled = kw.action({
         \\  id = "unavailable",
@@ -5001,9 +5010,9 @@ test "lua first-class actions drive controls and shortcuts through intents" {
         \\return kw.app({ child = kw.action_scope({
         \\  actions = { enabled, disabled },
         \\  child = kw.shortcuts({
-        \\    bindings = { enter = enabled },
+        \\    bindings = { enter = kw.intent(enabled, { source = "shortcut" }) },
         \\    child = kw.column({ children = {
-        \\      kw.button({ id = "enabled", label = "Enabled", intent = kw.intent(enabled) }),
+        \\      kw.button({ id = "enabled", label = "Enabled", intent = kw.intent(enabled, { source = "button" }) }),
         \\      kw.button({ id = "disabled", label = "Disabled", intent = disabled }),
         \\    } }),
         \\  }),
@@ -5026,6 +5035,10 @@ test "lua first-class actions drive controls and shortcuts through intents" {
         .y = enabled_hit.rect.y + enabled_hit.rect.height / 2,
     });
     try expectLuaBoolean(&app, "activated", true);
+    try expectLuaBoolean(&app, "button_target", true);
+
+    try runtime.keyInput(.enter);
+    try expectLuaBoolean(&app, "shortcut_target", true);
 }
 
 test "lua command menus present and activate command intents" {

@@ -41,7 +41,7 @@ end
 --- Declares an executable capability. Actions acquire meaning when installed
 --- in an `action_scope`; controls and shortcuts refer to them through intents.
 function ui.action(options)
-    options = validate(options, { id=true, enabled=true, activate=true }, "action")
+    options = validate(options, { id=true, enabled=true, input=true, activate=true }, "action")
     if type(options.id) ~= "string" or options.id == "" then
         error("action requires a non-empty id", 2)
     end
@@ -55,20 +55,30 @@ function ui.action(options)
         __keywork_kind = ACTION_KIND,
         id = options.id,
         enabled = options.enabled == nil and true or options.enabled,
+        input = options.input,
         activate = options.activate,
     }
 end
 
 --- Refers to an action without executing it. Passing the action object keeps
 --- its enabled state available to controls while dispatch still uses its id.
-function ui.intent(value)
-    if is_intent(value) then
+function ui.intent(value, target)
+    if is_intent(value) and target == nil then
         return value
+    end
+    if is_intent(value) then
+        return {
+            __keywork_kind = INTENT_KIND,
+            action = value.action,
+            target = target,
+            _action = value._action,
+        }
     end
     if is_action(value) then
         return {
             __keywork_kind = INTENT_KIND,
             action = value.id,
+            target = target,
             _action = value,
         }
     end
@@ -78,7 +88,15 @@ function ui.intent(value)
     return {
         __keywork_kind = INTENT_KIND,
         action = value,
+        target = target,
     }
+end
+
+local function native_intent(intent)
+    if intent == nil or intent.target == nil then
+        return intent and intent.action
+    end
+    return { action = intent.action, target = intent.target }
 end
 
 local function resolve_intent(value)
@@ -1113,7 +1131,7 @@ local function build_button(options, theme)
     end
     return ui.pressable({
         id = options.id,
-        intent = intent and intent.action,
+        intent = native_intent(intent),
         disabled = disabled,
         activation = options.activation,
         on_activate = options.on_activate,
@@ -1219,7 +1237,7 @@ local ListItem = ui.component({
         return ui.pressable({
             id = options.id,
             child = child,
-            intent = intent and intent.action,
+            intent = native_intent(intent),
             disabled = disabled,
             on_activate = options.on_activate,
             on_hover = options.on_hover,
@@ -1278,7 +1296,7 @@ local StatusView = ui.component({
                 id = options.id .. ":action",
                 label = options.command.title,
                 icon = options.command.icon,
-                intent = options.command.intent.action,
+                intent = native_intent(options.command.intent),
                 disabled = options.command.disabled,
                 appearance = "primary",
             }))
@@ -1424,7 +1442,7 @@ local function build_menu_item(options, theme)
         hover_background = hover_background,
         pressed_background = pressed_background,
         disabled = disabled,
-        intent = intent and intent.action,
+        intent = native_intent(intent),
         on_activate = options.on_activate,
         on_hover = options.on_hover,
         child = ui.container({
@@ -1474,7 +1492,7 @@ local function command_menu_item(command, options, index)
         child = ui.row({ spacing = 8, align = "center", children = content }),
         selected = options.selected == command.id or options.selected == index,
         disabled = command.disabled,
-        intent = command.intent.action,
+        intent = native_intent(command.intent),
         on_hover = options.on_hover and function(hovered)
             options.on_hover(command, index, hovered)
         end or nil,
@@ -1635,7 +1653,7 @@ function ui.action_scope(options)
         end
         seen[action.id] = true
         if action_enabled(action) then
-            bindings[action.id] = action.activate
+            bindings[action.id] = action
         end
     end
     return ui.actions({ bindings = bindings, child = options.child })

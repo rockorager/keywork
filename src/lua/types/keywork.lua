@@ -31,10 +31,12 @@
 ---@class keywork.Action
 ---@field id       string
 ---@field enabled  boolean | fun(): boolean
----@field activate fun()
+---@field input?   table<string, keywork.json.Value>
+---@field activate fun(target?: keywork.json.Value)
 
 ---@class keywork.Intent
----@field action string
+---@field action  string
+---@field target? keywork.json.Value
 
 ---@class keywork.Command
 ---@field id        string
@@ -907,7 +909,8 @@ function PixelBuffer:commit(options) end
 ---@class keywork.ActionOptions
 ---@field id       string
 ---@field enabled? boolean | fun(): boolean
----@field activate fun()
+---@field input?   table<string, keywork.json.Value>
+---@field activate fun(target?: keywork.json.Value)
 
 ---@class keywork.ActionScopeOptions
 ---@field actions keywork.Action[]
@@ -1221,9 +1224,10 @@ function M.badge(options) end
 ---@return keywork.Action
 function M.action(options) end
 
----@param value keywork.Action | keywork.Intent | string
+---@param value   keywork.Action | keywork.Intent | string
+---@param target? keywork.json.Value
 ---@return keywork.Intent
-function M.intent(value) end
+function M.intent(value, target) end
 
 ---@param options keywork.CommandOptions
 ---@return keywork.Command

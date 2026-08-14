@@ -12,6 +12,7 @@ const svg_icon = struct {
 const lua_codec = @import("codec.zig");
 const lua_handle = @import("handle.zig");
 const lua_image = @import("image.zig");
+const lua_json = @import("json.zig");
 const lua_pixel_buffer = @import("pixel_buffer.zig");
 const lua_task = @import("task.zig");
 const lua_theme = @import("theme.zig");
@@ -313,6 +314,15 @@ const LuaCallback = struct {
         };
     }
 
+    fn keyworkActionCallback(self: *LuaCallback) keywork.Widget.ActionCallback {
+        return .{
+            .ptr = self,
+            .call_fn = callAction,
+            .clone_fn = clone,
+            .destroy_fn = destroy,
+        };
+    }
+
     fn keyworkTapCallback(self: *LuaCallback) keywork.Widget.TapCallback {
         return .{ .ptr = self, .call_fn = callTapEvent, .clone_fn = clone, .destroy_fn = destroy };
     }
@@ -399,6 +409,16 @@ const LuaCallback = struct {
         const self: *LuaCallback = @ptrCast(@alignCast(ptr));
         c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
         if (c.lua_pcall(self.lua_state, 0, 0, 0) != 0) return failLuaCall(self.lua_state, "callback failed");
+    }
+
+    fn callAction(ptr: *anyopaque, target_json: ?[]const u8) !void {
+        const self: *LuaCallback = @ptrCast(@alignCast(ptr));
+        c.lua_rawgeti(self.lua_state, c.LUA_REGISTRYINDEX, self.ref);
+        const argument_count: c_int = if (target_json) |target| count: {
+            try lua_json.pushDecoded(self.lua_state, self.allocator, target);
+            break :count 1;
+        } else 0;
+        if (c.lua_pcall(self.lua_state, argument_count, 0, 0) != 0) return failLuaCall(self.lua_state, "action callback failed");
     }
 
     fn callFocusChange(ptr: *anyopaque, focused: bool) !void {
@@ -860,7 +880,10 @@ pub fn parse(
         const on_hover = try getOptionalFocusChangeCallbackField(lua_state, callback_allocator, table, "on_hover");
         errdefer if (on_hover) |callback| callback.destroy(callback_allocator);
         const intent = try getOptionalIntentField(lua_state, allocator, table, "action_id");
-        errdefer if (intent) |intent_value| allocator.free(intent_value.action_id);
+        errdefer if (intent) |intent_value| {
+            allocator.free(intent_value.action_id);
+            if (intent_value.target_json) |target| allocator.free(target);
+        };
         const child = try parseChild(host, lua_state, allocator, callback_allocator, runtime_state, parse_context, table);
         return .{ .clickable = .{
             .id = id,
@@ -1421,8 +1444,28 @@ fn parseActionBindings(
     while (c.lua_next(lua_state, bindings_table) != 0) {
         defer pop(lua_state, 1);
         const id = try stringFromStack(lua_state, -2);
+        if (c.lua_type(lua_state, -1) == c.LUA_TFUNCTION) {
+            const callback = try callbackFromStack(lua_state, callback_allocator, -1);
+            try bindings.append(allocator, .{ .id = try allocator.dupe(u8, id), .callback = callback });
+            continue;
+        }
+
+        try expectType(lua_state, -1, c.LUA_TTABLE);
+        const action = absoluteIndex(lua_state, -1);
+        c.lua_getfield(lua_state, action, "activate");
+        defer pop(lua_state, 1);
         const callback = try callbackFromStack(lua_state, callback_allocator, -1);
-        try bindings.append(allocator, .{ .id = try allocator.dupe(u8, id), .callback = callback });
+        const invoke = try actionCallbackFromStack(lua_state, callback_allocator, -1);
+
+        c.lua_getfield(lua_state, action, "input");
+        defer pop(lua_state, 1);
+        const input_schema_json = if (c.lua_isnil(lua_state, -1)) null else try lua_json.encodeAlloc(lua_state, -1, allocator);
+        try bindings.append(allocator, .{
+            .id = try allocator.dupe(u8, id),
+            .callback = callback,
+            .invoke = invoke,
+            .input_schema_json = input_schema_json,
+        });
     }
     return try bindings.toOwnedSlice(allocator);
 }
@@ -1531,8 +1574,15 @@ fn intentFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index:
     if (c.lua_istable(lua_state, index)) {
         const table = absoluteIndex(lua_state, index);
         c.lua_getfield(lua_state, table, "action");
+        const action_id = try allocator.dupe(u8, try stringFromStack(lua_state, -1));
+        pop(lua_state, 1);
+        errdefer allocator.free(action_id);
+        c.lua_getfield(lua_state, table, "target");
         defer pop(lua_state, 1);
-        return .action(try allocator.dupe(u8, try stringFromStack(lua_state, -1)));
+        return .{
+            .action_id = action_id,
+            .target_json = if (c.lua_isnil(lua_state, -1)) null else try lua_json.encodeAlloc(lua_state, -1, allocator),
+        };
     }
     return error.ExpectedLuaString;
 }
@@ -1680,6 +1730,11 @@ fn getOptionalFocusChangeCallbackField(
 fn callbackFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) !keywork.Widget.Callback {
     const callback = try luaCallbackFromStack(lua_state, allocator, index);
     return callback.keyworkCallback();
+}
+
+fn actionCallbackFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) !keywork.Widget.ActionCallback {
+    const callback = try luaCallbackFromStack(lua_state, allocator, index);
+    return callback.keyworkActionCallback();
 }
 
 fn luaCallbackFromStack(lua_state: *c.lua_State, allocator: std.mem.Allocator, index: c_int) !*LuaCallback {

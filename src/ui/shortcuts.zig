@@ -42,11 +42,11 @@ pub fn shortcutAllowedWhileEditing(key: ShortcutKey) bool {
     };
 }
 
-pub fn findShortcutAction(element: *const Element, key: ShortcutKey) ?Widget.Callback {
+pub fn findShortcutAction(element: *const Element, key: ShortcutKey) ?Widget.ActionInvocation {
     return findShortcutActionScoped(element, key, null);
 }
 
-pub fn findFocusedShortcutAction(element: *const Element, key: ShortcutKey, focused_id: []const u8) ?Widget.Callback {
+pub fn findFocusedShortcutAction(element: *const Element, key: ShortcutKey, focused_id: []const u8) ?Widget.ActionInvocation {
     return findFocusedShortcutActionScoped(element, key, focused_id, null, null);
 }
 
@@ -55,7 +55,7 @@ const ShortcutScope = struct {
     parent: ?*const ShortcutScope = null,
 };
 
-fn findShortcutActionScoped(element: *const Element, key: ShortcutKey, scope: ?*const ActionScope) ?Widget.Callback {
+fn findShortcutActionScoped(element: *const Element, key: ShortcutKey, scope: ?*const ActionScope) ?Widget.ActionInvocation {
     switch (element.widget) {
         .actions => |actions_widget| {
             const nested: ActionScope = .{ .bindings = actions_widget.bindings, .parent = scope };
@@ -83,11 +83,11 @@ fn findShortcutActionScoped(element: *const Element, key: ShortcutKey, scope: ?*
     return null;
 }
 
-pub fn findActionForIntent(scope: ?*const ActionScope, intent: Intent) ?Widget.Callback {
+pub fn findActionForIntent(scope: ?*const ActionScope, intent: Intent) ?Widget.ActionInvocation {
     var cursor = scope;
     while (cursor) |action_scope| {
         for (action_scope.bindings) |binding| {
-            if (std.mem.eql(u8, binding.id, intent.action_id)) return binding.callback;
+            if (std.mem.eql(u8, binding.id, intent.action_id)) return .{ .binding = binding, .target_json = intent.target_json };
         }
         cursor = action_scope.parent;
     }
@@ -100,7 +100,7 @@ fn findFocusedShortcutActionScoped(
     focused_id: []const u8,
     actions: ?*const ActionScope,
     shortcuts: ?*const ShortcutScope,
-) ?Widget.Callback {
+) ?Widget.ActionInvocation {
     switch (element.widget) {
         .actions => |actions_widget| {
             const nested_actions: ActionScope = .{ .bindings = actions_widget.bindings, .parent = actions };
@@ -124,14 +124,14 @@ fn findFocusedShortcutActionInChildren(
     focused_id: []const u8,
     actions: ?*const ActionScope,
     shortcuts: ?*const ShortcutScope,
-) ?Widget.Callback {
+) ?Widget.ActionInvocation {
     for (element.children) |*child| {
         if (findFocusedShortcutActionScoped(child, key, focused_id, actions, shortcuts)) |callback| return callback;
     }
     return null;
 }
 
-fn findShortcutInScope(scope: ?*const ShortcutScope, key: ShortcutKey, actions: ?*const ActionScope) ?Widget.Callback {
+fn findShortcutInScope(scope: ?*const ShortcutScope, key: ShortcutKey, actions: ?*const ActionScope) ?Widget.ActionInvocation {
     var cursor = scope;
     while (cursor) |shortcut_scope| {
         for (shortcut_scope.bindings) |binding| {

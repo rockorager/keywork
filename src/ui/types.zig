@@ -469,9 +469,15 @@ pub const ShortcutKey = enum {
 
 pub const Intent = struct {
     action_id: []const u8,
+    /// JSON-encoded input supplied to the action when the intent is activated.
+    target_json: ?[]const u8 = null,
 
     pub fn action(action_id: []const u8) Intent {
         return .{ .action_id = action_id };
+    }
+
+    pub fn targeted(action_id: []const u8, target_json: []const u8) Intent {
+        return .{ .action_id = action_id, .target_json = target_json };
     }
 };
 
