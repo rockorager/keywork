@@ -86,12 +86,16 @@ pub fn parseCommand(init: std.process.Init, allocator: std.mem.Allocator) !Comma
 }
 
 pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Options {
+    var args = init.minimal.args.iterate();
+    _ = args.skip();
+    return parseRun(&args, allocator);
+}
+
+fn parseRun(args: anytype, allocator: std.mem.Allocator) !Options {
     var result: Options = .{};
     var app_args: std.ArrayList([:0]const u8) = .empty;
     errdefer app_args.deinit(allocator);
     var script_seen = false;
-    var args = init.minimal.args.iterate();
-    _ = args.skip();
     while (args.next()) |arg| {
         if (script_seen) {
             try app_args.append(allocator, arg);
@@ -127,6 +131,8 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Options {
         } else if (std.mem.startsWith(u8, arg, "--script=")) {
             result.script_path = arg["--script=".len..];
             script_seen = true;
+        } else {
+            return error.UnknownOption;
         }
     }
     if (result.script_path.len == 0) return error.MissingScriptPath;
@@ -246,6 +252,18 @@ test "test command accepts its help option" {
     defer std.testing.allocator.free(options.paths);
 
     try std.testing.expect(options.help);
+}
+
+test "run command rejects unknown options before the script" {
+    var invalid: TestArgs = .{ .items = &.{ "--widht=800", "app.lua" } };
+    try std.testing.expectError(error.UnknownOption, parseRun(&invalid, std.testing.allocator));
+
+    var forwarded: TestArgs = .{ .items = &.{ "app.lua", "--application-option" } };
+    const options = try parseRun(&forwarded, std.testing.allocator);
+    defer std.testing.allocator.free(options.app_args);
+    try std.testing.expectEqualStrings("app.lua", options.script_path);
+    try std.testing.expectEqual(@as(usize, 1), options.app_args.len);
+    try std.testing.expectEqualStrings("--application-option", options.app_args[0]);
 }
 
 fn parseLayer(value: []const u8) native_runtime.LayerShellOptions.Layer {
