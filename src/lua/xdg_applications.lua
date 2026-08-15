@@ -407,6 +407,8 @@ local function expand_inline(token, context)
                 table.insert(out, context.name or "")
             elseif code == "k" then
                 table.insert(out, context.path or "")
+            elseif code:match("%a") then
+                return nil, "unknown field code %" .. code
             end
             -- Deprecated codes (%d %D %n %N %v %m) and %i expand to nothing
             -- inline; %i is only meaningful as a standalone token.
@@ -487,7 +489,11 @@ function M.exec_argv(entry, opts)
         elseif token:match("^%%[dDnNvm]$") then
             -- Deprecated standalone codes drop out entirely.
         else
-            table.insert(argv, expand_inline(token, context))
+            local expanded, expand_err = expand_inline(token, context)
+            if not expanded then
+                return nil, expand_err
+            end
+            table.insert(argv, expanded)
         end
     end
     if #argv == 0 then

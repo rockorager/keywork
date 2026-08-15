@@ -5755,6 +5755,14 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\assert(argv[8] == "--icon")
         \\assert(argv[9] == "editor-icon")
         \\
+        \\-- unknown field codes invalidate Exec instead of silently changing argv
+        \\local invalid_argv, invalid_err = apps.exec_argv({
+        \\  exec = "editor --mode=%Z",
+        \\  name = "Editor",
+        \\  path = "/tmp/editor.desktop",
+        \\})
+        \\assert(invalid_argv == nil and invalid_err == "unknown field code %Z")
+        \\
         \\-- files convert to escaped file:// URIs for %U
         \\local uris = assert(apps.exec_argv(viewer, { files = { "/tmp/a b.txt" } }))
         \\assert(uris[1] == "viewer")
