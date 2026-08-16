@@ -270,7 +270,17 @@ if [[ "$native_changed" == true ]]; then
 fi
 
 echo "Prefetching Zig package dependencies"
-zig build --fetch
+for attempt in {1..5}; do
+    if zig build --fetch; then
+        break
+    fi
+    if [[ "$attempt" == 5 ]]; then
+        echo "Failed to fetch Zig package dependencies after $attempt attempts" >&2
+        exit 1
+    fi
+    echo "Zig package fetch failed; retrying ($attempt/5)" >&2
+    sleep $((attempt * 5))
+done
 
 profile_marker="# keywork orb session bus"
 if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
