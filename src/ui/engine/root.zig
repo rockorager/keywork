@@ -24,6 +24,7 @@ const backend_behavior = @import("backend_behavior.zig");
 const focus_scroll = @import("focus_scroll.zig");
 const input_behavior = @import("input.zig");
 const lifecycle_reconciliation = @import("lifecycle_reconciliation.zig");
+const semantic_snapshot = @import("semantic_snapshot.zig");
 
 var next_action_owner_id: std.atomic.Value(u64) = .init(1);
 
@@ -480,6 +481,16 @@ pub const Runtime = struct {
         const root = if (self.element_root) |*element_root| element_root else return error.StaleAction;
         const binding = keywork.actionAt(root, token.index) orelse return error.StaleAction;
         try (keywork.Widget.ActionInvocation{ .binding = binding.*, .target_json = target_json }).call();
+    }
+
+    /// Writes the current retained widget tree without render boxes, callback
+    /// pointers, or obscured text-input values.
+    pub fn writeSemanticSnapshot(self: *const Runtime, json: *std.json.Stringify) !void {
+        const root = if (self.element_root) |*element_root| element_root else {
+            try json.write(null);
+            return;
+        };
+        try semantic_snapshot.write(json, root, self.action_owner_id, self.action_revision);
     }
 
     fn rebuild(self: *Runtime) !void {

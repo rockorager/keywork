@@ -55,6 +55,7 @@ pub const PointerButtons = types.PointerButtons;
 pub const TapSource = types.TapSource;
 pub const TapEvent = types.TapEvent;
 pub const AppContext = model.AppContext;
+pub const TextInputState = model.TextInputState;
 pub const textInputState = model.textInputState;
 pub const scrollState = model.scrollState;
 pub const listState = model.listState;
