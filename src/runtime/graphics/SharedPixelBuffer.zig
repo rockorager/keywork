@@ -108,7 +108,6 @@ pub fn cancelWrite(self: *SharedPixelBuffer) void {
 /// widget union every skipped revision or conservatively repaint in full.
 pub fn commit(self: *SharedPixelBuffer, rects: []const keywork.Rect) !u64 {
     if (!self.writing) return error.WriteNotBegun;
-    self.writing = false;
 
     var damage: keywork.DamageRegion = .{};
     damage.addSlice(rects);
@@ -120,6 +119,7 @@ pub fn commit(self: *SharedPixelBuffer, rects: []const keywork.Rect) !u64 {
     });
     if (damage.isEmpty()) return error.EmptyDamage;
 
+    self.writing = false;
     self.revision +%= 1;
     if (self.revision == 0) self.revision = 1;
     if (self.history_len == history_capacity) {
@@ -275,4 +275,22 @@ test "shared pixel buffer retains disjoint damage across skipped revisions" {
     );
     try std.testing.expectEqual(@as(usize, 2), widget_damage.slice().len);
     try std.testing.expectEqual(keywork.Rect{ .x = 12, .y = 24, .width = 6, .height = 8 }, widget_damage.slice()[0]);
+}
+
+test "invalid pixel buffer damage keeps the write unpublished and retryable" {
+    const buffer = try SharedPixelBuffer.create(std.testing.allocator, 10, 10, .xrgb8888);
+    defer buffer.release();
+    _ = try buffer.beginWrite();
+
+    try std.testing.expectError(error.EmptyDamage, buffer.commit(&.{.{
+        .x = 20,
+        .y = 20,
+        .width = 1,
+        .height = 1,
+    }}));
+    try std.testing.expect(buffer.writing);
+    try std.testing.expectEqual(@as(u64, 0), buffer.revision);
+
+    try std.testing.expectEqual(@as(u64, 1), try buffer.commit(&.{buffer.fullRect()}));
+    try std.testing.expect(!buffer.writing);
 }
