@@ -87,7 +87,7 @@ fn decodeValue(comptime T: type, lua_state: *c.lua_State, index: c_int, allocato
             const magnitude_bits = info.bits - @intFromBool(info.signedness == .signed);
             const limit: f64 = @floatFromInt(@as(u128, 1) << magnitude_bits);
             const minimum = if (info.signedness == .signed) -limit else 0;
-            if (!std.math.isFinite(value) or value < minimum or value >= limit) {
+            if (!std.math.isFinite(value) or value != @floor(value) or value < minimum or value >= limit) {
                 return error.InvalidLuaNumber;
             }
             return @intFromFloat(value);
@@ -192,6 +192,11 @@ test "numeric decoding rejects values that cannot be represented" {
     defer c.lua_close(lua_state);
 
     try std.testing.expectEqual(@as(c_int, 0), c.luaL_loadstring(lua_state, "return { count = -1 }"));
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(lua_state, 0, 1, 0));
+    try std.testing.expectError(error.InvalidLuaNumber, decode(Options, lua_state, -1, std.testing.allocator));
+    pop(lua_state, 1);
+
+    try std.testing.expectEqual(@as(c_int, 0), c.luaL_loadstring(lua_state, "return { count = 1.5 }"));
     try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(lua_state, 0, 1, 0));
     try std.testing.expectError(error.InvalidLuaNumber, decode(Options, lua_state, -1, std.testing.allocator));
     pop(lua_state, 1);
