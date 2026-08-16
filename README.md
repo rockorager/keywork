@@ -197,12 +197,19 @@ or manage a server in Lua. `keyworkctl` discovers and verifies those endpoints:
 keyworkctl app list
 keyworkctl app status [INSTANCE]
 keyworkctl app reload [INSTANCE]
+keyworkctl app actions [INSTANCE]
+keyworkctl app invoke HANDLE [--target JSON] [INSTANCE]
+keyworkctl app tree [INSTANCE]
+keyworkctl app watch [INSTANCE]
 ```
 
-When exactly one application is running, `status` and `reload` may omit the
-instance. `--address ADDRESS` targets an endpoint directly. Compositor commands
-are namespaced as `keyworkctl compositor ...`; their original unnamespaced
-forms remain compatibility aliases.
+When exactly one application is running, the instance may be omitted.
+`--address ADDRESS` targets an endpoint directly. `tree` emits the current
+semantic retained widget tree as JSON, including stable widget ids and action
+handles while redacting obscured text inputs. `watch` emits a new JSON line
+only when that semantic snapshot changes. Compositor commands are namespaced
+as `keyworkctl compositor ...`; their original unnamespaced forms remain
+compatibility aliases.
 
 Reload is explicit rather than file-watch driven. A request compiles the entry
 script and previously loaded application-local Lua modules before replacing

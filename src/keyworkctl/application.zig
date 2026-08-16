@@ -10,7 +10,7 @@ const Empty = struct {};
 pub const usage =
     \\usage: keyworkctl app COMMAND [INSTANCE | --address ADDRESS]
     \\
-    \\commands: list | status | reload | actions
+    \\commands: list | status | reload | actions | tree | watch
     \\          invoke HANDLE [--target JSON] [INSTANCE | --address ADDRESS]
     \\
     \\With no instance, commands require exactly one running app.
@@ -28,6 +28,8 @@ const Command = union(enum) {
     status: Target,
     reload: Target,
     actions: Target,
+    tree: Target,
+    watch: Target,
     invoke: struct {
         handle: []const u8,
         target_json: ?[]const u8,
@@ -44,8 +46,65 @@ pub fn run(init: std.process.Init, arguments: []const []const u8) !void {
         .status => |target| status(init, runtime_directory, target),
         .reload => |target| reload(init, runtime_directory, target),
         .actions => |target| actions(init, runtime_directory, target),
+        .tree => |target| tree(init, runtime_directory, target),
+        .watch => |target| watch(init, runtime_directory, target),
         .invoke => |invocation| invoke(init, runtime_directory, invocation.handle, invocation.target_json, invocation.target),
     };
+}
+
+fn tree(init: std.process.Init, runtime_directory: []const u8, target: Target) !void {
+    const address = try resolveAddress(init.gpa, init.io, runtime_directory, target);
+    defer init.gpa.free(address);
+    var client = try connect(init.gpa, init.io, address);
+    defer client.deinit();
+    var snapshot = try getUiSnapshot(init, &client);
+    defer snapshot.deinit();
+
+    var buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+    defer stdout.interface.flush() catch {};
+    try printUiSnapshot(init.gpa, &stdout.interface, snapshot.value.snapshot);
+}
+
+fn watch(init: std.process.Init, runtime_directory: []const u8, target: Target) !void {
+    const address = try resolveAddress(init.gpa, init.io, runtime_directory, target);
+    defer init.gpa.free(address);
+    var client = try connect(init.gpa, init.io, address);
+    defer client.deinit();
+    var last_generation: ?i64 = null;
+    var buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+    defer stdout.interface.flush() catch {};
+    while (true) {
+        var snapshot = try getUiSnapshot(init, &client);
+        defer snapshot.deinit();
+        if (last_generation == null or snapshot.value.snapshot.generation != last_generation.?) {
+            try printUiSnapshot(init.gpa, &stdout.interface, snapshot.value.snapshot);
+            try stdout.interface.flush();
+            last_generation = snapshot.value.snapshot.generation;
+        }
+        try init.io.sleep(.fromMilliseconds(250), .awake);
+    }
+}
+
+fn getUiSnapshot(init: std.process.Init, client: *varlink.Client) !std.json.Parsed(control.UiSnapshotReply) {
+    var reply = try client.call(control.get_ui_snapshot_method, Empty{});
+    defer reply.deinit();
+    try checkRemote(init.io, reply.value);
+    return std.json.parseFromValue(
+        control.UiSnapshotReply,
+        init.gpa,
+        reply.value.parameters orelse return error.MissingUiSnapshotReply,
+        .{},
+    );
+}
+
+fn printUiSnapshot(allocator: std.mem.Allocator, writer: *std.Io.Writer, snapshot: control.UiSnapshot) !void {
+    var tree_json = try std.json.parseFromSlice(std.json.Value, allocator, snapshot.snapshotJson, .{});
+    defer tree_json.deinit();
+    var output: std.json.Stringify = .{ .writer = writer };
+    try output.write(.{ .generation = snapshot.generation, .snapshot = tree_json.value });
+    try writer.writeByte('\n');
 }
 
 fn actions(init: std.process.Init, runtime_directory: []const u8, target: Target) !void {
@@ -219,7 +278,10 @@ fn checkRemote(io: std.Io, reply: varlink.Reply) !void {
 fn remoteErrorMessage(name: []const u8, parameters: ?std.json.Value) ?[]const u8 {
     if (std.mem.eql(u8, name, control.action_not_found_error)) return "action handle is stale or unknown";
     if (std.mem.eql(u8, name, control.actions_unavailable_error)) return "application actions are unavailable";
-    if (!std.mem.eql(u8, name, control.reload_failed_error) and !std.mem.eql(u8, name, control.action_failed_error)) return null;
+    if (std.mem.eql(u8, name, control.ui_unavailable_error)) return "application UI is unavailable";
+    if (!std.mem.eql(u8, name, control.reload_failed_error) and
+        !std.mem.eql(u8, name, control.action_failed_error) and
+        !std.mem.eql(u8, name, control.ui_snapshot_failed_error)) return null;
     const value = parameters orelse return null;
     const object = switch (value) {
         .object => |object| object,
@@ -315,6 +377,8 @@ fn parse(arguments: []const []const u8) !Command {
     if (std.mem.eql(u8, arguments[0], "status")) return .{ .status = target };
     if (std.mem.eql(u8, arguments[0], "reload")) return .{ .reload = target };
     if (std.mem.eql(u8, arguments[0], "actions")) return .{ .actions = target };
+    if (std.mem.eql(u8, arguments[0], "tree")) return .{ .tree = target };
+    if (std.mem.eql(u8, arguments[0], "watch")) return .{ .watch = target };
     return error.UnknownCommand;
 }
 
@@ -350,6 +414,8 @@ test "application command parsing supports discovery and explicit addresses" {
     try std.testing.expectEqual(Target.automatic, (try parse(&.{"status"})).status);
     try std.testing.expectEqualStrings("abc", (try parse(&.{ "reload", "abc" })).reload.instance);
     try std.testing.expectEqual(Target.automatic, (try parse(&.{"actions"})).actions);
+    try std.testing.expectEqual(Target.automatic, (try parse(&.{"tree"})).tree);
+    try std.testing.expectEqualStrings("abc", (try parse(&.{ "watch", "abc" })).watch.instance);
     const invocation = (try parse(&.{ "invoke", "1:2:3", "--target", "{\"id\":7}", "abc" })).invoke;
     try std.testing.expectEqualStrings("1:2:3", invocation.handle);
     try std.testing.expectEqualStrings("{\"id\":7}", invocation.target_json.?);

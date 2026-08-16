@@ -37,6 +37,15 @@ SD_VARLINK_DEFINE_METHOD(
     SD_VARLINK_DEFINE_INPUT(handle, SD_VARLINK_STRING, 0),
     SD_VARLINK_DEFINE_INPUT(targetJson, SD_VARLINK_STRING, SD_VARLINK_NULLABLE));
 
+SD_VARLINK_DEFINE_STRUCT_TYPE(
+    UiSnapshot,
+    SD_VARLINK_DEFINE_FIELD(generation, SD_VARLINK_INT, 0),
+    SD_VARLINK_DEFINE_FIELD(snapshotJson, SD_VARLINK_STRING, 0));
+
+SD_VARLINK_DEFINE_METHOD(
+    GetUiSnapshot,
+    SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(snapshot, UiSnapshot, 0));
+
 SD_VARLINK_DEFINE_ERROR(ReloadUnsupported);
 SD_VARLINK_DEFINE_ERROR(
     ReloadFailed,
@@ -46,21 +55,29 @@ SD_VARLINK_DEFINE_ERROR(ActionNotFound);
 SD_VARLINK_DEFINE_ERROR(
     ActionFailed,
     SD_VARLINK_DEFINE_FIELD(message, SD_VARLINK_STRING, 0));
+SD_VARLINK_DEFINE_ERROR(UiUnavailable);
+SD_VARLINK_DEFINE_ERROR(
+    UiSnapshotFailed,
+    SD_VARLINK_DEFINE_FIELD(message, SD_VARLINK_STRING, 0));
 
 SD_VARLINK_DEFINE_INTERFACE(
     application,
     "dev.rockorager.keywork.application",
     &vl_type_Status,
     &vl_type_Action,
+    &vl_type_UiSnapshot,
     &vl_method_GetStatus,
     &vl_method_Reload,
     &vl_method_ListActions,
     &vl_method_InvokeAction,
+    &vl_method_GetUiSnapshot,
     &vl_error_ReloadUnsupported,
     &vl_error_ReloadFailed,
     &vl_error_ActionsUnavailable,
     &vl_error_ActionNotFound,
-    &vl_error_ActionFailed);
+    &vl_error_ActionFailed,
+    &vl_error_UiUnavailable,
+    &vl_error_UiSnapshotFailed);
 
 const sd_varlink_interface *keywork_application_varlink_interface(void) {
     return &vl_interface_application;
@@ -126,5 +143,16 @@ int keywork_application_error_action_failed(sd_varlink *link, const char *messag
     return sd_varlink_errorbo(
         link,
         "dev.rockorager.keywork.application.ActionFailed",
+        SD_JSON_BUILD_PAIR_STRING("message", message));
+}
+
+int keywork_application_error_ui_unavailable(sd_varlink *link) {
+    return sd_varlink_error(link, "dev.rockorager.keywork.application.UiUnavailable", NULL);
+}
+
+int keywork_application_error_ui_snapshot_failed(sd_varlink *link, const char *message) {
+    return sd_varlink_errorbo(
+        link,
+        "dev.rockorager.keywork.application.UiSnapshotFailed",
         SD_JSON_BUILD_PAIR_STRING("message", message));
 }

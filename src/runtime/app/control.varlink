@@ -16,13 +16,21 @@ type Action (
     inputSchemaJson: ?string
 )
 
+type UiSnapshot (
+    generation: int,
+    snapshotJson: string
+)
+
 method GetStatus() -> (status: Status)
 method Reload() -> (generation: int)
 method ListActions() -> (actions: []Action)
 method InvokeAction(handle: string, targetJson: ?string) -> ()
+method GetUiSnapshot() -> (snapshot: UiSnapshot)
 
 error ReloadUnsupported()
 error ReloadFailed(message: string)
 error ActionsUnavailable()
 error ActionNotFound()
 error ActionFailed(message: string)
+error UiUnavailable()
+error UiSnapshotFailed(message: string)

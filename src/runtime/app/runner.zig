@@ -59,17 +59,41 @@ pub const Options = struct {
     /// Declarative window-set host; when present the Wayland backends run
     /// one runtime per declared window instead of a single main window.
     windows_host: ?app_windows.WindowsHost = null,
-    /// Per-process control endpoint that exposes actions from live retained
-    /// runtimes while this runner owns them.
-    action_control: ?*ApplicationControl = null,
+    /// Per-process control endpoint that exposes live retained runtimes while
+    /// this runner owns them.
+    application_control: ?*ApplicationControl = null,
 };
 
 fn bindActionHost(options: Options, host: ApplicationControl.ActionHost) void {
-    if (options.action_control) |control| control.bindActionHost(host);
+    if (options.application_control) |control| control.bindActionHost(host);
 }
 
 fn unbindActionHost(options: Options) void {
-    if (options.action_control) |control| control.unbindActionHost();
+    if (options.application_control) |control| control.unbindActionHost();
+}
+
+fn bindUiHost(options: Options, host: ApplicationControl.UiHost) void {
+    if (options.application_control) |control| control.bindUiHost(host);
+}
+
+fn unbindUiHost(options: Options) void {
+    if (options.application_control) |control| control.unbindUiHost();
+}
+
+fn writeRuntimeSurface(
+    json: *std.json.Stringify,
+    kind: []const u8,
+    id: []const u8,
+    runtime: *const runtime_mod.Runtime,
+) !void {
+    try json.beginObject();
+    try json.objectField("kind");
+    try json.write(kind);
+    try json.objectField("id");
+    try json.write(id);
+    try json.objectField("tree");
+    try runtime.writeSemanticSnapshot(json);
+    try json.endObject();
 }
 
 fn enumerateRuntimeActions(runtime: *const runtime_mod.Runtime, sink: ApplicationControl.ActionSink) !void {
@@ -108,6 +132,20 @@ const SingleActionHost = struct {
         return .{ .ptr = self, .enumerate_fn = enumerate, .invoke_fn = invoke };
     }
 
+    fn uiHost(self: *SingleActionHost) ApplicationControl.UiHost {
+        return .{ .ptr = self, .write_fn = writeUi };
+    }
+
+    fn writeUi(ptr: *anyopaque, json: *std.json.Stringify) !void {
+        const self: *SingleActionHost = @ptrCast(@alignCast(ptr));
+        try json.beginObject();
+        try json.objectField("surfaces");
+        try json.beginArray();
+        try writeRuntimeSurface(json, "window", "main", self.runtime);
+        try json.endArray();
+        try json.endObject();
+    }
+
     fn enumerate(ptr: *anyopaque, sink: ApplicationControl.ActionSink) !void {
         const self: *SingleActionHost = @ptrCast(@alignCast(ptr));
         try enumerateRuntimeActions(self.runtime, sink);
@@ -128,6 +166,23 @@ fn WaylandActionHost(comptime Backend: type) type {
 
         fn host(self: *Self) ApplicationControl.ActionHost {
             return .{ .ptr = self, .enumerate_fn = enumerate, .invoke_fn = invoke };
+        }
+
+        fn uiHost(self: *Self) ApplicationControl.UiHost {
+            return .{ .ptr = self, .write_fn = writeUi };
+        }
+
+        fn writeUi(ptr: *anyopaque, json: *std.json.Stringify) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try json.beginObject();
+            try json.objectField("surfaces");
+            try json.beginArray();
+            try writeRuntimeSurface(json, "window", "main", self.runtime);
+            for (self.popups.popups.items) |popup| {
+                try writeRuntimeSurface(json, "popup", popup.id, &popup.runtime);
+            }
+            try json.endArray();
+            try json.endObject();
         }
 
         fn enumerate(ptr: *anyopaque, sink: ApplicationControl.ActionSink) !void {
@@ -197,6 +252,8 @@ fn runHeadlessRuntime(
     var action_host: SingleActionHost = .{ .runtime = &runtime };
     bindActionHost(options, action_host.host());
     defer unbindActionHost(options);
+    bindUiHost(options, action_host.uiHost());
+    defer unbindUiHost(options);
     if (options.host_bindings) |bindings| bindings.bindInvalidator(.fromRuntime(&runtime));
     defer if (options.host_bindings) |bindings| bindings.unbindInvalidator();
     runtime.setDeferredRepaint(true);
@@ -315,6 +372,8 @@ fn runWayland(
         .{ .runtime = &runtime };
     bindActionHost(options, action_host.host());
     defer unbindActionHost(options);
+    bindUiHost(options, action_host.uiHost());
+    defer unbindUiHost(options);
     if (popups_supported) queue.popup_manager = popup_manager.hooks();
     win.setPointerButtonHandler(&queue, QueuedPlatformEvents.pointerButton);
     win.setPointerMoveHandler(&queue, QueuedPlatformEvents.pointerMove);
@@ -957,6 +1016,8 @@ fn runWaylandWindowed(
     if (manager.shouldQuit()) return;
     bindActionHost(options, manager.actionHost());
     defer unbindActionHost(options);
+    bindUiHost(options, manager.uiHost());
+    defer unbindUiHost(options);
 
     // Loop lifetime is the manager's decision, not the backend's: zero
     // live windows is a valid state while the app waits for outputs.
@@ -1104,6 +1165,25 @@ fn WindowManager(comptime Backend: type) type {
 
         fn actionHost(self: *Self) ApplicationControl.ActionHost {
             return .{ .ptr = self, .enumerate_fn = enumerateActions, .invoke_fn = invokeAction };
+        }
+
+        fn uiHost(self: *Self) ApplicationControl.UiHost {
+            return .{ .ptr = self, .write_fn = writeUi };
+        }
+
+        fn writeUi(ptr: *anyopaque, json: *std.json.Stringify) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try json.beginObject();
+            try json.objectField("surfaces");
+            try json.beginArray();
+            for (self.windows.items) |managed| {
+                try writeRuntimeSurface(json, "window", managed.id, &managed.runtime);
+                for (managed.popups.popups.items) |popup| {
+                    try writeRuntimeSurface(json, "popup", popup.id, &popup.runtime);
+                }
+            }
+            try json.endArray();
+            try json.endObject();
         }
 
         fn enumerateActions(ptr: *anyopaque, sink: ApplicationControl.ActionSink) !void {

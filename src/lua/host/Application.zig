@@ -90,6 +90,6 @@ pub fn run(
         .host_bindings = self.lua.hostBindings(),
         .keep_alive = true,
         .windows_host = self.lua.windowsHost(),
-        .action_control = control,
+        .application_control = control,
     });
 }

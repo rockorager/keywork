@@ -66,17 +66,32 @@ pub const ActionHost = struct {
     }
 };
 
+/// UI-thread view of every retained surface owned by this application. The
+/// host writes a JSON object whose shape is intentionally independent of the
+/// Varlink IDL so semantic nodes can evolve without generated protocol glue.
+pub const UiHost = struct {
+    ptr: *anyopaque,
+    write_fn: *const fn (*anyopaque, *std.json.Stringify) anyerror!void,
+
+    pub fn write(self: UiHost, json: *std.json.Stringify) !void {
+        try self.write_fn(self.ptr, json);
+    }
+};
+
 allocator: std.mem.Allocator,
 io: std.Io,
 native: *systemd.sd_varlink_server,
 reload_host: ReloadHost,
 action_host: ?ActionHost = null,
+ui_host: ?UiHost = null,
 app_id: [:0]u8,
 address: [:0]u8,
 instance_id: [instance_id_length:0]u8,
 generation: i64 = 1,
 reloading: bool = false,
 pending: std.ArrayList(*systemd.sd_varlink) = .empty,
+ui_generation: i64 = 0,
+last_ui_snapshot: ?[]u8 = null,
 
 pub fn create(
     allocator: std.mem.Allocator,
@@ -144,6 +159,7 @@ pub fn create(
     try check(systemd.sd_varlink_server_bind_method(self.native, protocol.reload_method, reloadCallback));
     try check(systemd.sd_varlink_server_bind_method(self.native, protocol.list_actions_method, listActionsCallback));
     try check(systemd.sd_varlink_server_bind_method(self.native, protocol.invoke_action_method, invokeActionCallback));
+    try check(systemd.sd_varlink_server_bind_method(self.native, protocol.get_ui_snapshot_method, getUiSnapshotCallback));
     try check(systemd.sd_varlink_server_attach_event(self.native, bridge.sdEvent(), 0));
     errdefer _ = systemd.sd_varlink_server_detach_event(self.native);
     // sd-varlink's server API accepts a filesystem path; `unix:` is the
@@ -156,6 +172,7 @@ pub fn create(
 }
 
 pub fn destroy(self: *ApplicationControl) void {
+    if (self.last_ui_snapshot) |snapshot| self.allocator.free(snapshot);
     while (self.pending.pop()) |link| _ = systemd.sd_varlink_unref(link);
     self.pending.deinit(self.allocator);
     _ = systemd.sd_varlink_server_shutdown(self.native);
@@ -181,6 +198,15 @@ pub fn bindActionHost(self: *ApplicationControl, host: ActionHost) void {
 
 pub fn unbindActionHost(self: *ApplicationControl) void {
     self.action_host = null;
+}
+
+pub fn bindUiHost(self: *ApplicationControl, host: UiHost) void {
+    std.debug.assert(self.ui_host == null);
+    self.ui_host = host;
+}
+
+pub fn unbindUiHost(self: *ApplicationControl) void {
+    self.ui_host = null;
 }
 
 pub fn controlAddress(self: *const ApplicationControl) []const u8 {
@@ -337,6 +363,44 @@ fn invokeActionCallback(
     return replyResult(systemd.keywork_application_reply_json(link, "{}"));
 }
 
+fn getUiSnapshotCallback(
+    link_optional: ?*systemd.sd_varlink,
+    _: ?*systemd.sd_json_variant,
+    _: systemd.sd_varlink_method_flags_t,
+    userdata: ?*anyopaque,
+) callconv(.c) c_int {
+    const self: *ApplicationControl = @ptrCast(@alignCast(userdata orelse return -1));
+    const link = link_optional orelse return -1;
+    const host = self.ui_host orelse {
+        return replyResult(systemd.keywork_application_error_ui_unavailable(link));
+    };
+
+    var snapshot_output: std.Io.Writer.Allocating = .init(self.allocator);
+    defer snapshot_output.deinit();
+    var snapshot_json: std.json.Stringify = .{ .writer = &snapshot_output.writer };
+    host.write(&snapshot_json) catch |err| {
+        return replyUiSnapshotFailed(self, link, @errorName(err));
+    };
+    const snapshot = snapshot_output.written();
+    if (self.last_ui_snapshot == null or !std.mem.eql(u8, self.last_ui_snapshot.?, snapshot)) {
+        const copy = self.allocator.dupe(u8, snapshot) catch return -1;
+        if (self.last_ui_snapshot) |previous| self.allocator.free(previous);
+        self.last_ui_snapshot = copy;
+        self.ui_generation += 1;
+    }
+
+    var reply_output: std.Io.Writer.Allocating = .init(self.allocator);
+    defer reply_output.deinit();
+    var reply_json: std.json.Stringify = .{ .writer = &reply_output.writer };
+    reply_json.write(.{ .snapshot = protocol.UiSnapshot{
+        .generation = self.ui_generation,
+        .snapshotJson = self.last_ui_snapshot.?,
+    } }) catch return -1;
+    const reply_z = self.allocator.dupeZ(u8, reply_output.written()) catch return -1;
+    defer self.allocator.free(reply_z);
+    return replyResult(systemd.keywork_application_reply_json(link, reply_z.ptr));
+}
+
 fn parseActionHandle(handle: []const u8) !ActionToken {
     var parts = std.mem.splitScalar(u8, handle, ':');
     const owner_id = try std.fmt.parseUnsigned(u64, parts.next() orelse return error.InvalidActionHandle, 10);
@@ -350,6 +414,12 @@ fn replyActionFailed(self: *ApplicationControl, link: *systemd.sd_varlink, messa
     const message_z = self.allocator.dupeZ(u8, message) catch return -1;
     defer self.allocator.free(message_z);
     return replyResult(systemd.keywork_application_error_action_failed(link, message_z.ptr));
+}
+
+fn replyUiSnapshotFailed(self: *ApplicationControl, link: *systemd.sd_varlink, message: []const u8) c_int {
+    const message_z = self.allocator.dupeZ(u8, message) catch return -1;
+    defer self.allocator.free(message_z);
+    return replyResult(systemd.keywork_application_error_ui_snapshot_failed(link, message_z.ptr));
 }
 
 fn replyResult(result: c_int) c_int {

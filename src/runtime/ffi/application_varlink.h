@@ -21,3 +21,5 @@ void keywork_application_free_json(char *json);
 int keywork_application_error_actions_unavailable(sd_varlink *link);
 int keywork_application_error_action_not_found(sd_varlink *link);
 int keywork_application_error_action_failed(sd_varlink *link, const char *message);
+int keywork_application_error_ui_unavailable(sd_varlink *link);
+int keywork_application_error_ui_snapshot_failed(sd_varlink *link, const char *message);
