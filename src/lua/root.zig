@@ -5083,13 +5083,6 @@ test "lua command menus present and activate command intents" {
 }
 
 test "lua generic surfaces and progress bars resolve from the ambient theme" {
-    const containsBackground = struct {
-        fn check(node: *const keywork.RenderNode, color: keywork.Color) bool {
-            if (node.background == color) return true;
-            for (node.children) |child| if (check(child, color)) return true;
-            return false;
-        }
-    }.check;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -5112,7 +5105,10 @@ test "lua generic surfaces and progress bars resolve from the ambient theme" {
     defer runtime.deinit();
 
     try std.testing.expect(runtime.root.?.rect.width >= 120);
-    try std.testing.expect(containsBackground(runtime.root.?, keywork.colors.neutral_background6_dark));
+    try runtime.repaint();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "color=#ff333333") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "color=#ff292929") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "color=#ff115ea3") != null);
 }
 
 test "lua list items and status states activate intents" {
@@ -5672,11 +5668,13 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\Name[de]=Bearbeiter
         \\GenericName=Text Editor
         \\Comment=Edit text files
-        \\Keywords=semi\;colon;plain;
-        \\Categories=Utility;TextEditor;
+        \\Keywords=semi\;colon;hello\sworld;path\\;plain;
+        \\Categories=Utility\sTools;TextEditor;
         \\Icon=editor-icon
         \\Exec=editor --title %c %%x %F --icon-args %i
+        \\TryExec=/bin/sh
         \\Terminal=false
+        \\OnlyShowIn=keywork;GNOME;
         \\Actions=new-window;
         \\MimeType=text/plain;
         \\
@@ -5693,6 +5691,7 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\Type=Application
         \\Name=Viewer
         \\Exec=viewer %U
+        \\NotShowIn=keywork;
         \\
         ,
     });
@@ -5713,13 +5712,19 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\assert(entry.name == "Bearbeiter")
         \\assert(entry.generic_name == "Text Editor")
         \\assert(entry.icon == "editor-icon")
-        \\assert(#entry.keywords == 2)
+        \\assert(#entry.keywords == 4)
         \\assert(entry.keywords[1] == "semi;colon")
-        \\assert(entry.keywords[2] == "plain")
+        \\assert(entry.keywords[2] == "hello world")
+        \\assert(entry.keywords[3] == "path\\")
+        \\assert(entry.keywords[4] == "plain")
+        \\assert(entry.categories[1] == "Utility Tools")
         \\assert(entry.categories[2] == "TextEditor")
         \\assert(#entry.actions == 1)
         \\assert(entry.actions[1].id == "new-window")
         \\assert(entry.actions[1].name == "New Window")
+        \\assert(apps.should_show(entry, { current_desktop = "keywork" }))
+        \\assert(apps.should_show(entry, { current_desktop = "KDE:keywork" }))
+        \\assert(not apps.should_show(entry, { current_desktop = "KDE" }))
         \\
         \\-- unmatched locale falls back to the plain key
         \\local plain = assert(apps.lookup("editor.desktop", { dirs = dirs, locale = "C" }))
@@ -5728,6 +5733,24 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\-- desktop-id dashes map to subdirectories
         \\local viewer = assert(apps.lookup("org-example-Viewer", { dirs = dirs }))
         \\assert(viewer.name == "Viewer")
+        \\assert(not apps.should_show(viewer, { current_desktop = "keywork" }))
+        \\assert(apps.should_show(viewer, { current_desktop = "KDE" }))
+        \\assert(not apps.should_show({
+        \\  hidden = false,
+        \\  no_display = false,
+        \\  only_show_in = {},
+        \\  not_show_in = {},
+        \\  try_exec = "keywork-definitely-missing-executable",
+        \\  exec = "missing",
+        \\  dbus_activatable = false,
+        \\}))
+        \\assert(apps.should_show({
+        \\  hidden = false,
+        \\  no_display = false,
+        \\  only_show_in = {},
+        \\  not_show_in = {},
+        \\  dbus_activatable = true,
+        \\}))
         \\
         \\-- missing entries report an error
         \\local missing, err = apps.lookup("nope", { dirs = dirs })
@@ -5744,6 +5767,14 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\assert(argv[7] == "--icon-args")
         \\assert(argv[8] == "--icon")
         \\assert(argv[9] == "editor-icon")
+        \\
+        \\-- unknown field codes invalidate Exec instead of silently changing argv
+        \\local invalid_argv, invalid_err = apps.exec_argv({
+        \\  exec = "editor --mode=%Z",
+        \\  name = "Editor",
+        \\  path = "/tmp/editor.desktop",
+        \\})
+        \\assert(invalid_argv == nil and invalid_err == "unknown field code %Z")
         \\
         \\-- files convert to escaped file:// URIs for %U
         \\local uris = assert(apps.exec_argv(viewer, { files = { "/tmp/a b.txt" } }))

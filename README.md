@@ -102,7 +102,7 @@ Common commands:
 | `zig build lint` | Run shell static analysis |
 | `zig build fmt` | Check Zig, Lua, and Lua type formatting |
 | `zig build format` | Format Zig, Lua, and Lua type sources |
-| `zig build release -Doptimize=ReleaseSafe` | Package a versioned Linux compositor bundle under `zig-out/release` |
+| `zig build release -Doptimize=ReleaseSafe -Dcpu=baseline` | Package a portable, versioned Linux compositor bundle under `zig-out/release` |
 | `zig build run-shell` | Build, validate, and run the desktop shell |
 | `zig build -p ~/.local` | Install all artifacts and service assets under `~/.local` |
 | `zig build install-gdm-session -p ~/.local` | Install a system-visible GDM entry targeting the user-local compositor |

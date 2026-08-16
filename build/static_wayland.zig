@@ -1,6 +1,7 @@
 //! Builds the pinned Wayland client and server static libraries.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Output = struct {
     b: *std.Build,
@@ -31,8 +32,13 @@ pub fn add(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) Output {
-    if (target.result.os.tag != .linux or !target.query.isNative()) {
-        @panic("the bundled static Wayland build currently supports native Linux targets only");
+    if (target.result.os.tag != .linux or
+        !target.query.isNativeOs() or
+        !target.query.isNativeAbi() or
+        target.query.ofmt != null or
+        target.result.cpu.arch != builtin.cpu.arch)
+    {
+        @panic("the bundled static Wayland build currently supports native Linux platform targets only");
     }
 
     const source = b.dependency("wayland_source", .{}).path("");

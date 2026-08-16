@@ -76,6 +76,7 @@ fn isCommandError(err: anyerror) bool {
         error.InvalidLogLevel,
         error.InvalidBorderWidth,
         error.InvalidColor,
+        error.InvalidHeadlessOutputMode,
         error.UnknownCommand,
         => true,
         else => false,
@@ -100,4 +101,8 @@ fn reportUsage(io: std.Io, err: anyerror, text: []const u8) anyerror {
 test "top-level help names application and compositor namespaces" {
     try std.testing.expect(std.mem.indexOf(u8, usage, "compositor") != null);
     try std.testing.expect(std.mem.indexOf(u8, usage, "app") != null);
+}
+
+test "invalid headless output mode is a compositor command error" {
+    try std.testing.expect(isCommandError(error.InvalidHeadlessOutputMode));
 }

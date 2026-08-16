@@ -122,10 +122,14 @@ pub fn flushInteractionRefresh(self: anytype) !void {
     if (self.rebuild_pending) return;
     const element_root = if (self.element_root) |*element_root| element_root else return;
     var ids: [8][]const u8 = undefined;
-    const count = @min(ids.len, self.pending_interaction_ids.items.len);
-    for (self.pending_interaction_ids.items[0..count], 0..) |id, index| ids[index] = id;
     var scope = buildScope(self, self.app_context);
-    _ = try keywork.refreshInteractionElements(self.allocator, &scope, element_root, self.constraints, ids[0..count]);
+    var offset: usize = 0;
+    while (offset < self.pending_interaction_ids.items.len) {
+        const count = @min(ids.len, self.pending_interaction_ids.items.len - offset);
+        for (self.pending_interaction_ids.items[offset..][0..count], 0..) |id, index| ids[index] = id;
+        _ = try keywork.refreshInteractionElements(self.allocator, &scope, element_root, self.constraints, ids[0..count]);
+        offset += count;
+    }
 }
 
 pub fn autofocusTarget(targets: []const keywork.FocusTarget, modal_scope_id: ?[]const u8) ?keywork.FocusTarget {

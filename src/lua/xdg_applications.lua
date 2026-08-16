@@ -62,7 +62,9 @@ local function unescape(value)
     end))
 end
 
--- Multiple values are ;-separated with \; escaping the separator.
+-- Multiple values are ;-separated with \; escaping the separator. Decode
+-- escapes while splitting so an escaped backslash before a separator is not
+-- mistaken for an escaped semicolon.
 local function split_list(value)
     local items = {}
     local current = {}
@@ -70,10 +72,12 @@ local function split_list(value)
     while index <= #value do
         local ch = value:sub(index, index)
         if ch == "\\" and index < #value then
-            table.insert(current, value:sub(index + 1, index + 1))
+            local escaped = value:sub(index + 1, index + 1)
+            local decoded = escaped == ";" and ";" or escapes[escaped]
+            table.insert(current, decoded or ("\\" .. escaped))
             index = index + 2
         elseif ch == ";" then
-            local item = unescape(table.concat(current))
+            local item = table.concat(current)
             if item ~= "" then
                 table.insert(items, item)
             end
@@ -84,22 +88,26 @@ local function split_list(value)
             index = index + 1
         end
     end
-    local tail = unescape(table.concat(current))
+    local tail = table.concat(current)
     if tail ~= "" then
         table.insert(items, tail)
     end
     return items
 end
 
--- Reads a group's key with locale fallback: Key[variant] wins over Key.
-local function localized(group, key, variants)
+-- Selects a group's raw key with locale fallback: Key[variant] wins over Key.
+local function localized_raw(group, key, variants)
     for _, variant in ipairs(variants) do
         local value = group[key .. "[" .. variant .. "]"]
         if value then
-            return unescape(value)
+            return value
         end
     end
-    local value = group[key]
+    return group[key]
+end
+
+local function localized(group, key, variants)
+    local value = localized_raw(group, key, variants)
     return value and unescape(value) or nil
 end
 
@@ -225,7 +233,7 @@ function M.parse(path, opts)
         hidden = main.Hidden == "true",
         single_main_window = main.SingleMainWindow == "true",
         startup_wm_class = main.StartupWMClass,
-        keywords = split_list(localized(main, "Keywords", variants) or ""),
+        keywords = split_list(localized_raw(main, "Keywords", variants) or ""),
         categories = split_list(main.Categories or ""),
         mime_types = split_list(main.MimeType or ""),
         only_show_in = split_list(main.OnlyShowIn or ""),
@@ -399,6 +407,8 @@ local function expand_inline(token, context)
                 table.insert(out, context.name or "")
             elseif code == "k" then
                 table.insert(out, context.path or "")
+            elseif code:match("%a") then
+                return nil, "unknown field code %" .. code
             end
             -- Deprecated codes (%d %D %n %N %v %m) and %i expand to nothing
             -- inline; %i is only meaningful as a standalone token.
@@ -479,7 +489,11 @@ function M.exec_argv(entry, opts)
         elseif token:match("^%%[dDnNvm]$") then
             -- Deprecated standalone codes drop out entirely.
         else
-            table.insert(argv, expand_inline(token, context))
+            local expanded, expand_err = expand_inline(token, context)
+            if not expanded then
+                return nil, expand_err
+            end
+            table.insert(argv, expanded)
         end
     end
     if #argv == 0 then
@@ -501,6 +515,43 @@ local function try_exec_ok(try_exec)
         end
     end
     return false
+end
+
+local function desktop_list_contains(list, current_desktop)
+    for desktop in (current_desktop or ""):gmatch("[^:]+") do
+        for _, candidate in ipairs(list) do
+            if desktop == candidate then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+--- Reports whether an entry belongs in an application launcher.
+--- opts.current_desktop overrides XDG_CURRENT_DESKTOP for deterministic
+--- callers and tests; colon-separated desktop names are matched against the
+--- entry's semicolon-separated OnlyShowIn and NotShowIn lists.
+function M.should_show(entry, opts)
+    opts = opts or {}
+    if entry.hidden or entry.no_display then
+        return false
+    end
+
+    local current_desktop = opts.current_desktop
+    if current_desktop == nil then
+        current_desktop = os.getenv("XDG_CURRENT_DESKTOP") or ""
+    end
+    if #entry.only_show_in > 0 and not desktop_list_contains(entry.only_show_in, current_desktop) then
+        return false
+    end
+    if desktop_list_contains(entry.not_show_in, current_desktop) then
+        return false
+    end
+    if entry.try_exec and entry.try_exec ~= "" and not try_exec_ok(entry.try_exec) then
+        return false
+    end
+    return (entry.exec ~= nil and entry.exec ~= "") or entry.dbus_activatable
 end
 
 -- D-Bus activation per the Application interface: the bus name is the

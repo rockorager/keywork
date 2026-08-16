@@ -664,6 +664,52 @@ test "deferred invalidations coalesce until flush" {
     try std.testing.expectEqual(@as(usize, 2), backend.presents);
 }
 
+test "interaction refresh applies every queued id" {
+    const ids = [_][]const u8{
+        "clickable-1",
+        "clickable-2",
+        "clickable-3",
+        "clickable-4",
+        "clickable-5",
+        "clickable-6",
+        "clickable-7",
+        "clickable-8",
+        "clickable-9",
+    };
+    const TestApp = struct {
+        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            var children: [ids.len]keywork.Widget = undefined;
+            for (&children, ids) |*child, id| {
+                const content = try keywork.Widget.alloc(scope.allocator, keywork.widgets.spacer(0));
+                const box: keywork.Widget = .{ .box = .{
+                    .child = content,
+                    .background = keywork.colors.transparent,
+                    .min_width = 10,
+                    .min_height = 10,
+                } };
+                child.* = try keywork.widgets.clickable(scope.allocator, id, box, null);
+                child.clickable.hover_style = .{ .background = keywork.colors.blue9 };
+            }
+            return keywork.widgets.row(scope.allocator, &children, 0);
+        }
+    };
+
+    var app: TestApp = .{};
+    var backend: TestBackend = .{};
+    var runtime = try initTestRuntime(&app, &backend, .{ .max_width = 100, .max_height = 40 });
+    defer runtime.deinit();
+
+    for (ids) |id| try std.testing.expect(try input_behavior.setHoveredId(&runtime, id));
+    try std.testing.expectEqual(ids.len, runtime.pending_interaction_ids.items.len);
+    try lifecycle_reconciliation.flushInteractionRefresh(&runtime);
+
+    const last_clickable = runtime.element_root.?.children[ids.len - 1];
+    try std.testing.expectEqual(
+        keywork.colors.blue9,
+        last_clickable.children[0].widget.box.background,
+    );
+}
+
 test "content height follows retained root state and respects its cap" {
     const TestApp = struct {
         height: f32 = 36,
@@ -2307,12 +2353,12 @@ test "focus scope contains tab traversal once focus is inside it" {
 
 test "modal focus scope traps autofocus traversal and focus requests" {
     const TestApp = struct {
-        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const background = try keywork.widgets.focusWithOptions(
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const background = try keywork.widgets.clickable(
                 scope.allocator,
-                .named("background"),
+                "background",
                 keywork.widgets.text("Background"),
-                .{ .autofocus = true },
+                .{ .ptr = ptr, .call_fn = noopTap },
             );
 
             const modal_a = try keywork.widgets.focusWithOptions(
@@ -2330,6 +2376,8 @@ test "modal focus scope traps autofocus traversal and focus requests" {
             const children = [_]keywork.Widget{ background, modal, after_modal };
             return keywork.widgets.column(scope.allocator, &children, 8);
         }
+
+        fn noopTap(_: *anyopaque, _: keywork.TapEvent) !void {}
     };
 
     var app: TestApp = .{};
@@ -2342,6 +2390,8 @@ test "modal focus scope traps autofocus traversal and focus requests" {
     try std.testing.expectError(error.FocusTargetOutsideModal, runtime.requestFocus("after-modal"));
 
     try runtime.requestFocus("modal-b");
+    try std.testing.expectEqualStrings("modal-b", runtime.focused_id.?);
+    try runtime.click(.{ .x = 5, .y = 5 });
     try std.testing.expectEqualStrings("modal-b", runtime.focused_id.?);
     try runtime.keyInput(.{ .tab = .{} });
     try std.testing.expectEqualStrings("modal-a", runtime.focused_id.?);

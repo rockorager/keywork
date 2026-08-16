@@ -298,6 +298,7 @@ const RenderOutput = struct {
     frame_callback_scheduled: bool,
     lock_frame_pending: bool,
     consecutive_output_busy_retries: u8,
+    output_busy_retry_pending: bool,
     frame_statistics: FrameStatistics,
     render_budget: RenderBudget,
     request_started_nanoseconds: ?i96,
@@ -371,6 +372,7 @@ const RenderOutput = struct {
             return false;
         }
         self.consecutive_output_busy_retries += 1;
+        self.output_busy_retry_pending = true;
         return true;
     }
 
@@ -545,6 +547,11 @@ fn outputRefreshNanoseconds(refresh_millihertz: i32) u64 {
     return (std.time.ns_per_s * 1000 + frequency / 2) / frequency;
 }
 
+fn outputBusyRetryDelayMilliseconds(refresh_millihertz: i32) i32 {
+    const interval = outputRefreshNanoseconds(refresh_millihertz);
+    return @intCast(@divTrunc(interval + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+}
+
 /// Rolling worst case of recent composited render durations, from render
 /// start to GPU completion. Determines how long a repaint may be delayed
 /// toward the next vblank without risking a missed deadline.
@@ -690,6 +697,11 @@ test "periodic output timer preserves fractional refresh phase" {
     const third = periodicTimerSchedule(17 * std.time.ns_per_ms, second.deadline_nanoseconds, interval);
     try std.testing.expectEqual(@as(i96, 24_999_999), third.deadline_nanoseconds);
     try std.testing.expectEqual(@as(i32, 8), third.delay_milliseconds);
+}
+
+test "busy output retries wait a complete refresh interval" {
+    try std.testing.expectEqual(@as(i32, 9), outputBusyRetryDelayMilliseconds(120_000));
+    try std.testing.expectEqual(@as(i32, 17), outputBusyRetryDelayMilliseconds(60_000));
 }
 
 test "repaint delay leaves the render budget and margin before vblank" {
@@ -1961,6 +1973,7 @@ fn addRenderOutput(
         .frame_callback_scheduled = false,
         .lock_frame_pending = false,
         .consecutive_output_busy_retries = 0,
+        .output_busy_retry_pending = false,
         .frame_statistics = .{},
         .render_budget = .{},
         .request_started_nanoseconds = null,
@@ -5126,7 +5139,19 @@ fn primaryRenderOutput(self: *Self) *RenderOutput {
 
 fn scheduleRepaint(self: *Self, output: *RenderOutput) void {
     if (!output.repaint_needed or output.render_scheduled or !output.backend.ready()) return;
-    if (output.backend.repaintIntervalNanoseconds()) |interval| {
+    if (output.output_busy_retry_pending) {
+        output.output_busy_retry_pending = false;
+        increment(&output.frame_statistics.repaints_delayed);
+        output.repaint_target_vblank_nanoseconds = null;
+        const timer = output.timer orelse unreachable;
+        timer.timerUpdate(outputBusyRetryDelayMilliseconds(
+            output.backend.refreshMillihertz(),
+        )) catch |err| {
+            log.err("failed to schedule busy output retry: {t}", .{err});
+            self.terminate();
+            return;
+        };
+    } else if (output.backend.repaintIntervalNanoseconds()) |interval| {
         const schedule = periodicTimerSchedule(
             nowNanoseconds(self.io),
             output.repaint_deadline_nanoseconds,

@@ -13,6 +13,7 @@ pub const usage =
     \\          toggle-fullscreen TARGET | toggle-floating TARGET
     \\          switch-workspace WORKSPACE | move-focused-to-workspace WORKSPACE
     \\          set-unfocused-border WIDTH COLOR
+    \\          set-headless-output-mode WIDTH HEIGHT SCALE
     \\          windows [--json] | stats [--json] [--reset]
     \\          set-log-level LEVEL | reload | quit
     \\directions: next, previous, left, down, up, right
@@ -36,6 +37,7 @@ const Command = union(enum) {
     windows: WindowOptions,
     stats: StatisticsOptions,
     set_unfocused_border: control.Border,
+    set_headless_output_mode: HeadlessOutputMode,
     set_log_level: control.LogLevel,
     reload,
     quit,
@@ -48,6 +50,12 @@ const StatisticsOptions = struct {
 
 const WindowOptions = struct {
     json: bool = false,
+};
+
+const HeadlessOutputMode = struct {
+    width: i64,
+    height: i64,
+    scale: i64,
 };
 
 const WindowParameters = struct {
@@ -78,6 +86,7 @@ pub fn run(init: std.process.Init, arguments: []const []const u8) !void {
         .windows => try client.call(control.get_windows_method, Empty{}),
         .stats => |options| try client.call(control.get_performance_statistics_method, .{ .reset = options.reset }),
         .set_unfocused_border => |border| try client.call(control.set_unfocused_border_method, .{ .border = border }),
+        .set_headless_output_mode => |mode| try client.call(control.set_headless_output_mode_method, mode),
         .set_log_level => |level| try client.call(control.set_log_level_method, .{ .level = level }),
         .reload => try client.call(control.reload_configuration_method, Empty{}),
         .quit => try client.call(control.quit_method, Empty{}),
@@ -596,6 +605,17 @@ fn parse(arguments: []const []const u8) !Command {
             .color = parseColor(arguments[2]) orelse return error.InvalidColor,
         } };
     }
+    if (arguments.len == 4 and std.mem.eql(u8, arguments[0], "set-headless-output-mode")) {
+        const width = std.fmt.parseInt(i64, arguments[1], 10) catch return error.InvalidHeadlessOutputMode;
+        const height = std.fmt.parseInt(i64, arguments[2], 10) catch return error.InvalidHeadlessOutputMode;
+        const scale = std.fmt.parseInt(i64, arguments[3], 10) catch return error.InvalidHeadlessOutputMode;
+        if (!control.validHeadlessOutputMode(width, height, scale)) return error.InvalidHeadlessOutputMode;
+        return .{ .set_headless_output_mode = .{
+            .width = width,
+            .height = height,
+            .scale = scale,
+        } };
+    }
     if (arguments.len != 2) return error.InvalidArguments;
     const name = arguments[0];
     const value = arguments[1];
@@ -669,6 +689,11 @@ test "CLI parsing maps wire values and validates workspaces" {
         .width = 2,
         .color = .{ .red = 0x3a, .green = 0x3a, .blue = 0x40, .alpha = 0xff },
     }, (try parse(&.{ "set-unfocused-border", "2", "#3a3a40" })).set_unfocused_border);
+    try std.testing.expectEqual(HeadlessOutputMode{
+        .width = 1920,
+        .height = 1080,
+        .scale = 180,
+    }, (try parse(&.{ "set-headless-output-mode", "1920", "1080", "180" })).set_headless_output_mode);
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "stats", "--json", "--json" }));
     try std.testing.expectError(error.InvalidArguments, parse(&.{ "windows", "--reset" }));
     try std.testing.expectEqual(Command.reload, try parse(&.{"reload"}));
@@ -679,6 +704,9 @@ test "CLI parsing maps wire values and validates workspaces" {
     try std.testing.expectError(error.InvalidLogLevel, parse(&.{ "set-log-level", "verbose" }));
     try std.testing.expectError(error.InvalidBorderWidth, parse(&.{ "set-unfocused-border", "257", "#3a3a40" }));
     try std.testing.expectError(error.InvalidColor, parse(&.{ "set-unfocused-border", "2", "slate" }));
+    try std.testing.expectError(error.InvalidHeadlessOutputMode, parse(&.{ "set-headless-output-mode", "0", "1080", "180" }));
+    try std.testing.expectError(error.InvalidHeadlessOutputMode, parse(&.{ "set-headless-output-mode", "8192", "8192", "180" }));
+    try std.testing.expectError(error.InvalidHeadlessOutputMode, parse(&.{ "set-headless-output-mode", "1920", "1080", "29" }));
     try std.testing.expectError(error.UnknownCommand, parse(&.{ "unknown", "value" }));
 }
 
