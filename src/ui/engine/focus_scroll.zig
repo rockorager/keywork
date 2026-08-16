@@ -75,6 +75,17 @@ pub fn setFocused(self: anytype, id: ?[]const u8) !bool {
     return self.focused_id == null and id == null;
 }
 
+pub fn setFocusedFromPointer(self: anytype, id: []const u8) !bool {
+    const root = self.root orelse return error.NotBuilt;
+    const targets = try keywork.collectFocusTargets(self.allocator, root);
+    defer self.allocator.free(targets);
+    if (activeModalScopeId(targets)) |modal_scope_id| {
+        const target = findCollectedFocusTarget(targets, id) orelse return false;
+        if (!sameOptionalString(target.modal_scope_id, modal_scope_id)) return false;
+    }
+    return setFocused(self, id);
+}
+
 pub fn focusedTarget(self: anytype) ?keywork.FocusTarget {
     const focused_id = self.focused_id orelse return null;
     const root = self.root orelse return null;

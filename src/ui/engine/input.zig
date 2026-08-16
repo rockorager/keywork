@@ -46,7 +46,7 @@ pub fn pointerDown(self: anytype, event: keywork.PointerButtonEvent) !void {
             return;
         }
         if (keywork.hitTestTextInput(root, point)) |id| {
-            const focus_changed = try focus_scroll.setFocused(self, id);
+            const focus_changed = try focus_scroll.setFocusedFromPointer(self, id);
             _ = try setPressedId(self, null);
             if (focus_changed) try self.invalidate() else try self.invalidateState();
             return;
@@ -54,7 +54,7 @@ pub fn pointerDown(self: anytype, event: keywork.PointerButtonEvent) !void {
     }
 
     if (keywork.hitTestClick(root, point, event.button)) |hit| {
-        const focus_changed = try focus_scroll.setFocused(self, hit.id);
+        const focus_changed = try focus_scroll.setFocusedFromPointer(self, hit.id);
         var needs_update = try setPressedId(self, hit.id);
         self.pressed_button = event.button;
         if (hit.tap_down) |callback| {

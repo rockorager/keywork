@@ -2272,12 +2272,12 @@ test "focus scope contains tab traversal once focus is inside it" {
 
 test "modal focus scope traps autofocus traversal and focus requests" {
     const TestApp = struct {
-        fn buildWidget(_: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
-            const background = try keywork.widgets.focusWithOptions(
+        fn buildWidget(ptr: *anyopaque, scope: *BuildScope, _: AppContext) !keywork.Widget {
+            const background = try keywork.widgets.clickable(
                 scope.allocator,
-                .named("background"),
+                "background",
                 keywork.widgets.text("Background"),
-                .{ .autofocus = true },
+                .{ .ptr = ptr, .call_fn = noopTap },
             );
 
             const modal_a = try keywork.widgets.focusWithOptions(
@@ -2295,6 +2295,8 @@ test "modal focus scope traps autofocus traversal and focus requests" {
             const children = [_]keywork.Widget{ background, modal, after_modal };
             return keywork.widgets.column(scope.allocator, &children, 8);
         }
+
+        fn noopTap(_: *anyopaque, _: keywork.TapEvent) !void {}
     };
 
     var app: TestApp = .{};
@@ -2307,6 +2309,8 @@ test "modal focus scope traps autofocus traversal and focus requests" {
     try std.testing.expectError(error.FocusTargetOutsideModal, runtime.requestFocus("after-modal"));
 
     try runtime.requestFocus("modal-b");
+    try std.testing.expectEqualStrings("modal-b", runtime.focused_id.?);
+    try runtime.click(.{ .x = 5, .y = 5 });
     try std.testing.expectEqualStrings("modal-b", runtime.focused_id.?);
     try runtime.keyInput(.{ .tab = .{} });
     try std.testing.expectEqualStrings("modal-a", runtime.focused_id.?);
