@@ -4,6 +4,7 @@
 
 ---@class keywork.process.SpawnOptions
 ---@field argv    string[]
+---@field cwd?    string Working directory for the child process.
 ---@field env?    table<string, string> Entries are merged over the inherited environment.
 ---@field stdin?  keywork.process.Stdio
 ---@field stdout? keywork.process.Stdio
@@ -53,6 +54,11 @@ local M = {}
 ---@return keywork.process.Process? process
 ---@return string? error
 function M.spawn(options) end
+
+--- Reports whether a path or command name resolves to an executable file.
+---@param name string
+---@return boolean
+function M.is_executable(name) end
 
 --- Runs a command to completion. Must be called from a loop task.
 ---@overload fun(spec: string[]): keywork.process.CaptureResult? result, string? error

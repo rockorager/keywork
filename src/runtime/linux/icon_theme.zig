@@ -62,7 +62,7 @@ const Directory = struct {
         return switch (self.type) {
             .fixed => self.size == size,
             .scalable => self.minSize() <= size and size <= self.maxSize(),
-            .threshold => self.size >= self.threshold and self.size - self.threshold <= size and size <= self.size + self.threshold,
+            .threshold => self.size -| self.threshold <= size and size <= self.size +| self.threshold,
         };
     }
 
@@ -70,7 +70,7 @@ const Directory = struct {
         return switch (self.type) {
             .fixed => distanceToPoint(self.size, size),
             .scalable => if (size < self.minSize()) self.minSize() - size else if (size > self.maxSize()) size - self.maxSize() else 0,
-            .threshold => if (size < self.size -| self.threshold) self.size - self.threshold - size else if (size > self.size + self.threshold) size - (self.size + self.threshold) else 0,
+            .threshold => if (size < self.size -| self.threshold) self.size -| self.threshold - size else if (size > self.size +| self.threshold) size - (self.size +| self.threshold) else 0,
         };
     }
 };
@@ -724,4 +724,21 @@ test "scalable directory size range survives any key order" {
     try std.testing.expect(status.matchesSize(24));
     try std.testing.expect(!status.matchesSize(23));
     try std.testing.expect(!status.matchesSize(25));
+}
+
+test "threshold directory range saturates at integer bounds" {
+    const small: Directory = .{ .path = undefined, .size = 1, .threshold = 2 };
+    try std.testing.expect(small.matchesSize(1));
+    try std.testing.expect(small.matchesSize(3));
+    try std.testing.expect(!small.matchesSize(4));
+    try std.testing.expectEqual(@as(u32, 0), small.distance(1));
+    try std.testing.expectEqual(@as(u32, 1), small.distance(4));
+
+    const large: Directory = .{
+        .path = undefined,
+        .size = std.math.maxInt(u32),
+        .threshold = 2,
+    };
+    try std.testing.expect(large.matchesSize(std.math.maxInt(u32)));
+    try std.testing.expectEqual(@as(u32, 0), large.distance(std.math.maxInt(u32)));
 }

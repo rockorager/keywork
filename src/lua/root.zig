@@ -1867,9 +1867,11 @@ fn loopModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn processModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app = lua_value.upvaluePointer(*App, lua_state, 1);
-    c.lua_createtable(lua_state, 0, 2);
+    c.lua_createtable(lua_state, 0, 3);
     c.lua_pushlightuserdata(lua_state, app);
     lua_value.setClosureField(lua_state, -2, "spawn", luaSpawn, 1);
+    c.lua_pushlightuserdata(lua_state, app);
+    lua_value.setClosureField(lua_state, -2, "is_executable", luaIsExecutable, 1);
     // The embedded Lua layer augments the native table in place (capture, ...).
     if (c.luaL_loadbuffer(lua_state, embedded_process_source.ptr, embedded_process_source.len, "@keywork/process.lua") != 0) return c.lua_error(lua_state);
     c.lua_pushvalue(lua_state, -2);
@@ -2189,22 +2191,37 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         return c.luaL_error(lua_state, "invalid spawn env (string names to string values)");
     };
     defer lua_process.freeEnv(app.allocator, env);
+    c.lua_getfield(lua_state, 1, "cwd");
+    const cwd: ?[]const u8 = if (c.lua_isnil(lua_state, -1)) null else lua_value.checkString(lua_state, -1);
 
     const spec: lua_process.SpawnSpec = .{
         .argv = argv,
         .stdin_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stdin") catch "ignore", "pipe"),
         .stdout_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stdout") catch "ignore", "pipe"),
         .stderr_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stderr") catch "ignore", "pipe"),
+        .cwd = cwd,
         .env = env,
     };
     // A missing executable or exhausted system resources are expected
     // runtime failures, so spawn reports nil, err instead of raising.
-    const process = app.addProcess(spec) catch |err| {
+    const process_result = app.addProcess(spec);
+    pop(lua_state, 1);
+    const process = process_result catch |err| {
         std.log.scoped(.keywork_luajit).warn("process.spawn failed: {}", .{err});
         return lua_value.pushNilError(lua_state, err);
     };
     lua_task.adoptResource(LuaProcess, lua_state, process);
     lua_process.pushHandle(lua_state, process);
+    return 1;
+}
+
+fn luaIsExecutable(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
+    const name = lua_value.checkString(lua_state, 1);
+    const exists = lua_process.executableExists(app.allocator, name) catch
+        return c.luaL_error(lua_state, "executable lookup failed");
+    c.lua_pushboolean(lua_state, @intFromBool(exists));
     return 1;
 }
 
@@ -4725,7 +4742,7 @@ test "lua fd watch cancel resumes a parked reader and ends iteration" {
     try app.ensureLoaded();
 }
 
-test "lua fd watch coalesces readiness and hands it to the next reader" {
+test "lua fd watch reports only kernel readiness" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4735,21 +4752,18 @@ test "lua fd watch coalesces readiness and hands it to the next reader" {
     defer _ = linux.close(fds[0]);
     defer _ = linux.close(fds[1]);
 
-    // Bind-time registration primes the watch with a read event while no
-    // reader is parked; it must coalesce into pending readiness that the
-    // first next() returns without yielding.
     const script = try std.fmt.allocPrint(allocator,
         \\local kw = require("keywork")
         \\local loop = require("keywork.loop")
         \\watch = loop.fd({d}, {{ read = true }})
+        \\got_event = false
         \\got_read = false
-        \\function start_reader()
-        \\  loop.spawn(function()
-        \\    local ev = watch:next()
-        \\    got_read = ev.read
-        \\    watch:cancel()
-        \\  end)
-        \\end
+        \\loop.spawn(function()
+        \\  local ev = watch:next()
+        \\  got_event = true
+        \\  got_read = ev.read
+        \\  watch:cancel()
+        \\end)
         \\return kw.app({{ child = kw.text("fd-pending") }})
         \\
     , .{fds[0]});
@@ -4764,11 +4778,29 @@ test "lua fd watch coalesces readiness and hands it to the next reader" {
     defer app.unbindEventLoop();
 
     try std.testing.expectEqual(@as(usize, 1), app.fd_watches.items.len);
-    try std.testing.expect(app.fd_watches.items[0].pending != 0);
+    try std.testing.expectEqual(@as(u32, 0), app.fd_watches.items[0].pending);
+    try expectLuaBoolean(&app, "got_event", false);
 
-    c.lua_getglobal(app.state, "start_reader");
-    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), linux.write(fds[1], "x", 1));
 
+    const ReadinessTest = struct {
+        app: *App,
+        rounds: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.rounds += 1;
+            c.lua_getglobal(self.app.state, "got_event");
+            const got_event = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (got_event or self.rounds > 1000) event_loop_instance.quit();
+        }
+    };
+    var context: ReadinessTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, ReadinessTest.callback);
+    try loop.run();
+
+    try expectLuaBoolean(&app, "got_event", true);
     try expectLuaBoolean(&app, "got_read", true);
     try std.testing.expect(app.fd_watches.items[0].canceled);
 }
@@ -5673,6 +5705,7 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\Icon=editor-icon
         \\Exec=editor --title %c %%x %F --icon-args %i
         \\TryExec=/bin/sh
+        \\Path=/tmp
         \\Terminal=false
         \\OnlyShowIn=keywork;GNOME;
         \\Actions=new-window;
@@ -5695,6 +5728,10 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\
         ,
     });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "share/not-executable",
+        .data = "installed but not executable",
+    });
 
     const data_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "share" });
     defer allocator.free(data_dir);
@@ -5702,6 +5739,7 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
     const script_body =
         \\local kw = require("keywork")
         \\local apps = require("keywork.xdg.applications")
+        \\local fs = require("keywork.fs")
         \\local loop = require("keywork.loop")
         \\local dirs = { data_dir }
         \\xdg_done = false
@@ -5712,6 +5750,7 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\assert(entry.name == "Bearbeiter")
         \\assert(entry.generic_name == "Text Editor")
         \\assert(entry.icon == "editor-icon")
+        \\assert(entry.wd == "/tmp")
         \\assert(#entry.keywords == 4)
         \\assert(entry.keywords[1] == "semi;colon")
         \\assert(entry.keywords[2] == "hello world")
@@ -5742,6 +5781,16 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\  not_show_in = {},
         \\  try_exec = "keywork-definitely-missing-executable",
         \\  exec = "missing",
+        \\  dbus_activatable = false,
+        \\}))
+        \\-- TryExec requires execute permission, not merely an existing file.
+        \\assert(not apps.should_show({
+        \\  hidden = false,
+        \\  no_display = false,
+        \\  only_show_in = {},
+        \\  not_show_in = {},
+        \\  try_exec = data_dir .. "/not-executable",
+        \\  exec = "installed",
         \\  dbus_activatable = false,
         \\}))
         \\assert(apps.should_show({
@@ -5793,6 +5842,13 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\assert(action_argv[1] == "editor")
         \\assert(action_argv[2] == "--new-window")
         \\
+        \\-- Path is the child process working directory.
+        \\plain.exec = "/usr/bin/touch " .. cwd_marker
+        \\local launched = assert(apps.launch(plain, { dbus = false }))
+        \\assert(assert(launched:wait()).ok)
+        \\assert(fs.stat("/tmp/" .. cwd_marker))
+        \\assert(fs.remove("/tmp/" .. cwd_marker))
+        \\
         \\-- symlink cycles are visited once rather than blocking launcher enumeration
         \\local listed = apps.list({ dirs = dirs })
         \\assert(#listed == 2)
@@ -5802,7 +5858,16 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\return kw.app({ child = kw.text("xdg") })
         \\
     ;
-    const script = try std.mem.concat(allocator, u8, &.{ "local data_dir = \"", data_dir, "\"\n", script_body });
+    const cwd_marker = try std.fmt.allocPrint(allocator, ".keywork-xdg-cwd-test-{d}", .{std.c.getpid()});
+    defer allocator.free(cwd_marker);
+    const cwd_marker_path = try std.fs.path.join(allocator, &.{ "/tmp", cwd_marker });
+    defer allocator.free(cwd_marker_path);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, cwd_marker_path) catch {};
+    const script = try std.mem.concat(allocator, u8, &.{
+        "local data_dir = \"",   data_dir,   "\"\n",
+        "local cwd_marker = \"", cwd_marker, "\"\n",
+        script_body,
+    });
     defer allocator.free(script);
 
     var app = try initTestApp(allocator, &tmp, "xdg.lua", script);

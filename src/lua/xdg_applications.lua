@@ -502,19 +502,8 @@ function M.exec_argv(entry, opts)
     return argv
 end
 
--- PATH lookup by readability: Lua cannot test the executable bit, but a
--- readable file at the resolved path is close enough for TryExec's
--- "is this installed?" intent.
 local function try_exec_ok(try_exec)
-    if try_exec:find("/", 1, true) then
-        return file_exists(try_exec)
-    end
-    for dir in (os.getenv("PATH") or ""):gmatch("[^:]+") do
-        if file_exists(dir .. "/" .. try_exec) then
-            return true
-        end
-    end
-    return false
+    return require("keywork.process").is_executable(try_exec)
 end
 
 local function desktop_list_contains(list, current_desktop)
@@ -672,7 +661,7 @@ function M.launch(entry, opts)
     end
 
     local process = require("keywork.process")
-    return process.spawn({ argv = argv, env = env })
+    return process.spawn({ argv = argv, cwd = entry.wd, env = env })
 end
 
 return M
