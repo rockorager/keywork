@@ -54,6 +54,11 @@ local M = {}
 ---@return string? error
 function M.spawn(options) end
 
+--- Reports whether a path or command name resolves to an executable file.
+---@param name string
+---@return boolean
+function M.is_executable(name) end
+
 --- Runs a command to completion. Must be called from a loop task.
 ---@overload fun(spec: string[]): keywork.process.CaptureResult? result, string? error
 ---@param spec keywork.process.CaptureOptions

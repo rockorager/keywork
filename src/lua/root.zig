@@ -1867,9 +1867,11 @@ fn loopModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
 fn processModuleLoader(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     const lua_state = lua_state_optional.?;
     const app = lua_value.upvaluePointer(*App, lua_state, 1);
-    c.lua_createtable(lua_state, 0, 2);
+    c.lua_createtable(lua_state, 0, 3);
     c.lua_pushlightuserdata(lua_state, app);
     lua_value.setClosureField(lua_state, -2, "spawn", luaSpawn, 1);
+    c.lua_pushlightuserdata(lua_state, app);
+    lua_value.setClosureField(lua_state, -2, "is_executable", luaIsExecutable, 1);
     // The embedded Lua layer augments the native table in place (capture, ...).
     if (c.luaL_loadbuffer(lua_state, embedded_process_source.ptr, embedded_process_source.len, "@keywork/process.lua") != 0) return c.lua_error(lua_state);
     c.lua_pushvalue(lua_state, -2);
@@ -2205,6 +2207,16 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
     };
     lua_task.adoptResource(LuaProcess, lua_state, process);
     lua_process.pushHandle(lua_state, process);
+    return 1;
+}
+
+fn luaIsExecutable(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
+    const lua_state = lua_state_optional.?;
+    const app = lua_value.upvaluePointer(*App, lua_state, 1);
+    const name = lua_value.checkString(lua_state, 1);
+    const exists = lua_process.executableExists(app.allocator, name) catch
+        return c.luaL_error(lua_state, "executable lookup failed");
+    c.lua_pushboolean(lua_state, @intFromBool(exists));
     return 1;
 }
 
@@ -5682,6 +5694,10 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\
         ,
     });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "share/not-executable",
+        .data = "installed but not executable",
+    });
 
     const data_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "share" });
     defer allocator.free(data_dir);
@@ -5729,6 +5745,16 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\  not_show_in = {},
         \\  try_exec = "keywork-definitely-missing-executable",
         \\  exec = "missing",
+        \\  dbus_activatable = false,
+        \\}))
+        \\-- TryExec requires execute permission, not merely an existing file.
+        \\assert(not apps.should_show({
+        \\  hidden = false,
+        \\  no_display = false,
+        \\  only_show_in = {},
+        \\  not_show_in = {},
+        \\  try_exec = data_dir .. "/not-executable",
+        \\  exec = "installed",
         \\  dbus_activatable = false,
         \\}))
         \\assert(apps.should_show({

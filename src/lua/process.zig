@@ -730,6 +730,21 @@ fn resolveExecutable(allocator: std.mem.Allocator, name: []const u8) ![:0]u8 {
     return error.FileNotFound;
 }
 
+pub fn executableExists(allocator: std.mem.Allocator, name: []const u8) !bool {
+    if (name.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, name, '/') != null) {
+        const path = try allocator.dupeZ(u8, name);
+        defer allocator.free(path);
+        return isExecutable(path);
+    }
+    const resolved = resolveExecutable(allocator, name) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    allocator.free(resolved);
+    return true;
+}
+
 fn getenv(name: []const u8) ?[]const u8 {
     var index: usize = 0;
     while (std.c.environ[index]) |entry_z| : (index += 1) {
