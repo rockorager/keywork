@@ -48,6 +48,9 @@ pub const SpawnSpec = struct {
     stdin_pipe: bool,
     stdout_pipe: bool,
     stderr_pipe: bool,
+    /// Working directory for the child. Opened before fork so an invalid
+    /// directory is reported by spawn rather than as a child exit.
+    cwd: ?[]const u8 = null,
     /// Additional environment variables for the child, merged over the
     /// inherited environment (additions win on name collisions).
     env: []const EnvVar = &.{},
@@ -105,6 +108,15 @@ pub const LuaProcess = struct {
         // Built before fork: the child must not allocate.
         var envp: ?PreparedArgv = if (spec.env.len > 0) try prepareEnvp(allocator, spec.env) else null;
         defer if (envp) |*prepared| prepared.deinit(allocator);
+        const cwd_fd = if (spec.cwd) |cwd| try posix.openat(
+            linux.AT.FDCWD,
+            cwd,
+            .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECTORY = true },
+            0,
+        ) else null;
+        defer if (cwd_fd) |fd| {
+            _ = linux.close(fd);
+        };
 
         const fork_result = linux.fork();
         switch (linux.errno(fork_result)) {
@@ -114,6 +126,9 @@ pub const LuaProcess = struct {
         }
 
         if (fork_result == 0) {
+            if (cwd_fd) |fd| {
+                if (linux.errno(linux.fchdir(fd)) != .SUCCESS) linux.exit(127);
+            }
             if (stdin_pipe) |pipe| {
                 _ = linux.close(pipe[1]);
                 dupTo(pipe[0], posix.STDIN_FILENO) catch linux.exit(127);

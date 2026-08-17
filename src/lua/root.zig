@@ -2191,17 +2191,22 @@ fn luaSpawn(lua_state_optional: ?*c.lua_State) callconv(.c) c_int {
         return c.luaL_error(lua_state, "invalid spawn env (string names to string values)");
     };
     defer lua_process.freeEnv(app.allocator, env);
+    c.lua_getfield(lua_state, 1, "cwd");
+    const cwd: ?[]const u8 = if (c.lua_isnil(lua_state, -1)) null else lua_value.checkString(lua_state, -1);
 
     const spec: lua_process.SpawnSpec = .{
         .argv = argv,
         .stdin_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stdin") catch "ignore", "pipe"),
         .stdout_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stdout") catch "ignore", "pipe"),
         .stderr_pipe = std.mem.eql(u8, lua_value.stringField(lua_state, 1, "stderr") catch "ignore", "pipe"),
+        .cwd = cwd,
         .env = env,
     };
     // A missing executable or exhausted system resources are expected
     // runtime failures, so spawn reports nil, err instead of raising.
-    const process = app.addProcess(spec) catch |err| {
+    const process_result = app.addProcess(spec);
+    pop(lua_state, 1);
+    const process = process_result catch |err| {
         std.log.scoped(.keywork_luajit).warn("process.spawn failed: {}", .{err});
         return lua_value.pushNilError(lua_state, err);
     };
@@ -5672,6 +5677,7 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\Icon=editor-icon
         \\Exec=editor --title %c %%x %F --icon-args %i
         \\TryExec=/bin/sh
+        \\Path=/tmp
         \\Terminal=false
         \\OnlyShowIn=keywork;GNOME;
         \\Actions=new-window;
@@ -5705,6 +5711,7 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
     const script_body =
         \\local kw = require("keywork")
         \\local apps = require("keywork.xdg.applications")
+        \\local fs = require("keywork.fs")
         \\local loop = require("keywork.loop")
         \\local dirs = { data_dir }
         \\xdg_done = false
@@ -5715,6 +5722,7 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\assert(entry.name == "Bearbeiter")
         \\assert(entry.generic_name == "Text Editor")
         \\assert(entry.icon == "editor-icon")
+        \\assert(entry.wd == "/tmp")
         \\assert(#entry.keywords == 4)
         \\assert(entry.keywords[1] == "semi;colon")
         \\assert(entry.keywords[2] == "hello world")
@@ -5806,6 +5814,13 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\assert(action_argv[1] == "editor")
         \\assert(action_argv[2] == "--new-window")
         \\
+        \\-- Path is the child process working directory.
+        \\plain.exec = "/usr/bin/touch " .. cwd_marker
+        \\local launched = assert(apps.launch(plain, { dbus = false }))
+        \\assert(assert(launched:wait()).ok)
+        \\assert(fs.stat("/tmp/" .. cwd_marker))
+        \\assert(fs.remove("/tmp/" .. cwd_marker))
+        \\
         \\-- symlink cycles are visited once rather than blocking launcher enumeration
         \\local listed = apps.list({ dirs = dirs })
         \\assert(#listed == 2)
@@ -5815,7 +5830,16 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\return kw.app({ child = kw.text("xdg") })
         \\
     ;
-    const script = try std.mem.concat(allocator, u8, &.{ "local data_dir = \"", data_dir, "\"\n", script_body });
+    const cwd_marker = try std.fmt.allocPrint(allocator, ".keywork-xdg-cwd-test-{d}", .{std.c.getpid()});
+    defer allocator.free(cwd_marker);
+    const cwd_marker_path = try std.fs.path.join(allocator, &.{ "/tmp", cwd_marker });
+    defer allocator.free(cwd_marker_path);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, cwd_marker_path) catch {};
+    const script = try std.mem.concat(allocator, u8, &.{
+        "local data_dir = \"",   data_dir,   "\"\n",
+        "local cwd_marker = \"", cwd_marker, "\"\n",
+        script_body,
+    });
     defer allocator.free(script);
 
     var app = try initTestApp(allocator, &tmp, "xdg.lua", script);

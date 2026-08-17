@@ -661,7 +661,7 @@ function M.launch(entry, opts)
     end
 
     local process = require("keywork.process")
-    return process.spawn({ argv = argv, env = env })
+    return process.spawn({ argv = argv, cwd = entry.wd, env = env })
 end
 
 return M

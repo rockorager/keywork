@@ -4,6 +4,7 @@
 
 ---@class keywork.process.SpawnOptions
 ---@field argv    string[]
+---@field cwd?    string Working directory for the child process.
 ---@field env?    table<string, string> Entries are merged over the inherited environment.
 ---@field stdin?  keywork.process.Stdio
 ---@field stdout? keywork.process.Stdio
