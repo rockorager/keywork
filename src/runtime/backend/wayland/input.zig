@@ -41,6 +41,7 @@ keyboard: ?*wl.Keyboard = null,
 xkb_context: ?*xkb.struct_xkb_context = null,
 xkb_keymap: ?*xkb.struct_xkb_keymap = null,
 xkb_state: ?*xkb.struct_xkb_state = null,
+xkb_compose_state: ?*xkb.struct_xkb_compose_state = null,
 pointer_position: ?keywork.Point = null,
 pointer_enter_serial: ?u32 = null,
 /// Serial of the most recent pointer button press; xdg_popup.grab rejects
@@ -187,6 +188,7 @@ pub fn init(
         .shm = shm,
         .xkb_context = xkb_context,
     };
+    self.xkb_compose_state = initComposeState(xkb_context);
     // Only bind devices the seat has advertised. Calling get_pointer on a
     // seat that has never had the pointer capability is a protocol error
     // (e.g. headless sway with no input devices).
@@ -197,6 +199,7 @@ pub fn init(
 pub fn deinit(self: *Self) void {
     self.targets.deinit(self.allocator);
     self.clearXkbKeymap();
+    if (self.xkb_compose_state) |state| xkb.xkb_compose_state_unref(state);
     if (self.xkb_context) |context| xkb.xkb_context_unref(context);
     self.destroyCursorShapeDevice();
     if (self.pointer) |pointer| destroyPointer(pointer);
@@ -694,11 +697,13 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, self: *Self) void
             self.keyboard_target = self.findTarget(enter.surface);
             self.last_input_serial = enter.serial;
             self.shift_down = false;
+            self.resetComposeState();
             self.stopKeyRepeat();
         },
         .leave => {
             self.keyboard_target = null;
             self.shift_down = false;
+            self.resetComposeState();
             self.stopKeyRepeat();
         },
         .key => |key| {
@@ -784,10 +789,15 @@ fn installXkbKeymap(self: *Self, keymap: @TypeOf(@as(wl.Keyboard.Event, undefine
 
 fn clearXkbKeymap(self: *Self) void {
     self.stopKeyRepeat();
+    self.resetComposeState();
     if (self.xkb_state) |state| xkb.xkb_state_unref(state);
     if (self.xkb_keymap) |keymap| xkb.xkb_keymap_unref(keymap);
     self.xkb_state = null;
     self.xkb_keymap = null;
+}
+
+fn resetComposeState(self: *Self) void {
+    if (self.xkb_compose_state) |state| xkb.xkb_compose_state_reset(state);
 }
 
 fn keyInputFromWaylandKey(self: *Self, key: u32) ?keywork.KeyInput {
@@ -797,6 +807,31 @@ fn keyInputFromWaylandKey(self: *Self, key: u32) ?keywork.KeyInput {
     const modifiers = self.currentModifiers();
     if (modifiers.ctrl and !modifiers.alt and !modifiers.super and (keysym == xkb.XKB_KEY_v or keysym == xkb.XKB_KEY_V)) return .paste;
     if (hasUnconsumedShortcutModifier(state, keycode)) return null;
+    if (self.xkb_compose_state) |compose_state| {
+        if (xkb.xkb_compose_state_feed(compose_state, keysym) == xkb.XKB_COMPOSE_FEED_ACCEPTED) {
+            switch (xkb.xkb_compose_state_get_status(compose_state)) {
+                xkb.XKB_COMPOSE_COMPOSING => return null,
+                xkb.XKB_COMPOSE_COMPOSED => {
+                    const written = xkb.xkb_compose_state_get_utf8(
+                        compose_state,
+                        &self.key_text_buffer,
+                        self.key_text_buffer.len,
+                    );
+                    xkb.xkb_compose_state_reset(compose_state);
+                    if (written <= 0) return null;
+                    const len: usize = @intCast(written);
+                    if (len >= self.key_text_buffer.len) return null;
+                    return .{ .text = self.key_text_buffer[0..len] };
+                },
+                xkb.XKB_COMPOSE_CANCELLED => {
+                    xkb.xkb_compose_state_reset(compose_state);
+                    return null;
+                },
+                xkb.XKB_COMPOSE_NOTHING => {},
+                else => unreachable,
+            }
+        }
+    }
     switch (keysym) {
         xkb.XKB_KEY_BackSpace => return .backspace,
         xkb.XKB_KEY_Return, xkb.XKB_KEY_KP_Enter => return .enter,
@@ -819,6 +854,27 @@ fn keyInputFromWaylandKey(self: *Self, key: u32) ?keywork.KeyInput {
     const len: usize = @intCast(written);
     if (len >= self.key_text_buffer.len) return null;
     return .{ .text = self.key_text_buffer[0..len] };
+}
+
+fn initComposeState(context: *xkb.struct_xkb_context) ?*xkb.struct_xkb_compose_state {
+    const locale = composeLocale();
+    const table = xkb.xkb_compose_table_new_from_locale(context, locale, xkb.XKB_COMPOSE_COMPILE_NO_FLAGS) orelse {
+        log.warn("failed to load XKB compose table for locale {s}", .{locale});
+        return null;
+    };
+    defer xkb.xkb_compose_table_unref(table);
+    return xkb.xkb_compose_state_new(table, xkb.XKB_COMPOSE_STATE_NO_FLAGS) orelse {
+        log.warn("failed to create XKB compose state", .{});
+        return null;
+    };
+}
+
+fn composeLocale() [*:0]const u8 {
+    inline for (.{ "LC_ALL", "LC_CTYPE", "LANG" }) |name| {
+        const value = std.c.getenv(name) orelse continue;
+        if (value[0] != 0) return value;
+    }
+    return "C";
 }
 
 fn hasUnconsumedShortcutModifier(state: *xkb.struct_xkb_state, keycode: xkb.xkb_keycode_t) bool {
@@ -1074,4 +1130,34 @@ test "Wayland key translation preserves consumed AltGr input" {
     // KEY_RIGHTALT selects level three; AltGr+Q is @ on the German layout.
     _ = xkb.xkb_state_update_key(state, 100 + 8, xkb.XKB_KEY_DOWN);
     try std.testing.expectEqualStrings("@", input.keyInputFromWaylandKey(16).?.text);
+}
+
+test "Wayland key translation composes dead keys" {
+    var input = try initTestInput("de");
+    defer input.deinit();
+
+    const compose = "<dead_acute> <e> : \"é\" U00E9\n";
+    const table = xkb.xkb_compose_table_new_from_buffer(
+        input.xkb_context.?,
+        compose.ptr,
+        compose.len,
+        "C",
+        xkb.XKB_COMPOSE_FORMAT_TEXT_V1,
+        xkb.XKB_COMPOSE_COMPILE_NO_FLAGS,
+    ) orelse return error.XkbComposeTableFailed;
+    defer xkb.xkb_compose_table_unref(table);
+    input.xkb_compose_state = xkb.xkb_compose_state_new(table, xkb.XKB_COMPOSE_STATE_NO_FLAGS) orelse
+        return error.XkbComposeStateFailed;
+
+    // KEY_EQUAL is dead_acute on the German layout; it waits for the next
+    // key instead of disappearing and leaving an unaccented character.
+    try std.testing.expect(input.keyInputFromWaylandKey(13) == null);
+    try std.testing.expectEqualStrings("é", input.keyInputFromWaylandKey(18).?.text);
+    try std.testing.expectEqualStrings("a", input.keyInputFromWaylandKey(30).?.text);
+
+    // A cancelled sequence follows conventional Unix behavior: suppress the
+    // unmatched key, reset, and accept the next key normally.
+    try std.testing.expect(input.keyInputFromWaylandKey(13) == null);
+    try std.testing.expect(input.keyInputFromWaylandKey(30) == null);
+    try std.testing.expectEqualStrings("a", input.keyInputFromWaylandKey(30).?.text);
 }
