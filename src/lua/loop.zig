@@ -120,7 +120,6 @@ pub const FdWatch = struct {
         });
         errdefer self.unregister(loop);
         self.registered = true;
-        try fdWatchCallback(self, loop, linux.EPOLL.IN);
     }
 
     pub fn unregister(self: *FdWatch, loop: *event_loop.EventLoop) void {

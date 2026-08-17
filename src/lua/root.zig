@@ -4742,7 +4742,7 @@ test "lua fd watch cancel resumes a parked reader and ends iteration" {
     try app.ensureLoaded();
 }
 
-test "lua fd watch coalesces readiness and hands it to the next reader" {
+test "lua fd watch reports only kernel readiness" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4752,21 +4752,18 @@ test "lua fd watch coalesces readiness and hands it to the next reader" {
     defer _ = linux.close(fds[0]);
     defer _ = linux.close(fds[1]);
 
-    // Bind-time registration primes the watch with a read event while no
-    // reader is parked; it must coalesce into pending readiness that the
-    // first next() returns without yielding.
     const script = try std.fmt.allocPrint(allocator,
         \\local kw = require("keywork")
         \\local loop = require("keywork.loop")
         \\watch = loop.fd({d}, {{ read = true }})
+        \\got_event = false
         \\got_read = false
-        \\function start_reader()
-        \\  loop.spawn(function()
-        \\    local ev = watch:next()
-        \\    got_read = ev.read
-        \\    watch:cancel()
-        \\  end)
-        \\end
+        \\loop.spawn(function()
+        \\  local ev = watch:next()
+        \\  got_event = true
+        \\  got_read = ev.read
+        \\  watch:cancel()
+        \\end)
         \\return kw.app({{ child = kw.text("fd-pending") }})
         \\
     , .{fds[0]});
@@ -4781,11 +4778,29 @@ test "lua fd watch coalesces readiness and hands it to the next reader" {
     defer app.unbindEventLoop();
 
     try std.testing.expectEqual(@as(usize, 1), app.fd_watches.items.len);
-    try std.testing.expect(app.fd_watches.items[0].pending != 0);
+    try std.testing.expectEqual(@as(u32, 0), app.fd_watches.items[0].pending);
+    try expectLuaBoolean(&app, "got_event", false);
 
-    c.lua_getglobal(app.state, "start_reader");
-    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(app.state, 0, 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), linux.write(fds[1], "x", 1));
 
+    const ReadinessTest = struct {
+        app: *App,
+        rounds: u32 = 0,
+
+        fn callback(ctx: *anyopaque, event_loop_instance: *event_loop.EventLoop, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.rounds += 1;
+            c.lua_getglobal(self.app.state, "got_event");
+            const got_event = c.lua_toboolean(self.app.state, -1) != 0;
+            pop(self.app.state, 1);
+            if (got_event or self.rounds > 1000) event_loop_instance.quit();
+        }
+    };
+    var context: ReadinessTest = .{ .app = &app };
+    try loop.addRepeatingTimer(1, &context, ReadinessTest.callback);
+    try loop.run();
+
+    try expectLuaBoolean(&app, "got_event", true);
     try expectLuaBoolean(&app, "got_read", true);
     try std.testing.expect(app.fd_watches.items[0].canceled);
 }
