@@ -24,8 +24,14 @@ pub fn add(
         \\#include <stb_image.h>
         \\
         \\#define STBIR_ASSERT(x)
+        \\#include <stb_image_resize2.h>
+        \\// Packed coefficient rows are float-aligned; make stb's 64-bit copy
+        \\// type reflect that alignment and its intentional type punning.
+        \\typedef uint64_t keywork_stbir_uint64 __attribute__((aligned(4), may_alias));
+        \\#define stbir_uint64 keywork_stbir_uint64
         \\#define STB_IMAGE_RESIZE_IMPLEMENTATION
         \\#include <stb_image_resize2.h>
+        \\#undef stbir_uint64
         \\
         \\#define STB_IMAGE_WRITE_IMPLEMENTATION
         \\#include <stb_image_write.h>

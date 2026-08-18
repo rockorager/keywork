@@ -795,6 +795,15 @@ test "cropped image resampling selects the fitted source region" {
     for (pixels) |pixel| try std.testing.expectEqual(blue, pixel);
 }
 
+test "RGBA resampling supports packed three-coefficient filters" {
+    const source = [_]u8{ 255, 0, 0, 255 } ** 9;
+    const pixels = try resampledRgbaPixels(std.testing.allocator, &source, 3, 3, 2, 2, .{});
+    defer std.testing.allocator.free(pixels);
+
+    try std.testing.expectEqual(@as(usize, 4), pixels.len);
+    for (pixels) |pixel| try std.testing.expectEqual(keywork.Color.argb(255, 255, 0, 0), pixel);
+}
+
 test "file image decodes lazily and invalidates same-path replacements" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
