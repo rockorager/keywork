@@ -211,6 +211,9 @@ fn lookupInTheme(
     defer if (fallback_theme) |*theme| theme.deinit(allocator);
     const fallback: ?*const Theme = if (fallback_theme) |*theme| theme else null;
 
+    if (env("HOME")) |home| {
+        if (try lookupInLegacyHomeTheme(allocator, home, name, size, theme_name, formats, &inherited, fallback)) |path| return path;
+    }
     if (try lookupInHomeTheme(allocator, name, size, theme_name, formats, &inherited, fallback)) |path| return path;
     if (try lookupInDataDirThemes(allocator, name, size, theme_name, formats, &inherited, fallback)) |path| return path;
 
@@ -221,6 +224,21 @@ fn lookupInTheme(
         if (try lookupInTheme(allocator, name, size, "hicolor", formats, visited, depth + 1)) |path| return path;
     }
     return null;
+}
+
+fn lookupInLegacyHomeTheme(
+    allocator: std.mem.Allocator,
+    home: []const u8,
+    name: []const u8,
+    size: u32,
+    theme_name: []const u8,
+    formats: []const IconFormat,
+    inherited: *std.ArrayList([]u8),
+    fallback_theme: ?*const Theme,
+) !?IconFile {
+    const icon_root = try std.fmt.allocPrint(allocator, "{s}/.icons", .{home});
+    defer allocator.free(icon_root);
+    return lookupInIconRootTheme(allocator, icon_root, name, size, theme_name, formats, inherited, fallback_theme);
 }
 
 fn lookupInHomeTheme(
@@ -265,7 +283,22 @@ fn lookupInDataRootTheme(
     inherited: *std.ArrayList([]u8),
     fallback_theme: ?*const Theme,
 ) !?IconFile {
-    var loaded_theme = try loadTheme(allocator, data_root, theme_name);
+    const icon_root = try std.fmt.allocPrint(allocator, "{s}/icons", .{data_root});
+    defer allocator.free(icon_root);
+    return lookupInIconRootTheme(allocator, icon_root, name, size, theme_name, formats, inherited, fallback_theme);
+}
+
+fn lookupInIconRootTheme(
+    allocator: std.mem.Allocator,
+    icon_root: []const u8,
+    name: []const u8,
+    size: u32,
+    theme_name: []const u8,
+    formats: []const IconFormat,
+    inherited: *std.ArrayList([]u8),
+    fallback_theme: ?*const Theme,
+) !?IconFile {
+    var loaded_theme = try loadThemeFromIconRoot(allocator, icon_root, theme_name);
     defer if (loaded_theme) |*theme| theme.deinit(allocator);
     const theme: *const Theme = if (loaded_theme) |*value| value else fallback_theme orelse return null;
 
@@ -273,11 +306,16 @@ fn lookupInDataRootTheme(
         if (!visitedContains(inherited.items, parent)) try inherited.append(allocator, try allocator.dupe(u8, parent));
     }
 
-    if (try lookupExactSizeInTheme(allocator, data_root, theme_name, name, size, formats, theme.directories.items)) |path| return path;
-    return lookupClosestSizeInTheme(allocator, data_root, theme_name, name, size, formats, theme.directories.items);
+    if (try lookupExactSizeInTheme(allocator, icon_root, theme_name, name, size, formats, theme.directories.items)) |path| return path;
+    return lookupClosestSizeInTheme(allocator, icon_root, theme_name, name, size, formats, theme.directories.items);
 }
 
 fn loadThemeFromSearchPath(allocator: std.mem.Allocator, theme_name: []const u8) !?Theme {
+    if (env("HOME")) |home| {
+        const icon_root = try std.fmt.allocPrint(allocator, "{s}/.icons", .{home});
+        defer allocator.free(icon_root);
+        if (try loadThemeFromIconRoot(allocator, icon_root, theme_name)) |theme| return theme;
+    }
     if (try allocDataHome(allocator)) |data_home| {
         defer allocator.free(data_home);
         if (try loadTheme(allocator, data_home, theme_name)) |theme| return theme;
@@ -294,7 +332,7 @@ fn loadThemeFromSearchPath(allocator: std.mem.Allocator, theme_name: []const u8)
 
 fn lookupExactSizeInTheme(
     allocator: std.mem.Allocator,
-    data_root: []const u8,
+    icon_root: []const u8,
     theme_name: []const u8,
     name: []const u8,
     size: u32,
@@ -303,14 +341,14 @@ fn lookupExactSizeInTheme(
 ) !?IconFile {
     for (directories) |directory| {
         if (!directory.matchesSize(size)) continue;
-        if (try lookupCandidate(allocator, data_root, theme_name, directory.path, name, formats)) |path| return path;
+        if (try lookupCandidate(allocator, icon_root, theme_name, directory.path, name, formats)) |path| return path;
     }
     return null;
 }
 
 fn lookupClosestSizeInTheme(
     allocator: std.mem.Allocator,
-    data_root: []const u8,
+    icon_root: []const u8,
     theme_name: []const u8,
     name: []const u8,
     size: u32,
@@ -320,7 +358,7 @@ fn lookupClosestSizeInTheme(
     var best_icon: ?IconFile = null;
     var best_distance: u32 = std.math.maxInt(u32);
     for (directories) |directory| {
-        const icon = try lookupCandidate(allocator, data_root, theme_name, directory.path, name, formats) orelse continue;
+        const icon = try lookupCandidate(allocator, icon_root, theme_name, directory.path, name, formats) orelse continue;
         const candidate_distance = directory.distance(size);
         if (candidate_distance < best_distance) {
             if (best_icon) |old| allocator.free(old.path);
@@ -334,7 +372,13 @@ fn lookupClosestSizeInTheme(
 }
 
 fn loadTheme(allocator: std.mem.Allocator, data_root: []const u8, theme_name: []const u8) !?Theme {
-    const path = try std.fmt.allocPrint(allocator, "{s}/icons/{s}/index.theme", .{ data_root, theme_name });
+    const icon_root = try std.fmt.allocPrint(allocator, "{s}/icons", .{data_root});
+    defer allocator.free(icon_root);
+    return loadThemeFromIconRoot(allocator, icon_root, theme_name);
+}
+
+fn loadThemeFromIconRoot(allocator: std.mem.Allocator, icon_root: []const u8, theme_name: []const u8) !?Theme {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}/index.theme", .{ icon_root, theme_name });
     defer allocator.free(path);
     const contents = try readSmallFile(allocator, path) orelse return null;
     defer allocator.free(contents);
@@ -433,8 +477,8 @@ fn lookupInDataRootPixmaps(allocator: std.mem.Allocator, data_root: []const u8, 
     return lookupFileCandidates(allocator, "{s}/pixmaps/{s}.{s}", "{s}/pixmaps/{s}-symbolic.{s}", .{ data_root, name }, formats);
 }
 
-fn lookupCandidate(allocator: std.mem.Allocator, data_root: []const u8, theme: []const u8, dir: []const u8, name: []const u8, formats: []const IconFormat) !?IconFile {
-    return lookupFileCandidates(allocator, "{s}/icons/{s}/{s}/{s}.{s}", "{s}/icons/{s}/{s}/{s}-symbolic.{s}", .{ data_root, theme, dir, name }, formats);
+fn lookupCandidate(allocator: std.mem.Allocator, icon_root: []const u8, theme: []const u8, dir: []const u8, name: []const u8, formats: []const IconFormat) !?IconFile {
+    return lookupFileCandidates(allocator, "{s}/{s}/{s}/{s}.{s}", "{s}/{s}/{s}/{s}-symbolic.{s}", .{ icon_root, theme, dir, name }, formats);
 }
 
 fn lookupFileCandidates(allocator: std.mem.Allocator, comptime exact_fmt: []const u8, comptime symbolic_fmt: []const u8, args: anytype, formats: []const IconFormat) !?IconFile {
@@ -689,6 +733,47 @@ test "data root without index uses theme metadata from search path" {
 
     try std.testing.expectEqual(IconFormat.svg, icon.format);
     try std.testing.expect(std.mem.endsWith(u8, icon.path, "/icons/hicolor/scalable/apps/keywork-overlay-test.svg"));
+}
+
+test "legacy home icon root participates in themed lookup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".icons/legacy-test/32x32/apps");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".icons/legacy-test/index.theme",
+        .data =
+        \\[Icon Theme]
+        \\Directories=32x32/apps
+        \\
+        \\[32x32/apps]
+        \\Size=32
+        \\Type=Fixed
+        \\
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".icons/legacy-test/32x32/apps/keywork-legacy-home-test.svg",
+        .data = "<svg/>",
+    });
+    const home = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+
+    var inherited: std.ArrayList([]u8) = .empty;
+    defer inherited.deinit(std.testing.allocator);
+    const icon = (try lookupInLegacyHomeTheme(
+        std.testing.allocator,
+        home,
+        "keywork-legacy-home-test",
+        32,
+        "legacy-test",
+        &.{ .svg, .png },
+        &inherited,
+        null,
+    )).?;
+    defer std.testing.allocator.free(icon.path);
+
+    try std.testing.expectEqual(IconFormat.svg, icon.format);
+    try std.testing.expect(std.mem.endsWith(u8, icon.path, "/.icons/legacy-test/32x32/apps/keywork-legacy-home-test.svg"));
 }
 
 test "scalable directory size range survives any key order" {
