@@ -5729,6 +5729,16 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "share/outside.desktop",
+        .data =
+        \\[Desktop Entry]
+        \\Type=Application
+        \\Name=Outside
+        \\Exec=outside
+        \\
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "share/not-executable",
         .data = "installed but not executable",
     });
@@ -5804,6 +5814,9 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\-- missing entries report an error
         \\local missing, err = apps.lookup("nope", { dirs = dirs })
         \\assert(missing == nil and err ~= nil)
+        \\-- desktop ids cannot escape the applications directory
+        \\local outside, outside_err = apps.lookup("../outside", { dirs = dirs })
+        \\assert(outside == nil and outside_err == "invalid desktop id ../outside")
         \\
         \\-- exec expansion: %c name, %% literal, %F file list, %i icon pair
         \\local argv = assert(apps.exec_argv(plain, { files = { "/tmp/a b.txt", "/tmp/c.txt" } }))

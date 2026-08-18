@@ -321,6 +321,9 @@ end
 function M.lookup(desktop_id, opts)
     opts = opts or {}
     assert(type(desktop_id) == "string" and desktop_id ~= "", "lookup requires a desktop id")
+    if desktop_id:find("/", 1, true) then
+        return nil, "invalid desktop id " .. desktop_id
+    end
     if not desktop_id:match("%.desktop$") then
         desktop_id = desktop_id .. ".desktop"
     end
