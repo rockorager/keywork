@@ -871,8 +871,9 @@ fn initComposeState(context: *xkb.struct_xkb_context) ?*xkb.struct_xkb_compose_s
 
 fn composeLocale() [*:0]const u8 {
     inline for (.{ "LC_ALL", "LC_CTYPE", "LANG" }) |name| {
-        const value = std.c.getenv(name) orelse continue;
-        if (value[0] != 0) return value;
+        if (std.c.getenv(name)) |value| {
+            if (value[0] != 0) return value;
+        }
     }
     return "C";
 }
