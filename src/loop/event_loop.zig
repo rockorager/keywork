@@ -769,6 +769,7 @@ pub const EventLoop = struct {
             try self.submitPrepared();
         }
 
+        var callback_error: ?anyerror = null;
         for (source_events) |event| {
             const token = event.data.u64;
             const index: usize = @intCast(@as(u32, @truncate(token)));
@@ -779,10 +780,17 @@ pub const EventLoop = struct {
             const slot = self.sources.items[index];
             if (slot.generation != generation) continue;
             const source = slot.source orelse continue;
-            try source.callback(source.ctx, self, event.events);
+            source.callback(source.ctx, self, event.events) catch |err| {
+                // epoll has already consumed this ready batch. Continue so
+                // one failing callback cannot strand a sibling EPOLLET edge.
+                if (callback_error == null) callback_error = err;
+            };
         }
 
-        if (self.end_turn_hook) |hook| try hook(self.end_turn_context.?, self);
+        if (self.end_turn_hook) |hook| hook(self.end_turn_context.?, self) catch |err| {
+            if (callback_error == null) callback_error = err;
+        };
+        if (callback_error) |err| return err;
     }
 
     fn dispatchCompletions(self: *EventLoop) !void {
@@ -1248,6 +1256,51 @@ test "source removed during dispatch does not fire stale events" {
     try loop.run();
 
     try std.testing.expectEqual(@as(usize, 1), context_a.fired + context_b.fired);
+}
+
+test "source callback error does not discard sibling edge-triggered events" {
+    const PipeTest = struct {
+        fired: usize = 0,
+        ended: bool = false,
+
+        fn callback(ctx: *anyopaque, _: *EventLoop, _: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fired += 1;
+            return error.Intentional;
+        }
+
+        fn end(ctx: *anyopaque, _: *EventLoop) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ended = true;
+        }
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+
+    var fds_a: [2]i32 = undefined;
+    try linuxVoid(linux.pipe2(&fds_a, .{ .NONBLOCK = true, .CLOEXEC = true }));
+    defer for (fds_a) |fd| {
+        _ = linux.close(fd);
+    };
+    var fds_b: [2]i32 = undefined;
+    try linuxVoid(linux.pipe2(&fds_b, .{ .NONBLOCK = true, .CLOEXEC = true }));
+    defer for (fds_b) |fd| {
+        _ = linux.close(fd);
+    };
+
+    var context: PipeTest = .{};
+    loop.setEndTurnHook(&context, PipeTest.end);
+    _ = try loop.addFd(.{ .fd = fds_a[0], .events = linux.EPOLL.IN | linux.EPOLL.ET, .ctx = &context, .callback = PipeTest.callback });
+    _ = try loop.addFd(.{ .fd = fds_b[0], .events = linux.EPOLL.IN | linux.EPOLL.ET, .ctx = &context, .callback = PipeTest.callback });
+
+    // epoll returns both ready edges in one batch. A callback failure must
+    // not discard its sibling because EPOLLET will not report that edge again.
+    _ = linux.write(fds_a[1], "x", 1);
+    _ = linux.write(fds_b[1], "x", 1);
+    try std.testing.expectError(error.Intentional, loop.run());
+    try std.testing.expectEqual(@as(usize, 2), context.fired);
+    try std.testing.expect(context.ended);
 }
 
 test "removed slot is reused with a fresh generation" {
