@@ -50,6 +50,8 @@ touch_points: std.ArrayList(TouchPoint),
 touch_frame_resources: std.ArrayList(*wl.Touch),
 latest_pointer_enter: ?UserAction,
 active_cursor: ?ActiveCursor,
+// Distinguishes a pending cursor choice after enter from explicit set_cursor(null).
+pointer_cursor_configured: bool,
 compositor_cursor: ?CursorImage,
 default_cursor: ?CursorImage,
 cursor_controller: ?CursorController,
@@ -309,6 +311,7 @@ pub fn init(
         .touch_frame_resources = .empty,
         .latest_pointer_enter = null,
         .active_cursor = null,
+        .pointer_cursor_configured = false,
         .compositor_cursor = null,
         .default_cursor = null,
         .cursor_controller = null,
@@ -674,8 +677,19 @@ pub fn isUnfocusedCursorController(self: *const Self, client: *wl.Client) bool {
 }
 
 pub fn setDragCursorController(self: *Self, client: ?*wl.Client) void {
+    if (self.drag_cursor_client == client) return;
+    if (client) |value| {
+        self.drag_cursor_client = value;
+        return;
+    }
+    const old_cursor = self.cursorInfo();
     self.drag_cursor_client = client;
-    if (client == null) self.restoreControllerCursor();
+    self.pointer_cursor_configured = false;
+    self.active_cursor = if (self.pointer_focus == null)
+        if (self.cursor_controller) |controller| controller.cursor else null
+    else
+        null;
+    self.notifyCursorChanged(old_cursor);
 }
 
 pub fn suppressPointerFocus(self: *Self, suppress: bool) void {
@@ -716,8 +730,12 @@ pub fn cursorInfo(self: *const Self) ?CursorInfo {
         .y = cursorCoordinate(position.y, cursor.hotspot_y),
     } };
     const cursor = self.active_cursor orelse {
-        if (self.pointer_focus != null or self.drag_cursor_client != null) return null;
-        if (self.cursor_controller) |controller| if (controller.configured) return null;
+        if (!defaultCursorVisible(
+            self.pointer_focus != null,
+            self.pointer_cursor_configured,
+            self.drag_cursor_client != null,
+            if (self.cursor_controller) |controller| controller.configured else false,
+        )) return null;
         const fallback = self.default_cursor orelse return null;
         return .{ .shape = .{
             .buffer = fallback.buffer,
@@ -737,6 +755,16 @@ pub fn cursorInfo(self: *const Self) ?CursorInfo {
             .y = cursorCoordinate(position.y, shape.hotspot_y),
         } },
     };
+}
+
+fn defaultCursorVisible(
+    pointer_focused: bool,
+    pointer_cursor_configured: bool,
+    drag_cursor_active: bool,
+    controller_configured: bool,
+) bool {
+    if (pointer_focused) return !pointer_cursor_configured;
+    return !drag_cursor_active and !controller_configured;
 }
 
 /// Overrides client and fallback cursors while the compositor owns the pointer.
@@ -1181,15 +1209,16 @@ pub fn warpPointer(
 
 pub fn pointerLeave(self: *Self) void {
     const old_cursor = self.cursorInfo();
-    const fallback_visible = self.active_cursor == null and self.cursorInfo() != null;
-    self.clearCursor();
     self.sendPointerLeave();
+    self.active_cursor = null;
+    self.pointer_cursor_configured = false;
+    self.compositor_cursor = null;
     self.pointer_focus = null;
     self.pointer_position = null;
     self.latest_pointer_enter = null;
     self.pointer_grab = null;
     self.pressed_pointer_buttons.clearRetainingCapacity();
-    if (fallback_visible) self.notifyCursorChanged(old_cursor);
+    self.notifyCursorChanged(old_cursor);
 }
 
 pub fn pointerButton(
@@ -1939,12 +1968,17 @@ fn updatePointerFocus(self: *Self, focus: ?PointerFocus, motion_time: ?u32) void
         focus != null;
     if (changed) {
         const old_cursor = self.cursorInfo();
-        self.active_cursor = null;
+        const drag_cursor = if (self.drag_cursor_client) |client|
+            if (self.activeCursorOwnedBy(client)) self.active_cursor else null
+        else
+            null;
+        self.active_cursor = drag_cursor;
         self.sendPointerLeave();
         self.pointer_focus = focus;
+        if (self.drag_cursor_client == null) self.pointer_cursor_configured = false;
         self.latest_pointer_enter = null;
         self.sendPointerEnter();
-        if (focus == null) {
+        if (focus == null and self.drag_cursor_client == null) {
             self.active_cursor = if (self.cursor_controller) |controller| controller.cursor else null;
         }
         self.notifyCursorChanged(old_cursor);
@@ -2074,6 +2108,7 @@ fn setCursor(
             if (focused_surface == null or focused_surface.?.resource.getClient() != pointer.getClient()) return;
         }
     }
+    self.pointer_cursor_configured = true;
     self.active_cursor = requested;
     self.notifyCursorChanged(old_cursor);
 }
@@ -2109,6 +2144,7 @@ pub fn setCursorShape(
             if (focused_surface == null or focused_surface.?.resource.getClient() != client) return;
         }
     }
+    self.pointer_cursor_configured = true;
     self.active_cursor = requested;
     self.notifyCursorChanged(old_cursor);
 }
@@ -2300,6 +2336,14 @@ test "cursor position accounts for hotspot and fractional motion" {
         std.math.minInt(i32),
         cursorCoordinate(-0.25, std.math.maxInt(i32)),
     );
+}
+
+test "default cursor only bridges a pending focused cursor choice" {
+    try std.testing.expect(defaultCursorVisible(true, false, false, false));
+    try std.testing.expect(!defaultCursorVisible(true, true, false, false));
+    try std.testing.expect(defaultCursorVisible(false, false, false, false));
+    try std.testing.expect(!defaultCursorVisible(false, false, true, false));
+    try std.testing.expect(!defaultCursorVisible(false, false, false, true));
 }
 
 test "protocol serial ordering handles wraparound" {

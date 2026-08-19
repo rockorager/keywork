@@ -6089,8 +6089,7 @@ fn pointerEnter(context: *anyopaque, x: f64, y: f64) void {
 
 fn pointerLeave(context: *anyopaque) void {
     const self = serverForOutput(context);
-    if (self.endCompositorPointerGrab(false)) requestRepaint(self);
-    self.seat.setCompositorCursor(null);
+    if (self.window_manager.endCompositorPointerGrab(false)) requestRepaint(self);
     self.pointer_constraints.deactivateAll();
     self.data_device.pointerLeft();
     if (self.xwm_initialized) self.xwm.dragLeft();
