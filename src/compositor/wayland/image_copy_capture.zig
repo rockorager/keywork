@@ -789,11 +789,9 @@ pub fn captureOutput(self: *Self, output: OutputLayout.Id) void {
 }
 
 pub fn needsComposedCursorFrame(self: *const Self, output: OutputLayout.Id) bool {
-    for (self.frames.items) |frame| {
-        if (frame.finished or frame.pending != null or !frame.paint_cursors) continue;
-        const scheduled = frame.scheduled_output orelse continue;
-        if (!std.meta.eql(scheduled, output)) continue;
-        const target = frame.target orelse continue;
+    for (self.sessions.items) |session| {
+        if (session.stopped or !session.paint_cursors) continue;
+        const target = session.target orelse continue;
         if (target != .source) continue;
         const source = target.source;
         if (source != .output) continue;

@@ -3731,7 +3731,13 @@ fn cursorIntersectsOutput(self: *Self, output: *RenderOutput, info: ?Seat.Cursor
 
 fn updateOutputCursor(self: *Self, output: *RenderOutput, old: ?Seat.CursorInfo, new: ?Seat.CursorInfo) void {
     if (!output.backend.powered()) return;
-    const eligible = self.shapeCursorForOutput(output, new);
+    // Keep the cursor software-composited for the lifetime of a capture that
+    // includes it. Re-enabling the hardware plane after every captured frame
+    // makes continuous capture alternate between the two paths at frame rate.
+    const eligible = if (self.needsComposedCursorFrame(output.protocol_id))
+        null
+    else
+        self.shapeCursorForOutput(output, new);
     switch (output.cursor_state) {
         .software => if (eligible) |shape| {
             if (self.cursorIntersectsOutput(output, old)) {
@@ -5257,8 +5263,10 @@ fn outputPresented(context: *anyopaque, info: presentation.Info) void {
             .deactivating => {
                 if (output.backend.disableShapeCursor()) {
                     output.cursor_state = .software;
-                    const cursor = self.seatCursorInfo(&self.seat, self.session_lock.isLocked());
-                    self.updateOutputCursor(output, cursor, cursor);
+                    if (!self.needsComposedCursorFrame(output.protocol_id)) {
+                        const cursor = self.seatCursorInfo(&self.seat, self.session_lock.isLocked());
+                        self.updateOutputCursor(output, cursor, cursor);
+                    }
                 } else {
                     self.damageFullOutput(output);
                 }

@@ -624,9 +624,7 @@ pub fn needsComposedCursorFrame(
     cursor_bounds: ?render.Rect,
 ) bool {
     for (self.frames.items) |frame| {
-        if (frame.finished or !frame.used or frame.pending != null or !frame.overlay_cursor) {
-            continue;
-        }
+        if (frame.finished or !frame.used or !frame.overlay_cursor) continue;
         const target = frame.target orelse continue;
         if (!std.meta.eql(target.output, output)) continue;
         if (!captureRegionIntersectsCursor(target.region, cursor_bounds)) continue;
