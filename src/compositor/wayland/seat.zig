@@ -1938,12 +1938,16 @@ fn updatePointerFocus(self: *Self, focus: ?PointerFocus, motion_time: ?u32) void
     else
         focus != null;
     if (changed) {
-        self.clearCursor();
+        const old_cursor = self.cursorInfo();
+        self.active_cursor = null;
         self.sendPointerLeave();
         self.pointer_focus = focus;
         self.latest_pointer_enter = null;
         self.sendPointerEnter();
-        if (focus == null) self.restoreControllerCursor();
+        if (focus == null) {
+            self.active_cursor = if (self.cursor_controller) |controller| controller.cursor else null;
+        }
+        self.notifyCursorChanged(old_cursor);
         return;
     }
     self.pointer_focus = focus;
