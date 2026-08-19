@@ -760,6 +760,15 @@ pub fn executableExists(allocator: std.mem.Allocator, name: []const u8) !bool {
     return true;
 }
 
+test "executable detection rejects directories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expect(!try executableExists(std.testing.allocator, path));
+}
+
 fn getenv(name: []const u8) ?[]const u8 {
     var index: usize = 0;
     while (std.c.environ[index]) |entry_z| : (index += 1) {
@@ -770,7 +779,20 @@ fn getenv(name: []const u8) ?[]const u8 {
 }
 
 fn isExecutable(path: [:0]const u8) bool {
-    return linux.errno(linux.access(path.ptr, linux.X_OK)) == .SUCCESS;
+    var stat = std.mem.zeroes(linux.Statx);
+    while (true) switch (linux.errno(linux.statx(
+        linux.AT.FDCWD,
+        path.ptr,
+        0,
+        .{ .TYPE = true },
+        &stat,
+    ))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        else => return false,
+    };
+    return linux.S.ISREG(stat.mode) and
+        linux.errno(linux.access(path.ptr, linux.X_OK)) == .SUCCESS;
 }
 
 fn createPipe() ![2]i32 {
