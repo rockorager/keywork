@@ -5817,6 +5817,8 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\-- desktop ids cannot escape the applications directory
         \\local outside, outside_err = apps.lookup("../outside", { dirs = dirs })
         \\assert(outside == nil and outside_err == "invalid desktop id ../outside")
+        \\local encoded_outside, encoded_outside_err = apps.lookup("..-outside", { dirs = dirs })
+        \\assert(encoded_outside == nil and encoded_outside_err == "no desktop entry for ..-outside.desktop")
         \\
         \\-- exec expansion: %c name, %% literal, %F file list, %i icon pair
         \\local argv = assert(apps.exec_argv(plain, { files = { "/tmp/a b.txt", "/tmp/c.txt" } }))

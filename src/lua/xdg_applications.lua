@@ -307,9 +307,14 @@ local function find_by_id(base, id)
         if not dash then
             return nil
         end
-        local nested = find_by_id(base .. "/" .. id:sub(1, dash - 1), id:sub(dash + 1))
-        if nested then
-            return nested
+        local directory = id:sub(1, dash - 1)
+        -- Dash decoding must not turn an otherwise slash-free desktop id
+        -- into a path outside the applications directory.
+        if directory ~= "." and directory ~= ".." then
+            local nested = find_by_id(base .. "/" .. directory, id:sub(dash + 1))
+            if nested then
+                return nested
+            end
         end
         from = dash + 1
     end
