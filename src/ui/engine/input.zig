@@ -45,12 +45,15 @@ pub fn pointerDown(self: anytype, event: keywork.PointerButtonEvent) !void {
             self.pressed_button = .left;
             return;
         }
-        if (keywork.hitTestTextInput(root, point)) |id| {
-            const focus_changed = try focus_scroll.setFocusedFromPointer(self, id);
-            _ = try setPressedId(self, null);
-            if (focus_changed) try self.invalidate() else try self.invalidateState();
-            return;
-        }
+        if (keywork.hitTestPrimary(root, point)) |primary_hit| switch (primary_hit) {
+            .text_input => |id| {
+                const focus_changed = try focus_scroll.setFocusedFromPointer(self, id);
+                _ = try setPressedId(self, null);
+                if (focus_changed) try self.invalidate() else try self.invalidateState();
+                return;
+            },
+            .click => {},
+        };
     }
 
     if (keywork.hitTestClick(root, point, event.button)) |hit| {

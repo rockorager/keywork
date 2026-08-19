@@ -33,6 +33,11 @@ pub const ClickHit = struct {
     cursor: CursorShape = .default,
 };
 
+pub const PrimaryHit = union(enum) {
+    text_input: []const u8,
+    click: ClickHit,
+};
+
 pub const FocusTarget = struct {
     id: []const u8,
     kind: Kind,
@@ -133,6 +138,10 @@ pub fn hitTestClick(node: *const RenderNode, point: Point, button: model.Pointer
         if (hitTestClick(node.children[index], point, button)) |hit| return hit;
     }
 
+    return clickHitAtNode(node, point, button);
+}
+
+fn clickHitAtNode(node: *const RenderNode, point: Point, button: model.PointerButton) ?ClickHit {
     if (node.kind == .clickable and node.rect.contains(point) and node.click_buttons.accepts(button)) {
         if (!nodeHasTapCallback(node)) return null;
         return .{
@@ -153,6 +162,24 @@ pub fn hitTestClick(node: *const RenderNode, point: Point, button: model.Pointer
         }
     }
     return null;
+}
+
+/// Resolves competing primary-pointer targets in paint order. A single walk
+/// keeps a later-painted clickable from falling through to an obscured text
+/// input (and vice versa).
+pub fn hitTestPrimary(node: *const RenderNode, point: Point) ?PrimaryHit {
+    if (node.kind.isViewport() and !node.rect.contains(point)) return null;
+    var index = node.children.len;
+    while (index > 0) {
+        index -= 1;
+        if (hitTestPrimary(node.children[index], point)) |hit| return hit;
+    }
+
+    if (node.kind == .text_input and node.rect.contains(point)) {
+        return .{ .text_input = node.focus_id orelse return null };
+    }
+    const click = clickHitAtNode(node, point, .left) orelse return null;
+    return .{ .click = click };
 }
 
 test "right click skips left-only child and hits accepting ancestor" {
@@ -301,7 +328,42 @@ fn revealDelta(start: f32, extent: f32, viewport_start: f32, viewport_extent: f3
 }
 
 pub fn hitTestCursorShape(node: *const RenderNode, point: Point) CursorShape {
-    if (hitTestTextInput(node, point) != null) return .text;
-    if (hitTestClick(node, point, .left)) |hit| return hit.cursor;
-    return .default;
+    const hit = hitTestPrimary(node, point) orelse return .default;
+    return switch (hit) {
+        .text_input => .text,
+        .click => |click| click.cursor,
+    };
+}
+
+test "primary hit testing respects paint order across target kinds" {
+    const Callback = struct {
+        fn call(_: *anyopaque, _: model.TapEvent) !void {}
+    };
+    var state: u8 = 0;
+    const callback: Widget.TapCallback = .{ .ptr = &state, .call_fn = Callback.call };
+    var input: RenderNode = .{
+        .kind = .text_input,
+        .rect = .{ .x = 0, .y = 0, .width = 20, .height = 20 },
+        .focus_id = "input",
+    };
+    var button: RenderNode = .{
+        .kind = .clickable,
+        .rect = .{ .x = 0, .y = 0, .width = 20, .height = 20 },
+        .clickable_id = "button",
+        .click_callback = callback,
+        .click_cursor = .pointer,
+    };
+    var children = [_]*RenderNode{ &input, &button };
+    const root: RenderNode = .{
+        .kind = .column,
+        .rect = .{ .x = 0, .y = 0, .width = 20, .height = 20 },
+        .children = &children,
+    };
+
+    try std.testing.expectEqualStrings("button", hitTestPrimary(&root, .{ .x = 5, .y = 5 }).?.click.id);
+    try std.testing.expectEqual(CursorShape.pointer, hitTestCursorShape(&root, .{ .x = 5, .y = 5 }));
+
+    std.mem.swap(*RenderNode, &children[0], &children[1]);
+    try std.testing.expectEqualStrings("input", hitTestPrimary(&root, .{ .x = 5, .y = 5 }).?.text_input);
+    try std.testing.expectEqual(CursorShape.text, hitTestCursorShape(&root, .{ .x = 5, .y = 5 }));
 }

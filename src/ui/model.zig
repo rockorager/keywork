@@ -3431,10 +3431,12 @@ const hit_testing_model = @import("hit_testing.zig");
 
 pub const hitTestButton = hit_testing_model.hitTestButton;
 pub const ClickHit = hit_testing_model.ClickHit;
+pub const PrimaryHit = hit_testing_model.PrimaryHit;
 pub const FocusTarget = hit_testing_model.FocusTarget;
 pub const collectFocusTargets = hit_testing_model.collectFocusTargets;
 pub const findFocusTarget = hit_testing_model.findFocusTarget;
 pub const hitTestClick = hit_testing_model.hitTestClick;
+pub const hitTestPrimary = hit_testing_model.hitTestPrimary;
 pub const ScrollHit = hit_testing_model.ScrollHit;
 pub const hitTestScrollCallback = hit_testing_model.hitTestScrollCallback;
 pub const findClickHitById = hit_testing_model.findClickHitById;
