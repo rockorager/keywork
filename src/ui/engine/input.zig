@@ -299,11 +299,13 @@ pub fn setInteractionId(self: anytype, slot: *?[]u8, id: ?[]const u8) !bool {
         }
     } else if (id == null) return false;
 
+    const owned_id = if (id) |new_id| try self.allocator.dupe(u8, new_id) else null;
+    errdefer if (owned_id) |value| self.allocator.free(value);
     const old_id = slot.*;
     if (old_id) |value| try queueInteractionRefresh(self, value);
     if (id) |value| try queueInteractionRefresh(self, value);
     if (old_id) |value| self.allocator.free(value);
-    slot.* = if (id) |new_id| try self.allocator.dupe(u8, new_id) else null;
+    slot.* = owned_id;
     return true;
 }
 
@@ -345,4 +347,32 @@ pub fn popLastGrapheme(bytes: *std.ArrayList(u8)) void {
         start = grapheme.start;
     }
     bytes.shrinkRetainingCapacity(start);
+}
+
+test "interaction id remains owned when replacement allocation fails" {
+    var slot: ?[]u8 = try std.testing.allocator.dupe(u8, "old");
+    defer if (slot) |id| std.testing.allocator.free(id);
+    var pending_interaction_ids: std.ArrayList([]u8) = .empty;
+    defer {
+        for (pending_interaction_ids.items) |id| std.testing.allocator.free(id);
+        pending_interaction_ids.deinit(std.testing.allocator);
+    }
+    for ([_][]const u8{ "old", "new" }) |id| {
+        const owned = try std.testing.allocator.dupe(u8, id);
+        errdefer std.testing.allocator.free(owned);
+        try pending_interaction_ids.append(std.testing.allocator, owned);
+    }
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    const allocator = failing.allocator();
+    var runtime = .{
+        .allocator = allocator,
+        .pending_interaction_ids = pending_interaction_ids,
+    };
+
+    try std.testing.expectError(error.OutOfMemory, setInteractionId(&runtime, &slot, "new"));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqualStrings("old", slot.?);
 }
