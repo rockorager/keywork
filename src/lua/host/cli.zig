@@ -114,20 +114,20 @@ fn parseRun(args: anytype, allocator: std.mem.Allocator) !Options {
             if (result.layer_shell == null) result.layer_shell = .{};
         } else if (std.mem.startsWith(u8, arg, "--layer=")) {
             if (result.layer_shell == null) result.layer_shell = .{};
-            result.layer_shell.?.layer = parseLayer(arg["--layer=".len..]);
+            result.layer_shell.?.layer = try parseLayer(arg["--layer=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--anchor=")) {
             if (result.layer_shell == null) result.layer_shell = .{};
-            result.layer_shell.?.anchors = parseAnchors(arg["--anchor=".len..]);
+            result.layer_shell.?.anchors = try parseAnchors(arg["--anchor=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--exclusive-zone=")) {
             if (result.layer_shell == null) result.layer_shell = .{};
-            result.layer_shell.?.exclusive_zone = std.fmt.parseInt(i32, arg["--exclusive-zone=".len..], 10) catch result.layer_shell.?.exclusive_zone;
+            result.layer_shell.?.exclusive_zone = std.fmt.parseInt(i32, arg["--exclusive-zone=".len..], 10) catch return error.InvalidOptionValue;
         } else if (std.mem.startsWith(u8, arg, "--keyboard=")) {
             if (result.layer_shell == null) result.layer_shell = .{};
-            result.layer_shell.?.keyboard_interactivity = parseKeyboardInteractivity(arg["--keyboard=".len..]);
+            result.layer_shell.?.keyboard_interactivity = try parseKeyboardInteractivity(arg["--keyboard=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--width=")) {
-            result.width = std.fmt.parseFloat(f32, arg["--width=".len..]) catch result.width;
+            result.width = try parseDimension(arg["--width=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--height=")) {
-            result.height = std.fmt.parseFloat(f32, arg["--height=".len..]) catch result.height;
+            result.height = try parseDimension(arg["--height=".len..]);
         } else if (std.mem.startsWith(u8, arg, "--script=")) {
             result.script_path = arg["--script=".len..];
             script_seen = true;
@@ -266,27 +266,58 @@ test "run command rejects unknown options before the script" {
     try std.testing.expectEqualStrings("--application-option", options.app_args[0]);
 }
 
-fn parseLayer(value: []const u8) native_runtime.LayerShellOptions.Layer {
-    if (std.mem.eql(u8, value, "background")) return .background;
-    if (std.mem.eql(u8, value, "bottom")) return .bottom;
-    if (std.mem.eql(u8, value, "overlay")) return .overlay;
-    return .top;
+test "run command rejects invalid recognized option values" {
+    const cases = [_][]const [:0]const u8{
+        &.{ "--width=wide", "app.lua" },
+        &.{ "--height=nan", "app.lua" },
+        &.{ "--layer=front", "app.lua" },
+        &.{ "--anchor=top,center", "app.lua" },
+        &.{ "--exclusive-zone=full", "app.lua" },
+        &.{ "--keyboard=sometimes", "app.lua" },
+    };
+    for (cases) |items| {
+        var args: TestArgs = .{ .items = items };
+        try std.testing.expectError(error.InvalidOptionValue, parseRun(&args, std.testing.allocator));
+    }
 }
 
-fn parseAnchors(value: []const u8) native_runtime.LayerShellOptions.AnchorSet {
+fn parseDimension(value: []const u8) !f32 {
+    const dimension = std.fmt.parseFloat(f32, value) catch return error.InvalidOptionValue;
+    if (!std.math.isFinite(dimension)) return error.InvalidOptionValue;
+    return dimension;
+}
+
+fn parseLayer(value: []const u8) !native_runtime.LayerShellOptions.Layer {
+    if (std.mem.eql(u8, value, "background")) return .background;
+    if (std.mem.eql(u8, value, "bottom")) return .bottom;
+    if (std.mem.eql(u8, value, "top")) return .top;
+    if (std.mem.eql(u8, value, "overlay")) return .overlay;
+    return error.InvalidOptionValue;
+}
+
+fn parseAnchors(value: []const u8) !native_runtime.LayerShellOptions.AnchorSet {
     var result: native_runtime.LayerShellOptions.AnchorSet = .{};
+    if (value.len == 0) return error.InvalidOptionValue;
     var it = std.mem.splitScalar(u8, value, ',');
     while (it.next()) |anchor| {
-        if (std.mem.eql(u8, anchor, "top")) result.top = true;
-        if (std.mem.eql(u8, anchor, "bottom")) result.bottom = true;
-        if (std.mem.eql(u8, anchor, "left")) result.left = true;
-        if (std.mem.eql(u8, anchor, "right")) result.right = true;
+        if (std.mem.eql(u8, anchor, "top")) {
+            result.top = true;
+        } else if (std.mem.eql(u8, anchor, "bottom")) {
+            result.bottom = true;
+        } else if (std.mem.eql(u8, anchor, "left")) {
+            result.left = true;
+        } else if (std.mem.eql(u8, anchor, "right")) {
+            result.right = true;
+        } else {
+            return error.InvalidOptionValue;
+        }
     }
     return result;
 }
 
-fn parseKeyboardInteractivity(value: []const u8) native_runtime.LayerShellOptions.KeyboardInteractivity {
+fn parseKeyboardInteractivity(value: []const u8) !native_runtime.LayerShellOptions.KeyboardInteractivity {
+    if (std.mem.eql(u8, value, "none")) return .none;
     if (std.mem.eql(u8, value, "exclusive")) return .exclusive;
     if (std.mem.eql(u8, value, "on-demand") or std.mem.eql(u8, value, "on_demand")) return .on_demand;
-    return .none;
+    return error.InvalidOptionValue;
 }
