@@ -757,19 +757,29 @@ pub const EventLoop = struct {
             self.flushPendingDestroy();
         }
 
+        var dispatch_error: ?anyerror = null;
         if (self.wayland) |wayland| {
-            if (!try wayland.finish(wayland.ctx, wayland_events)) self.running = false;
+            const keep_running = wayland.finish(wayland.ctx, wayland_events) catch |err| blk: {
+                dispatch_error = err;
+                break :blk true;
+            };
+            if (!keep_running) self.running = false;
         }
 
-        if (self.after_platform_hook) |hook| try hook(self.after_platform_context.?, self);
+        if (self.after_platform_hook) |hook| hook(self.after_platform_context.?, self) catch |err| {
+            if (dispatch_error == null) dispatch_error = err;
+        };
 
-        try self.dispatchCompletions();
+        self.dispatchCompletions() catch |err| {
+            if (dispatch_error == null) dispatch_error = err;
+        };
 
         if (self.submission_pending) {
-            try self.submitPrepared();
+            self.submitPrepared() catch |err| {
+                if (dispatch_error == null) dispatch_error = err;
+            };
         }
 
-        var callback_error: ?anyerror = null;
         for (source_events) |event| {
             const token = event.data.u64;
             const index: usize = @intCast(@as(u32, @truncate(token)));
@@ -783,14 +793,14 @@ pub const EventLoop = struct {
             source.callback(source.ctx, self, event.events) catch |err| {
                 // epoll has already consumed this ready batch. Continue so
                 // one failing callback cannot strand a sibling EPOLLET edge.
-                if (callback_error == null) callback_error = err;
+                if (dispatch_error == null) dispatch_error = err;
             };
         }
 
         if (self.end_turn_hook) |hook| hook(self.end_turn_context.?, self) catch |err| {
-            if (callback_error == null) callback_error = err;
+            if (dispatch_error == null) dispatch_error = err;
         };
-        if (callback_error) |err| return err;
+        if (dispatch_error) |err| return err;
     }
 
     fn dispatchCompletions(self: *EventLoop) !void {
@@ -1301,6 +1311,45 @@ test "source callback error does not discard sibling edge-triggered events" {
     try std.testing.expectError(error.Intentional, loop.run());
     try std.testing.expectEqual(@as(usize, 2), context.fired);
     try std.testing.expect(context.ended);
+}
+
+test "phase hook error does not discard edge-triggered source events" {
+    const PipeTest = struct {
+        fired: usize = 0,
+
+        fn callback(ctx: *anyopaque, _: *EventLoop, _: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fired += 1;
+        }
+
+        fn after(_: *anyopaque, _: *EventLoop) !void {
+            return error.Intentional;
+        }
+    };
+
+    var loop = try EventLoop.init(std.testing.allocator);
+    defer loop.deinit();
+
+    var fds_a: [2]i32 = undefined;
+    try linuxVoid(linux.pipe2(&fds_a, .{ .NONBLOCK = true, .CLOEXEC = true }));
+    defer for (fds_a) |fd| {
+        _ = linux.close(fd);
+    };
+    var fds_b: [2]i32 = undefined;
+    try linuxVoid(linux.pipe2(&fds_b, .{ .NONBLOCK = true, .CLOEXEC = true }));
+    defer for (fds_b) |fd| {
+        _ = linux.close(fd);
+    };
+
+    var context: PipeTest = .{};
+    loop.setAfterPlatformHook(&context, PipeTest.after);
+    _ = try loop.addFd(.{ .fd = fds_a[0], .events = linux.EPOLL.IN | linux.EPOLL.ET, .ctx = &context, .callback = PipeTest.callback });
+    _ = try loop.addFd(.{ .fd = fds_b[0], .events = linux.EPOLL.IN | linux.EPOLL.ET, .ctx = &context, .callback = PipeTest.callback });
+
+    _ = linux.write(fds_a[1], "x", 1);
+    _ = linux.write(fds_b[1], "x", 1);
+    try std.testing.expectError(error.Intentional, loop.run());
+    try std.testing.expectEqual(@as(usize, 2), context.fired);
 }
 
 test "removed slot is reused with a fresh generation" {
