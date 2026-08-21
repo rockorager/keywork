@@ -485,7 +485,9 @@ fn parseU32(value: []const u8) ?u32 {
 
 fn positiveIconSize(logical_size: f32) u32 {
     if (!std.math.isFinite(logical_size) or logical_size <= 0) return 16;
-    return @max(1, @as(u32, @intFromFloat(@round(logical_size))));
+    const rounded = @round(logical_size);
+    if (rounded >= @as(f32, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+    return @max(1, @as(u32, @intFromFloat(rounded)));
 }
 
 fn distanceToPoint(a: u32, b: u32) u32 {
@@ -504,6 +506,10 @@ test "icon theme preference uses overrides before Keywork default" {
     try std.testing.expectEqualStrings("explicit", preferredThemeFrom("explicit", "gtk"));
     try std.testing.expectEqualStrings("gtk", preferredThemeFrom(null, "gtk"));
     try std.testing.expectEqualStrings("Keywork", preferredThemeFrom(null, null));
+}
+
+test "icon size conversion saturates large finite values" {
+    try std.testing.expectEqual(std.math.maxInt(u32), positiveIconSize(std.math.floatMax(f32)));
 }
 
 test "lookup rejects relative slash names as direct paths" {
