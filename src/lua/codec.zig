@@ -129,7 +129,7 @@ fn decodeBoxShadow(lua_state: *c.lua_State, index: c_int, allocator: std.mem.All
 pub fn decodeColor(lua_state: *c.lua_State, index: c_int) !keywork.Color {
     if (c.lua_isnumber(lua_state, index) == 0) return error.ExpectedLuaNumber;
     const value = c.lua_tonumber(lua_state, index);
-    if (!std.math.isFinite(value) or value < 0 or value > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return error.InvalidLuaColor;
+    if (!std.math.isFinite(value) or value != @floor(value) or value < 0 or value > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return error.InvalidLuaColor;
     return @bitCast(@as(u32, @intFromFloat(value)));
 }
 
@@ -210,6 +210,11 @@ test "numeric decoding rejects values that cannot be represented" {
     try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(lua_state, 0, 1, 0));
     try std.testing.expectError(error.InvalidLuaColor, decodeColor(lua_state, -1));
     try std.testing.expectError(error.InvalidLuaNumber, decodeInsets(lua_state, -1, std.testing.allocator));
+    pop(lua_state, 1);
+
+    try std.testing.expectEqual(@as(c_int, 0), c.luaL_loadstring(lua_state, "return 1.5"));
+    try std.testing.expectEqual(@as(c_int, 0), c.lua_pcall(lua_state, 0, 1, 0));
+    try std.testing.expectError(error.InvalidLuaColor, decodeColor(lua_state, -1));
 }
 
 const stringFromStack = lua_value.stringFromStack;
