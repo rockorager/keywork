@@ -5839,6 +5839,20 @@ test "lua xdg.applications parses entries, looks up ids, and expands exec" {
         \\  path = "/tmp/editor.desktop",
         \\})
         \\assert(invalid_argv == nil and invalid_err == "unknown field code %Z")
+        \\-- multi-argument field codes are invalid when embedded in another argument
+        \\local inline_list_argv, inline_list_err = apps.exec_argv({
+        \\  exec = "editor --files=%F",
+        \\  name = "Editor",
+        \\  path = "/tmp/editor.desktop",
+        \\}, { files = { "/tmp/one", "/tmp/two" } })
+        \\assert(inline_list_argv == nil and inline_list_err == "field code %F must be a standalone argument")
+        \\local inline_icon_argv, inline_icon_err = apps.exec_argv({
+        \\  exec = "editor --icon=%i",
+        \\  name = "Editor",
+        \\  icon = "editor-icon",
+        \\  path = "/tmp/editor.desktop",
+        \\})
+        \\assert(inline_icon_argv == nil and inline_icon_err == "field code %i must be a standalone argument")
         \\
         \\-- files convert to escaped file:// URIs for %U
         \\local uris = assert(apps.exec_argv(viewer, { files = { "/tmp/a b.txt" } }))

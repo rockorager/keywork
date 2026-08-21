@@ -395,9 +395,9 @@ function M.list(opts)
     return entries
 end
 
--- Expands one token's inline field codes. Standalone list codes are
--- handled by the caller; here %f/%u fall back to the first value so
--- lenient files still work.
+-- Expands one token's inline field codes. Codes that produce multiple
+-- arguments are handled by the caller; here %f/%u fall back to the first
+-- value so lenient files still work.
 local function expand_inline(token, context)
     local out = {}
     local index = 1
@@ -407,19 +407,20 @@ local function expand_inline(token, context)
             local code = token:sub(index + 1, index + 1)
             if code == "%" then
                 table.insert(out, "%")
-            elseif code == "f" or code == "F" then
+            elseif code == "f" then
                 table.insert(out, context.files[1] or "")
-            elseif code == "u" or code == "U" then
+            elseif code == "u" then
                 table.insert(out, context.uris[1] or "")
             elseif code == "c" then
                 table.insert(out, context.name or "")
             elseif code == "k" then
                 table.insert(out, context.path or "")
+            elseif code == "F" or code == "U" or code == "i" then
+                return nil, "field code %" .. code .. " must be a standalone argument"
             elseif code:match("%a") then
                 return nil, "unknown field code %" .. code
             end
-            -- Deprecated codes (%d %D %n %N %v %m) and %i expand to nothing
-            -- inline; %i is only meaningful as a standalone token.
+            -- Deprecated codes (%d %D %n %N %v %m) expand to nothing.
             index = index + 2
         else
             table.insert(out, ch)
